@@ -2,7 +2,7 @@
 name = "gosub-sonar"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.88"
 authors = ["Gosub Community <info@gosub.io>"]
 license = "MIT"
 readme = "README.md"
