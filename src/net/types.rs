@@ -16,8 +16,9 @@ use url::Url;
 
 /// Priority of the scheduled request. Documents usually have high priority, while images have low.
 /// Currently, the scheduler uses a round-robin system to load resources
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 pub enum Priority {
+    #[default]
     High,
     Normal,
     Low,
@@ -41,9 +42,10 @@ impl Display for Priority {
 /// Callers that need finer-grained classification can extend this at the
 /// application layer; the net crate only uses these values for logging and
 /// to pass them back through [`crate::net::fetcher_context::FetcherContext::observer_for`].
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum ResourceKind {
     /// Top-level or primary resource (e.g. a document, feed, or binary download)
+    #[default]
     Primary,
     /// Secondary asset loaded on behalf of a primary resource (e.g. image, font, script)
     Asset,
@@ -55,9 +57,10 @@ pub enum ResourceKind {
 ///
 /// Used for logging and passed back through [`crate::net::fetcher_context::FetcherContext::observer_for`];
 /// the net crate does not alter scheduling based on this value.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum Initiator {
     /// Triggered by a user action (e.g. address bar, link click, button)
+    #[default]
     User,
     /// Triggered programmatically by the application
     Application,
@@ -94,6 +97,18 @@ pub struct FetchKeyData {
     pub method: Method,
     /// HTTP headers
     pub headers: HeaderMap,
+}
+
+impl Default for FetchKeyData {
+    fn default() -> Self {
+        let url = Url::parse("https:://example.net").unwrap();
+
+        Self {
+            url: url,
+            method: Method::default(),
+            headers: HeaderMap::default(),
+        }
+    }
 }
 
 impl Hash for FetchKeyData {
@@ -362,6 +377,93 @@ pub struct FetchRequest {
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
     /// `None` for GET and HEAD requests.
     pub body: Option<RequestBody>,
+}
+
+impl FetchRequest {
+    pub fn builder() -> FetchRequestBuilder {
+        FetchRequestBuilder::default()
+    }
+}
+
+#[derive(Default)]
+pub struct FetchRequestBuilder {
+    reference: RequestReference,
+    req_id: RequestId,
+    key_data: FetchKeyData,
+    priority: Priority,
+    initiator: Initiator,
+    kind: ResourceKind,
+    streaming: bool,
+    auto_decode: bool,
+    max_bytes: Option<usize>,
+    body: Option<RequestBody>,
+}
+
+impl FetchRequestBuilder {
+    pub fn with_reference(mut self, refernece: RequestReference) -> Self {
+        self.reference = refernece;
+        self
+    }
+
+    pub fn with_req_id(mut self, req_id: RequestId) -> Self {
+        self.req_id = req_id;
+        self
+    }
+
+    pub fn with_key_data(mut self, key_data: FetchKeyData) -> Self {
+        self.key_data = key_data;
+        self
+    }
+
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    pub fn with_initiator(mut self, initiator: Initiator) -> Self {
+        self.initiator = initiator;
+        self
+    }
+
+    pub fn with_king(mut self, kind: ResourceKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
+    }
+
+    pub fn with_auto_decode(mut self, auto_decode: bool) -> Self {
+        self.auto_decode = auto_decode;
+        self
+    }
+
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
+    }
+
+    pub fn with_body(mut self, body: RequestBody) -> Self {
+        self.body = Some(body);
+        self
+    }
+
+    pub fn build(self) -> FetchRequest {
+        FetchRequest {
+            reference: self.reference,
+            req_id: self.req_id,
+            key_data: self.key_data,
+            priority: self.priority,
+            initiator: self.initiator,
+            kind: self.kind,
+            streaming: self.streaming,
+            auto_decode: self.auto_decode,
+            max_bytes: self.max_bytes,
+            body: self.body,
+        }
+    }
 }
 
 /// FetchResult defines the resource response. Either a stream or buffered response are possible
