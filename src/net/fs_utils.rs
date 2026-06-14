@@ -26,11 +26,12 @@ mod tests {
 
     #[test]
     fn test_temp_path_creation() -> io::Result<()> {
-        let dest = Path::new("/tmp/testfile.txt");
-        let temp_file = temp_path_for(dest)?;
+        let dir = std::env::temp_dir();
+        let dest = dir.join("testfile.txt");
+        let temp_file = temp_path_for(&dest)?;
 
         assert!(temp_file.path().exists());
-        assert!(temp_file.path().parent() == Some(Path::new("/tmp")));
+        assert!(temp_file.path().parent() == Some(dir.as_path()));
         assert!(temp_file
             .path()
             .to_string_lossy()
