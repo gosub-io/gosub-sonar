@@ -13,6 +13,12 @@ pub enum RequestReference {
     Tagged(u64),
 }
 
+impl Default for RequestReference {
+    fn default() -> Self {
+        RequestReference::Background(0)
+    }
+}
+
 impl Display for RequestReference {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

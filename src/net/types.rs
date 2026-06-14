@@ -16,9 +16,10 @@ use url::Url;
 
 /// Priority of the scheduled request. Documents usually have high priority, while images have low.
 /// Currently, the scheduler uses a round-robin system to load resources
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 pub enum Priority {
     High,
+    #[default]
     Normal,
     Low,
     Idle,
@@ -41,9 +42,10 @@ impl Display for Priority {
 /// Callers that need finer-grained classification can extend this at the
 /// application layer; the net crate only uses these values for logging and
 /// to pass them back through [`crate::net::fetcher_context::FetcherContext::observer_for`].
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum ResourceKind {
     /// Top-level or primary resource (e.g. a document, feed, or binary download)
+    #[default]
     Primary,
     /// Secondary asset loaded on behalf of a primary resource (e.g. image, font, script)
     Asset,
@@ -55,9 +57,10 @@ pub enum ResourceKind {
 ///
 /// Used for logging and passed back through [`crate::net::fetcher_context::FetcherContext::observer_for`];
 /// the net crate does not alter scheduling based on this value.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum Initiator {
     /// Triggered by a user action (e.g. address bar, link click, button)
+    #[default]
     User,
     /// Triggered programmatically by the application
     Application,
@@ -364,6 +367,123 @@ pub struct FetchRequest {
     pub body: Option<RequestBody>,
 }
 
+impl FetchRequest {
+    pub fn builder(method: Method, url: impl Into<Url>) -> FetchRequestBuilder {
+        FetchRequestBuilder::new(method, url)
+    }
+}
+
+pub struct FetchRequestBuilder {
+    reference: RequestReference,
+    req_id: RequestId,
+    key_data: FetchKeyData,
+    priority: Priority,
+    initiator: Initiator,
+    kind: ResourceKind,
+    streaming: bool,
+    auto_decode: bool,
+    max_bytes: Option<usize>,
+    body: Option<RequestBody>,
+}
+
+impl FetchRequestBuilder {
+    pub fn new(method: Method, url: impl Into<Url>) -> Self {
+        Self {
+            key_data: FetchKeyData {
+                url: url.into(),
+                method,
+                headers: HeaderMap::default(),
+            },
+            reference: RequestReference::default(),
+            req_id: RequestId {
+                ..Default::default()
+            },
+            priority: Priority::default(),
+            initiator: Initiator::default(),
+            kind: ResourceKind::default(),
+            streaming: false,
+            auto_decode: false,
+            max_bytes: None,
+            body: None,
+        }
+    }
+
+    pub fn with_reference(mut self, reference: RequestReference) -> Self {
+        self.reference = reference;
+        self
+    }
+
+    pub fn with_req_id(mut self, req_id: RequestId) -> Self {
+        self.req_id = req_id;
+        self
+    }
+
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    pub fn with_initiator(mut self, initiator: Initiator) -> Self {
+        self.initiator = initiator;
+        self
+    }
+
+    pub fn with_kind(mut self, kind: ResourceKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    pub fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
+        self
+    }
+
+    pub fn with_auto_decode(mut self, auto_decode: bool) -> Self {
+        self.auto_decode = auto_decode;
+        self
+    }
+
+    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
+    }
+
+    pub fn with_body(mut self, body: RequestBody) -> Self {
+        self.body = Some(body);
+        self
+    }
+
+    pub fn with_url(mut self, url: impl Into<Url>) -> Self {
+        self.key_data.url = url.into();
+        self
+    }
+
+    pub fn with_method(mut self, method: Method) -> Self {
+        self.key_data.method = method;
+        self
+    }
+
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.key_data.headers = headers;
+        self
+    }
+
+    pub fn build(self) -> FetchRequest {
+        FetchRequest {
+            reference: self.reference,
+            req_id: self.req_id,
+            key_data: self.key_data,
+            priority: self.priority,
+            initiator: self.initiator,
+            kind: self.kind,
+            streaming: self.streaming,
+            auto_decode: self.auto_decode,
+            max_bytes: self.max_bytes,
+            body: self.body,
+        }
+    }
+}
+
 /// FetchResult defines the resource response. Either a stream or buffered response are possible
 #[derive(Clone)]
 pub enum FetchResult {
@@ -571,5 +691,52 @@ mod tests {
         };
         assert_eq!(stream.meta().unwrap().status, 200);
         assert!(format!("{:?}", stream).contains("Stream"));
+    }
+
+    #[test]
+    fn fetch_request_builder_builds_correctly() {
+        let mut headers = HeaderMap::new();
+        headers.insert("ACCEPT", "text/html".parse().unwrap());
+        headers.insert("CONTENT_TYPE", "application/json".parse().unwrap());
+
+        let reference = RequestReference::default();
+        let req_id = RequestId::new();
+        let priority = Priority::High;
+        let initiator = Initiator::Application;
+        let kind = ResourceKind::Asset;
+        let body = RequestBody::json(r#"{"key": "value"}"#);
+
+        let request =
+            FetchRequest::builder(Method::POST, Url::parse("https://example.com/api").unwrap())
+                .with_reference(reference)
+                .with_req_id(req_id)
+                .with_priority(priority)
+                .with_initiator(initiator)
+                .with_kind(kind)
+                .with_headers(headers)
+                .with_streaming(true)
+                .with_auto_decode(true)
+                .with_max_bytes(1024)
+                .with_body(body)
+                .build();
+
+        assert_eq!(request.reference, reference);
+        assert_eq!(request.req_id, req_id);
+        assert_eq!(request.priority, priority);
+        assert_eq!(request.initiator, initiator);
+        assert_eq!(request.kind, kind);
+        assert!(request.streaming);
+        assert!(request.auto_decode);
+        assert_eq!(request.max_bytes, Some(1024));
+        assert_eq!(
+            request.body.as_ref().unwrap().content_type,
+            Some("application/json".into())
+        );
+
+        let key_data = &request.key_data;
+        assert_eq!(key_data.url.as_str(), "https://example.com/api");
+        assert_eq!(key_data.method, Method::POST);
+        assert!(key_data.headers.contains_key("ACCEPT"));
+        assert!(key_data.headers.contains_key("CONTENT_TYPE"));
     }
 }
