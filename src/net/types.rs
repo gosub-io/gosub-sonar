@@ -18,8 +18,8 @@ use url::Url;
 /// Currently, the scheduler uses a round-robin system to load resources
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 pub enum Priority {
-    #[default]
     High,
+    #[default]
     Normal,
     Low,
     Idle,
@@ -97,18 +97,6 @@ pub struct FetchKeyData {
     pub method: Method,
     /// HTTP headers
     pub headers: HeaderMap,
-}
-
-impl Default for FetchKeyData {
-    fn default() -> Self {
-        let url = Url::parse("https:://example.net").unwrap();
-
-        Self {
-            url: url,
-            method: Method::default(),
-            headers: HeaderMap::default(),
-        }
-    }
 }
 
 impl Hash for FetchKeyData {
@@ -380,12 +368,11 @@ pub struct FetchRequest {
 }
 
 impl FetchRequest {
-    pub fn builder() -> FetchRequestBuilder {
-        FetchRequestBuilder::default()
+    pub fn builder(method: Method, url: impl Into<Url>) -> FetchRequestBuilder {
+        FetchRequestBuilder::new(method, url)
     }
 }
 
-#[derive(Default)]
 pub struct FetchRequestBuilder {
     reference: RequestReference,
     req_id: RequestId,
@@ -400,18 +387,34 @@ pub struct FetchRequestBuilder {
 }
 
 impl FetchRequestBuilder {
-    pub fn with_reference(mut self, refernece: RequestReference) -> Self {
-        self.reference = refernece;
+    pub fn new(method: Method, url: impl Into<Url>) -> Self {
+        Self {
+            key_data: FetchKeyData {
+                url: url.into(),
+                method,
+                headers: HeaderMap::default(),
+            },
+            reference: RequestReference::default(),
+            req_id: RequestId {
+                ..Default::default()
+            },
+            priority: Priority::default(),
+            initiator: Initiator::default(),
+            kind: ResourceKind::default(),
+            streaming: false,
+            auto_decode: false,
+            max_bytes: None,
+            body: None,
+        }
+    }
+
+    pub fn with_reference(mut self, reference: RequestReference) -> Self {
+        self.reference = reference;
         self
     }
 
     pub fn with_req_id(mut self, req_id: RequestId) -> Self {
         self.req_id = req_id;
-        self
-    }
-
-    pub fn with_key_data(mut self, key_data: FetchKeyData) -> Self {
-        self.key_data = key_data;
         self
     }
 
@@ -425,7 +428,7 @@ impl FetchRequestBuilder {
         self
     }
 
-    pub fn with_king(mut self, kind: ResourceKind) -> Self {
+    pub fn with_kind(mut self, kind: ResourceKind) -> Self {
         self.kind = kind;
         self
     }
@@ -447,6 +450,21 @@ impl FetchRequestBuilder {
 
     pub fn with_body(mut self, body: RequestBody) -> Self {
         self.body = Some(body);
+        self
+    }
+
+    pub fn with_url(mut self, url: impl Into<Url>) -> Self {
+        self.key_data.url = url.into();
+        self
+    }
+
+    pub fn with_method(mut self, method: Method) -> Self {
+        self.key_data.method = method;
+        self
+    }
+
+    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
+        self.key_data.headers = headers;
         self
     }
 
@@ -673,5 +691,52 @@ mod tests {
         };
         assert_eq!(stream.meta().unwrap().status, 200);
         assert!(format!("{:?}", stream).contains("Stream"));
+    }
+
+    #[test]
+    fn fetch_request_builder_builds_correctly() {
+        let mut headers = HeaderMap::new();
+        headers.insert("ACCEPT", "text/html".parse().unwrap());
+        headers.insert("CONTENT_TYPE", "application/json".parse().unwrap());
+
+        let reference = RequestReference::default();
+        let req_id = RequestId::new();
+        let priority = Priority::High;
+        let initiator = Initiator::Application;
+        let kind = ResourceKind::Asset;
+        let body = RequestBody::json(r#"{"key": "value"}"#);
+
+        let request =
+            FetchRequest::builder(Method::POST, Url::parse("https://example.com/api").unwrap())
+                .with_reference(reference)
+                .with_req_id(req_id)
+                .with_priority(priority)
+                .with_initiator(initiator)
+                .with_kind(kind)
+                .with_headers(headers)
+                .with_streaming(true)
+                .with_auto_decode(true)
+                .with_max_bytes(1024)
+                .with_body(body)
+                .build();
+
+        assert_eq!(request.reference, reference);
+        assert_eq!(request.req_id, req_id);
+        assert_eq!(request.priority, priority);
+        assert_eq!(request.initiator, initiator);
+        assert_eq!(request.kind, kind);
+        assert!(request.streaming);
+        assert!(request.auto_decode);
+        assert_eq!(request.max_bytes, Some(1024));
+        assert_eq!(
+            request.body.as_ref().unwrap().content_type,
+            Some("application/json".into())
+        );
+
+        let key_data = &request.key_data;
+        assert_eq!(key_data.url.as_str(), "https://example.com/api");
+        assert_eq!(key_data.method, Method::POST);
+        assert!(key_data.headers.contains_key("ACCEPT"));
+        assert!(key_data.headers.contains_key("CONTENT_TYPE"));
     }
 }
