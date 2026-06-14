@@ -25,10 +25,10 @@ jobs:
     name: cargo audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # rustsec/audit-check fetches the advisory database, runs cargo audit,
       # and annotates the PR / commit with any findings.
-      - uses: rustsec/audit-check@v1
+      - uses: rustsec/audit-check@e9159ac5f7d7d873ce074ca134da2f445c0a4a61 # v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
