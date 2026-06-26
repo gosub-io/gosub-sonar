@@ -756,19 +756,21 @@ mod tests {
         let kind = ResourceKind::Asset;
         let body = RequestBody::json(r#"{"key": "value"}"#);
 
-        let request =
-            FetchRequest::builder(Method::POST, Url::parse("https://example.com/api").unwrap())
-                .with_reference(reference)
-                .with_req_id(req_id)
-                .with_priority(priority)
-                .with_initiator(initiator)
-                .with_kind(kind)
-                .with_headers(headers)
-                .with_streaming(true)
-                .with_auto_decode(true)
-                .with_max_bytes(1024)
-                .with_body(body)
-                .build();
+        let request = FetchRequest::builder(
+            &Method::POST,
+            &Url::parse("https://example.com/api").unwrap(),
+        )
+        .with_reference(&reference)
+        .with_req_id(&req_id)
+        .with_priority(&priority)
+        .with_initiator(&initiator)
+        .with_kind(&kind)
+        .with_headers(&headers)
+        .with_streaming(true)
+        .with_auto_decode(true)
+        .with_max_bytes(&1024)
+        .with_body(&body)
+        .build();
 
         assert_eq!(request.reference, reference);
         assert_eq!(request.req_id, req_id);
