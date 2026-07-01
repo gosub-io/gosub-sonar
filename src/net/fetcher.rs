@@ -10,7 +10,6 @@ use crate::net::shared_body::{ReaderOptions, SharedBody};
 use crate::net::types::{FetchHandle, FetchKeyData, FetchRequest, FetchResult, NetError, Priority};
 use crate::net::utils::{short_url, spawn_named, Waiter};
 use crate::types::RequestId;
-use bytes::Bytes;
 use dashmap::{DashMap, Entry};
 use http::header;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -629,10 +628,8 @@ async fn perform_buffered(
     // Notify the context's cookie jar about any Set-Cookie headers in the response
     notify_cookies(&ctx, &meta);
 
-    Ok(FetchResult::Buffered {
-        meta,
-        body: Bytes::from(body),
-    })
+    // `body` is already an `Arc`-backed `Bytes`; moving it into the result is zero-copy.
+    Ok(FetchResult::Buffered { meta, body })
 }
 
 /// Extract `Set-Cookie` header values from `meta` and forward them to the context.
