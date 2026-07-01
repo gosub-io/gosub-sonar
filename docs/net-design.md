@@ -1,5 +1,9 @@
 # The architecture of the network stack of Gosub
 
+> For a structured, top-level map of the crate (module layout, data model, component diagram,
+> request lifecycle), see [`architecture.md`](architecture.md). This document is the narrative
+> companion that explains *why* the design looks the way it does.
+
 This document is kind of a blog post / brain dump of the current state of the network architecture that currently
 is implemented in this respository. Even though fetching resources over the network is easy enough with crates likes 
 `reqwest`, there is much more that needs to be taken care of when designing a network stack for browser.
