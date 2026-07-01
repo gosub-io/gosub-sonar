@@ -6,7 +6,7 @@ use crate::net::observer::NetObserver;
 use crate::net::types::{FetchResultMeta, NetError};
 use crate::types::PeekBuf;
 use anyhow::{anyhow, Context};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_util::{stream, StreamExt, TryStreamExt};
 use http::{header, HeaderMap, Method};
 use std::pin::Pin;
@@ -379,7 +379,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
     }
 }
 
-/// Fetch a complete resource, returning the metadata and the full body as a `Vec<u8>`.
+/// Spare capacity kept available for each `read_buf` so it never returns 0 for lack of room
+/// (which the loop would misread as EOF).
+const READ_CHUNK: usize = 16 * 1024;
+
+/// Fetch a complete resource, returning the metadata and the full body as `Bytes`.
+///
+/// The body is assembled with a single copy per chunk: bytes are read straight from the
+/// underlying stream into a pre-sized [`BytesMut`] (sized from `Content-Length` when known) and
+/// then `freeze`d into an `Arc`-backed [`Bytes`]. Handing the result to the caller — and the
+/// `Bytes::from`/`freeze` at the boundary — is zero-copy, so the only memcpy of the payload is the
+/// unavoidable assembly into one contiguous buffer.
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch_response_complete(
     client: Arc<reqwest::Client>,
@@ -394,7 +404,7 @@ pub async fn fetch_response_complete(
     // Total time of read allowed (if any)
     total_body_timeout: Option<Duration>,
     policy: NetPolicy,
-) -> Result<(FetchResultMeta, Vec<u8>), NetError> {
+) -> Result<(FetchResultMeta, Bytes), NetError> {
     let started = Instant::now();
 
     let ResponseTop {
@@ -403,10 +413,16 @@ pub async fn fetch_response_complete(
         mut reader,
     } = fetch_response_top(client, url, init, cancel.clone(), observer.clone(), policy).await?;
 
-    // We don't care about the peek buffer. We just create a new buffer and read the rest of the
-    // stream into it.
-    let mut body_buf = peek_buf.to_vec();
-    let mut chunk = [0u8; 16 * 1024];
+    // Pre-size from Content-Length when known to avoid reallocations as the body grows; otherwise
+    // start from the peek length. The peek bytes have already been read off the stream, so seed the
+    // buffer with them (a one-off copy of the small peek region, not the whole body).
+    let initial_cap = meta
+        .content_length
+        .map(|n| n as usize)
+        .unwrap_or(0)
+        .max(peek_buf.len());
+    let mut body_buf = BytesMut::with_capacity(initial_cap);
+    body_buf.extend_from_slice(peek_buf.as_slice());
 
     loop {
         // Check if we hit the total body timeout
@@ -416,13 +432,20 @@ pub async fn fetch_response_complete(
             }
         }
 
+        // Ensure there is spare capacity so `read_buf` reads directly into the buffer (single copy
+        // from the stream) rather than returning 0 for lack of room.
+        if body_buf.capacity() - body_buf.len() < READ_CHUNK {
+            body_buf.reserve(READ_CHUNK);
+        }
+
         let n = tokio::select! {
             // Stream cancelled
             _ = cancel.cancelled() => {
                 return Err(NetError::Cancelled("fetch_request_complete cancelled".into()));
             }
-            // Read bytes, or timeout when not read something in time
-            r = timeout(read_idle_timeout, reader.read(&mut chunk)) => {
+            // Read bytes, or timeout when not read something in time. `read_buf` reads directly into
+            // the spare capacity of `body_buf`, so there is no intermediate scratch buffer.
+            r = timeout(read_idle_timeout, reader.read_buf(&mut body_buf)) => {
                 match r {
                     Err(_) => return Err(NetError::Timeout("fetch_request_complete timeout".into())),
                     Ok(Err(e)) => return Err(NetError::Io(Arc::new(e))),
@@ -439,19 +462,17 @@ pub async fn fetch_response_complete(
         if let Some(max) = max_bytes {
             // Too many bytes are read. We throw an error (@TODO: should we do this? not just cap
             // the buffer and return that?
-            if body_buf.len() + n > max {
+            if body_buf.len() > max {
                 return Err(NetError::Read(Arc::new(anyhow!(
                     "fetch_request_complete exceeded maximum size of {} bytes",
                     max
                 ))));
             }
         }
-
-        // Extent the buffer with read chunk
-        body_buf.extend_from_slice(&chunk[..n]);
     }
 
-    Ok((meta, body_buf))
+    // `freeze` converts the `BytesMut` into an `Arc`-backed `Bytes` without copying.
+    Ok((meta, body_buf.freeze()))
 }
 
 /// Perform a GET request, following redirects up to MAX_REDIRECTS times, while sending out net events.
@@ -614,6 +635,12 @@ mod tests {
     fn observer() -> Arc<dyn NetObserver + Send + Sync> {
         Arc::new(TestObserver)
     }
+
+    /// Deterministic, position-dependent byte pattern. Any truncation or mis-ordering during body
+    /// assembly changes the bytes, so an exact compare catches it.
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
     fn client() -> Arc<reqwest::Client> {
         Arc::new(
             reqwest::Client::builder()
@@ -624,8 +651,16 @@ mod tests {
     }
 
     async fn server() -> crate::net::test_support::TestServerHandle {
+        // 64 KiB pattern, chunked so the body arrives in many pieces with no Content-Length.
+        let big = pattern(64 * 1024);
+        let big_chunks: Vec<&[u8]> = big.chunks(5_000).collect();
+        // Exactly one READ_CHUNK worth of body, chunked (no Content-Length).
+        let exact = vec![b'Y'; super::READ_CHUNK];
         TestServer::new()
             .route("/big", RouteConfig::ok(vec![b'X'; 12 * 1024]))
+            .route("/big-chunked", RouteConfig::chunked(big_chunks))
+            .route("/exact-chunk", RouteConfig::chunked(vec![exact.as_slice()]))
+            .route("/large-cl", RouteConfig::ok(pattern(64 * 1024)))
             .route("/redirect", RouteConfig::redirect_to("/big"))
             .route(
                 "/slow",
@@ -969,5 +1004,105 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(meta.status, 200);
+    }
+
+    // Body assembly / READ_CHUNK reservation path.
+
+    /// A large body with no Content-Length (chunked) forces `initial_cap == 0`, so every byte of
+    /// growth goes through the `reserve(READ_CHUNK)` guard across many loop iterations. Verifies
+    /// the loop never mistakes a full buffer for EOF and assembles all 64 KiB in order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn large_chunked_body_without_content_length_is_assembled() {
+        let srv = server().await;
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/big-chunked"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(body.len(), 64 * 1024);
+        assert_eq!(&body[..], pattern(64 * 1024).as_slice());
+    }
+
+    /// A chunked body of exactly `READ_CHUNK` bytes lands on the reservation boundary: after the
+    /// data is read the spare capacity is fully consumed, and the next `read_buf` must reserve more
+    /// before it can observe the real EOF. Guards against an off-by-one false EOF at the boundary.
+    #[tokio::test(flavor = "current_thread")]
+    async fn chunked_body_exactly_read_chunk_size_is_assembled() {
+        let srv = server().await;
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/exact-chunk"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(body.len(), super::READ_CHUNK);
+        assert!(body.iter().all(|&b| b == b'Y'));
+    }
+
+    /// A body larger than READ_CHUNK *with* Content-Length exercises the pre-sized path (buffer
+    /// seeded to the full length up front). The reservation guard should rarely fire, and the body
+    /// must still come back byte-for-byte.
+    #[tokio::test(flavor = "current_thread")]
+    async fn large_body_with_content_length_is_assembled() {
+        let srv = server().await;
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/large-cl"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(meta.content_length, Some(64 * 1024));
+        assert_eq!(&body[..], pattern(64 * 1024).as_slice());
+    }
+
+    /// `max_bytes` is checked with a strict `>`, so a body whose length equals the cap exactly must
+    /// succeed. Boundary partner to `fetch_complete_max_bytes_exceeded`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn max_bytes_equal_to_body_size_succeeds() {
+        let srv = server().await;
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/big"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            Some(12 * 1024),
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(body.len(), 12 * 1024);
     }
 }
