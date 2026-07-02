@@ -25,10 +25,9 @@ use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::sync::mpsc;
-use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
@@ -288,8 +287,9 @@ pub struct ReaderOptions {
     /// Total deadline for the entire body. When exceeded, reading stops with
     /// `NetError::Timeout("total read timeout")`.
     pub total_timeout: Option<Duration>,
-    /// Maximum total number of bytes to read. Exceeding this limit triggers an
-    /// error and closes the stream.
+    /// Maximum total number of bytes to read. A body that exceeds this limit
+    /// triggers an error and closes the stream; a body of exactly this size is
+    /// delivered normally.
     pub max_size: Option<u64>,
 }
 
@@ -364,13 +364,13 @@ impl SharedBody {
                 max_size,
             } = opts;
 
-            let deadline = total_timeout.map(|d| Instant::now() + d);
+            let deadline = total_timeout.map(|d| tokio::time::Instant::now() + d);
             let cancel = cancel.unwrap_or_else(CancellationToken::new);
             let mut buf = vec![0u8; buf_size];
             let mut total_read: u64 = 0; // Does NOT take into account the peek buf!
 
             // Some helper functions
-            let check_total_deadline = |now: Instant| -> Result<(), NetError> {
+            let check_total_deadline = |now: tokio::time::Instant| -> Result<(), NetError> {
                 if let Some(dl) = deadline {
                     if now >= dl {
                         return Err(NetError::Timeout("total read timeout".to_string()));
@@ -380,70 +380,75 @@ impl SharedBody {
             };
 
             // Make sure we haven't already exceeded the total deadline
-            if let Err(e) = check_total_deadline(Instant::now()) {
+            if let Err(e) = check_total_deadline(tokio::time::Instant::now()) {
                 sb_clone.error(e);
                 return;
             }
 
             loop {
-                // User cancelled the read
+                // User cancelled the read (fast path; the select below also observes a cancel
+                // that arrives while a read is blocked)
                 if cancel.is_cancelled() {
                     sb_clone.error(NetError::Cancelled("read cancelled".to_string()));
                     return;
                 }
 
-                // Check how much we can read this iteration
-                let read_cap = if let Some(max) = max_size {
+                // Check how much we can read this iteration. When the max-size budget is
+                // exhausted, probe one byte: a clean EOF means the body is exactly max_size
+                // (legal); any data means the limit is exceeded.
+                let (read_cap, probing) = if let Some(max) = max_size {
                     let remaining = max.saturating_sub(total_read);
                     if remaining == 0 {
-                        sb_clone.error(NetError::Io(Arc::new(std::io::Error::other(
-                            "max size reached before read",
-                        ))));
+                        (1, true)
+                    } else {
+                        (remaining.min(buf.len() as u64) as usize, false)
                     }
-                    remaining.min(buf.len() as u64) as usize
                 } else {
-                    buf.len()
+                    (buf.len(), false)
                 };
 
-                // Read with optional idle timeout
-                let read_res = if let Some(idle) = idle_timeout {
-                    timeout(idle, reader.read(&mut buf[..read_cap]))
-                        .await
-                        .map_err(|_| NetError::Timeout("read idle timeout".to_string()))
-                        .and_then(|r| r.map_err(|e| NetError::Io(Arc::new(e))))
-                } else {
-                    reader
-                        .read(&mut buf[..read_cap])
-                        .await
-                        .map_err(|e| NetError::Io(Arc::new(e)))
+                // Race the read against cancellation, the per-read idle timeout, and the total
+                // deadline, so a blocked read cannot outlive any of them.
+                let idle_sleep = async {
+                    match idle_timeout {
+                        Some(d) => tokio::time::sleep(d).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let deadline_sleep = async {
+                    match deadline {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let read_res = tokio::select! {
+                    r = reader.read(&mut buf[..read_cap]) => r.map_err(|e| NetError::Io(Arc::new(e))),
+                    _ = cancel.cancelled() => Err(NetError::Cancelled("read cancelled".to_string())),
+                    _ = idle_sleep => Err(NetError::Timeout("read idle timeout".to_string())),
+                    _ = deadline_sleep => Err(NetError::Timeout("total read timeout".to_string())),
                 };
 
                 match read_res {
                     Ok(0) => {
-                        // Eof
+                        // EOF — also the probing case where the body ends exactly at max_size
                         sb_clone.finish();
                         return;
                     }
+                    Ok(_) if probing => {
+                        // The reader produced data beyond the max-size budget
+                        sb_clone.error(NetError::Io(Arc::new(std::io::Error::other(
+                            "max size exceeded during read",
+                        ))));
+                        return;
+                    }
                     Ok(n) => {
-                        // Read n bytes
-                        // last_progress = Instant::now();
                         total_read = total_read.saturating_add(n as u64);
 
                         // Push to shared body
                         sb_clone.push(Bytes::copy_from_slice(&buf[..n]));
 
-                        // Did we hit the max size limit?
-                        if let Some(max) = max_size {
-                            if total_read > max {
-                                sb_clone.error(NetError::Io(Arc::new(std::io::Error::other(
-                                    "max size exceeded during read",
-                                ))));
-                                return;
-                            }
-                        }
-
                         // Did we hit the total deadline?
-                        if let Err(e) = check_total_deadline(Instant::now()) {
+                        if let Err(e) = check_total_deadline(tokio::time::Instant::now()) {
                             sb_clone.error(e);
                             return;
                         }
@@ -697,6 +702,62 @@ mod tests {
     async fn from_reader_io_error_errors_subscribers() {
         let sb = SharedBody::from_reader(ErrorReader, ReaderOptions::default());
         assert!(drain_result(&sb).await.is_err());
+    }
+
+    /// A body of exactly `max_size` bytes is legal: it must be delivered in full with a clean
+    /// EOF, not rejected. Boundary partner to `from_reader_max_size_exceeded_errors_subscribers`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_reader_exact_max_size_succeeds() {
+        let sb = SharedBody::from_reader(
+            std::io::Cursor::new(vec![7u8; 10]),
+            ReaderOptions {
+                max_size: Some(10),
+                ..ReaderOptions::default()
+            },
+        );
+        let body = drain_result(&sb).await.unwrap();
+        assert_eq!(body, vec![7u8; 10]);
+    }
+
+    /// The total deadline must fire even while a read is blocked (previously it was only
+    /// checked between reads, so a stalled reader without an idle timeout hung forever).
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_reader_total_timeout_fires_during_stalled_read() {
+        let sb = SharedBody::from_reader(
+            BlockingReader,
+            ReaderOptions {
+                total_timeout: Some(Duration::from_millis(50)),
+                ..ReaderOptions::default()
+            },
+        );
+        let err = tokio::time::timeout(Duration::from_secs(2), drain_result(&sb))
+            .await
+            .expect("total timeout did not interrupt the blocked read")
+            .unwrap_err();
+        assert!(err.to_string().contains("total"), "got: {err}");
+    }
+
+    /// Cancellation must interrupt a blocked read (previously the token was only polled
+    /// between reads, so cancelling mid-read hung forever).
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_reader_cancel_interrupts_blocked_read() {
+        let cancel = CancellationToken::new();
+        let sb = SharedBody::from_reader(
+            BlockingReader,
+            ReaderOptions {
+                cancel: Some(cancel.clone()),
+                ..ReaderOptions::default()
+            },
+        );
+        let mut stream = sb.subscribe_stream();
+        // Let the reader task start and block in its read before cancelling.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        let item = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("cancel did not interrupt the blocked read")
+            .unwrap();
+        assert!(item.is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
