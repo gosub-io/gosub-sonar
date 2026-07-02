@@ -118,6 +118,9 @@ impl RequestInit {
 const PEEK_MAX: usize = 5 * 1024;
 /// Maximum number of redirects allowed
 const MAX_REDIRECTS: usize = 20;
+/// Ceiling on the body buffer pre-allocation. Content-Length is server-controlled, so we never
+/// allocate more than this up front; larger honest bodies grow the buffer as bytes arrive.
+const MAX_PREALLOC: usize = 1024 * 1024;
 
 // This is the top of the response (HTTP headers + first 5KB of the body, if any), plus a stream (that starts from the peeked bytes)
 pub struct ResponseTop {
@@ -413,14 +416,25 @@ pub async fn fetch_response_complete(
         mut reader,
     } = fetch_response_top(client, url, init, cancel.clone(), observer.clone(), policy).await?;
 
+    // Reject responses that already declare a body larger than max_bytes, before reading any of it.
+    // The in-loop check below remains the backstop for servers that lie or use chunked encoding.
+    if let (Some(max), Some(len)) = (max_bytes, meta.content_length) {
+        if len as usize > max {
+            return Err(NetError::Read(Arc::new(anyhow!(
+                "content-length {} exceeds maximum size of {} bytes",
+                len,
+                max
+            ))));
+        }
+    }
+
     // Pre-size from Content-Length when known to avoid reallocations as the body grows; otherwise
     // start from the peek length. The peek bytes have already been read off the stream, so seed the
-    // buffer with them (a one-off copy of the small peek region, not the whole body).
-    let initial_cap = meta
-        .content_length
-        .map(|n| n as usize)
-        .unwrap_or(0)
-        .max(peek_buf.len());
+    // buffer with them (a one-off copy of the small peek region, not the whole body). Content-Length
+    // is untrusted, so the pre-allocation is clamped to MAX_PREALLOC (and max_bytes when set).
+    let advertised = meta.content_length.map(|n| n as usize).unwrap_or(0);
+    let ceiling = max_bytes.unwrap_or(MAX_PREALLOC).min(MAX_PREALLOC);
+    let initial_cap = advertised.min(ceiling).max(peek_buf.len());
     let mut body_buf = BytesMut::with_capacity(initial_cap);
     body_buf.extend_from_slice(peek_buf.as_slice());
 
@@ -667,6 +681,14 @@ mod tests {
                 RouteConfig::stall_mid_body(super::PEEK_MAX, Duration::from_millis(2_000)),
             )
             .route("/drop", RouteConfig::drop_mid_body(100, 10_000))
+            // Declares an absurd Content-Length, sends exactly the peek window, then drops. The
+            // peek loop stops at PEEK_MAX without another read, so the fetch reaches the body
+            // phase with the hostile Content-Length intact.
+            .route(
+                "/huge-cl",
+                RouteConfig::drop_mid_body(super::PEEK_MAX, 1 << 45),
+            )
+            .route("/xl-cl", RouteConfig::ok(pattern(2 * 1024 * 1024)))
             .route("/empty", RouteConfig::ok(b""))
             .route("/nohead", RouteConfig::no_location_redirect())
             .route("/loop", RouteConfig::redirect_self())
@@ -777,12 +799,15 @@ mod tests {
             .contains("cancel"));
     }
 
+    /// Uses a chunked route (no Content-Length) so the in-loop size check is what fires; responses
+    /// that declare an oversized Content-Length up front are rejected earlier, see
+    /// `huge_content_length_rejected_before_body_read`.
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_complete_max_bytes_exceeded() {
         let srv = server().await;
         let res = super::fetch_response_complete(
             client(),
-            srv.url("/big"),
+            srv.url("/big-chunked"),
             RequestInit::get(HeaderMap::new()),
             CancellationToken::new(),
             observer(),
@@ -1104,5 +1129,73 @@ mod tests {
 
         assert_eq!(meta.status, 200);
         assert_eq!(body.len(), 12 * 1024);
+    }
+
+    /// A response whose Content-Length already exceeds `max_bytes` is rejected right after the
+    /// header/peek phase, before any body bytes beyond the peek are read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn huge_content_length_rejected_before_body_read() {
+        let srv = server().await;
+        let res = super::fetch_response_complete(
+            client(),
+            srv.url("/huge-cl"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            Some(1024),
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await;
+        assert!(res.is_err());
+        let msg = res.err().unwrap().to_string();
+        assert!(msg.contains("content-length"), "unexpected error: {msg}");
+        assert!(msg.contains("exceeds"), "unexpected error: {msg}");
+    }
+
+    /// With no `max_bytes`, a hostile Content-Length must not drive the buffer pre-allocation
+    /// (it is clamped to MAX_PREALLOC). The connection then drops, so the fetch surfaces a read
+    /// error instead of attempting a multi-terabyte allocation.
+    #[tokio::test(flavor = "current_thread")]
+    async fn huge_content_length_does_not_preallocate() {
+        let srv = server().await;
+        let res = super::fetch_response_complete(
+            client(),
+            srv.url("/huge-cl"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    /// A body larger than MAX_PREALLOC still assembles correctly: the pre-allocation is clamped,
+    /// and the read loop grows the buffer as real bytes arrive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn body_larger_than_prealloc_cap_is_assembled() {
+        let srv = server().await;
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/xl-cl"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(meta.content_length, Some(2 * 1024 * 1024));
+        assert_eq!(&body[..], pattern(2 * 1024 * 1024).as_slice());
     }
 }
