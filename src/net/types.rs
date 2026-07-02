@@ -368,8 +368,8 @@ pub struct FetchRequest {
 }
 
 impl FetchRequest {
-    pub fn builder(method: Method, url: impl Into<Url>) -> FetchRequestBuilder {
-        FetchRequestBuilder::new(method, url)
+    pub fn builder<'a>(method: &Method, url: impl Into<&'a Url>) -> FetchRequestBuilder {
+        FetchRequestBuilder::new(method.clone(), url.into().clone())
     }
 }
 
@@ -408,28 +408,28 @@ impl FetchRequestBuilder {
         }
     }
 
-    pub fn with_reference(mut self, reference: RequestReference) -> Self {
-        self.reference = reference;
+    pub fn with_reference(mut self, reference: &RequestReference) -> Self {
+        self.reference = *reference;
         self
     }
 
-    pub fn with_req_id(mut self, req_id: RequestId) -> Self {
-        self.req_id = req_id;
+    pub fn with_req_id(mut self, req_id: &RequestId) -> Self {
+        self.req_id = *req_id;
         self
     }
 
-    pub fn with_priority(mut self, priority: Priority) -> Self {
-        self.priority = priority;
+    pub fn with_priority(mut self, priority: &Priority) -> Self {
+        self.priority = *priority;
         self
     }
 
-    pub fn with_initiator(mut self, initiator: Initiator) -> Self {
-        self.initiator = initiator;
+    pub fn with_initiator(mut self, initiator: &Initiator) -> Self {
+        self.initiator = *initiator;
         self
     }
 
-    pub fn with_kind(mut self, kind: ResourceKind) -> Self {
-        self.kind = kind;
+    pub fn with_kind(mut self, kind: &ResourceKind) -> Self {
+        self.kind = *kind;
         self
     }
 
@@ -443,28 +443,28 @@ impl FetchRequestBuilder {
         self
     }
 
-    pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
-        self.max_bytes = Some(max_bytes);
+    pub fn with_max_bytes(mut self, max_bytes: &usize) -> Self {
+        self.max_bytes = Some(*max_bytes);
         self
     }
 
-    pub fn with_body(mut self, body: RequestBody) -> Self {
-        self.body = Some(body);
+    pub fn with_body(mut self, body: &RequestBody) -> Self {
+        self.body = Some(body.clone());
         self
     }
 
-    pub fn with_url(mut self, url: impl Into<Url>) -> Self {
-        self.key_data.url = url.into();
+    pub fn with_url<'a>(mut self, url: impl Into<&'a Url>) -> Self {
+        self.key_data.url = url.into().clone();
         self
     }
 
-    pub fn with_method(mut self, method: Method) -> Self {
-        self.key_data.method = method;
+    pub fn with_method(mut self, method: &Method) -> Self {
+        self.key_data.method = method.clone();
         self
     }
 
-    pub fn with_headers(mut self, headers: HeaderMap) -> Self {
-        self.key_data.headers = headers;
+    pub fn with_headers(mut self, headers: &HeaderMap) -> Self {
+        self.key_data.headers = headers.clone();
         self
     }
 
@@ -706,19 +706,21 @@ mod tests {
         let kind = ResourceKind::Asset;
         let body = RequestBody::json(r#"{"key": "value"}"#);
 
-        let request =
-            FetchRequest::builder(Method::POST, Url::parse("https://example.com/api").unwrap())
-                .with_reference(reference)
-                .with_req_id(req_id)
-                .with_priority(priority)
-                .with_initiator(initiator)
-                .with_kind(kind)
-                .with_headers(headers)
-                .with_streaming(true)
-                .with_auto_decode(true)
-                .with_max_bytes(1024)
-                .with_body(body)
-                .build();
+        let request = FetchRequest::builder(
+            &Method::POST,
+            &Url::parse("https://example.com/api").unwrap(),
+        )
+        .with_reference(&reference)
+        .with_req_id(&req_id)
+        .with_priority(&priority)
+        .with_initiator(&initiator)
+        .with_kind(&kind)
+        .with_headers(&headers)
+        .with_streaming(true)
+        .with_auto_decode(true)
+        .with_max_bytes(&1024)
+        .with_body(&body)
+        .build();
 
         assert_eq!(request.reference, reference);
         assert_eq!(request.req_id, req_id);
