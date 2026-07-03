@@ -564,7 +564,11 @@ async fn perform_streaming(
         cancel: Some(cancel.clone()),
         idle_timeout: Some(cfg.read_idle_timeout),
         total_timeout: cfg.total_body_timeout,
-        max_size: None,
+        // The reader counts only post-peek bytes — the peek was already read off the stream —
+        // so subtract it from the budget. A body of exactly max_bytes is delivered in full.
+        max_size: req
+            .max_bytes
+            .map(|max| max.saturating_sub(peek_buf.len()) as u64),
     };
 
     Ok(FetchResult::Stream {
@@ -653,6 +657,14 @@ mod tests {
             )
             .route("/hang", RouteConfig::hang_after_connect())
             .route("/fast", RouteConfig::ok(b"x"))
+            // 12 KiB dribbled in 1 KiB chunks: headers arrive immediately, the body takes
+            // ~360 ms, so tests can subscribe to a stream before it completes (no replay).
+            // Chunk size divides PEEK_MAX exactly, so the peek phase leaves no excess bytes
+            // that would be pushed to subscribers before a test can attach.
+            .route(
+                "/dribble-big",
+                RouteConfig::chunked_with_delay(vec![&[b'X'; 1024][..]; 12], Duration::from_millis(30)),
+            )
             .route(
                 "/timed",
                 RouteConfig::delay(Duration::from_millis(60), b"ok".to_vec()),
@@ -1060,6 +1072,70 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(&body[..], b"hello");
+            }
+            other => panic!("expected Stream, got {:?}", other),
+        }
+        shutdown.cancel();
+    }
+
+    /// Streaming fetches must honor `max_bytes`: a subscriber sees an error when the body
+    /// exceeds the cap, and a body of exactly `max_bytes` streams in full (boundary case).
+    /// Uses a dribbling route so the subscriber attaches before the body completes —
+    /// `SharedBody` has no replay.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_streaming_respects_max_bytes() {
+        use futures_util::StreamExt;
+
+        let srv = start_server().await;
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        // Over the cap: /dribble-big is 12 KiB, cap at 6 KiB (peek is 5 KiB).
+        let (mut req, _) = make_req(srv.url("/dribble-big"), Priority::Normal);
+        req.streaming = true;
+        req.max_bytes = Some(6 * 1024);
+        let result = tokio::time::timeout(Duration::from_secs(5), fetcher.fetch(req))
+            .await
+            .unwrap();
+        match result {
+            FetchResult::Stream { shared, .. } => {
+                let mut sub = shared.subscribe_stream();
+                let mut saw_error = false;
+                while let Some(chunk) = tokio::time::timeout(Duration::from_secs(5), sub.next())
+                    .await
+                    .unwrap()
+                {
+                    if chunk.is_err() {
+                        saw_error = true;
+                        break;
+                    }
+                }
+                assert!(saw_error, "stream exceeded max_bytes without an error");
+            }
+            other => panic!("expected Stream, got {:?}", other),
+        }
+
+        // Exactly the cap: the full body must stream through, including the boundary byte.
+        let (mut req, _) = make_req(srv.url("/dribble-big"), Priority::Normal);
+        req.streaming = true;
+        req.max_bytes = Some(12 * 1024);
+        let result = tokio::time::timeout(Duration::from_secs(5), fetcher.fetch(req))
+            .await
+            .unwrap();
+        match result {
+            FetchResult::Stream {
+                peek_buf, shared, ..
+            } => {
+                let mut reader =
+                    crate::net::shared_body::SharedBody::combined_reader(peek_buf, shared);
+                let mut body = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut body)
+                    .await
+                    .unwrap();
+                assert_eq!(body.len(), 12 * 1024);
             }
             other => panic!("expected Stream, got {:?}", other),
         }
