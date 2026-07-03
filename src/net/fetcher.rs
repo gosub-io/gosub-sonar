@@ -5,18 +5,14 @@ use crate::net::fetch::{
 };
 use crate::net::fetcher_context::FetcherContext;
 use crate::net::observer::NetObserver;
-use crate::net::pump::{spawn_pump, PumpCfg, PumpTargets};
 use crate::net::shared_body::{ReaderOptions, SharedBody};
-use crate::net::types::{FetchHandle, FetchKeyData, FetchRequest, FetchResult, NetError, Priority};
+use crate::net::types::{FetchHandle, FetchRequest, FetchResult, NetError, Priority};
 use crate::net::utils::{short_url, spawn_named, Waiter};
-use crate::types::RequestId;
 use dashmap::{DashMap, Entry};
 use http::header;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Instant;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, Notify, Semaphore};
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
@@ -116,81 +112,6 @@ impl FetchInflightEntry {
     fn dec_sub_and_maybe_cancel(&self) {
         if self.subs.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.parent_cancel.cancel();
-        }
-    }
-}
-
-pub struct FetchInflightMap {
-    map: Arc<DashMap<FetchKeyData, Arc<FetchInflightEntry>>>,
-    client: Arc<reqwest::Client>,
-    observer: Arc<dyn NetObserver + Send + Sync>,
-    cfg: FetcherConfig,
-}
-
-impl FetchInflightMap {
-    pub fn new(
-        client: Arc<reqwest::Client>,
-        observer: Arc<dyn NetObserver + Send + Sync>,
-        cfg: FetcherConfig,
-    ) -> Self {
-        Self {
-            map: Arc::new(DashMap::new()),
-            client,
-            observer,
-            cfg,
-        }
-    }
-
-    pub fn join_or_start(
-        &self,
-        req: &FetchRequest,
-        wants_stream: bool,
-    ) -> (FetchHandle, oneshot::Receiver<FetchResult>, bool) {
-        match self.map.entry(req.key_data.clone()) {
-            Entry::Occupied(e) => {
-                let entry = e.get().clone();
-                let (tx, rx) = oneshot::channel();
-                entry.waiter.register(tx, wants_stream);
-                let handle = FetchHandle {
-                    req_id: RequestId::new(),
-                    key: req.key_data.clone(),
-                    cancel: entry.parent_cancel.child_token(),
-                };
-                (handle, rx, false)
-            }
-            Entry::Vacant(v) => {
-                let entry = Arc::new(FetchInflightEntry {
-                    parent_cancel: CancellationToken::new(),
-                    waiter: Arc::new(Waiter::new()),
-                    wants_streaming: AtomicBool::new(wants_stream),
-                    subs: AtomicUsize::new(0),
-                    done: CancellationToken::new(),
-                });
-                let (tx, rx) = oneshot::channel();
-                entry.waiter.register(tx, wants_stream);
-                v.insert(entry.clone());
-
-                let key = req.key_data.clone();
-                let map = self.map.clone();
-
-                spawn_fetch_task(
-                    req.clone(),
-                    entry.clone(),
-                    self.client.clone(),
-                    self.observer.clone(),
-                    self.cfg.clone(),
-                    move || {
-                        map.remove(&key);
-                    },
-                );
-
-                let handle = FetchHandle {
-                    req_id: RequestId::new(),
-                    key: req.key_data.clone(),
-                    cancel: entry.parent_cancel.child_token(),
-                };
-                (handle, rx, true)
-            }
         }
     }
 }
@@ -660,79 +581,6 @@ fn notify_cookies(ctx: &Arc<dyn FetcherContext>, meta: &crate::net::types::Fetch
     if !values.is_empty() {
         ctx.on_cookies_received(&meta.final_url, &values);
     }
-}
-
-pub fn spawn_fetch_task(
-    req: FetchRequest,
-    entry: Arc<FetchInflightEntry>,
-    client: Arc<reqwest::Client>,
-    observer: Arc<dyn NetObserver + Send + Sync>,
-    cfg: FetcherConfig,
-    on_finish: impl FnOnce() + Send + 'static,
-) -> JoinHandle<()> {
-    let url = req.key_data.url.clone();
-    let cancel_parent = entry.parent_cancel.clone();
-
-    spawn_named(&format!("Fetch: {}", short_url(&url, 80)), async move {
-        struct Cleanup<F: FnOnce()>(Option<F>);
-        impl<F: FnOnce()> Drop for Cleanup<F> {
-            fn drop(&mut self) {
-                if let Some(f) = self.0.take() {
-                    f();
-                }
-            }
-        }
-        let _cleanup = Cleanup(Some(on_finish));
-
-        let top = match fetch_response_top(
-            client.clone(),
-            url.clone(),
-            make_request_init(&req),
-            cancel_parent.clone(),
-            observer.clone(),
-            NetPolicy::default(),
-        )
-        .await
-        {
-            Ok(top) => top,
-            Err(e) => {
-                let _ = entry.waiter.finish(FetchResult::Error(e)).await;
-                return;
-            }
-        };
-        let ResponseTop {
-            meta,
-            peek_buf,
-            reader,
-        } = top;
-
-        let shared = Arc::new(SharedBody::new(SHARED_MAX_CAPACITY));
-
-        let pump_cfg = PumpCfg {
-            idle: cfg.read_idle_timeout,
-            total_deadline: cfg.total_body_timeout.map(|d| Instant::now() + d),
-        };
-
-        let _pump = spawn_pump(
-            reader,
-            PumpTargets {
-                shared: Some(shared.clone()),
-                file_dest: None,
-                peek_buf: peek_buf.clone(),
-            },
-            pump_cfg,
-            cancel_parent.clone(),
-            observer.clone(),
-            url.clone(),
-        );
-
-        let res = FetchResult::Stream {
-            meta,
-            peek_buf,
-            shared,
-        };
-        let _ = entry.waiter.finish(res).await;
-    })
 }
 
 #[cfg(test)]
