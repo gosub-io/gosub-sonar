@@ -75,7 +75,6 @@ pub async fn simple_get(url: &Url) -> Result<Bytes> {
 ///
 /// Like [`simple_get`] but sync and safe to call from any context (including inside a Tokio
 /// runtime). Errors on non-2xx status codes.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn sync_get(url: &Url) -> Result<Bytes> {
     let url = url.clone();
     std::thread::spawn(move || {
@@ -97,7 +96,6 @@ pub fn sync_get(url: &Url) -> Result<Bytes> {
 ///
 /// Use this for engine-internal code that must issue an HTTP request synchronously
 /// (e.g. the HTML parser loading an external stylesheet mid-parse).
-#[cfg(not(target_arch = "wasm32"))]
 pub fn sync_fetch(url: &Url) -> Result<Response> {
     let url = url.clone();
     std::thread::spawn(move || do_sync_fetch(url))
@@ -105,7 +103,6 @@ pub fn sync_fetch(url: &Url) -> Result<Response> {
         .map_err(|_| anyhow::anyhow!("sync_fetch: HTTP thread panicked"))?
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn do_sync_fetch(url: Url) -> Result<Response> {
     use std::io::Read as _;
 
@@ -215,7 +212,6 @@ mod tests {
         assert_eq!(&bytes[..], b"file content");
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn sync_get_fetches_from_http_server() {
         use std::io::{Read, Write};
@@ -235,7 +231,6 @@ mod tests {
         assert_eq!(&bytes[..], b"hello");
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn sync_fetch_returns_full_response() {
         use std::io::{Read, Write};

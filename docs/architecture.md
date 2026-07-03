@@ -59,10 +59,9 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `http::response` | `src/http/response.rs` | Simple `Response` struct returned by the blocking one-shot helpers. |
 | `types` | `src/types.rs` | Crate-wide primitives: `PeekBuf`, `RequestId`. |
 
-**Platform gating.** Tokio, `tokio-util`, `tokio-stream`, and the full `reqwest` feature set are
-compiled only for non-`wasm32` targets (see `Cargo.toml`); `wasm32` gets a stripped `reqwest`. The
-crate forbids `unsafe_code` and denies `todo!`/`unimplemented!`/`dbg!` and (outside tests)
-`unwrap`/`expect`/`panic`.
+**Lint posture.** The crate forbids `unsafe_code` and denies `todo!`/`unimplemented!`/`dbg!` and
+(outside tests) `unwrap`/`expect`/`panic`. There is no `wasm32` support: the scheduler stack is
+built on Tokio throughout.
 
 ---
 
