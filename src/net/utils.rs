@@ -169,7 +169,8 @@ impl Waiter {
                             }
                         }
                         Err(e) => {
-                            let res = FetchResult::Error(NetError::Read(Arc::new(e)));
+                            // `e` is already a typed NetError — pass it through unwrapped.
+                            let res = FetchResult::Error(e);
                             for tx in buffered_ls {
                                 let _ = tx.send(res.clone());
                             }
@@ -187,13 +188,20 @@ impl Waiter {
     }
 }
 
-/// Convert a streaming body a buffered fetch-result by reading it to the end.
+/// Convert a streaming body to a buffered fetch-result by reading it to the end.
 /// This could be more efficient with allocations, probably.
-pub async fn stream_to_bytes(peek_buf: PeekBuf, shared: Arc<SharedBody>) -> anyhow::Result<Bytes> {
+pub async fn stream_to_bytes(peek_buf: PeekBuf, shared: Arc<SharedBody>) -> Result<Bytes, NetError> {
     let mut out = Vec::with_capacity(peek_buf.len() + 8192);
     let mut reader = SharedBody::combined_reader(peek_buf, shared);
     if let Err(e) = reader.read_to_end(&mut out).await {
-        return Err(NetError::Io(Arc::new(e)).into());
+        // The reader wraps stream errors in io::Error (see NetError::to_io); recover the
+        // original typed NetError when one is carried, otherwise wrap the io::Error once.
+        let net = e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<NetError>())
+            .cloned()
+            .unwrap_or_else(|| NetError::Io(Arc::new(e)));
+        return Err(net);
     }
     Ok(Bytes::from(out))
 }
@@ -391,6 +399,16 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(rx_buf.await.unwrap(), FetchResult::Error(_)));
+        // The typed error must survive the stream→buffered conversion unwrapped: the
+        // subscriber sees the original NetError::Cancelled, not a nested Read(Io(...)).
+        match rx_buf.await.unwrap() {
+            FetchResult::Error(e) => {
+                assert!(
+                    matches!(e, NetError::Cancelled(_)),
+                    "expected the original typed error, got: {e}"
+                );
+            }
+            _ => panic!("expected an error result"),
+        }
     }
 }
