@@ -16,12 +16,16 @@ use url::Url;
 
 static HASH_STATE: OnceLock<RandomState> = OnceLock::new();
 
-pub fn spawn_named<F, T>(_name: &str, fut: F) -> JoinHandle<T>
+/// Spawn a task with a human-readable name attached as a tracing span, so task activity can
+/// be attributed in trace output.
+pub fn spawn_named<F, T>(name: &str, fut: F) -> JoinHandle<T>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::spawn(fut)
+    use tracing::Instrument as _;
+    let span = tracing::debug_span!("task", %name);
+    tokio::spawn(fut.instrument(span))
 }
 
 /// Normalizes a URL by removing its fragment and returning it as a string.
@@ -39,14 +43,23 @@ pub fn short_hash(bytes: &[u8]) -> u64 {
     HASH_STATE.get_or_init(RandomState::new).hash_one(bytes)
 }
 
-/// Returns a URL string truncated to `max` characters with `...` suffix.
+/// Returns a URL string truncated to at most `max` bytes with `...` suffix.
 pub fn short_url(u: &Url, max: usize) -> String {
     let s = u.as_str();
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        format!("{}...", truncate_on_char_boundary(s, max))
     }
+}
+
+/// Truncate `s` to at most `max` bytes without slicing through a multi-byte character.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Minimal async reader backed by an in-memory `Bytes` buffer.
@@ -215,6 +228,34 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::time::{sleep, Duration};
     use url::Url;
+
+    /// Truncation must never slice through a multi-byte character. `Url::as_str()` is ASCII in
+    /// practice (punycode / percent-encoding), so exercise the boundary logic on the helper.
+    #[test]
+    fn truncate_on_char_boundary_is_panic_free() {
+        let s = "héllo wörld"; // é and ö are 2 bytes each
+        for max in 0..=s.len() + 2 {
+            let t = truncate_on_char_boundary(s, max);
+            assert!(t.len() <= max.min(s.len()));
+            assert!(s.starts_with(t));
+        }
+        assert_eq!(truncate_on_char_boundary("héllo", 2), "h"); // byte 2 is inside é
+        assert_eq!(truncate_on_char_boundary("héllo", 3), "hé");
+    }
+
+    #[test]
+    fn short_url_truncates_with_suffix() {
+        let u = Url::parse("https://example.com/a/very/long/path").unwrap();
+        assert_eq!(short_url(&u, 19), "https://example.com...");
+        // Under the limit: returned untouched, no suffix.
+        assert_eq!(short_url(&u, 500), u.as_str());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_named_runs_task_to_completion() {
+        let handle = spawn_named("test-task", async { 21 * 2 });
+        assert_eq!(handle.await.unwrap(), 42);
+    }
 
     #[test]
     fn normalize_url_strips_fragment() {
