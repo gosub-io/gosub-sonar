@@ -29,7 +29,10 @@ async fn main() -> anyhow::Result<()> {
     let url = Url::parse(&raw)?;
 
     // Build the fetcher with default config and the no-op context, and start its run loop.
-    let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), Arc::new(NullContext))?);
+    let fetcher = Arc::new(Fetcher::new(
+        FetcherConfig::default(),
+        Arc::new(NullContext),
+    )?);
 
     let shutdown = CancellationToken::new();
     let fetcher_task = fetcher.clone();
