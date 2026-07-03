@@ -1,5 +1,6 @@
 //! Integration trait for wiring the fetcher into an application.
 
+use crate::net::null_emitter::NullEmitter;
 use crate::net::observer::NetObserver;
 use crate::net::request_ref::RequestReference;
 use crate::net::types::{Initiator, ResourceKind};
@@ -52,4 +53,29 @@ pub trait FetcherContext: Send + Sync {
     ///
     /// The default implementation does nothing.
     fn on_cookies_received(&self, _url: &Url, _values: &[&str]) {}
+}
+
+/// A no-op [`FetcherContext`] for consumers that don't need lifecycle hooks.
+///
+/// Ignores all events (via [`NullEmitter`]), allows every URL, and has no cookie jar.
+/// Use this to get a [`Fetcher`](crate::net::fetcher::Fetcher) running without writing
+/// any integration code:
+///
+/// ```ignore
+/// let fetcher = Fetcher::new(FetcherConfig::default(), Arc::new(NullContext))?;
+/// ```
+pub struct NullContext;
+
+impl FetcherContext for NullContext {
+    fn observer_for(
+        &self,
+        _: RequestReference,
+        _: RequestId,
+        _: ResourceKind,
+        _: Initiator,
+    ) -> Arc<dyn NetObserver + Send + Sync> {
+        Arc::new(NullEmitter)
+    }
+    fn on_ref_active(&self, _: RequestReference) {}
+    fn on_ref_done(&self, _: RequestReference) {}
 }
