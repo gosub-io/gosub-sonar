@@ -55,7 +55,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::request_ref` | `src/net/request_ref.rs` | `RequestReference` — opaque host correlation tag (e.g. a tab id). |
 | `net::simple` | `src/net/simple.rs` | One-shot `simple_get` / `sync_get` / `sync_fetch` for callers that don't need the scheduler. |
 | `net::fs_utils` | `src/net/fs_utils.rs` | `temp_path_for` — same-directory temp file for atomic renames. |
-| `net::test_support` | `src/net/test_support.rs` | In-process mock HTTP server (`TestServer` / `RouteConfig`), test-only. |
+| `net::test_support` | `src/net/test_support.rs` | In-process mock HTTP server (`TestServer` / `RouteConfig`); crate tests + `test-support` feature. |
 | `http::response` | `src/http/response.rs` | Simple `Response` struct returned by the blocking one-shot helpers. |
 | `types` | `src/types.rs` | Crate-wide primitives: `PeekBuf`, `RequestId`. |
 

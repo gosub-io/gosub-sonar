@@ -18,6 +18,10 @@
 //! assert_eq!(server.hit_count("/ok"), 1);
 //! ```
 
+// This is a test utility: panicking on setup failure is the desired behavior, and the crate-wide
+// unwrap/expect/panic denial only exempts cfg(test), not the `test-support` feature build.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

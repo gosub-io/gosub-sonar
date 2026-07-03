@@ -13,105 +13,16 @@
 //! Run with:
 //!   cargo run -p gosub_sonar --example fetcher_harness
 
-use dashmap::DashMap;
+use gosub_sonar::net::test_support::{RouteConfig, TestServer, TestServerHandle};
 use gosub_sonar::{
     FetchHandle, FetchKeyData, FetchRequest, FetchResult, Fetcher, FetcherConfig, Initiator,
     NullContext, Priority, RequestId, RequestReference, ResourceKind,
 };
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-
-/// Per-path configuration for the mock server.
-#[derive(Clone)]
-struct PathConfig {
-    status: u16,
-    body: &'static str,
-    delay: Duration,
-}
-
-struct MockServer {
-    port: u16,
-    /// How many times each path has been requested
-    hits: Arc<DashMap<String, AtomicUsize>>,
-}
-
-impl MockServer {
-    async fn start(routes: Vec<(&'static str, PathConfig)>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let route_map: Arc<DashMap<String, PathConfig>> = Arc::new(DashMap::new());
-        for (path, cfg) in routes {
-            route_map.insert(path.to_string(), cfg);
-        }
-
-        let hits: Arc<DashMap<String, AtomicUsize>> = Arc::new(DashMap::new());
-        let hits_clone = hits.clone();
-
-        tokio::spawn(async move {
-            loop {
-                if let Ok((mut stream, _)) = listener.accept().await {
-                    let routes = route_map.clone();
-                    let hits = hits_clone.clone();
-
-                    tokio::spawn(async move {
-                        let mut buf = [0u8; 4096];
-                        let n = stream.read(&mut buf).await.unwrap_or(0);
-                        let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
-
-                        // Extract path from "GET /path HTTP/1.1"
-                        let path = req
-                            .lines()
-                            .next()
-                            .and_then(|l| l.split_whitespace().nth(1))
-                            .unwrap_or("/");
-
-                        hits.entry(path.to_string())
-                            .or_insert_with(|| AtomicUsize::new(0))
-                            .fetch_add(1, Ordering::Relaxed);
-
-                        let cfg = routes.get(path).map(|e| e.clone()).unwrap_or(PathConfig {
-                            status: 404,
-                            body: "not found",
-                            delay: Duration::ZERO,
-                        });
-
-                        if !cfg.delay.is_zero() {
-                            tokio::time::sleep(cfg.delay).await;
-                        }
-
-                        let response = format!(
-                            "HTTP/1.1 {} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            cfg.status,
-                            cfg.body.len(),
-                            cfg.body
-                        );
-                        let _ = stream.write_all(response.as_bytes()).await;
-                    });
-                }
-            }
-        });
-
-        MockServer { port, hits }
-    }
-
-    fn url(&self, path: &str) -> Url {
-        Url::parse(&format!("http://127.0.0.1:{}{}", self.port, path)).unwrap()
-    }
-
-    fn hit_count(&self, path: &str) -> usize {
-        self.hits
-            .get(path)
-            .map(|e| e.load(Ordering::Relaxed))
-            .unwrap_or(0)
-    }
-}
 
 fn make_fetcher(config: FetcherConfig) -> (Arc<Fetcher>, CancellationToken) {
     let shutdown = CancellationToken::new();
@@ -166,7 +77,7 @@ fn status_of(result: &FetchResult) -> Option<u16> {
     result.meta().map(|m| m.status)
 }
 
-async fn scenario_concurrent(server: &MockServer) {
+async fn scenario_concurrent(server: &TestServerHandle) {
     println!("\nScenario 1: Concurrent downloads");
 
     let (fetcher, shutdown) = make_fetcher(FetcherConfig::default());
@@ -216,7 +127,7 @@ async fn scenario_concurrent(server: &MockServer) {
     shutdown.cancel();
 }
 
-async fn scenario_coalescing(server: &MockServer) {
+async fn scenario_coalescing(server: &TestServerHandle) {
     println!("\nScenario 2: Request coalescing");
 
     let (fetcher, shutdown) = make_fetcher(FetcherConfig::default());
@@ -265,7 +176,7 @@ async fn scenario_coalescing(server: &MockServer) {
     shutdown.cancel();
 }
 
-async fn scenario_priority(server: &MockServer) {
+async fn scenario_priority(server: &TestServerHandle) {
     println!("\nScenario 3: Priority ordering");
 
     // Use a single global slot so requests execute one at a time — this makes
@@ -312,7 +223,7 @@ async fn scenario_priority(server: &MockServer) {
     shutdown.cancel();
 }
 
-async fn scenario_cancellation(server: &MockServer) {
+async fn scenario_cancellation(server: &TestServerHandle) {
     println!("\nScenario 4: Cancellation");
 
     let (fetcher, shutdown) = make_fetcher(FetcherConfig::default());
@@ -340,7 +251,7 @@ async fn scenario_cancellation(server: &MockServer) {
     shutdown.cancel();
 }
 
-async fn scenario_errors(server: &MockServer) {
+async fn scenario_errors(server: &TestServerHandle) {
     println!("\nScenario 5: Error handling");
 
     let (fetcher, shutdown) = make_fetcher(FetcherConfig::default());
@@ -365,152 +276,50 @@ async fn scenario_errors(server: &MockServer) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let paths: Vec<(&'static str, PathConfig)> = vec![
+    let server = TestServer::new()
         // Scenario 1 — 10 distinct paths
-        (
-            "/a",
-            PathConfig {
-                status: 200,
-                body: "a",
-                delay: Duration::ZERO,
-            },
-        ),
-        (
-            "/b",
-            PathConfig {
-                status: 200,
-                body: "b",
-                delay: Duration::ZERO,
-            },
-        ),
-        (
-            "/c",
-            PathConfig {
-                status: 200,
-                body: "c",
-                delay: Duration::ZERO,
-            },
-        ),
-        (
-            "/d",
-            PathConfig {
-                status: 200,
-                body: "d",
-                delay: Duration::ZERO,
-            },
-        ),
-        (
-            "/e",
-            PathConfig {
-                status: 200,
-                body: "e",
-                delay: Duration::ZERO,
-            },
-        ),
-        (
-            "/f",
-            PathConfig {
-                status: 200,
-                body: "f",
-                delay: Duration::ZERO,
-            },
-        ),
-        (
-            "/g",
-            PathConfig {
-                status: 200,
-                body: "g",
-                delay: Duration::ZERO,
-            },
-        ),
-        (
-            "/h",
-            PathConfig {
-                status: 200,
-                body: "h",
-                delay: Duration::ZERO,
-            },
-        ),
-        (
-            "/i",
-            PathConfig {
-                status: 200,
-                body: "i",
-                delay: Duration::ZERO,
-            },
-        ),
-        (
-            "/j",
-            PathConfig {
-                status: 200,
-                body: "j",
-                delay: Duration::ZERO,
-            },
-        ),
+        .route("/a", RouteConfig::ok(b"a"))
+        .route("/b", RouteConfig::ok(b"b"))
+        .route("/c", RouteConfig::ok(b"c"))
+        .route("/d", RouteConfig::ok(b"d"))
+        .route("/e", RouteConfig::ok(b"e"))
+        .route("/f", RouteConfig::ok(b"f"))
+        .route("/g", RouteConfig::ok(b"g"))
+        .route("/h", RouteConfig::ok(b"h"))
+        .route("/i", RouteConfig::ok(b"i"))
+        .route("/j", RouteConfig::ok(b"j"))
         // Scenario 2 — coalescing target (small delay to help submissions arrive together)
-        (
+        .route(
             "/coalesce",
-            PathConfig {
-                status: 200,
-                body: "coalesced",
-                delay: Duration::from_millis(50),
-            },
-        ),
+            RouteConfig::delay(Duration::from_millis(50), b"coalesced".to_vec()),
+        )
         // Scenario 3 — priority paths
-        (
+        .route(
             "/prio-high",
-            PathConfig {
-                status: 200,
-                body: "high",
-                delay: Duration::from_millis(10),
-            },
-        ),
-        (
+            RouteConfig::delay(Duration::from_millis(10), b"high".to_vec()),
+        )
+        .route(
             "/prio-normal",
-            PathConfig {
-                status: 200,
-                body: "normal",
-                delay: Duration::from_millis(10),
-            },
-        ),
-        (
+            RouteConfig::delay(Duration::from_millis(10), b"normal".to_vec()),
+        )
+        .route(
             "/prio-low",
-            PathConfig {
-                status: 200,
-                body: "low",
-                delay: Duration::from_millis(10),
-            },
-        ),
-        (
+            RouteConfig::delay(Duration::from_millis(10), b"low".to_vec()),
+        )
+        .route(
             "/prio-idle",
-            PathConfig {
-                status: 200,
-                body: "idle",
-                delay: Duration::from_millis(10),
-            },
-        ),
+            RouteConfig::delay(Duration::from_millis(10), b"idle".to_vec()),
+        )
         // Scenario 4 — slow path for cancellation
-        (
+        .route(
             "/slow",
-            PathConfig {
-                status: 200,
-                body: "slow",
-                delay: Duration::from_secs(30),
-            },
-        ),
+            RouteConfig::delay(Duration::from_secs(30), b"slow".to_vec()),
+        )
         // Scenario 5 — error path (404)
-        (
-            "/missing",
-            PathConfig {
-                status: 404,
-                body: "not found",
-                delay: Duration::ZERO,
-            },
-        ),
-    ];
-
-    let server = MockServer::start(paths).await;
-    println!("Mock server listening on port {}", server.port);
+        .route("/missing", RouteConfig::status(404, b"not found"))
+        .start()
+        .await;
+    println!("Mock server listening on {}", server.base_url());
 
     scenario_concurrent(&server).await;
     scenario_coalescing(&server).await;
