@@ -663,7 +663,10 @@ mod tests {
             // that would be pushed to subscribers before a test can attach.
             .route(
                 "/dribble-big",
-                RouteConfig::chunked_with_delay(vec![&[b'X'; 1024][..]; 12], Duration::from_millis(30)),
+                RouteConfig::chunked_with_delay(
+                    vec![&[b'X'; 1024][..]; 12],
+                    Duration::from_millis(30),
+                ),
             )
             .route(
                 "/timed",
