@@ -203,7 +203,10 @@ impl Waiter {
 
 /// Convert a streaming body to a buffered fetch-result by reading it to the end.
 /// This could be more efficient with allocations, probably.
-pub async fn stream_to_bytes(peek_buf: PeekBuf, shared: Arc<SharedBody>) -> Result<Bytes, NetError> {
+pub async fn stream_to_bytes(
+    peek_buf: PeekBuf,
+    shared: Arc<SharedBody>,
+) -> Result<Bytes, NetError> {
     let mut out = Vec::with_capacity(peek_buf.len() + 8192);
     let mut reader = SharedBody::combined_reader(peek_buf, shared);
     if let Err(e) = reader.read_to_end(&mut out).await {

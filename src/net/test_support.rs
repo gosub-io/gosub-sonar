@@ -76,7 +76,10 @@ pub enum RouteConfig {
     Chunked(Vec<Vec<u8>>),
     /// Like `Chunked`, but sleeps `delay` before each chunk: headers arrive immediately, the
     /// body dribbles in. Use when a test must subscribe to a stream before the body completes.
-    ChunkedWithDelay { chunks: Vec<Vec<u8>>, delay: Duration },
+    ChunkedWithDelay {
+        chunks: Vec<Vec<u8>>,
+        delay: Duration,
+    },
     /// Gzip-compress `body` and respond with `Content-Encoding: gzip`.
     /// Use to verify that `auto_decode: true` decompresses and `auto_decode: false` returns raw bytes.
     GzipOk(Vec<u8>),
