@@ -29,12 +29,22 @@ tokio = { version = "1.52.3", features = ["rt", "io-util", "sync", "time", "macr
 tokio-util = { version = "0.7.16", features = ["io"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 reqwest = { version = "0.13.3", features = ["rustls", "stream", "blocking", "gzip", "brotli", "deflate"] }
+flate2 = { version = "1", optional = true }
+
+[features]
+# Expose the in-process mock HTTP server (net::test_support) to downstream
+# integration tests and examples.
+test-support = ["dep:flate2"]
 
 [dev-dependencies]
 cow-utils = "0.1.3"
 flate2 = "1"
 # rt-multi-thread is test-only: race-condition regression tests need real parallelism.
 tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
+
+[[example]]
+name = "fetcher_harness"
+required-features = ["test-support"]
 
 [lints.rust]
 unsafe_code = "forbid"

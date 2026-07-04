@@ -74,7 +74,7 @@ See the `examples/` directory for runnable versions.
 ```text
 cargo run --example simple_fetch -- https://example.org
 cargo run --example fetcher -- https://example.org
-cargo run --example fetcher_harness
+cargo run --example fetcher_harness --features test-support
 ```
 
 ## License
