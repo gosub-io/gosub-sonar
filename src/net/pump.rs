@@ -48,18 +48,23 @@ pub struct PumpTargets {
 /// - **Total deadline**: wall-clock deadline via `total_deadline` → `NetError::Timeout("Pump total timeout")`.
 /// - **Cancellation**: cooperative cancellation via [`CancellationToken`] → `NetError::Cancelled("Pump cancelled")`.
 ///
-/// If a file destination is provided, the pump writes to a **temporary path**
-/// (via `temp_path_for`) and **atomically renames** to the final destination
-/// *only if* the transfer finishes cleanly. On read errors, timeouts, or
-/// cancellation, the temporary file is left in place (caller may clean up).
+/// If a file destination is provided, the pump writes to a **temporary file in the destination
+/// directory** (via `temp_path_for`) and **atomically renames** it to the final destination
+/// *only if* the transfer finishes cleanly. On read errors, timeouts, or cancellation, the
+/// temporary file is removed automatically (it is a `tempfile::NamedTempFile`).
+///
+/// A failure to *set up* the file target (temp-file creation, open, or peek write) degrades the
+/// same way as a mid-stream write failure: when a `shared` target is present, an observer
+/// warning is emitted and streaming continues without a file target. A file-only pump returns
+/// the error instead — there is nothing left to deliver to.
 ///
 /// `peek` is emitted *first* to both targets (if present), then the streamed tail.
 ///
 /// # Return
 /// The task resolves to:
 /// - `Ok(Some(final_path))` on a clean EOF and successful rename,
-/// - `Ok(None)` if no file target was requested or the transfer did not finish cleanly,
-/// - `Err(NetError)` only for early I/O failures before the main loop opens/writes the temp file.
+/// - `Ok(None)` if no file target was requested or the transfer did not produce a file,
+/// - `Err(NetError)` only when file setup fails and there is no `shared` target.
 pub fn spawn_pump<R>(
     // Reader we pump from
     mut reader: R,
@@ -81,31 +86,42 @@ where
     let total_deadline = cfg.total_deadline;
 
     tokio::spawn(async move {
-        // If we need to send to file, first open the file and write the peek data
+        // If we need to send to file, first open the file and write the peek data.
+        // A setup failure must not strand live subscribers: with a shared target we degrade to
+        // stream-only (like a mid-stream write failure); a file-only pump fails outright.
         let mut writer = if let Some(dest) = &file_dest {
-            let tmp_dest = match temp_path_for(dest) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err(NetError::Io(Arc::new(e)));
-                }
-            };
+            let setup = async {
+                let tmp_dest = temp_path_for(dest).map_err(|e| NetError::Io(Arc::new(e)))?;
 
-            let mut f = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(tmp_dest.path())
-                .await
-                .map_err(|e| NetError::Io(Arc::new(e)))?;
-
-            // Write peek data first
-            if !peek_buf.is_empty() {
-                f.write_all(&peek_buf)
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(tmp_dest.path())
                     .await
                     .map_err(|e| NetError::Io(Arc::new(e)))?;
-            }
 
-            Some((tmp_dest, BufWriter::new(f)))
+                // Write peek data first
+                if !peek_buf.is_empty() {
+                    f.write_all(&peek_buf)
+                        .await
+                        .map_err(|e| NetError::Io(Arc::new(e)))?;
+                }
+
+                Ok::<_, NetError>((tmp_dest, BufWriter::new(f)))
+            };
+
+            match setup.await {
+                Ok(w) => Some(w),
+                Err(e) if shared.is_none() => return Err(e),
+                Err(e) => {
+                    observer.on_event(NetEvent::Warning {
+                        url: url.clone(),
+                        message: format!("file setup failed, streaming without file target: {}", e),
+                    });
+                    None
+                }
+            }
         } else {
             None
         };
@@ -484,6 +500,59 @@ mod tests {
         let result = handle.await.unwrap().unwrap();
         assert_eq!(result, Some(dest.clone()));
         assert_eq!(std::fs::read(&dest).unwrap(), b"head tail");
+    }
+
+    /// A file-setup failure (unwritable destination directory) must not strand shared
+    /// subscribers: the pump degrades to stream-only and they still get the full body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pump_file_setup_failure_still_streams_to_shared() {
+        let shared = Arc::new(SharedBody::new(32));
+        let mut sub = shared.subscribe_stream();
+        let dest = PathBuf::from("/nonexistent-gosub-test-dir/out.bin");
+        let handle = spawn_pump(
+            std::io::Cursor::new(b" tail".to_vec()),
+            PumpTargets {
+                shared: Some(shared.clone()),
+                file_dest: Some(dest.clone()),
+                peek_buf: PeekBuf::from_slice(b"head"),
+            },
+            long_timeout(),
+            CancellationToken::new(),
+            observer(),
+            url(),
+        );
+
+        let mut out = Vec::new();
+        let drain_fut = async {
+            while let Some(chunk) = sub.next().await {
+                out.extend_from_slice(&chunk.unwrap());
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), drain_fut)
+            .await
+            .expect("subscriber hung after file-setup failure");
+        assert_eq!(out, b"head tail");
+        assert_eq!(handle.await.unwrap().unwrap(), None);
+        assert!(!dest.exists());
+    }
+
+    /// With no shared target there is nothing left to deliver to: a file-setup failure
+    /// resolves the pump task to an error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pump_file_only_setup_failure_returns_error() {
+        let handle = spawn_pump(
+            std::io::Cursor::new(b"data".to_vec()),
+            PumpTargets {
+                shared: None,
+                file_dest: Some(PathBuf::from("/nonexistent-gosub-test-dir/out.bin")),
+                peek_buf: PeekBuf::empty(),
+            },
+            long_timeout(),
+            CancellationToken::new(),
+            observer(),
+            url(),
+        );
+        assert!(handle.await.unwrap().is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
