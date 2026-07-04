@@ -84,9 +84,10 @@ impl Default for FetcherConfig {
 ///    `parent_cancel`.  When a subscriber cancels, `dec_sub_and_maybe_cancel` decrements `subs`.
 ///    If the count reaches zero (all subscribers cancelled), `parent_cancel` is fired, which
 ///    in turn cancels the in-progress HTTP request.
-/// 4. **Completion** — the leader calls `waiter.finish(result)`, which fans the result out to
-///    all registered receivers.  `done` is then cancelled to unblock any lingering child-cancel
-///    tasks, and the entry is removed from the map.
+/// 4. **Completion** — the leader removes the entry from the map (so new requests start a fresh
+///    fetch instead of joining a waiter that is about to be drained), then calls
+///    `waiter.finish(result)`, which fans the result out to all registered receivers.  `done` is
+///    then cancelled to unblock any lingering child-cancel tasks.
 pub struct FetchInflightEntry {
     /// Fires when *all* subscribers have cancelled, aborting the underlying HTTP request.
     parent_cancel: CancellationToken,
@@ -375,8 +376,20 @@ impl Fetcher {
                 format!("{};D={}", base, req.auto_decode as u8)
             };
 
+            // Register the reply channel while still holding the DashMap entry guard.
+            // `register` is synchronous (no await), so holding the shard lock here is safe. The
+            // leader removes the entry from the map *before* draining the waiter, and entry() and
+            // remove() serialize on the shard lock — so a follower that finds the entry here is
+            // guaranteed to register before the drain; otherwise it finds the map vacant and
+            // becomes the leader of a fresh fetch. Registering after releasing the guard would
+            // leave a window where the result is lost and the subscriber gets a RecvError.
             let (inflight_entry, is_leader) = match self.inflight_map.entry(key_str.clone()) {
-                Entry::Occupied(entry) => (entry.get().clone(), false),
+                Entry::Occupied(entry) => {
+                    let arc = entry.get().clone();
+                    arc.waiter.register(reply_tx, req.streaming);
+                    arc.inc_sub();
+                    (arc, false)
+                }
                 Entry::Vacant(v) => {
                     let arc = Arc::new(FetchInflightEntry {
                         parent_cancel: CancellationToken::new(),
@@ -385,6 +398,8 @@ impl Fetcher {
                         done: CancellationToken::new(),
                         subs: AtomicUsize::new(0),
                     });
+                    arc.waiter.register(reply_tx, req.streaming);
+                    arc.inc_sub();
                     v.insert(arc.clone());
                     (arc, true)
                 }
@@ -393,9 +408,6 @@ impl Fetcher {
             if is_leader {
                 self.ctx.on_ref_active(req.reference);
             }
-
-            inflight_entry.waiter.register(reply_tx, req.streaming);
-            inflight_entry.inc_sub();
 
             let child_cancel = handle.cancel.clone();
             let entry_for_cancel = inflight_entry.clone();
@@ -418,9 +430,10 @@ impl Fetcher {
                 let err = FetchResult::Error(NetError::Other(std::sync::Arc::new(
                     anyhow::anyhow!("URL blocked by policy: {}", req.key_data.url),
                 )));
+                // Remove before finish — see the registration comment above for the ordering.
+                self.inflight_map.remove(&key_str);
                 inflight_entry.waiter.finish(err).await;
                 inflight_entry.done.cancel();
-                self.inflight_map.remove(&key_str);
                 self.ctx.on_ref_done(req.reference);
                 continue;
             }
@@ -502,10 +515,14 @@ impl Fetcher {
                     Err(e) => FetchResult::Error(e.clone()),
                 };
 
+                // Remove from the map before draining the waiter: entry() and remove() serialize
+                // on the shard lock, so any follower that found this entry has already registered,
+                // and later arrivals find the map vacant and start a fresh fetch instead.
+                inflight.remove(&key_for_remove);
+
                 inflight_entry2.waiter.finish(fr).await;
 
                 inflight_entry2.done.cancel();
-                inflight.remove(&key_for_remove);
 
                 ctx_clone.on_ref_done(req.reference);
             });
@@ -771,6 +788,7 @@ mod tests {
                 RouteConfig::delay(Duration::from_millis(50), b"coalesced".to_vec()),
             )
             .route("/hang", RouteConfig::hang_after_connect())
+            .route("/fast", RouteConfig::ok(b"x"))
             .route(
                 "/timed",
                 RouteConfig::delay(Duration::from_millis(60), b"ok".to_vec()),
@@ -1295,6 +1313,40 @@ mod tests {
             1,
             "coalescing must deduplicate to a single HTTP request"
         );
+        shutdown.cancel();
+    }
+
+    /// Regression test for the follower-registration vs leader-finish race: a subscriber that
+    /// joins an in-flight entry must never lose the result (RecvError) because the leader
+    /// drained the waiter between the map lookup and the registration. A fast route plus many
+    /// rounds of live submissions makes joins race with completions constantly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetcher_coalescing_join_never_loses_result_under_races() {
+        let srv = start_server().await;
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        for _round in 0..20 {
+            let mut receivers = Vec::new();
+            for _ in 0..30 {
+                let (req, handle) = make_req(srv.url("/fast"), Priority::Normal);
+                let (tx, rx) = oneshot::channel();
+                fetcher.submit(req, handle, tx).await;
+                receivers.push(rx);
+            }
+            for rx in receivers {
+                let result = tokio::time::timeout(Duration::from_secs(5), rx)
+                    .await
+                    .expect("subscriber timed out waiting for result")
+                    .expect("subscriber lost the result (waiter drained before registration)");
+                assert!(!result.is_error());
+            }
+        }
+
         shutdown.cancel();
     }
 
