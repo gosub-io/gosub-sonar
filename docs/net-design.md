@@ -5,13 +5,13 @@
 > companion that explains *why* the design looks the way it does.
 
 This document is kind of a blog post / brain dump of the current state of the network architecture that currently
-is implemented in this respository. Even though fetching resources over the network is easy enough with crates likes 
-`reqwest`, there is much more that needs to be taken care of when designing a network stack for browser.
+is implemented in this repository. Even though fetching resources over the network is easy enough with crates like 
+`reqwest`, there is much more that needs to be taken care of when designing a network stack for a browser.
 
 
 ## Starting with the beginning
 
-Let assume a very naive network stack:
+Let's assume a very naive network stack:
 
 ```rust
 
@@ -29,7 +29,7 @@ This, in theory, should be enough to fetch a resource over the network. But ther
    complete. In a browser, we want to be able to fetch resources without blocking the main thread.
 2. **Memory usage**: The above function reads the entire response body into memory before returning it. This can be a 
    problem for large resources, as it can lead to high memory usage.
-3. **Coalsecing**: Suppose you have multiple tabs open in your browser, and each tab is trying to fetch resources from 
+3. **Coalescing**: Suppose you have multiple tabs open in your browser, and each tab is trying to fetch resources from 
    the same domain. If each tab makes its own request, this can lead to a lot of redundant network traffic. Instead, we 
    want to be able to coalesce requests for the same resource, so that only one request is made and the response is 
    shared among all the tabs that need it.
@@ -94,7 +94,7 @@ observer machinery entirely.
 
 ## Fetcher
 The `fetcher.run()` function is the main loop of the fetcher. It is responsible for processing requests.
-It works by fetching a request from the priority queues, and process it. If none a present, it will sleep until a new
+It works by fetching a request from the priority queues, and process it. If none are present, it will sleep until a new
 request has been submitted through `submit()`.
 
 ### Priority queues
@@ -110,7 +110,7 @@ priority levels are:
 The scheduler will try and fetch requests from the highest priority queue first. If there are no requests in the 
 highest priority queue, it will try and fetch from the next highest priority queue, and so on. Note that it will not 
 starve lower priority queues. 
-If a lower priority queue has been waiting for a while, it will be given a chance to be processed, even when higer 
+If a lower priority queue has been waiting for a while, it will be given a chance to be processed, even when higher 
 priority queues are not empty.
 
 Once the fetcher has selected a request to process, it will check if there is already an ongoing request for the same 
@@ -121,11 +121,11 @@ To find out if we can coalesce, we need to generate some kind of key for the req
 method, headers, etc. Once we have the key, we can check if there is an ongoing request with the same key. If so, we 
 can coalesce the requests. If not, we can start a new request.
 
-There is some small thing we need to consider when coalescing requests. Some consumers can requests to be fetch as 
+There is some small thing we need to consider when coalescing requests. Some consumers want requests to be fetched as 
 streaming, others as buffered. Streaming requests will return a stream of data, while buffered requests will return the 
 entire response body as a single buffer.
 
-Each unique non-coalseced request will be represented by a `FetchInflightEntry`. This struct will contain the request,
+Each unique non-coalesced request will be represented by a `FetchInflightEntry`. This struct will contain the request,
 the list of listeners, and the state of the job. This system will also take care of streamable vs buffered requests,
 and can serve both types of requests from the same inflight job.
 
@@ -138,7 +138,7 @@ running into issues with browsers that limit the number of connections to a sing
 In total, the fetcher will limit the total amount of connections that can be open at the same time, as well as the 
 amount of connections that can be open to a single origin.
 
-At this point we can actualy fetch the request. If the request is a streaming request, we will use `perform_streaming`, 
+At this point we can actually fetch the request. If the request is a streaming request, we will use `perform_streaming`, 
 otherwise we will use the `perform_buffered` function.
 
 There is a bit of a subtlety here, because streaming and buffered consumers can be coalesced onto the same inflight 
@@ -150,8 +150,9 @@ coalesced subscriber asked for streaming, the fetch is performed as a stream (`p
 
 Both mixes are then served from that single job:
 
-- **Buffered job, streaming subscriber:** once we have the buffered body we simply wrap it in a stream and hand it to 
-  the streaming listeners.
+- **Buffered job, streaming subscriber:** the streaming listener receives the `FetchResult::Buffered` as-is — the body 
+  is already complete, so there is nothing left to stream. Callers that ask for streaming must therefore be prepared 
+  to handle a `Buffered` result as well (this can happen when they coalesce onto a fetch that was started buffered).
 - **Streaming job, buffered subscriber:** the buffered listener is served by draining the `SharedBody` to its end into 
   a single buffer (see `stream_to_bytes` in `Waiter::finish`). We never keep a second copy of the response, and we 
   never start a separate request for it.
@@ -165,7 +166,7 @@ all the listeners of the request, and the inflight job will be removed. That wil
 
 Before we go into more detail of the buffered and streaming fetchers, let's take a look at the `FetchInflightEntry`
 struct. This struct is responsible for keeping track of the state of a request. It contains the request, the list of
-listeners, and wether or not streaming is being used. The most important part is the set of listeners, also called
+listeners, and whether or not streaming is being used. The most important part is the set of listeners, also called
 `Waiter`s. It allows you to register channels that will receive the `FetchResult` from the `perform_buffered` and
 `perform_streaming` functions.
 
@@ -187,10 +188,10 @@ This function is responsible for fetching the top of the response. These are the
 initial 5KB of the body. With this information, the client (or engine) can decide how to treat the response. For 
 instance, if the response is a HTML document, the engine could decide to send the stream to the HTML5 parser etc.
 
-There are a small issues:
+There is a small issue:
 If you read the first 5KB of the body, you can't read the rest of the body from the stream, it's possible that you
 have read more than 5KB. Since we only want to have 5KB, we need to "unread" the extra bytes. This is done by dumping
-the extra bytes into a 'excess' buffer.
+the extra bytes into an 'excess' buffer.
 
 When we return the stream back to the caller, we will not return the existing stream (since that already read the 
 excess bytes), but we recreate a new stream that first reads the excess bytes, and then reads the rest of the body 
@@ -204,7 +205,7 @@ from the original
 ```
 
 This means that now the FetchResult::Stream contains the 'peek_buf' and the reader that reads DIRECTLY behind
-the peek_buf. (resulting in a small bit over 'rereading' the excess buffer).
+the peek_buf. (resulting in a small bit of 'rereading' of the excess buffer).
 
 ### perform_streaming
 This function calls `fetch_response_top` to get the top of the response and turns the result into a
@@ -224,7 +225,7 @@ client. They will convert any `NetEvent` into a more suitable event for the clie
 
 When reading a streaming response, we will send a `NetEvent::Progress` event every time we read a chunk of data. This 
 way, the client can be notified of the progress of the request. For this, we wrap the read stream into a 
-`ProgressReader`, which does nothing more than read the stream, and send a `NetEvent::Progress` events. Besides that,
+`ProgressReader`, which does nothing more than read the stream and send `NetEvent::Progress` events. Besides that,
 it also takes care of idle timeouts, and total timeouts, cancellation and max size limits.
 
 

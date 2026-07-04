@@ -18,6 +18,10 @@
 //! assert_eq!(server.hit_count("/ok"), 1);
 //! ```
 
+// This is a test utility: panicking on setup failure is the desired behavior, and the crate-wide
+// unwrap/expect/panic denial only exempts cfg(test), not the `test-support` feature build.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,6 +78,12 @@ pub enum RouteConfig {
     /// HTTP/1.1 chunked transfer encoding with the given chunks.
     /// Use to test that the body is correctly assembled across multiple chunks.
     Chunked(Vec<Vec<u8>>),
+    /// Like `Chunked`, but sleeps `delay` before each chunk: headers arrive immediately, the
+    /// body dribbles in. Use when a test must subscribe to a stream before the body completes.
+    ChunkedWithDelay {
+        chunks: Vec<Vec<u8>>,
+        delay: Duration,
+    },
     /// Gzip-compress `body` and respond with `Content-Encoding: gzip`.
     /// Use to verify that `auto_decode: true` decompresses and `auto_decode: false` returns raw bytes.
     GzipOk(Vec<u8>),
@@ -127,6 +137,12 @@ impl RouteConfig {
     }
     pub fn chunked(chunks: Vec<&[u8]>) -> Self {
         Self::Chunked(chunks.into_iter().map(|c| c.to_vec()).collect())
+    }
+    pub fn chunked_with_delay(chunks: Vec<&[u8]>, delay: Duration) -> Self {
+        Self::ChunkedWithDelay {
+            chunks: chunks.into_iter().map(|c| c.to_vec()).collect(),
+            delay,
+        }
     }
 }
 
@@ -300,6 +316,20 @@ impl TestServer {
                                         let _ = stream.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).await;
                                         let _ = stream.write_all(chunk).await;
                                         let _ = stream.write_all(b"\r\n").await;
+                                    }
+                                    let _ = stream.write_all(b"0\r\n\r\n").await;
+                                }
+                                RouteConfig::ChunkedWithDelay { chunks, delay } => {
+                                    let _ = stream.write_all(
+                                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                                    ).await;
+                                    let _ = stream.flush().await;
+                                    for chunk in &chunks {
+                                        tokio::time::sleep(delay).await;
+                                        let _ = stream.write_all(format!("{:x}\r\n", chunk.len()).as_bytes()).await;
+                                        let _ = stream.write_all(chunk).await;
+                                        let _ = stream.write_all(b"\r\n").await;
+                                        let _ = stream.flush().await;
                                     }
                                     let _ = stream.write_all(b"0\r\n\r\n").await;
                                 }

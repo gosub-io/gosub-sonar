@@ -16,12 +16,16 @@ use url::Url;
 
 static HASH_STATE: OnceLock<RandomState> = OnceLock::new();
 
-pub fn spawn_named<F, T>(_name: &str, fut: F) -> JoinHandle<T>
+/// Spawn a task with a human-readable name attached as a tracing span, so task activity can
+/// be attributed in trace output.
+pub fn spawn_named<F, T>(name: &str, fut: F) -> JoinHandle<T>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::spawn(fut)
+    use tracing::Instrument as _;
+    let span = tracing::debug_span!("task", %name);
+    tokio::spawn(fut.instrument(span))
 }
 
 /// Normalizes a URL by removing its fragment and returning it as a string.
@@ -39,14 +43,23 @@ pub fn short_hash(bytes: &[u8]) -> u64 {
     HASH_STATE.get_or_init(RandomState::new).hash_one(bytes)
 }
 
-/// Returns a URL string truncated to `max` characters with `...` suffix.
+/// Returns a URL string truncated to at most `max` bytes with `...` suffix.
 pub fn short_url(u: &Url, max: usize) -> String {
     let s = u.as_str();
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        format!("{}...", truncate_on_char_boundary(s, max))
     }
+}
+
+/// Truncate `s` to at most `max` bytes without slicing through a multi-byte character.
+fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Minimal async reader backed by an in-memory `Bytes` buffer.
@@ -169,7 +182,8 @@ impl Waiter {
                             }
                         }
                         Err(e) => {
-                            let res = FetchResult::Error(NetError::Read(Arc::new(e)));
+                            // `e` is already a typed NetError — pass it through unwrapped.
+                            let res = FetchResult::Error(e);
                             for tx in buffered_ls {
                                 let _ = tx.send(res.clone());
                             }
@@ -187,13 +201,23 @@ impl Waiter {
     }
 }
 
-/// Convert a streaming body a buffered fetch-result by reading it to the end.
+/// Convert a streaming body to a buffered fetch-result by reading it to the end.
 /// This could be more efficient with allocations, probably.
-pub async fn stream_to_bytes(peek_buf: PeekBuf, shared: Arc<SharedBody>) -> anyhow::Result<Bytes> {
+pub async fn stream_to_bytes(
+    peek_buf: PeekBuf,
+    shared: Arc<SharedBody>,
+) -> Result<Bytes, NetError> {
     let mut out = Vec::with_capacity(peek_buf.len() + 8192);
     let mut reader = SharedBody::combined_reader(peek_buf, shared);
     if let Err(e) = reader.read_to_end(&mut out).await {
-        return Err(NetError::Io(Arc::new(e)).into());
+        // The reader wraps stream errors in io::Error (see NetError::to_io); recover the
+        // original typed NetError when one is carried, otherwise wrap the io::Error once.
+        let net = e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<NetError>())
+            .cloned()
+            .unwrap_or_else(|| NetError::Io(Arc::new(e)));
+        return Err(net);
     }
     Ok(Bytes::from(out))
 }
@@ -207,6 +231,34 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio::time::{sleep, Duration};
     use url::Url;
+
+    /// Truncation must never slice through a multi-byte character. `Url::as_str()` is ASCII in
+    /// practice (punycode / percent-encoding), so exercise the boundary logic on the helper.
+    #[test]
+    fn truncate_on_char_boundary_is_panic_free() {
+        let s = "héllo wörld"; // é and ö are 2 bytes each
+        for max in 0..=s.len() + 2 {
+            let t = truncate_on_char_boundary(s, max);
+            assert!(t.len() <= max.min(s.len()));
+            assert!(s.starts_with(t));
+        }
+        assert_eq!(truncate_on_char_boundary("héllo", 2), "h"); // byte 2 is inside é
+        assert_eq!(truncate_on_char_boundary("héllo", 3), "hé");
+    }
+
+    #[test]
+    fn short_url_truncates_with_suffix() {
+        let u = Url::parse("https://example.com/a/very/long/path").unwrap();
+        assert_eq!(short_url(&u, 19), "https://example.com...");
+        // Under the limit: returned untouched, no suffix.
+        assert_eq!(short_url(&u, 500), u.as_str());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_named_runs_task_to_completion() {
+        let handle = spawn_named("test-task", async { 21 * 2 });
+        assert_eq!(handle.await.unwrap(), 42);
+    }
 
     #[test]
     fn normalize_url_strips_fragment() {
@@ -391,6 +443,16 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(rx_buf.await.unwrap(), FetchResult::Error(_)));
+        // The typed error must survive the stream→buffered conversion unwrapped: the
+        // subscriber sees the original NetError::Cancelled, not a nested Read(Io(...)).
+        match rx_buf.await.unwrap() {
+            FetchResult::Error(e) => {
+                assert!(
+                    matches!(e, NetError::Cancelled(_)),
+                    "expected the original typed error, got: {e}"
+                );
+            }
+            _ => panic!("expected an error result"),
+        }
     }
 }

@@ -198,8 +198,11 @@ impl From<std::io::Error> for NetError {
 }
 
 impl NetError {
+    /// Wrap this error in an `io::Error`, carrying the typed error as the source so the other
+    /// side of an `AsyncRead` boundary can recover the original `NetError` (see
+    /// `stream_to_bytes`) instead of a stringified copy.
     pub fn to_io(&self) -> std::io::Error {
-        std::io::Error::other(format!("{self}"))
+        std::io::Error::other(self.clone())
     }
 
     pub fn from_anyhow(e: anyhow::Error) -> Self {

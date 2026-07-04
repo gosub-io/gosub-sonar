@@ -12,9 +12,13 @@ pub struct Response {
     pub status_text: String,
     /// HTTP version string (e.g. "HTTP/1.1", "HTTP/2")
     pub version: String,
-    /// Response headers, keyed by lowercase header name
+    /// Response headers, keyed by lowercase header name.
+    /// Repeated headers collapse to a single entry (last one wins) — notably multiple
+    /// `Set-Cookie` lines; use the scheduler API if you need every raw header value.
     pub headers: HashMap<String, String>,
-    /// Cookies parsed from `Set-Cookie` headers, keyed by cookie name
+    /// Cookies parsed from `Set-Cookie` headers, keyed by cookie name.
+    /// Only the `name=value` pair is kept; attributes (`Path`, `Expires`, …) are dropped,
+    /// and duplicate cookie names collapse to the last one received.
     pub cookies: HashMap<String, String>,
     /// Raw response body bytes
     pub body: Vec<u8>,
@@ -49,7 +53,7 @@ impl From<Vec<u8>> for Response {
 
 impl Display for Response {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
-        writeln!(f, "HTTP/1.1 {}", self.status)?;
+        writeln!(f, "{} {}", self.version, self.status)?;
         writeln!(f, "Headers:")?;
         for (key, value) in &self.headers {
             writeln!(f, "  {key}: {value}")?;
@@ -72,6 +76,16 @@ mod tests {
         let response = Response::new();
         let s = format!("{response}");
         assert_eq!(s, "HTTP/1.1 0\nHeaders:\nCookies:\nBody: 0 bytes\n");
+    }
+
+    /// Display must use the actual negotiated version, not a hardcoded "HTTP/1.1".
+    #[test]
+    fn display_uses_actual_version() {
+        let mut r = Response::new();
+        r.status = 200;
+        r.version = "HTTP/2.0".to_string();
+        let s = format!("{r}");
+        assert!(s.starts_with("HTTP/2.0 200\n"), "got: {s}");
     }
 
     #[test]
