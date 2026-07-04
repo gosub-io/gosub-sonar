@@ -230,6 +230,40 @@ impl Fetcher {
         }
     }
 
+    /// Submit a request and await its result.
+    ///
+    /// Convenience over [`submit`](Self::submit): builds the [`FetchHandle`] and reply channel
+    /// internally, so a fetch is a single call on a built [`FetchRequest`]. The request cannot
+    /// be cancelled individually; use [`fetch_with_cancel`](Self::fetch_with_cancel) for that.
+    ///
+    /// Requires the [`run`](Self::run) loop to be running; if the fetcher stops before
+    /// delivering, this resolves to a [`FetchResult::Error`].
+    pub async fn fetch(&self, req: FetchRequest) -> FetchResult {
+        self.fetch_with_cancel(req, CancellationToken::new()).await
+    }
+
+    /// Like [`fetch`](Self::fetch), with a caller-supplied cancellation token for this
+    /// subscriber. Cancelling the token abandons this caller's interest in the result; the
+    /// underlying HTTP request is aborted once all subscribers have cancelled.
+    pub async fn fetch_with_cancel(
+        &self,
+        req: FetchRequest,
+        cancel: CancellationToken,
+    ) -> FetchResult {
+        let handle = FetchHandle {
+            req_id: req.req_id,
+            key: req.key_data.clone(),
+            cancel,
+        };
+        let (tx, rx) = oneshot::channel();
+        self.submit(req, handle, tx).await;
+        rx.await.unwrap_or_else(|_| {
+            FetchResult::Error(NetError::Cancelled(
+                "fetcher stopped before delivering a result".into(),
+            ))
+        })
+    }
+
     pub async fn submit(
         &self,
         req: FetchRequest,
@@ -586,9 +620,7 @@ fn notify_cookies(ctx: &Arc<dyn FetcherContext>, meta: &crate::net::types::Fetch
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::fetcher_context::FetcherContext;
-    use crate::net::null_emitter::NullEmitter;
-    use crate::net::observer::NetObserver;
+    use crate::net::fetcher_context::NullContext;
     use crate::net::request_ref::RequestReference;
     use crate::net::test_support::{RouteConfig, TestServer};
     use crate::net::types::{FetchHandle, FetchKeyData, FetchRequest, Initiator, ResourceKind};
@@ -598,22 +630,6 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio_util::sync::CancellationToken;
     use url::Url;
-
-    struct NullContext;
-
-    impl FetcherContext for NullContext {
-        fn observer_for(
-            &self,
-            _: RequestReference,
-            _: RequestId,
-            _: ResourceKind,
-            _: Initiator,
-        ) -> Arc<dyn NetObserver + Send + Sync> {
-            Arc::new(NullEmitter)
-        }
-        fn on_ref_active(&self, _: RequestReference) {}
-        fn on_ref_done(&self, _: RequestReference) {}
-    }
 
     fn test_config() -> FetcherConfig {
         FetcherConfig {
@@ -1123,6 +1139,33 @@ mod tests {
             "requests should be serialized, elapsed: {:?}",
             start.elapsed()
         );
+        shutdown.cancel();
+    }
+
+    /// The `fetch` convenience must deliver the same result as the manual
+    /// submit/handle/oneshot ritual, and a stopped fetcher must resolve to an error
+    /// rather than hanging.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_fetch_convenience_delivers_result() {
+        let srv = start_server().await;
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let (req, _) = make_req(srv.url("/fast"), Priority::Normal);
+        let result = tokio::time::timeout(Duration::from_secs(3), fetcher.fetch(req))
+            .await
+            .unwrap();
+        match result {
+            FetchResult::Buffered { meta, body } => {
+                assert_eq!(meta.status, 200);
+                assert_eq!(&body[..], b"x");
+            }
+            _ => panic!("expected buffered result"),
+        }
         shutdown.cancel();
     }
 

@@ -6,44 +6,20 @@
 //!
 //! Callers that don't need the scheduler (tools, renderers) should use `simple_get`
 //! instead. This example shows how to wire up the `Fetcher` standalone, outside of
-//! the engine, using a minimal no-op `FetcherContext`.
+//! the engine, using the no-op `NullContext`. Implement your own `FetcherContext`
+//! to receive per-request events and lifecycle callbacks instead.
 //!
 //! Run with:
 //! ```text
 //! cargo run -p gosub_sonar --example fetcher -- https://example.org
 //! ```
 
-use gosub_sonar::net::fetcher::{Fetcher, FetcherConfig};
-use gosub_sonar::net::fetcher_context::FetcherContext;
-use gosub_sonar::net::null_emitter::NullEmitter;
-use gosub_sonar::net::observer::NetObserver;
-use gosub_sonar::net::request_ref::RequestReference;
-use gosub_sonar::net::types::{
-    FetchHandle, FetchKeyData, FetchRequest, FetchResult, Initiator, Priority, ResourceKind,
-};
-use gosub_sonar::types::RequestId;
+use gosub_sonar::{FetchRequest, FetchResult, Fetcher, FetcherConfig, NullContext, SharedBody};
+use http::Method;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-
-struct StandaloneContext;
-
-impl FetcherContext for StandaloneContext {
-    fn observer_for(
-        &self,
-        _reference: RequestReference,
-        _req_id: RequestId,
-        _kind: ResourceKind,
-        _initiator: Initiator,
-    ) -> Arc<dyn NetObserver + Send + Sync> {
-        Arc::new(NullEmitter)
-    }
-
-    fn on_ref_active(&self, _reference: RequestReference) {}
-    fn on_ref_done(&self, _reference: RequestReference) {}
-}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
@@ -52,48 +28,28 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| "https://example.org".to_string());
     let url = Url::parse(&raw)?;
 
-    // Build the fetcher with default config and our no-op context.
-    let config = FetcherConfig::default();
-    let fetcher = Arc::new(Fetcher::new(config, Arc::new(StandaloneContext))?);
+    // Build the fetcher with default config and the no-op context, and start its run loop.
+    let fetcher = Arc::new(Fetcher::new(
+        FetcherConfig::default(),
+        Arc::new(NullContext),
+    )?);
 
     let shutdown = CancellationToken::new();
-
     let fetcher_task = fetcher.clone();
     let cancel = shutdown.clone();
     tokio::spawn(async move {
         fetcher_task.run(cancel).await;
     });
 
-    // Build the request.
-    let key_data = FetchKeyData::new(url.clone());
-    let req_id = RequestId::new();
-
-    let req = FetchRequest {
-        reference: RequestReference::Background(0),
-        req_id,
-        key_data: key_data.clone(),
-        priority: Priority::Normal,
-        initiator: Initiator::Other,
-        kind: ResourceKind::Primary,
-        streaming: false,
-        auto_decode: true,
-        body: None,
-        max_bytes: None,
-    };
-
-    let handle = FetchHandle {
-        req_id,
-        key: key_data,
-        cancel: CancellationToken::new(),
-    };
-
-    // Submit the request and wait for the result.
-    let (reply_tx, reply_rx) = oneshot::channel();
-    fetcher.submit(req, handle, reply_tx).await;
+    // Build the request and fetch. `fetch` handles the reply channel and request handle
+    // internally; use `submit` directly if you need to manage those yourself.
+    let req = FetchRequest::builder(Method::GET, url.clone())
+        .with_auto_decode(true)
+        .build();
 
     println!("Fetching {url} ...");
 
-    match reply_rx.await? {
+    match fetcher.fetch(req).await {
         FetchResult::Buffered { meta, body } => {
             println!(
                 "Buffered response: HTTP {} — {} bytes",
@@ -110,8 +66,7 @@ async fn main() -> anyhow::Result<()> {
             shared,
         } => {
             println!("Streamed response: HTTP {}", meta.status);
-            let mut reader =
-                gosub_sonar::net::shared_body::SharedBody::combined_reader(peek_buf, shared);
+            let mut reader = SharedBody::combined_reader(peek_buf, shared);
             let mut buf = Vec::new();
             reader.read_to_end(&mut buf).await?;
             println!("Read {} bytes total", buf.len());

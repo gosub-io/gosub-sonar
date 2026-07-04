@@ -2,19 +2,30 @@
 //!
 //! Two APIs are available depending on how much control you need:
 //!
-//! - [`net::simple::simple_get`] — one-shot GET, no setup required.
-//! - [`net::fetcher::Fetcher`] — priority-scheduled fetcher with request coalescing,
+//! - [`simple_get`] — one-shot GET, no setup required.
+//! - [`Fetcher`] — priority-scheduled fetcher with request coalescing,
 //!   per-origin concurrency limits, and fan-out to multiple subscribers.
 //!
-//! For the full scheduler, implement [`net::fetcher_context::FetcherContext`] to receive
-//! lifecycle callbacks, or use [`net::null_emitter::NullEmitter`] to ignore them.
+//! For the full scheduler, implement [`FetcherContext`] to receive lifecycle callbacks,
+//! or use [`NullContext`] if you don't need any:
+//!
+//! ```ignore
+//! let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), Arc::new(NullContext))?);
+//! tokio::spawn({ let f = fetcher.clone(); async move { f.run(shutdown).await } });
+//!
+//! let req = FetchRequest::builder(Method::GET, url).build();
+//! let result = fetcher.fetch(req).await;
+//! ```
+//!
+//! The most common types are re-exported at the crate root; the full API remains
+//! available under [`net`].
 //!
 //! # Examples
 //!
 //! Runnable examples are in the `examples/` directory:
 //!
-//! - `simple_fetch` — one-shot GET using [`net::simple::simple_get`]
-//! - `fetcher` — minimal [`net::fetcher::Fetcher`] setup with a no-op context
+//! - `simple_fetch` — one-shot GET using [`simple_get`]
+//! - `fetcher` — minimal [`Fetcher`] setup with a no-op context
 //! - `fetcher_harness` — self-contained harness covering concurrency, coalescing, priority, cancellation, and errors
 
 #![forbid(unsafe_code)]
@@ -29,3 +40,16 @@
 pub mod http;
 pub mod net;
 pub mod types;
+
+pub use net::fetcher::{Fetcher, FetcherConfig};
+pub use net::fetcher_context::{FetcherContext, NullContext};
+pub use net::null_emitter::NullEmitter;
+pub use net::observer::NetObserver;
+pub use net::request_ref::RequestReference;
+pub use net::shared_body::SharedBody;
+pub use net::simple::{simple_get, sync_fetch, sync_get};
+pub use net::types::{
+    FetchHandle, FetchKeyData, FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta,
+    Initiator, NetError, Priority, RequestBody, ResourceKind,
+};
+pub use types::{PeekBuf, RequestId};

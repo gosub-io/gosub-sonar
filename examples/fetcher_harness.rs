@@ -14,15 +14,10 @@
 //!   cargo run -p gosub_sonar --example fetcher_harness
 
 use dashmap::DashMap;
-use gosub_sonar::net::fetcher::{Fetcher, FetcherConfig};
-use gosub_sonar::net::fetcher_context::FetcherContext;
-use gosub_sonar::net::null_emitter::NullEmitter;
-use gosub_sonar::net::observer::NetObserver;
-use gosub_sonar::net::request_ref::RequestReference;
-use gosub_sonar::net::types::{
-    FetchHandle, FetchKeyData, FetchRequest, FetchResult, Initiator, Priority, ResourceKind,
+use gosub_sonar::{
+    FetchHandle, FetchKeyData, FetchRequest, FetchResult, Fetcher, FetcherConfig, Initiator,
+    NullContext, Priority, RequestId, RequestReference, ResourceKind,
 };
-use gosub_sonar::types::RequestId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,22 +26,6 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-
-struct NullContext;
-
-impl FetcherContext for NullContext {
-    fn observer_for(
-        &self,
-        _: RequestReference,
-        _: RequestId,
-        _: ResourceKind,
-        _: Initiator,
-    ) -> Arc<dyn NetObserver + Send + Sync> {
-        Arc::new(NullEmitter)
-    }
-    fn on_ref_active(&self, _: RequestReference) {}
-    fn on_ref_done(&self, _: RequestReference) {}
-}
 
 /// Per-path configuration for the mock server.
 #[derive(Clone)]

@@ -37,49 +37,25 @@ let bytes = simple_get(&Url::parse("https://example.org")?).await?;
 
 ```rust
 use std::sync::Arc;
-use gosub_sonar::net::fetcher::{Fetcher, FetcherConfig};
-use gosub_sonar::net::fetcher_context::FetcherContext;
-use gosub_sonar::net::null_emitter::NullEmitter;
-use gosub_sonar::net::observer::NetObserver;
-use gosub_sonar::net::request_ref::RequestReference;
-use gosub_sonar::net::types::{FetchHandle, FetchRequest, FetchResult, Initiator, Priority, ResourceKind};
-use gosub_sonar::types::RequestId;
+use gosub_sonar::{FetchRequest, FetchResult, Fetcher, FetcherConfig, NullContext, Priority};
 use http::Method;
-use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-struct MyContext;
-
-impl FetcherContext for MyContext {
-    fn observer_for(&self, _: RequestReference, _: RequestId, _: ResourceKind, _: Initiator)
-        -> Arc<dyn NetObserver + Send + Sync> { Arc::new(NullEmitter) }
-    fn on_ref_active(&self, _: RequestReference) {}
-    fn on_ref_done(&self, _: RequestReference) {}
-}
+// NullContext ignores all lifecycle events; implement FetcherContext to receive them.
+let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), Arc::new(NullContext))?);
 
 let shutdown = CancellationToken::new();
-let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), Arc::new(MyContext))?);
-
 let f = fetcher.clone();
 let cancel = shutdown.clone();
 tokio::spawn(async move { f.run(cancel).await });
 
 let req = FetchRequest::builder(Method::GET, Url::parse("https://example.org")?)
     .with_priority(Priority::Normal)
-    .with_kind(ResourceKind::Primary)
     .with_auto_decode(true)
     .build();
-// The handle shares the request's id and key so the fetcher can correlate them.
-let handle = FetchHandle {
-    req_id: req.req_id,
-    key: req.key_data.clone(),
-    cancel: CancellationToken::new(),
-};
-let (tx, rx) = oneshot::channel();
-fetcher.submit(req, handle, tx).await;
 
-match rx.await? {
+match fetcher.fetch(req).await {
     FetchResult::Buffered { meta, body } => println!("{} — {} bytes", meta.status, body.len()),
     FetchResult::Stream { .. } => println!("streaming"),
     FetchResult::Error(e) => eprintln!("error: {e}"),
@@ -87,6 +63,9 @@ match rx.await? {
 
 shutdown.cancel();
 ```
+
+For per-subscriber cancellation use `fetcher.fetch_with_cancel(req, token)`; for full control
+over the reply channel and request handle use `fetcher.submit(req, handle, tx)`.
 
 See the `examples/` directory for runnable versions.
 
