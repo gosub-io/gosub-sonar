@@ -27,6 +27,9 @@ pub type UrlFilter = Box<dyn Fn(&Url) -> bool + Send + Sync>;
 /// Callback type for per-URL cookie jar queries.
 pub type CookieJarFn = Box<dyn Fn(&Url) -> Option<String> + Send + Sync>;
 
+/// Callback type for reporting `Set-Cookie` values received on a response.
+pub type CookieSinkFn = Box<dyn Fn(&Url, &[&str]) + Send + Sync>;
+
 /// Network-level request policies threaded through the fetch stack.
 ///
 /// Bundles the URL allowlist check and the cookie-jar query so both can be applied at
@@ -41,6 +44,10 @@ pub struct NetPolicy {
     /// Called on each hop after cross-origin cookie stripping, so the jar is always consulted
     /// for the correct origin.
     pub cookies_for: CookieJarFn,
+    /// Called with the raw `Set-Cookie` values of each redirect (3xx) response, so cookies set
+    /// mid-chain (e.g. a session cookie on a login 302) reach the jar before the next hop.
+    /// The final response's cookies are reported by the fetcher, not here.
+    pub on_cookies: CookieSinkFn,
 }
 
 impl Default for NetPolicy {
@@ -48,6 +55,7 @@ impl Default for NetPolicy {
         Self {
             url_allowed: Box::new(|_| true),
             cookies_for: Box::new(|_| None),
+            on_cookies: Box::new(|_, _| {}),
         }
     }
 }
@@ -57,9 +65,11 @@ impl NetPolicy {
     pub fn from_context(ctx: &Arc<dyn FetcherContext>) -> Self {
         let ctx_url = ctx.clone();
         let ctx_cookies = ctx.clone();
+        let ctx_sink = ctx.clone();
         Self {
             url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
             cookies_for: Box::new(move |url| ctx_cookies.cookies_for(url)),
+            on_cookies: Box::new(move |url, values| ctx_sink.on_cookies_received(url, values)),
         }
     }
 }
@@ -118,6 +128,9 @@ impl RequestInit {
 const PEEK_MAX: usize = 5 * 1024;
 /// Maximum number of redirects allowed
 const MAX_REDIRECTS: usize = 20;
+/// Ceiling on the body buffer pre-allocation. Content-Length is server-controlled, so we never
+/// allocate more than this up front; larger honest bodies grow the buffer as bytes arrive.
+const MAX_PREALLOC: usize = 1024 * 1024;
 
 // This is the top of the response (HTTP headers + first 5KB of the body, if any), plus a stream (that starts from the peeked bytes)
 pub struct ResponseTop {
@@ -413,14 +426,25 @@ pub async fn fetch_response_complete(
         mut reader,
     } = fetch_response_top(client, url, init, cancel.clone(), observer.clone(), policy).await?;
 
+    // Reject responses that already declare a body larger than max_bytes, before reading any of it.
+    // The in-loop check below remains the backstop for servers that lie or use chunked encoding.
+    if let (Some(max), Some(len)) = (max_bytes, meta.content_length) {
+        if len as usize > max {
+            return Err(NetError::Read(Arc::new(anyhow!(
+                "content-length {} exceeds maximum size of {} bytes",
+                len,
+                max
+            ))));
+        }
+    }
+
     // Pre-size from Content-Length when known to avoid reallocations as the body grows; otherwise
     // start from the peek length. The peek bytes have already been read off the stream, so seed the
-    // buffer with them (a one-off copy of the small peek region, not the whole body).
-    let initial_cap = meta
-        .content_length
-        .map(|n| n as usize)
-        .unwrap_or(0)
-        .max(peek_buf.len());
+    // buffer with them (a one-off copy of the small peek region, not the whole body). Content-Length
+    // is untrusted, so the pre-allocation is clamped to MAX_PREALLOC (and max_bytes when set).
+    let advertised = meta.content_length.map(|n| n as usize).unwrap_or(0);
+    let ceiling = max_bytes.unwrap_or(MAX_PREALLOC).min(MAX_PREALLOC);
+    let initial_cap = advertised.min(ceiling).max(peek_buf.len());
     let mut body_buf = BytesMut::with_capacity(initial_cap);
     body_buf.extend_from_slice(peek_buf.as_slice());
 
@@ -485,6 +509,8 @@ pub async fn fetch_response_complete(
 ///   the cookie jar is re-queried for the new origin.
 /// - Only `http` and `https` targets are followed; other schemes are rejected.
 /// - `policy.url_allowed` and `policy.cookies_for` are called at every hop.
+/// - `Set-Cookie` values on 3xx responses are reported via `policy.on_cookies` and the jar is
+///   re-queried for the next hop; the final response's cookies are the caller's responsibility.
 async fn get_with_redirects(
     client: Arc<reqwest::Client>,
     url: Url,
@@ -550,6 +576,21 @@ async fn get_with_redirects(
         // 3xx — resolve the Location header
         let status = resp.status().as_u16();
         let from = resp.url().clone();
+
+        // Report Set-Cookie values on this hop to the jar before following the redirect —
+        // login flows commonly set the session cookie on a 302. Dropping our Cookie header
+        // makes the next hop re-query the now-updated jar instead of resending a stale value.
+        let set_cookies: Vec<&str> = resp
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        if !set_cookies.is_empty() {
+            (policy.on_cookies)(&from, &set_cookies);
+            current_headers.remove(header::COOKIE);
+        }
+
         let loc = resp
             .headers()
             .get(reqwest::header::LOCATION)
@@ -667,6 +708,19 @@ mod tests {
                 RouteConfig::stall_mid_body(super::PEEK_MAX, Duration::from_millis(2_000)),
             )
             .route("/drop", RouteConfig::drop_mid_body(100, 10_000))
+            // Declares an absurd Content-Length, sends exactly the peek window, then drops. The
+            // peek loop stops at PEEK_MAX without another read, so the fetch reaches the body
+            // phase with the hostile Content-Length intact.
+            .route(
+                "/huge-cl",
+                RouteConfig::drop_mid_body(super::PEEK_MAX, 1 << 45),
+            )
+            .route("/xl-cl", RouteConfig::ok(pattern(2 * 1024 * 1024)))
+            .route(
+                "/login",
+                RouteConfig::redirect_with_cookie("/whoami", "session=abc123; Path=/"),
+            )
+            .route("/whoami", RouteConfig::echo_cookie_header())
             .route("/empty", RouteConfig::ok(b""))
             .route("/nohead", RouteConfig::no_location_redirect())
             .route("/loop", RouteConfig::redirect_self())
@@ -777,12 +831,15 @@ mod tests {
             .contains("cancel"));
     }
 
+    /// Uses a chunked route (no Content-Length) so the in-loop size check is what fires; responses
+    /// that declare an oversized Content-Length up front are rejected earlier, see
+    /// `huge_content_length_rejected_before_body_read`.
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_complete_max_bytes_exceeded() {
         let srv = server().await;
         let res = super::fetch_response_complete(
             client(),
-            srv.url("/big"),
+            srv.url("/big-chunked"),
             RequestInit::get(HeaderMap::new()),
             CancellationToken::new(),
             observer(),
@@ -1104,5 +1161,153 @@ mod tests {
 
         assert_eq!(meta.status, 200);
         assert_eq!(body.len(), 12 * 1024);
+    }
+
+    /// A response whose Content-Length already exceeds `max_bytes` is rejected right after the
+    /// header/peek phase, before any body bytes beyond the peek are read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn huge_content_length_rejected_before_body_read() {
+        let srv = server().await;
+        let res = super::fetch_response_complete(
+            client(),
+            srv.url("/huge-cl"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            Some(1024),
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await;
+        assert!(res.is_err());
+        let msg = res.err().unwrap().to_string();
+        assert!(msg.contains("content-length"), "unexpected error: {msg}");
+        assert!(msg.contains("exceeds"), "unexpected error: {msg}");
+    }
+
+    /// With no `max_bytes`, a hostile Content-Length must not drive the buffer pre-allocation
+    /// (it is clamped to MAX_PREALLOC). The connection then drops, so the fetch surfaces a read
+    /// error instead of attempting a multi-terabyte allocation.
+    #[tokio::test(flavor = "current_thread")]
+    async fn huge_content_length_does_not_preallocate() {
+        let srv = server().await;
+        let res = super::fetch_response_complete(
+            client(),
+            srv.url("/huge-cl"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    /// A body larger than MAX_PREALLOC still assembles correctly: the pre-allocation is clamped,
+    /// and the read loop grows the buffer as real bytes arrive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn body_larger_than_prealloc_cap_is_assembled() {
+        let srv = server().await;
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/xl-cl"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(meta.content_length, Some(2 * 1024 * 1024));
+        assert_eq!(&body[..], pattern(2 * 1024 * 1024).as_slice());
+    }
+
+    /// A cookie set on an intermediate 302 must be reported via `on_cookies` before the next hop,
+    /// and the next hop must carry the updated jar contents instead of a stale Cookie header.
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_set_cookie_reaches_jar_and_next_hop() {
+        let srv = server().await;
+
+        type ReceivedCookies = Vec<(Url, Vec<String>)>;
+        let jar: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let received: Arc<std::sync::Mutex<ReceivedCookies>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let jar_read = jar.clone();
+        let jar_write = jar.clone();
+        let received_sink = received.clone();
+        let policy = NetPolicy {
+            cookies_for: Box::new(move |_| jar_read.lock().unwrap().clone()),
+            on_cookies: Box::new(move |url, values| {
+                received_sink
+                    .lock()
+                    .unwrap()
+                    .push((url.clone(), values.iter().map(|v| v.to_string()).collect()));
+                // Store only the name=value part, as a real jar would.
+                if let Some(v) = values.first() {
+                    let nv = v.split(';').next().unwrap_or(v).trim().to_string();
+                    *jar_write.lock().unwrap() = Some(nv);
+                }
+            }),
+            ..NetPolicy::default()
+        };
+
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/login"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            policy,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        // The /whoami route echoes back the Cookie header the follow-up request carried.
+        assert_eq!(&body[..], b"session=abc123");
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].0.path(), "/login");
+        assert_eq!(received[0].1, vec!["session=abc123; Path=/".to_string()]);
+    }
+
+    /// When a redirect hop sets cookies but no jar is wired up, the pre-existing Cookie header is
+    /// dropped for subsequent hops rather than resending a value the server just replaced.
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_set_cookie_drops_stale_cookie_header() {
+        let srv = server().await;
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::COOKIE, "stale=1".parse().unwrap());
+
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/login"),
+            RequestInit::get(headers),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"");
     }
 }

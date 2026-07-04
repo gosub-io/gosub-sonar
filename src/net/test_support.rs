@@ -62,6 +62,12 @@ pub enum RouteConfig {
     RedirectSelf,
     /// 302 without a Location header (malformed redirect).
     NoLocationRedirect,
+    /// 302 redirect to `target` that also carries a `Set-Cookie: cookie` header.
+    /// Use to verify that cookies set on intermediate redirect hops reach the jar.
+    RedirectWithCookie { target: String, cookie: String },
+    /// Respond 200 with the request's `Cookie` header value as the body (empty if absent).
+    /// Use to verify which cookies a request actually carried.
+    EchoCookieHeader,
     /// Accept the TCP connection but never send any data.
     /// Use to trigger `req_timeout` (the client's request timeout).
     HangAfterConnect,
@@ -106,6 +112,15 @@ impl RouteConfig {
     }
     pub fn no_location_redirect() -> Self {
         Self::NoLocationRedirect
+    }
+    pub fn redirect_with_cookie(target: impl Into<String>, cookie: impl Into<String>) -> Self {
+        Self::RedirectWithCookie {
+            target: target.into(),
+            cookie: cookie.into(),
+        }
+    }
+    pub fn echo_cookie_header() -> Self {
+        Self::EchoCookieHeader
     }
     pub fn hang_after_connect() -> Self {
         Self::HangAfterConnect
@@ -256,6 +271,21 @@ impl TestServer {
                                     let _ = stream.write_all(
                                         b"HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                                     ).await;
+                                }
+                                RouteConfig::RedirectWithCookie { target, cookie } => {
+                                    let hdr = format!(
+                                        "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{}{}\r\nSet-Cookie: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                        port, target, cookie
+                                    );
+                                    let _ = stream.write_all(hdr.as_bytes()).await;
+                                }
+                                RouteConfig::EchoCookieHeader => {
+                                    let cookie = req
+                                        .lines()
+                                        .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                                        .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+                                        .unwrap_or_default();
+                                    send_response(&mut stream, 200, cookie.as_bytes()).await;
                                 }
                                 RouteConfig::HangAfterConnect => {
                                     // Hold the connection open without sending anything.
