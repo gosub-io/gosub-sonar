@@ -7,6 +7,11 @@ authors = ["Gosub Community <info@gosub.io>"]
 license = "MIT"
 readme = "README.md"
 description = "Browser-agnostic priority-scheduled HTTP/HTTPS fetching library"
+repository = "https://github.com/gosub-io/gosub-sonar"
+documentation = "https://docs.rs/gosub-sonar"
+homepage = "https://gosub.io"
+keywords = ["http", "fetch", "scheduler", "networking", "async"]
+categories = ["network-programming", "web-programming::http-client", "asynchronous"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -46,8 +51,12 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
 name = "fetcher_harness"
 required-features = ["test-support"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [lints.rust]
 unsafe_code = "forbid"
+missing_docs = "warn"
 
 [lints.clippy]
 todo = "deny"

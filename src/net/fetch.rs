@@ -132,7 +132,8 @@ const MAX_REDIRECTS: usize = 20;
 /// allocate more than this up front; larger honest bodies grow the buffer as bytes arrive.
 const MAX_PREALLOC: usize = 1024 * 1024;
 
-// This is the top of the response (HTTP headers + first 5KB of the body, if any), plus a stream (that starts from the peeked bytes)
+/// The top of a response (HTTP headers + first 5KB of the body, if any), plus a stream
+/// for the remainder of the body.
 pub struct ResponseTop {
     /// Metadata about the result
     pub meta: FetchResultMeta,

@@ -11,34 +11,42 @@ use uuid::Uuid;
 pub struct PeekBuf(Bytes);
 
 impl PeekBuf {
+    /// Creates a peek buffer that takes ownership of the given vector
     pub fn from_vec(vec: Vec<u8>) -> Self {
         Self(Bytes::from(vec))
     }
 
+    /// Creates a peek buffer by copying the given slice
     pub fn from_slice(s: &[u8]) -> Self {
         Self(Bytes::copy_from_slice(s))
     }
 
+    /// Creates an empty peek buffer
     pub fn empty() -> Self {
         Self(Bytes::new())
     }
 
+    /// Returns the number of bytes in the buffer
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// Returns true when the buffer contains no bytes
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Returns the buffer contents as a byte slice
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
 
+    /// Returns a reference to the underlying [`Bytes`]
     pub fn as_bytes(&self) -> &Bytes {
         &self.0
     }
 
+    /// Consumes the buffer and returns the underlying [`Bytes`]
     pub fn into_bytes(self) -> Bytes {
         self.0
     }
@@ -62,6 +70,7 @@ impl Deref for PeekBuf {
 pub struct RequestId(pub Uuid);
 
 impl RequestId {
+    /// Creates a new random request ID
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }

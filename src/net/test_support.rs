@@ -1,6 +1,7 @@
 //! In-process mock HTTP server for tests.
 //!
-//! Provides a fluent [`TestServer`] builder with configurable per-route behaviours:
+//! Provides a fluent [`TestServer`](crate::net::test_support::TestServer) builder with
+//! configurable per-route behaviours:
 //! immediate responses, delays, mid-body stalls, connection drops, and redirect variants.
 //! Hit counts per path are tracked so coalescing and retry logic can be asserted.
 //!
@@ -56,10 +57,20 @@ pub enum RouteConfig {
     Delay(Duration, Vec<u8>),
     /// Send headers and `initial` body bytes immediately, then stall for `stall` before
     /// closing. Use to trigger read-idle-timeout errors.
-    StallMidBody { initial: usize, stall: Duration },
+    StallMidBody {
+        /// Number of body bytes to send before stalling
+        initial: usize,
+        /// How long to stall before closing the connection
+        stall: Duration,
+    },
     /// Declare `total` bytes in Content-Length but only send `prefix` bytes then drop the
     /// connection. Use to trigger unexpected-EOF / IO errors.
-    DropMidBody { prefix: usize, total: usize },
+    DropMidBody {
+        /// Number of body bytes actually sent
+        prefix: usize,
+        /// Byte count declared in the Content-Length header
+        total: usize,
+    },
     /// 302 redirect to another `path` on this server.
     RedirectTo(String),
     /// 302 redirect to the same path on every request — creates an infinite redirect loop.
@@ -68,7 +79,12 @@ pub enum RouteConfig {
     NoLocationRedirect,
     /// 302 redirect to `target` that also carries a `Set-Cookie: cookie` header.
     /// Use to verify that cookies set on intermediate redirect hops reach the jar.
-    RedirectWithCookie { target: String, cookie: String },
+    RedirectWithCookie {
+        /// Path to redirect to
+        target: String,
+        /// Value sent in the `Set-Cookie` header
+        cookie: String,
+    },
     /// Respond 200 with the request's `Cookie` header value as the body (empty if absent).
     /// Use to verify which cookies a request actually carried.
     EchoCookieHeader,
@@ -81,7 +97,9 @@ pub enum RouteConfig {
     /// Like `Chunked`, but sleeps `delay` before each chunk: headers arrive immediately, the
     /// body dribbles in. Use when a test must subscribe to a stream before the body completes.
     ChunkedWithDelay {
+        /// Body chunks to send, in order
         chunks: Vec<Vec<u8>>,
+        /// Sleep before each chunk
         delay: Duration,
     },
     /// Gzip-compress `body` and respond with `Content-Encoding: gzip`.
@@ -93,51 +111,66 @@ pub enum RouteConfig {
 }
 
 impl RouteConfig {
+    /// Shorthand for [`RouteConfig::Ok`]
     pub fn ok(body: impl Into<Vec<u8>>) -> Self {
         Self::Ok(body.into())
     }
+    /// Shorthand for [`RouteConfig::Status`]
     pub fn status(code: u16, body: impl Into<Vec<u8>>) -> Self {
         Self::Status(code, body.into())
     }
+    /// Shorthand for [`RouteConfig::Delay`]
     pub fn delay(d: Duration, body: impl Into<Vec<u8>>) -> Self {
         Self::Delay(d, body.into())
     }
+    /// Shorthand for [`RouteConfig::StallMidBody`]
     pub fn stall_mid_body(initial: usize, stall: Duration) -> Self {
         Self::StallMidBody { initial, stall }
     }
+    /// Shorthand for [`RouteConfig::DropMidBody`]
     pub fn drop_mid_body(prefix: usize, total: usize) -> Self {
         Self::DropMidBody { prefix, total }
     }
+    /// Shorthand for [`RouteConfig::RedirectTo`]
     pub fn redirect_to(path: impl Into<String>) -> Self {
         Self::RedirectTo(path.into())
     }
+    /// Shorthand for [`RouteConfig::GzipOk`]
     pub fn gzip_ok(body: impl Into<Vec<u8>>) -> Self {
         Self::GzipOk(body.into())
     }
+    /// Shorthand for [`RouteConfig::EchoBody`]
     pub fn echo_body() -> Self {
         Self::EchoBody
     }
+    /// Shorthand for [`RouteConfig::RedirectSelf`]
     pub fn redirect_self() -> Self {
         Self::RedirectSelf
     }
+    /// Shorthand for [`RouteConfig::NoLocationRedirect`]
     pub fn no_location_redirect() -> Self {
         Self::NoLocationRedirect
     }
+    /// Shorthand for [`RouteConfig::RedirectWithCookie`]
     pub fn redirect_with_cookie(target: impl Into<String>, cookie: impl Into<String>) -> Self {
         Self::RedirectWithCookie {
             target: target.into(),
             cookie: cookie.into(),
         }
     }
+    /// Shorthand for [`RouteConfig::EchoCookieHeader`]
     pub fn echo_cookie_header() -> Self {
         Self::EchoCookieHeader
     }
+    /// Shorthand for [`RouteConfig::HangAfterConnect`]
     pub fn hang_after_connect() -> Self {
         Self::HangAfterConnect
     }
+    /// Shorthand for [`RouteConfig::Chunked`]
     pub fn chunked(chunks: Vec<&[u8]>) -> Self {
         Self::Chunked(chunks.into_iter().map(|c| c.to_vec()).collect())
     }
+    /// Shorthand for [`RouteConfig::ChunkedWithDelay`]
     pub fn chunked_with_delay(chunks: Vec<&[u8]>, delay: Duration) -> Self {
         Self::ChunkedWithDelay {
             chunks: chunks.into_iter().map(|c| c.to_vec()).collect(),
