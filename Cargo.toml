@@ -25,23 +25,16 @@ parking_lot = "0.12"
 tempfile = "3.21.0"
 dashmap = "7.0.0-rc2"
 chrono = "0.4"
-
-[dev-dependencies]
-cow-utils = "0.1.3"
-flate2 = "1"
-
-# rt-multi-thread is test-only: race-condition regression tests need real parallelism.
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.52.3", features = ["rt", "io-util", "sync", "time", "macros", "net"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 reqwest = { version = "0.13.3", features = ["rustls", "stream", "blocking", "gzip", "brotli", "deflate"] }
 
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-reqwest = { version = "0.13.3", default-features = false }
+[dev-dependencies]
+cow-utils = "0.1.3"
+flate2 = "1"
+# rt-multi-thread is test-only: race-condition regression tests need real parallelism.
+tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"
