@@ -18,10 +18,14 @@ use url::Url;
 /// Currently, the scheduler uses a round-robin system to load resources
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 pub enum Priority {
+    /// Fetched before all lower priorities (e.g. primary documents)
     High,
+    /// Default priority for most resources
     #[default]
     Normal,
+    /// Fetched after normal-priority resources (e.g. images)
     Low,
+    /// Only fetched when nothing else is pending (e.g. prefetches)
     Idle,
 }
 
@@ -169,24 +173,31 @@ impl FetchKeyData {
 /// Network-level errors.
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum NetError {
+    /// Error reported by the underlying HTTP client
     #[error("net error: reqwest: {0}")]
     Reqwest(#[from] Arc<reqwest::Error>),
 
+    /// Redirect could not be followed (e.g. too many redirects, invalid target)
     #[error("net error: redirect: {0}")]
     Redirect(Arc<anyhow::Error>),
 
+    /// I/O error while transferring data
     #[error("net error: I/O: {0}")]
     Io(#[from] Arc<std::io::Error>),
 
+    /// Request was cancelled before it completed; the string describes why
     #[error("net error: cancelled: {0}")]
     Cancelled(String),
 
+    /// Error while reading the response body
     #[error(transparent)]
     Read(Arc<anyhow::Error>),
 
+    /// Any other error not covered by the variants above
     #[error(transparent)]
     Other(Arc<anyhow::Error>),
 
+    /// Request did not complete within the configured time limit
     #[error("net error: timeout: {0}")]
     Timeout(String),
 }
@@ -205,6 +216,7 @@ impl NetError {
         std::io::Error::other(self.clone())
     }
 
+    /// Wraps an [`anyhow::Error`] as a [`NetError::Read`]
     pub fn from_anyhow(e: anyhow::Error) -> Self {
         Self::Read(Arc::new(e))
     }
@@ -233,6 +245,7 @@ impl Debug for BodyStream {
 }
 
 impl BodyStream {
+    /// Creates a non-seekable, non-clonable stream from the given reader and optional length
     pub fn new(inner: Pin<Box<dyn AsyncRead + Send + 'static>>, len: Option<u64>) -> Self {
         Self {
             inner,
@@ -268,6 +281,10 @@ impl AsyncRead for BodyStream {
     }
 }
 
+/// Handle identifying a submitted request, used to track and cancel it.
+///
+/// Created by the caller when using [`Fetcher::submit`](crate::Fetcher::submit); the
+/// higher-level `fetch` methods create one internally.
 #[derive(Clone)]
 pub struct FetchHandle {
     /// Unique ID of this request (for logging and tracking)
@@ -335,10 +352,12 @@ impl RequestBody {
         }
     }
 
+    /// Returns true when the body contains no bytes
     pub fn is_empty(&self) -> bool {
         self.bytes.is_empty()
     }
 
+    /// Returns the number of bytes in the body
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
@@ -359,7 +378,7 @@ pub struct FetchRequest {
     pub initiator: Initiator,
     /// What kind of resource is being fetched
     pub kind: ResourceKind,
-    // whether to stream or buffer
+    /// Whether to stream the response body or buffer it fully before returning
     pub streaming: bool,
     /// Auto decode the request (if for instance, gzipped), or pass directly through to the caller
     pub auto_decode: bool,
@@ -371,11 +390,16 @@ pub struct FetchRequest {
 }
 
 impl FetchRequest {
+    /// Starts building a request for the given method and URL
     pub fn builder(method: Method, url: impl Into<Url>) -> FetchRequestBuilder {
         FetchRequestBuilder::new(method, url)
     }
 }
 
+/// Builder for [`FetchRequest`], created via [`FetchRequest::builder`].
+///
+/// All settings are optional; `build()` produces a buffered, non-decoding request
+/// with [`Priority::Normal`] unless configured otherwise.
 pub struct FetchRequestBuilder {
     reference: RequestReference,
     req_id: RequestId,
@@ -390,6 +414,7 @@ pub struct FetchRequestBuilder {
 }
 
 impl FetchRequestBuilder {
+    /// Creates a builder for the given method and URL with default settings
     pub fn new(method: Method, url: impl Into<Url>) -> Self {
         Self {
             key_data: FetchKeyData {
@@ -411,66 +436,79 @@ impl FetchRequestBuilder {
         }
     }
 
+    /// Sets what initiated this request (navigation, document, prefetch, background task)
     pub fn with_reference(mut self, reference: RequestReference) -> Self {
         self.reference = reference;
         self
     }
 
+    /// Sets an explicit request ID instead of the generated one
     pub fn with_req_id(mut self, req_id: RequestId) -> Self {
         self.req_id = req_id;
         self
     }
 
+    /// Sets the scheduling priority (default: [`Priority::Normal`])
     pub fn with_priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
         self
     }
 
+    /// Sets who initiated this request (default: [`Initiator::User`])
     pub fn with_initiator(mut self, initiator: Initiator) -> Self {
         self.initiator = initiator;
         self
     }
 
+    /// Sets the kind of resource being fetched (default: [`ResourceKind::Primary`])
     pub fn with_kind(mut self, kind: ResourceKind) -> Self {
         self.kind = kind;
         self
     }
 
+    /// Sets whether to stream the response body instead of buffering it (default: buffered)
     pub fn with_streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
         self
     }
 
+    /// Sets whether to transparently decode compressed responses (default: false)
     pub fn with_auto_decode(mut self, auto_decode: bool) -> Self {
         self.auto_decode = auto_decode;
         self
     }
 
+    /// Sets the maximum number of body bytes to buffer (default: unlimited)
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = Some(max_bytes);
         self
     }
 
+    /// Sets the request body (for POST, PUT, PATCH, etc.)
     pub fn with_body(mut self, body: RequestBody) -> Self {
         self.body = Some(body);
         self
     }
 
+    /// Replaces the URL set by [`FetchRequestBuilder::new`]
     pub fn with_url(mut self, url: impl Into<Url>) -> Self {
         self.key_data.url = url.into();
         self
     }
 
+    /// Replaces the HTTP method set by [`FetchRequestBuilder::new`]
     pub fn with_method(mut self, method: Method) -> Self {
         self.key_data.method = method;
         self
     }
 
+    /// Sets the request headers
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
         self.key_data.headers = headers;
         self
     }
 
+    /// Builds the [`FetchRequest`]
     pub fn build(self) -> FetchRequest {
         FetchRequest {
             reference: self.reference,
@@ -492,17 +530,26 @@ impl FetchRequestBuilder {
 pub enum FetchResult {
     /// Streamed response body
     Stream {
+        /// Response metadata (status, headers, final URL)
         meta: FetchResultMeta,
+        /// First bytes of the body, for content-type sniffing
         peek_buf: PeekBuf,
+        /// Shared body that fans the stream out to all subscribers
         shared: Arc<SharedBody>,
     },
     /// Buffered response body
-    Buffered { meta: FetchResultMeta, body: Bytes },
+    Buffered {
+        /// Response metadata (status, headers, final URL)
+        meta: FetchResultMeta,
+        /// Complete response body
+        body: Bytes,
+    },
     /// Network error occurred
     Error(NetError),
 }
 
 impl FetchResult {
+    /// Returns true when the result is an error
     pub fn is_error(&self) -> bool {
         matches!(self, FetchResult::Error(_))
     }

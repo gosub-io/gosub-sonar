@@ -9,12 +9,27 @@
 //! For the full scheduler, implement [`FetcherContext`] to receive lifecycle callbacks,
 //! or use [`NullContext`] if you don't need any:
 //!
-//! ```ignore
-//! let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), Arc::new(NullContext))?);
-//! tokio::spawn({ let f = fetcher.clone(); async move { f.run(shutdown).await } });
+//! ```no_run
+//! use std::sync::Arc;
+//! use gosub_sonar::{FetchRequest, Fetcher, FetcherConfig, NullContext};
+//! use http::Method;
+//! use tokio_util::sync::CancellationToken;
+//! use url::Url;
 //!
-//! let req = FetchRequest::builder(Method::GET, url).build();
+//! # async fn example() -> anyhow::Result<()> {
+//! let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), Arc::new(NullContext))?);
+//!
+//! let shutdown = CancellationToken::new();
+//! tokio::spawn({
+//!     let f = fetcher.clone();
+//!     let cancel = shutdown.clone();
+//!     async move { f.run(cancel).await }
+//! });
+//!
+//! let req = FetchRequest::builder(Method::GET, Url::parse("https://example.org")?).build();
 //! let result = fetcher.fetch(req).await;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! The most common types are re-exported at the crate root; the full API remains

@@ -132,6 +132,12 @@ struct QueueItem {
     reply: oneshot::Sender<FetchResult>,
 }
 
+/// Priority-scheduled fetcher with request coalescing, per-origin concurrency limits,
+/// and fan-out to multiple subscribers.
+///
+/// Construct with [`Fetcher::new`], spawn [`Fetcher::run`] on a Tokio runtime, then
+/// submit requests with [`Fetcher::fetch`], [`Fetcher::fetch_with_cancel`], or
+/// [`Fetcher::submit`]. See the crate-level docs for a complete example.
 pub struct Fetcher {
     /// Client with automatic content-decoding (gzip, brotli, deflate). Used when `auto_decode: true`.
     client: reqwest::Client,
@@ -156,6 +162,10 @@ pub struct Fetcher {
 }
 
 impl Fetcher {
+    /// Creates a fetcher with the given configuration and lifecycle context.
+    ///
+    /// Use [`NullContext`](crate::NullContext) as the context if you don't need lifecycle
+    /// callbacks. Fails if the configured concurrency limits are zero.
     pub fn new(config: FetcherConfig, ctx: Arc<dyn FetcherContext>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             config.global_slots > 0,
@@ -264,6 +274,11 @@ impl Fetcher {
         })
     }
 
+    /// Enqueues a request with a caller-supplied handle and reply channel.
+    ///
+    /// This is the lowest-level entry point: the caller controls the [`FetchHandle`]
+    /// (and thus the cancellation token) and receives the [`FetchResult`] on `reply_tx`.
+    /// Most callers want [`fetch`](Self::fetch) or [`fetch_with_cancel`](Self::fetch_with_cancel).
     pub async fn submit(
         &self,
         req: FetchRequest,
@@ -286,6 +301,11 @@ impl Fetcher {
         self.wake.notify_one();
     }
 
+    /// Runs the scheduler loop until `shutdown` is cancelled.
+    ///
+    /// Dequeues requests via weighted round-robin across the four priority lanes and
+    /// spawns fetch tasks subject to the global and per-origin concurrency limits.
+    /// Spawn this on a Tokio runtime before calling [`fetch`](Self::fetch).
     pub async fn run(&self, shutdown: CancellationToken) {
         let mut lane_counter: u8 = 0;
 

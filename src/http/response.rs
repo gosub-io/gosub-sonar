@@ -25,6 +25,7 @@ pub struct Response {
 }
 
 impl Response {
+    /// Creates an empty response with version `HTTP/1.1` and status 0
     #[must_use]
     pub fn new() -> Response {
         Self {
@@ -33,6 +34,7 @@ impl Response {
         }
     }
 
+    /// Returns true when the status code is in the 2xx range
     #[must_use]
     pub fn is_ok(&self) -> bool {
         self.status >= 200 && self.status < 300

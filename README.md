@@ -1,5 +1,10 @@
 # gosub-sonar
 
+[![Crates.io](https://img.shields.io/crates/v/gosub-sonar.svg)](https://crates.io/crates/gosub-sonar)
+[![Documentation](https://docs.rs/gosub-sonar/badge.svg)](https://docs.rs/gosub-sonar)
+[![CI](https://github.com/gosub-io/gosub-sonar/actions/workflows/ci.yml/badge.svg)](https://github.com/gosub-io/gosub-sonar/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Browser-agnostic priority-scheduled HTTP/HTTPS fetching library.
 
 ## Overview
@@ -76,6 +81,15 @@ cargo run --example simple_fetch -- https://example.org
 cargo run --example fetcher -- https://example.org
 cargo run --example fetcher_harness --features test-support
 ```
+
+## Documentation
+
+API documentation is available on [docs.rs](https://docs.rs/gosub-sonar). Design notes live
+in the [`docs/`](docs/) directory:
+
+- [architecture.md](docs/architecture.md) — overall structure of the fetch stack
+- [net-design.md](docs/net-design.md) — scheduler design (coalescing, priorities, fan-out)
+- [pump.md](docs/pump.md) — how streamed bodies are pumped to subscribers
 
 ## License
 
