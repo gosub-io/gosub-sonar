@@ -11,7 +11,6 @@ use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, ReadBuf};
-use tokio_util::sync::CancellationToken;
 use url::Url;
 
 /// Priority of the scheduled request. Documents usually have high priority, while images have low.
@@ -281,30 +280,6 @@ impl AsyncRead for BodyStream {
     }
 }
 
-/// Handle identifying a submitted request, used to track and cancel it.
-///
-/// Created by the caller when using [`Fetcher::submit`](crate::Fetcher::submit); the
-/// higher-level `fetch` methods create one internally.
-#[derive(Clone)]
-pub struct FetchHandle {
-    /// Unique ID of this request (for logging and tracking)
-    pub req_id: RequestId,
-    /// Key data identifying the resource to fetch
-    pub key: FetchKeyData,
-    /// Cancellation token
-    pub cancel: CancellationToken,
-}
-
-impl Debug for FetchHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FetchHandle")
-            .field("req_id", &self.req_id)
-            .field("key", &self.key)
-            .field("cancel", &self.cancel)
-            .finish()
-    }
-}
-
 /// Body sent with a non-GET request (POST, PUT, PATCH, …).
 ///
 /// The `content_type` field is automatically injected as a `Content-Type` header when the
@@ -370,8 +345,6 @@ pub struct FetchRequest {
     pub reference: RequestReference,
     /// Unique ID of this request (for logging and tracking)
     pub req_id: RequestId,
-    /// Key data identifying the resource to fetch (URL, method, headers)
-    pub key_data: FetchKeyData,
     /// Priority of this request
     pub priority: Priority,
     /// Who initiated this request
@@ -384,15 +357,63 @@ pub struct FetchRequest {
     pub auto_decode: bool,
     /// Maximum amount of (buffered) bytes we can fetch
     pub max_bytes: Option<usize>,
+    /// HTTP Method used
+    pub method: Method,
+    /// Target Url
+    pub url: Url,
+    /// HTTP Headers (unified).
+    pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
     /// `None` for GET and HEAD requests.
     pub body: Option<RequestBody>,
 }
 
 impl FetchRequest {
-    /// Starts building a request for the given method and URL
-    pub fn builder(method: Method, url: impl Into<Url>) -> FetchRequestBuilder {
+    /// Gives a FetchRequestBuilder
+    pub fn builder(method: Method, url: Url) -> FetchRequestBuilder {
         FetchRequestBuilder::new(method, url)
+    }
+
+    /// Generates a key for coalescing in-flight requests based on the request's method, URL, and headers.
+    pub fn generate_request_key(&self) -> Option<String> {
+        match self.method {
+            Method::GET | Method::HEAD => {}
+            _ => return None,
+        }
+
+        let url = normalize_url(&self.url);
+        let h = &self.headers;
+
+        let range = h
+            .get(header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let accept = h
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let accept_enc = h
+            .get(header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let accept_lang = h
+            .get(header::ACCEPT_LANGUAGE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let auth_hash = h
+            .get(header::AUTHORIZATION)
+            .map(|v| format!("{:x}", short_hash(v.as_bytes())))
+            .unwrap_or_default();
+        let cookie_hash = h
+            .get(header::COOKIE)
+            .map(|v| format!("{:x}", short_hash(v.as_bytes())))
+            .unwrap_or_default();
+
+        Some(format!(
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={}",
+            self.method, url, range, accept, accept_lang, accept_enc, auth_hash, cookie_hash
+        ))
     }
 }
 
@@ -403,29 +424,27 @@ impl FetchRequest {
 pub struct FetchRequestBuilder {
     reference: RequestReference,
     req_id: RequestId,
-    key_data: FetchKeyData,
     priority: Priority,
     initiator: Initiator,
     kind: ResourceKind,
     streaming: bool,
     auto_decode: bool,
     max_bytes: Option<usize>,
+    method: Method,
+    headers: HeaderMap,
+    url: Url,
     body: Option<RequestBody>,
 }
 
 impl FetchRequestBuilder {
-    /// Creates a builder for the given method and URL with default settings
-    pub fn new(method: Method, url: impl Into<Url>) -> Self {
+    /// Create a new FetchRequestBuilder
+    pub fn new(method: Method, url: Url) -> Self {
         Self {
-            key_data: FetchKeyData {
-                url: url.into(),
-                method,
-                headers: HeaderMap::default(),
-            },
+            url,
+            method,
+            headers: HeaderMap::default(),
             reference: RequestReference::default(),
-            req_id: RequestId {
-                ..Default::default()
-            },
+            req_id: RequestId::default(),
             priority: Priority::default(),
             initiator: Initiator::default(),
             kind: ResourceKind::default(),
@@ -436,31 +455,31 @@ impl FetchRequestBuilder {
         }
     }
 
-    /// Sets what initiated this request (navigation, document, prefetch, background task)
+    /// Sets a reference for the request
     pub fn with_reference(mut self, reference: RequestReference) -> Self {
         self.reference = reference;
         self
     }
 
-    /// Sets an explicit request ID instead of the generated one
+    /// Sets an ID for the request
     pub fn with_req_id(mut self, req_id: RequestId) -> Self {
         self.req_id = req_id;
         self
     }
 
-    /// Sets the scheduling priority (default: [`Priority::Normal`])
+    /// Sets the priority of the request
     pub fn with_priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
         self
     }
 
-    /// Sets who initiated this request (default: [`Initiator::User`])
+    /// Sets initiator of the request
     pub fn with_initiator(mut self, initiator: Initiator) -> Self {
         self.initiator = initiator;
         self
     }
 
-    /// Sets the kind of resource being fetched (default: [`ResourceKind::Primary`])
+    /// Sets the kind property of the request
     pub fn with_kind(mut self, kind: ResourceKind) -> Self {
         self.kind = kind;
         self
@@ -490,21 +509,21 @@ impl FetchRequestBuilder {
         self
     }
 
-    /// Replaces the URL set by [`FetchRequestBuilder::new`]
-    pub fn with_url(mut self, url: impl Into<Url>) -> Self {
-        self.key_data.url = url.into();
+    /// Sets the URL for the request
+    pub fn with_url(mut self, url: Url) -> Self {
+        self.url = url;
         self
     }
 
-    /// Replaces the HTTP method set by [`FetchRequestBuilder::new`]
+    /// Sets the HTTP method of the request
     pub fn with_method(mut self, method: Method) -> Self {
-        self.key_data.method = method;
+        self.method = method;
         self
     }
 
-    /// Sets the request headers
+    /// Sets the headers for the request
     pub fn with_headers(mut self, headers: HeaderMap) -> Self {
-        self.key_data.headers = headers;
+        self.headers = headers;
         self
     }
 
@@ -513,13 +532,15 @@ impl FetchRequestBuilder {
         FetchRequest {
             reference: self.reference,
             req_id: self.req_id,
-            key_data: self.key_data,
             priority: self.priority,
             initiator: self.initiator,
             kind: self.kind,
             streaming: self.streaming,
             auto_decode: self.auto_decode,
             max_bytes: self.max_bytes,
+            headers: self.headers,
+            method: self.method,
+            url: self.url,
             body: self.body,
         }
     }
@@ -692,18 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn fetch_handle_implements_debug() {
-        let key = FetchKeyData::new(Url::parse("http://example.com/").unwrap());
-        let req_id = crate::types::RequestId::new();
-        let handle = FetchHandle {
-            req_id,
-            key,
-            cancel: tokio_util::sync::CancellationToken::new(),
-        };
-        assert!(format!("{:?}", handle).contains("FetchHandle"));
-    }
-
-    #[test]
     fn fetch_result_meta_returns_none_for_error() {
         let e = FetchResult::Error(NetError::Cancelled("x".into()));
         assert!(e.meta().is_none());
@@ -783,10 +792,9 @@ mod tests {
             Some("application/json".into())
         );
 
-        let key_data = &request.key_data;
-        assert_eq!(key_data.url.as_str(), "https://example.com/api");
-        assert_eq!(key_data.method, Method::POST);
-        assert!(key_data.headers.contains_key("ACCEPT"));
-        assert!(key_data.headers.contains_key("CONTENT_TYPE"));
+        assert_eq!(request.url.as_str(), "https://example.com/api");
+        assert_eq!(request.method, Method::POST);
+        assert!(request.headers.contains_key("ACCEPT"));
+        assert!(request.headers.contains_key("CONTENT_TYPE"));
     }
 }

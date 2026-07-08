@@ -6,7 +6,7 @@ use crate::net::fetch::{
 use crate::net::fetcher_context::FetcherContext;
 use crate::net::observer::NetObserver;
 use crate::net::shared_body::{ReaderOptions, SharedBody};
-use crate::net::types::{FetchHandle, FetchRequest, FetchResult, NetError, Priority};
+use crate::net::types::{FetchRequest, FetchResult, NetError, Priority};
 use crate::net::utils::{short_url, spawn_named, Waiter};
 use dashmap::{DashMap, Entry};
 use http::header;
@@ -126,7 +126,7 @@ struct QueueItem {
     /// Per-request handle carrying the cancellation token for this specific subscriber.
     /// Distinct from `FetchInflightEntry::parent_cancel`, which fires only when *all*
     /// subscribers cancel; this token fires when just this one caller cancels.
-    handle: FetchHandle,
+    cancel: CancellationToken,
     /// One-shot channel back to the caller.  The run loop hands this to the
     /// [`FetchInflightEntry`] waiter; the result is sent when the fetch completes.
     reply: oneshot::Sender<FetchResult>,
@@ -242,8 +242,8 @@ impl Fetcher {
 
     /// Submit a request and await its result.
     ///
-    /// Convenience over [`submit`](Self::submit): builds the [`FetchHandle`] and reply channel
-    /// internally, so a fetch is a single call on a built [`FetchRequest`]. The request cannot
+    /// Convenience over [`submit`](Self::submit): Reply channel internally
+    /// so a fetch is a single call on a built [`FetchRequest`]. The request cannot
     /// be cancelled individually; use [`fetch_with_cancel`](Self::fetch_with_cancel) for that.
     ///
     /// Requires the [`run`](Self::run) loop to be running; if the fetcher stops before
@@ -260,13 +260,8 @@ impl Fetcher {
         req: FetchRequest,
         cancel: CancellationToken,
     ) -> FetchResult {
-        let handle = FetchHandle {
-            req_id: req.req_id,
-            key: req.key_data.clone(),
-            cancel,
-        };
         let (tx, rx) = oneshot::channel();
-        self.submit(req, handle, tx).await;
+        self.submit(req, cancel, tx).await;
         rx.await.unwrap_or_else(|_| {
             FetchResult::Error(NetError::Cancelled(
                 "fetcher stopped before delivering a result".into(),
@@ -276,13 +271,13 @@ impl Fetcher {
 
     /// Enqueues a request with a caller-supplied handle and reply channel.
     ///
-    /// This is the lowest-level entry point: the caller controls the [`FetchHandle`]
-    /// (and thus the cancellation token) and receives the [`FetchResult`] on `reply_tx`.
+    /// This is the lowest-level entry point: the caller controls the [`CancellationToken`]
+    /// and receives the [`FetchResult`] on `reply_tx`.
     /// Most callers want [`fetch`](Self::fetch) or [`fetch_with_cancel`](Self::fetch_with_cancel).
     pub async fn submit(
         &self,
         req: FetchRequest,
-        req_handle: FetchHandle,
+        cancel: CancellationToken,
         reply_tx: oneshot::Sender<FetchResult>,
     ) {
         log::debug!("Submitting fetch request: {:?}", req);
@@ -295,7 +290,8 @@ impl Fetcher {
         };
         lane.push_back(QueueItem {
             req,
-            handle: req_handle,
+            // handle: req_handle,\
+            cancel,
             reply: reply_tx,
         });
         self.wake.notify_one();
@@ -324,7 +320,7 @@ impl Fetcher {
 
             let Some(QueueItem {
                 req,
-                handle,
+                cancel,
                 reply: reply_tx,
             }) = next
             else {
@@ -335,16 +331,14 @@ impl Fetcher {
                 continue;
             };
 
-            let key_opt = req.key_data.generate();
-            // Include auto_decode in the coalescing key so decode=true and decode=false requests
-            // for the same URL are never merged into a single in-flight entry.
+            let key_opt = req.generate_request_key();
             let key_str = {
                 let base = match key_opt {
                     Some(k) => k,
                     None => format!(
                         "{} {} @{}",
-                        req.key_data.method,
-                        req.key_data.url,
+                        req.method,
+                        req.url,
                         chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
                     ),
                 };
@@ -384,7 +378,7 @@ impl Fetcher {
                 self.ctx.on_ref_active(req.reference);
             }
 
-            let child_cancel = handle.cancel.clone();
+            let child_cancel = cancel.clone();
             let entry_for_cancel = inflight_entry.clone();
             let done = entry_for_cancel.done.clone();
             tokio::spawn(async move {
@@ -401,9 +395,9 @@ impl Fetcher {
             }
 
             // URL policy check — only the leader makes the actual request
-            if is_leader && !self.ctx.is_url_allowed(&req.key_data.url) {
+            if is_leader && !self.ctx.is_url_allowed(&req.url) {
                 let err = FetchResult::Error(NetError::Other(std::sync::Arc::new(
-                    anyhow::anyhow!("URL blocked by policy: {}", req.key_data.url),
+                    anyhow::anyhow!("URL blocked by policy: {}", req.url),
                 )));
                 // Remove before finish — see the registration comment above for the ordering.
                 self.inflight_map.remove(&key_str);
@@ -437,16 +431,13 @@ impl Fetcher {
             let cancel_parent = inflight_entry2.parent_cancel.clone();
             let ctx_clone = self.ctx.clone();
 
-            let title = format!("Fetcher: {}", short_url(&req.key_data.url, 80));
+            let title = format!("Fetcher: {}", short_url(&req.url, 80));
             spawn_named(&title, async move {
-                let origin = Fetcher::origin_key(&req.key_data.url);
+                let origin = Fetcher::origin_key(&req.url);
                 let slots = per_origin
                     .entry(origin.clone())
                     .or_insert_with(|| {
-                        Arc::new(Semaphore::new(per_origin_limit_for(
-                            &cfg,
-                            &req.key_data.url,
-                        )))
+                        Arc::new(Semaphore::new(per_origin_limit_for(&cfg, &req.url)))
                     })
                     .clone();
 
@@ -508,7 +499,7 @@ impl Fetcher {
 /// Build a [`RequestInit`] from a [`FetchRequest`], injecting a `Content-Type` header from
 /// the body descriptor when the headers don't already contain one.
 fn make_request_init(req: &FetchRequest) -> RequestInit {
-    let mut headers = req.key_data.headers.clone();
+    let mut headers = req.headers.clone();
     let body = req.body.as_ref().map(|b| {
         if let Some(ref ct) = b.content_type {
             if !headers.contains_key(header::CONTENT_TYPE) {
@@ -519,7 +510,7 @@ fn make_request_init(req: &FetchRequest) -> RequestInit {
         }
         b.bytes.clone()
     });
-    RequestInit::new(req.key_data.method.clone(), headers, body)
+    RequestInit::new(req.method.clone(), headers, body)
 }
 
 /// Build a reqwest client from `FetcherConfig`.
@@ -567,7 +558,7 @@ async fn perform_streaming(
         reader,
     } = fetch_response_top(
         Arc::new(client.clone()),
-        req.key_data.url.clone(),
+        req.url.clone(),
         make_request_init(req),
         cancel.clone(),
         observer.clone(),
@@ -610,7 +601,7 @@ async fn perform_buffered(
 
     let (meta, body) = fetch_response_complete(
         Arc::new(client.clone()),
-        req.key_data.url.clone(),
+        req.url.clone(),
         make_request_init(req),
         cancel.clone(),
         observer,
@@ -647,7 +638,7 @@ mod tests {
     use crate::net::fetcher_context::NullContext;
     use crate::net::request_ref::RequestReference;
     use crate::net::test_support::{RouteConfig, TestServer};
-    use crate::net::types::{FetchHandle, FetchKeyData, FetchRequest, Initiator, ResourceKind};
+    use crate::net::types::{FetchKeyData, FetchRequest, Initiator, ResourceKind};
     use crate::types::RequestId;
     use std::sync::Arc;
     use std::time::Duration;
@@ -698,13 +689,15 @@ mod tests {
             .await
     }
 
-    fn make_req(url: Url, priority: Priority) -> (FetchRequest, FetchHandle) {
+    fn make_req(url: Url, priority: Priority) -> (FetchRequest, CancellationToken) {
         let key = FetchKeyData::new(url);
         let req_id = RequestId::new();
         let req = FetchRequest {
             reference: RequestReference::Background(0),
             req_id,
-            key_data: key.clone(),
+            url: key.url.clone(),
+            method: key.method.clone(),
+            headers: key.headers.clone(),
             priority,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
@@ -713,12 +706,8 @@ mod tests {
             max_bytes: None,
             body: None,
         };
-        let handle = FetchHandle {
-            req_id,
-            key,
-            cancel: CancellationToken::new(),
-        };
-        (req, handle)
+
+        (req, CancellationToken::new())
     }
 
     fn dummy_item(priority: Priority) -> QueueItem {
@@ -730,7 +719,9 @@ mod tests {
             req: FetchRequest {
                 reference: RequestReference::Background(0),
                 req_id,
-                key_data: key.clone(),
+                url: key.url.clone(),
+                method: key.method.clone(),
+                headers: key.headers.clone(),
                 priority,
                 initiator: Initiator::Other,
                 kind: ResourceKind::Primary,
@@ -739,11 +730,7 @@ mod tests {
                 max_bytes: None,
                 body: None,
             },
-            handle: FetchHandle {
-                req_id,
-                key,
-                cancel: CancellationToken::new(),
-            },
+            cancel: CancellationToken::new(),
             reply: tx,
         }
     }
@@ -948,7 +935,9 @@ mod tests {
         let req = FetchRequest {
             reference: RequestReference::Background(0),
             req_id,
-            key_data: key.clone(),
+            url: key.url.clone(),
+            headers: key.headers.clone(),
+            method: key.method.clone(),
             priority: Priority::Normal,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
@@ -957,13 +946,9 @@ mod tests {
             max_bytes: None,
             body: None,
         };
-        let handle = FetchHandle {
-            req_id,
-            key,
-            cancel: cancel.clone(),
-        };
+
         let (tx, rx) = oneshot::channel();
-        fetcher.submit(req, handle, tx).await;
+        fetcher.submit(req, cancel.clone(), tx).await;
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancel.cancel();
@@ -1060,7 +1045,9 @@ mod tests {
         let req = FetchRequest {
             reference: RequestReference::Background(0),
             req_id,
-            key_data: key.clone(),
+            url: key.url.clone(),
+            method: key.method.clone(),
+            headers: key.headers.clone(),
             priority: Priority::Normal,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
@@ -1069,13 +1056,9 @@ mod tests {
             max_bytes: None,
             body: None,
         };
-        let handle = FetchHandle {
-            req_id,
-            key,
-            cancel: CancellationToken::new(),
-        };
+        let cancel = CancellationToken::new();
         let (tx, rx) = oneshot::channel();
-        fetcher.submit(req, handle, tx).await;
+        fetcher.submit(req, cancel, tx).await;
 
         let result = tokio::time::timeout(Duration::from_secs(3), rx)
             .await
@@ -1377,7 +1360,7 @@ mod tests {
     fn make_post_req(
         url: Url,
         body: crate::net::types::RequestBody,
-    ) -> (FetchRequest, FetchHandle) {
+    ) -> (FetchRequest, CancellationToken) {
         use http::Method;
         let mut key = FetchKeyData::new(url);
         key.method = Method::POST;
@@ -1385,7 +1368,9 @@ mod tests {
         let req = FetchRequest {
             reference: RequestReference::Background(0),
             req_id,
-            key_data: key.clone(),
+            url: key.url.clone(),
+            method: key.method.clone(),
+            headers: key.headers.clone(),
             priority: Priority::Normal,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
@@ -1394,12 +1379,7 @@ mod tests {
             max_bytes: None,
             body: Some(body),
         };
-        let handle = FetchHandle {
-            req_id,
-            key,
-            cancel: CancellationToken::new(),
-        };
-        (req, handle)
+        (req, CancellationToken::new())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1484,13 +1464,15 @@ mod tests {
         url: Url,
         priority: Priority,
         auto_decode: bool,
-    ) -> (FetchRequest, FetchHandle) {
+    ) -> (FetchRequest, CancellationToken) {
         let key = FetchKeyData::new(url);
         let req_id = RequestId::new();
         let req = FetchRequest {
             reference: RequestReference::Background(0),
             req_id,
-            key_data: key.clone(),
+            url: key.url.clone(),
+            method: key.method.clone(),
+            headers: key.headers.clone(),
             priority,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
@@ -1499,12 +1481,7 @@ mod tests {
             max_bytes: None,
             body: None,
         };
-        let handle = FetchHandle {
-            req_id,
-            key,
-            cancel: CancellationToken::new(),
-        };
-        (req, handle)
+        (req, CancellationToken::new())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1520,9 +1497,9 @@ mod tests {
         let s = shutdown.clone();
         tokio::spawn(async move { f.run(s).await });
 
-        let (req, handle) = make_req_with_decode(srv.url("/gz"), Priority::Normal, true);
+        let (req, cancel) = make_req_with_decode(srv.url("/gz"), Priority::Normal, true);
         let (tx, rx) = oneshot::channel();
-        fetcher.submit(req, handle, tx).await;
+        fetcher.submit(req, cancel, tx).await;
 
         match tokio::time::timeout(Duration::from_secs(3), rx)
             .await

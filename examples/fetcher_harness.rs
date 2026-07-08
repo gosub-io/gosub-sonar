@@ -15,8 +15,8 @@
 
 use gosub_sonar::net::test_support::{RouteConfig, TestServer, TestServerHandle};
 use gosub_sonar::{
-    FetchHandle, FetchKeyData, FetchRequest, FetchResult, Fetcher, FetcherConfig, Initiator,
-    NullContext, Priority, RequestId, RequestReference, ResourceKind,
+    FetchKeyData, FetchRequest, FetchResult, Fetcher, FetcherConfig, Initiator, NullContext,
+    Priority, RequestId, RequestReference, ResourceKind,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,25 +42,20 @@ async fn fetch(
 ) -> FetchResult {
     let key = FetchKeyData::new(url);
     let req_id = RequestId::new();
-    let req = FetchRequest {
-        reference: RequestReference::Background(0),
-        req_id,
-        key_data: key.clone(),
-        priority,
-        initiator: Initiator::Other,
-        kind: ResourceKind::Primary,
-        streaming: false,
-        auto_decode: true,
-        body: None,
-        max_bytes: None,
-    };
-    let handle = FetchHandle {
-        req_id,
-        key,
-        cancel: cancel.unwrap_or_default(),
-    };
+
+    let req = FetchRequest::builder(key.method, key.url)
+        .with_reference(RequestReference::Background(0))
+        .with_headers(key.headers)
+        .with_priority(priority)
+        .with_initiator(Initiator::Other)
+        .with_kind(ResourceKind::Primary)
+        .with_streaming(false)
+        .with_auto_decode(true)
+        .build();
+
+    let cancle_token = cancel.unwrap_or_default();
     let (tx, rx) = oneshot::channel();
-    fetcher.submit(req, handle, tx).await;
+    fetcher.submit(req, cancle_token, tx).await;
     rx.await.unwrap_or(FetchResult::Error(
         gosub_sonar::net::types::NetError::Cancelled("channel closed".into()),
     ))
