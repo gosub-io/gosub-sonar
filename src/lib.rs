@@ -64,7 +64,7 @@ pub use net::request_ref::RequestReference;
 pub use net::shared_body::SharedBody;
 pub use net::simple::{simple_get, sync_fetch, sync_get};
 pub use net::types::{
-    FetchKeyData, FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta, Initiator,
-    NetError, Priority, RequestBody, ResourceKind,
+    FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta, Initiator, NetError, Priority,
+    RequestBody, ResourceKind,
 };
 pub use types::{PeekBuf, RequestId};

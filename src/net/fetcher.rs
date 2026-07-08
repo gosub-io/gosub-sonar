@@ -638,8 +638,9 @@ mod tests {
     use crate::net::fetcher_context::NullContext;
     use crate::net::request_ref::RequestReference;
     use crate::net::test_support::{RouteConfig, TestServer};
-    use crate::net::types::{FetchKeyData, FetchRequest, Initiator, ResourceKind};
+    use crate::net::types::{FetchRequest, Initiator, ResourceKind};
     use crate::types::RequestId;
+    use http::{HeaderMap, Method};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::oneshot;
@@ -690,14 +691,13 @@ mod tests {
     }
 
     fn make_req(url: Url, priority: Priority) -> (FetchRequest, CancellationToken) {
-        let key = FetchKeyData::new(url);
         let req_id = RequestId::new();
         let req = FetchRequest {
             reference: RequestReference::Background(0),
             req_id,
-            url: key.url.clone(),
-            method: key.method.clone(),
-            headers: key.headers.clone(),
+            url,
+            method: Method::GET,
+            headers: HeaderMap::new(),
             priority,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
@@ -712,16 +712,15 @@ mod tests {
 
     fn dummy_item(priority: Priority) -> QueueItem {
         let url = Url::parse("http://example.com/").unwrap();
-        let key = FetchKeyData::new(url);
         let req_id = RequestId::new();
         let (tx, _rx) = oneshot::channel();
         QueueItem {
             req: FetchRequest {
                 reference: RequestReference::Background(0),
                 req_id,
-                url: key.url.clone(),
-                method: key.method.clone(),
-                headers: key.headers.clone(),
+                url,
+                method: Method::GET,
+                headers: HeaderMap::new(),
                 priority,
                 initiator: Initiator::Other,
                 kind: ResourceKind::Primary,
@@ -930,14 +929,13 @@ mod tests {
         tokio::spawn(async move { f.run(shutdown.clone()).await });
 
         let cancel = CancellationToken::new();
-        let key = FetchKeyData::new(base.join("slow").unwrap());
         let req_id = RequestId::new();
         let req = FetchRequest {
             reference: RequestReference::Background(0),
             req_id,
-            url: key.url.clone(),
-            headers: key.headers.clone(),
-            method: key.method.clone(),
+            url: base.join("slow").unwrap(),
+            headers: HeaderMap::new(),
+            method: Method::GET,
             priority: Priority::Normal,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
@@ -1040,14 +1038,13 @@ mod tests {
         tokio::spawn(async move { f.run(s).await });
 
         let url = srv.base_url();
-        let key = FetchKeyData::new(url);
         let req_id = RequestId::new();
         let req = FetchRequest {
             reference: RequestReference::Background(0),
             req_id,
-            url: key.url.clone(),
-            method: key.method.clone(),
-            headers: key.headers.clone(),
+            url,
+            method: Method::GET,
+            headers: HeaderMap::new(),
             priority: Priority::Normal,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
@@ -1362,15 +1359,13 @@ mod tests {
         body: crate::net::types::RequestBody,
     ) -> (FetchRequest, CancellationToken) {
         use http::Method;
-        let mut key = FetchKeyData::new(url);
-        key.method = Method::POST;
         let req_id = RequestId::new();
         let req = FetchRequest {
             reference: RequestReference::Background(0),
             req_id,
-            url: key.url.clone(),
-            method: key.method.clone(),
-            headers: key.headers.clone(),
+            url,
+            method: Method::POST,
+            headers: HeaderMap::new(),
             priority: Priority::Normal,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
@@ -1465,14 +1460,13 @@ mod tests {
         priority: Priority,
         auto_decode: bool,
     ) -> (FetchRequest, CancellationToken) {
-        let key = FetchKeyData::new(url);
         let req_id = RequestId::new();
         let req = FetchRequest {
             reference: RequestReference::Background(0),
             req_id,
-            url: key.url.clone(),
-            method: key.method.clone(),
-            headers: key.headers.clone(),
+            url,
+            method: Method::GET,
+            headers: HeaderMap::new(),
             priority,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
