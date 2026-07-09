@@ -66,7 +66,7 @@ pub use net::simple::simple_get;
 #[cfg(not(target_arch = "wasm32"))]
 pub use net::simple::{sync_fetch, sync_get};
 pub use net::types::{
-    FetchKeyData, FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta, Initiator,
-    NetError, Priority, RequestBody, ResourceKind,
+    FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta, Initiator, NetError, Priority,
+    RequestBody, ResourceKind,
 };
 pub use types::{PeekBuf, RequestId};

@@ -90,85 +90,6 @@ pub struct FetchResultMeta {
     pub has_body: bool,
 }
 
-/// A fetch key data is a key that is used to find out if two requests want to fetch the same resource.
-/// If this is true, the requests are bundled so only once the resource will be fetched.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FetchKeyData {
-    /// URL fetched
-    pub url: Url,
-    /// HTTP method used (GET, POST etc.)
-    pub method: Method,
-    /// HTTP headers
-    pub headers: HeaderMap,
-}
-
-impl Hash for FetchKeyData {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        if let Some(key) = self.generate() {
-            key.hash(state);
-        }
-    }
-}
-
-impl Display for FetchKeyData {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.url)
-    }
-}
-
-impl FetchKeyData {
-    /// Creates a new fetch key data with the given URL, method GET and no headers
-    pub fn new(url: Url) -> Self {
-        Self {
-            url,
-            method: Method::GET,
-            headers: HeaderMap::new(),
-        }
-    }
-
-    /// Generates a key for coalescing in-flight requests based on the request's method, URL, and headers.
-    pub fn generate(&self) -> Option<String> {
-        match self.method {
-            Method::GET | Method::HEAD => {}
-            _ => return None,
-        }
-
-        let url = normalize_url(&self.url);
-        let h = &self.headers;
-
-        let range = h
-            .get(header::RANGE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let accept = h
-            .get(header::ACCEPT)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let accept_enc = h
-            .get(header::ACCEPT_ENCODING)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let accept_lang = h
-            .get(header::ACCEPT_LANGUAGE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        let auth_hash = h
-            .get(header::AUTHORIZATION)
-            .map(|v| format!("{:x}", short_hash(v.as_bytes())))
-            .unwrap_or_default();
-        let cookie_hash = h
-            .get(header::COOKIE)
-            .map(|v| format!("{:x}", short_hash(v.as_bytes())))
-            .unwrap_or_default();
-
-        Some(format!(
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={}",
-            self.method, url, range, accept, accept_lang, accept_enc, auth_hash, cookie_hash
-        ))
-    }
-}
-
 /// Network-level errors.
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum NetError {
@@ -647,29 +568,33 @@ mod tests {
     }
 
     #[test]
-    fn fetch_key_generate_get_and_headers() {
-        let mut fk = FetchKeyData::new(Url::parse("https://example.org/a/b#frag").unwrap());
-        fk.headers
+    fn fetch_request_generate_get_and_headers() {
+        let mut fr = FetchRequest::builder(
+            Method::default(),
+            Url::parse("https://example.org/a/b#frag").unwrap(),
+        )
+        .build();
+        fr.headers
             .insert(header::RANGE, "bytes=0-99".parse().unwrap());
-        fk.headers
+        fr.headers
             .insert(header::ACCEPT, "text/html".parse().unwrap());
-        fk.headers
+        fr.headers
             .insert(header::ACCEPT_LANGUAGE, "en-US".parse().unwrap());
-        fk.headers
+        fr.headers
             .insert(header::ACCEPT_ENCODING, "gzip".parse().unwrap());
-        fk.headers
+        fr.headers
             .insert(header::AUTHORIZATION, "Bearer abc".parse().unwrap());
-        fk.headers
+        fr.headers
             .insert(header::COOKIE, "a=1; b=2".parse().unwrap());
 
-        let key = fk.generate().expect("GET should produce a key");
+        let key = fr.generate_request_key().expect("GET should produce a key");
 
-        let url_norm = normalize_url(&fk.url);
+        let url_norm = normalize_url(&fr.url);
         let auth_hash = format!("{:x}", short_hash(b"Bearer abc"));
         let cookie_hash = format!("{:x}", short_hash(b"a=1; b=2"));
         let expected = format!(
             "M={};U={};R={};A={};AL={};AE={};Auth={};C={}",
-            fk.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash
+            fr.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash
         );
 
         assert_eq!(key, expected);
@@ -678,10 +603,14 @@ mod tests {
     }
 
     #[test]
-    fn fetch_key_generate_post_is_none() {
-        let mut fk = FetchKeyData::new(Url::parse("https://example.org/").unwrap());
-        fk.method = Method::POST;
-        assert!(fk.generate().is_none());
+    fn fetch_request_generate_post_is_none() {
+        let mut fr = FetchRequest::builder(
+            Method::default(),
+            Url::parse("https://example.org/").unwrap(),
+        )
+        .build();
+        fr.method = Method::POST;
+        assert!(fr.generate_request_key().is_none());
     }
 
     #[test]
@@ -706,21 +635,6 @@ mod tests {
     fn net_error_redirect_formats_with_redirect_prefix() {
         let e = NetError::Redirect(Arc::new(anyhow::anyhow!("too many redirects")));
         assert!(e.to_string().contains("redirect"));
-    }
-
-    #[test]
-    fn fetch_key_data_display_shows_url() {
-        let key = FetchKeyData::new(Url::parse("http://example.com/path").unwrap());
-        assert_eq!(format!("{}", key), "http://example.com/path");
-    }
-
-    #[test]
-    fn fetch_key_data_is_usable_as_hash_map_key() {
-        use std::collections::HashMap;
-        let key = FetchKeyData::new(Url::parse("http://example.com/").unwrap());
-        let mut map = HashMap::new();
-        map.insert(key.clone(), 42u32);
-        assert_eq!(map.get(&key), Some(&42));
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -15,9 +15,10 @@
 
 use gosub_sonar::net::test_support::{RouteConfig, TestServer, TestServerHandle};
 use gosub_sonar::{
-    FetchKeyData, FetchRequest, FetchResult, Fetcher, FetcherConfig, Initiator, NullContext,
-    Priority, RequestId, RequestReference, ResourceKind,
+    FetchRequest, FetchResult, Fetcher, FetcherConfig, Initiator, NullContext, Priority, RequestId,
+    RequestReference, ResourceKind,
 };
+use http::{HeaderMap, Method};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -40,12 +41,8 @@ async fn fetch(
     priority: Priority,
     cancel: Option<CancellationToken>,
 ) -> FetchResult {
-    let key = FetchKeyData::new(url);
-    let req_id = RequestId::new();
-
-    let req = FetchRequest::builder(key.method, key.url)
+    let req = FetchRequest::builder(Method::GET, url)
         .with_reference(RequestReference::Background(0))
-        .with_headers(key.headers)
         .with_priority(priority)
         .with_initiator(Initiator::Other)
         .with_kind(ResourceKind::Primary)
