@@ -27,23 +27,37 @@ thiserror = "2"
 futures-core = "0.3"
 futures-util = "0.3"
 parking_lot = "0.12"
-tempfile = "3.21.0"
 dashmap = "6"
 chrono = "0.4"
+flate2 = { version = "1", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tempfile = "3.21.0"
 tokio = { version = "1.52.3", features = ["rt", "io-util", "sync", "time", "macros", "net"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 reqwest = { version = "0.13.3", features = ["rustls", "stream", "blocking", "gzip", "brotli", "deflate"] }
-flate2 = { version = "1", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# tokio's wasm32-supported feature subset — "net" needs mio, which cannot build for
+# wasm. reqwest's wasm backend delegates TLS, connections, redirects, cookies, and
+# decompression to the browser's fetch(), so none of those features apply.
+tokio = { version = "1.52.3", features = ["rt", "io-util", "sync", "time", "macros"] }
+tokio-util = { version = "0.7.16", features = ["io"] }
+tokio-stream = { version = "0.1.17", features = ["sync"] }
+reqwest = { version = "0.13.3", default-features = false, features = ["stream"] }
+uuid = { version = "1", features = ["v4", "js"] }
 
 [features]
 # Expose the in-process mock HTTP server (net::test_support) to downstream
-# integration tests and examples.
+# integration tests and examples. Native-only: the mock server needs real sockets.
 test-support = ["dep:flate2"]
 
 [dev-dependencies]
 cow-utils = "0.1.3"
 flate2 = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # rt-multi-thread is test-only: race-condition regression tests need real parallelism.
 tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
 

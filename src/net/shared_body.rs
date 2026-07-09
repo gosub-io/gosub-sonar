@@ -13,7 +13,8 @@
 //!   that starts receiving future chunks from this point onward.
 //! - `combined_reader(peek, shared)`: convenient `AsyncRead` of `peek` then tail.
 
-use crate::net::types::NetError;
+use crate::net::types::{MaybeSend, NetError};
+use crate::net::utils::spawn_named;
 use crate::types::PeekBuf;
 use bytes::Bytes;
 use futures_core::stream::BoxStream;
@@ -348,13 +349,13 @@ impl SharedBody {
     /// ```
     pub fn from_reader<R>(mut reader: R, opts: ReaderOptions) -> Arc<Self>
     where
-        R: AsyncRead + Send + 'static + Unpin,
+        R: AsyncRead + MaybeSend + 'static + Unpin,
     {
         let sb = Arc::new(SharedBody::new(opts.capacity));
         let sb_clone = sb.clone();
 
         // read in background
-        tokio::spawn(async move {
+        spawn_named("SharedBody::from_reader pump", async move {
             let ReaderOptions {
                 capacity: _,
                 buf_size,

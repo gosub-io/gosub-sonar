@@ -42,6 +42,26 @@ jobs:
       - name: cargo doc
         run: cargo doc --no-deps
 
+  wasm:
+    name: Check (wasm32)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      # Separate cache key so wasm artefacts don't pollute the native build cache.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: wasm32
+
+      - name: cargo check (wasm32-unknown-unknown)
+        run: cargo check --target wasm32-unknown-unknown
+
   test:
     name: Test / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}

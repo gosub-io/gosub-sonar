@@ -140,7 +140,12 @@ pub struct ResponseTop {
     /// Peek buffer of the first PEEK_MAX of data
     pub peek_buf: PeekBuf,
     /// Stream reader to read the REMAINDER of the body (this does NOT include peek buffer read data)
+    #[cfg(not(target_arch = "wasm32"))]
     pub reader: Box<dyn AsyncRead + Unpin + Send>,
+    /// Stream reader to read the REMAINDER of the body (this does NOT include peek buffer read data).
+    /// Not `Send` on wasm32: reqwest's fetch-backed body stream wraps JS types.
+    #[cfg(target_arch = "wasm32")]
+    pub reader: Box<dyn AsyncRead + Unpin>,
 }
 
 /// This function will make a request to a given URL and returns the top of the response. These
@@ -255,12 +260,22 @@ pub async fn fetch_response_top(
     //  |--- Peek buffer ---|---- Excess buffer ----| ---- body stream ----|
     //                                              ^ stream starts here
     //                      ^  new body stream "rereads" the excess buffer and starts here
+    // boxed() demands a `Send` stream; reqwest's wasm body stream is `!Send` (single thread).
+    #[cfg(not(target_arch = "wasm32"))]
     let body_stream = if let Some(ex) = excess {
         stream::once(async move { Ok::<Bytes, NetError>(ex) })
             .chain(body_stream)
             .boxed()
     } else {
         body_stream.boxed()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let body_stream = if let Some(ex) = excess {
+        stream::once(async move { Ok::<Bytes, NetError>(ex) })
+            .chain(body_stream)
+            .boxed_local()
+    } else {
+        body_stream.boxed_local()
     };
 
     // Update last remaining items in meta struct
