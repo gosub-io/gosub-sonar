@@ -142,10 +142,32 @@ impl NetError {
     }
 }
 
+/// Marker for types that must be [`Send`] on native targets. On wasm32 the crate runs
+/// single-threaded and its fetch-backed streams wrap `!Send` JS types, so the bound is empty.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait MaybeSend: Send {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Send> MaybeSend for T {}
+/// Marker for types that must be [`Send`] on native targets. On wasm32 the crate runs
+/// single-threaded and its fetch-backed streams wrap `!Send` JS types, so the bound is empty.
+#[cfg(target_arch = "wasm32")]
+pub trait MaybeSend {}
+#[cfg(target_arch = "wasm32")]
+impl<T> MaybeSend for T {}
+
+/// Boxed async reader backing [`BodyStream`]: `Send` on native targets, plain on wasm32
+/// (see [`MaybeSend`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub type BoxedAsyncRead = Pin<Box<dyn AsyncRead + Send + 'static>>;
+/// Boxed async reader backing [`BodyStream`]: `Send` on native targets, plain on wasm32
+/// (see [`MaybeSend`]).
+#[cfg(target_arch = "wasm32")]
+pub type BoxedAsyncRead = Pin<Box<dyn AsyncRead + 'static>>;
+
 /// A BodyStream is an async reader that can be used to read the body of a response.
 pub struct BodyStream {
     /// Inner reader
-    inner: Pin<Box<dyn AsyncRead + Send + 'static>>,
+    inner: BoxedAsyncRead,
     /// Content length (if known)
     pub len: Option<u64>,
     /// True when the stream is seekable (most often not, unless it's backed by a memory buffer)
@@ -166,7 +188,7 @@ impl Debug for BodyStream {
 
 impl BodyStream {
     /// Creates a non-seekable, non-clonable stream from the given reader and optional length
-    pub fn new(inner: Pin<Box<dyn AsyncRead + Send + 'static>>, len: Option<u64>) -> Self {
+    pub fn new(inner: BoxedAsyncRead, len: Option<u64>) -> Self {
         Self {
             inner,
             len,

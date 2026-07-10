@@ -1,14 +1,20 @@
 //! One-shot GET helpers for callers that don't need the full scheduler.
 
-use crate::http::response::Response;
 use anyhow::Result;
 use bytes::Bytes;
-use cookie::Cookie;
-use cow_utils::CowUtils;
 use futures_util::StreamExt;
-use std::collections::HashMap;
-use std::time::Duration;
 use url::Url;
+
+#[cfg(not(target_arch = "wasm32"))]
+use crate::http::response::Response;
+#[cfg(not(target_arch = "wasm32"))]
+use cookie::Cookie;
+#[cfg(not(target_arch = "wasm32"))]
+use cow_utils::CowUtils;
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Duration;
 
 /// Maximum body size accepted by the simple API (10 MiB).
 const MAX_SIMPLE_BODY: u64 = 10 * 1024 * 1024;
@@ -22,6 +28,8 @@ const MAX_SIMPLE_BODY: u64 = 10 * 1024 * 1024;
 /// callers are responsible for validating the URL before passing it here.
 pub async fn simple_get(url: &Url) -> Result<Bytes> {
     match url.scheme() {
+        // wasm32 has no filesystem; file:// URLs fall through to the unsupported-scheme error.
+        #[cfg(not(target_arch = "wasm32"))]
         "file" => {
             use std::io::Read as _;
             let path = url
@@ -39,11 +47,15 @@ pub async fn simple_get(url: &Url) -> Result<Bytes> {
             Ok(Bytes::from(body))
         }
         "http" | "https" => {
+            #[cfg(not(target_arch = "wasm32"))]
             let client = reqwest::Client::builder()
                 .use_rustls_tls()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build()?;
+            // The browser's fetch() owns TLS and timeouts; no builder knobs on wasm32.
+            #[cfg(target_arch = "wasm32")]
+            let client = reqwest::Client::new();
             let resp = client.get(url.as_str()).send().await?;
             let status = resp.status();
             if !status.is_success() {
@@ -75,6 +87,9 @@ pub async fn simple_get(url: &Url) -> Result<Bytes> {
 ///
 /// Like [`simple_get`] but sync and safe to call from any context (including inside a Tokio
 /// runtime). Errors on non-2xx status codes.
+///
+/// Native-only: blocking a thread is impossible on wasm32.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn sync_get(url: &Url) -> Result<Bytes> {
     let url = url.clone();
     std::thread::spawn(move || {
@@ -96,6 +111,9 @@ pub fn sync_get(url: &Url) -> Result<Bytes> {
 ///
 /// Use this for engine-internal code that must issue an HTTP request synchronously
 /// (e.g. the HTML parser loading an external stylesheet mid-parse).
+///
+/// Native-only: blocking a thread is impossible on wasm32.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn sync_fetch(url: &Url) -> Result<Response> {
     let url = url.clone();
     std::thread::spawn(move || do_sync_fetch(url))
@@ -103,6 +121,7 @@ pub fn sync_fetch(url: &Url) -> Result<Response> {
         .map_err(|_| anyhow::anyhow!("sync_fetch: HTTP thread panicked"))?
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn do_sync_fetch(url: Url) -> Result<Response> {
     use std::io::Read as _;
 

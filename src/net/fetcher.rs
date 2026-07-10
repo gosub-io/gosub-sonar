@@ -519,19 +519,33 @@ fn make_request_init(req: &FetchRequest) -> RequestInit {
 /// response bodies and sends the corresponding `Accept-Encoding` request header.
 /// When `false` neither header is added nor is any decompression performed.
 fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder()
-        .connection_verbose(false)
-        .http2_adaptive_window(true)
-        .connect_timeout(cfg.connect_timeout)
-        .timeout(cfg.req_timeout)
-        .use_rustls_tls()
-        .gzip(decode)
-        .brotli(decode)
-        .deflate(decode);
-    if let Some(ref ua) = cfg.user_agent {
-        b = b.user_agent(ua);
+    // The browser's fetch() owns TLS, connection management, timeouts, and transparent
+    // decompression; none of the tuning knobs below exist in reqwest's wasm backend.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = decode;
+        let mut b = reqwest::Client::builder();
+        if let Some(ref ua) = cfg.user_agent {
+            b = b.user_agent(ua);
+        }
+        Ok(b.build()?)
     }
-    Ok(b.build()?)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut b = reqwest::Client::builder()
+            .connection_verbose(false)
+            .http2_adaptive_window(true)
+            .connect_timeout(cfg.connect_timeout)
+            .timeout(cfg.req_timeout)
+            .use_rustls_tls()
+            .gzip(decode)
+            .brotli(decode)
+            .deflate(decode);
+        if let Some(ref ua) = cfg.user_agent {
+            b = b.user_agent(ua);
+        }
+        Ok(b.build()?)
+    }
 }
 
 fn per_origin_limit_for(cfg: &FetcherConfig, url: &Url) -> usize {

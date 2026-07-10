@@ -62,7 +62,9 @@ pub use net::null_emitter::NullEmitter;
 pub use net::observer::NetObserver;
 pub use net::request_ref::RequestReference;
 pub use net::shared_body::SharedBody;
-pub use net::simple::{simple_get, sync_fetch, sync_get};
+pub use net::simple::simple_get;
+#[cfg(not(target_arch = "wasm32"))]
+pub use net::simple::{sync_fetch, sync_get};
 pub use net::types::{
     FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta, Initiator, NetError, Priority,
     RequestBody, ResourceKind,

@@ -59,9 +59,16 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `http::response` | `src/http/response.rs` | Simple `Response` struct returned by the blocking one-shot helpers. |
 | `types` | `src/types.rs` | Crate-wide primitives: `PeekBuf`, `RequestId`. |
 
+**Platform gating.** The crate compiles for `wasm32-unknown-unknown` (CI checks it). On wasm32,
+reqwest's fetch()-backed client replaces the native one — the browser owns TLS, connections,
+redirects, cookies, and decompression — and tokio is limited to its wasm-supported features
+(`sync`, `rt`, `time`, `io-util`, `macros`; no `net`). Facilities that need a filesystem or a
+blockable thread are native-only: `net::pump`, `net::fs_utils`, `sync_get`/`sync_fetch`, `file://`
+URLs, and `net::test_support`. Tasks spawn via `spawn_named`, which maps to `tokio::spawn`
+natively and `tokio::task::spawn_local` on wasm32 (the embedder must drive a `LocalSet`).
+
 **Lint posture.** The crate forbids `unsafe_code` and denies `todo!`/`unimplemented!`/`dbg!` and
-(outside tests) `unwrap`/`expect`/`panic`. There is no `wasm32` support: the scheduler stack is
-built on Tokio throughout.
+(outside tests) `unwrap`/`expect`/`panic`.
 
 ---
 

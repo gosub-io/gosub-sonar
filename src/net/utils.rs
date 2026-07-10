@@ -18,6 +18,7 @@ static HASH_STATE: OnceLock<RandomState> = OnceLock::new();
 
 /// Spawn a task with a human-readable name attached as a tracing span, so task activity can
 /// be attributed in trace output.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_named<F, T>(name: &str, fut: F) -> JoinHandle<T>
 where
     F: std::future::Future<Output = T> + Send + 'static,
@@ -26,6 +27,23 @@ where
     use tracing::Instrument as _;
     let span = tracing::debug_span!("task", %name);
     tokio::spawn(fut.instrument(span))
+}
+
+/// Spawn a task with a human-readable name attached as a tracing span, so task activity can
+/// be attributed in trace output.
+///
+/// wasm32 is single-threaded and its JS-backed futures are `!Send`, so tasks go onto the
+/// thread-local task set instead; the caller must drive them from a tokio `LocalSet` (or an
+/// equivalent local executor).
+#[cfg(target_arch = "wasm32")]
+pub fn spawn_named<F, T>(name: &str, fut: F) -> JoinHandle<T>
+where
+    F: std::future::Future<Output = T> + 'static,
+    T: 'static,
+{
+    use tracing::Instrument as _;
+    let span = tracing::debug_span!("task", %name);
+    tokio::task::spawn_local(fut.instrument(span))
 }
 
 /// Normalizes a URL by removing its fragment and returning it as a string.

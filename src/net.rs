@@ -6,16 +6,19 @@
 
 /// In-process mock HTTP server, available to this crate's tests and — behind the
 /// `test-support` cargo feature — to downstream integration tests and examples.
-#[cfg(any(test, feature = "test-support"))]
+/// Native-only: the mock server listens on a real TCP socket.
+#[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
 pub mod test_support;
 
 pub mod events;
 pub mod fetch;
 pub mod fetcher;
 pub mod fetcher_context;
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod fs_utils;
 pub mod null_emitter;
 pub mod observer;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod pump;
 pub mod request_ref;
 pub mod shared_body;
