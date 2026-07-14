@@ -11,6 +11,7 @@ use crate::net::utils::{short_url, spawn_named, Waiter};
 use dashmap::{DashMap, Entry};
 use http::header;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Instant;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -59,7 +60,7 @@ impl Default for FetcherConfig {
             connect_timeout: Duration::from_secs(5),
             req_timeout: Duration::from_secs(60),
             read_idle_timeout: Duration::from_secs(15),
-            total_body_timeout: Some(Duration::from_secs(180)),
+            total_body_timeout: Some(Duration::from_secs(10)),
             user_agent: None,
         }
     }
@@ -304,10 +305,16 @@ impl Fetcher {
     /// Spawn this on a Tokio runtime before calling [`fetch`](Self::fetch).
     pub async fn run(&self, shutdown: CancellationToken) {
         let mut lane_counter: u8 = 0;
-
+        let start_time = Instant::now();
         loop {
             if shutdown.is_cancelled() {
                 break;
+            }
+            if let Some(tbt) = self.cfg.total_body_timeout {
+                println!("I am here");
+                if start_time.elapsed() >= tbt {
+                    break;
+                }
             }
 
             let next = {
@@ -556,6 +563,7 @@ fn per_origin_limit_for(cfg: &FetcherConfig, url: &Url) -> usize {
     }
 }
 
+// TODO: FS check here for body time out
 async fn perform_streaming(
     client: &reqwest::Client,
     observer: Arc<dyn NetObserver + Send + Sync>,
@@ -602,7 +610,7 @@ async fn perform_streaming(
         shared: SharedBody::from_reader(reader, opts),
     })
 }
-
+// TODO: FS check here for body time out
 async fn perform_buffered(
     client: &reqwest::Client,
     observer: Arc<dyn NetObserver + Send + Sync>,
