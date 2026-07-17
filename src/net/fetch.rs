@@ -740,8 +740,8 @@ mod tests {
         )
     }
 
-    /// A TLS `TestServer` plus a client pointed at it: the certificate is trusted explicitly and
-    /// the domain resolved to the loopback listener, so no DNS or public CA is involved.
+    /// A TLS `TestServer` plus a client that trusts its certificate and resolves its domain to
+    /// the loopback listener. No DNS or public CA involved.
     async fn tls_server_and_client(
         routes: Vec<(&str, RouteConfig)>,
     ) -> (
@@ -764,8 +764,8 @@ mod tests {
         (srv, Arc::new(client))
     }
 
-    /// A real HTTPS response must arm the store. This is the one path the hermetic HTTP tests
-    /// cannot reach: HSTS ignores plaintext responses and IP-literal hosts alike.
+    /// The plain mock server cannot cover this: HSTS ignores plaintext responses and IP-literal
+    /// hosts, so only a TLS server with a domain name can arm a store.
     #[tokio::test(flavor = "current_thread")]
     async fn hsts_is_recorded_from_a_real_https_response() {
         let (srv, client) = tls_server_and_client(vec![(
@@ -798,8 +798,7 @@ mod tests {
         assert!(!entry.is_expired(chrono::Utc::now()));
     }
 
-    /// The header must be ignored unless it arrived over TLS, so the same response served over
-    /// plain HTTP arms nothing.
+    /// The same header over plain HTTP must arm nothing (§8.1).
     #[tokio::test(flavor = "current_thread")]
     async fn hsts_is_not_recorded_over_plaintext() {
         let srv = TestServer::new()
@@ -827,7 +826,7 @@ mod tests {
         assert!(store.is_empty(), "plaintext must never arm HSTS");
     }
 
-    /// max-age=0 over TLS disarms a host that was previously armed.
+    /// max-age=0 disarms a previously armed host (§6.1.1).
     #[tokio::test(flavor = "current_thread")]
     async fn hsts_max_age_zero_disarms_over_tls() {
         let (srv, client) = tls_server_and_client(vec![(

@@ -8,6 +8,9 @@
 //! is enforced without any embedder code.
 //!
 //! The preload list is out of scope; only the dynamic, header-driven part is implemented.
+//!
+//! Native-only: on wasm32 the browser's fetch() applies its own HSTS, and CORS filtering hides the
+//! `Strict-Transport-Security` response header from us anyway.
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dashmap::DashMap;
@@ -23,8 +26,8 @@ const MAX_AGE_CAP_SECS: u64 = 100 * 365 * 24 * 60 * 60;
 pub struct HstsEntry {
     /// When this policy stops applying. Derived from `max-age` at the time the header was seen.
     pub expires_at: DateTime<Utc>,
-    /// Whether the policy extends to subdomains. Gates only inherited matches — see
-    /// [`should_upgrade`].
+    /// Whether the policy extends to subdomains. Gates inherited matches only: a host always
+    /// matches its own entry regardless of this flag.
     pub include_subdomains: bool,
 }
 

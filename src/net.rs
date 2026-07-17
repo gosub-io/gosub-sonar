@@ -16,8 +16,6 @@ pub mod fetcher;
 pub mod fetcher_context;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod fs_utils;
-/// HTTP Strict Transport Security. Native-only: on wasm32 the browser's fetch() applies its own
-/// HSTS, and CORS filtering hides the `Strict-Transport-Security` response header from us anyway.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hsts;
 pub mod null_emitter;

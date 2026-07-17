@@ -14,6 +14,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FetcherContext`. Gated on the `test-support` feature; CI now enables it.
 - `NetEvent` is re-exported at the crate root; implementing `NetObserver`
   previously required the `net::events` path.
+- HTTP Strict Transport Security (RFC 6797, dynamic part): a `Strict-Transport-Security`
+  header received over HTTPS is recorded, and later `http://` requests to that host are
+  rewritten to `https://` before any connection is opened. Enabled by default via
+  `FetcherConfig::hsts`, which holds an `InMemoryHstsStore` unless you supply your own
+  `HstsStore`; set it to `None` to disable HSTS (e.g. for private browsing). The crate owns
+  the protocol — header parsing, `includeSubDomains` matching, expiry, and the URL rewrite —
+  so a store only has to behave like a map. No preload list. Native-only: on wasm32 the
+  browser's `fetch()` applies its own HSTS.
+- `NetPolicy::with_hsts` for callers using the low-level `fetch` API directly.
+- `test-support`: the mock server can now serve HTTPS — `TestServer::tls(domain)` with
+  `TestServerHandle::{cert_pem, socket_addr, tls_domain}` — and `RouteConfig::ok_with_headers`
+  responds 200 with arbitrary extra response headers.
+
+### Fixed
+
+- **The URL policy is now applied to redirect targets.** `build_client` never disabled reqwest's
+  own redirect following, so reqwest resolved each 3xx internally and the manual
+  `get_with_redirects` loop only ever saw the final response. `FetcherContext::is_url_allowed`
+  was therefore consulted for the initial URL but **not** for any redirect target, contrary to
+  its documentation — a redirect to an internal address bypassed an embedder's SSRF guard. The
+  `Set-Cookie`-on-3xx jar reporting and the cross-origin `Authorization`/`Cookie` stripping were
+  inert for the same reason and are now live.
 
 ## [0.1.0] - 2026-07-04
 

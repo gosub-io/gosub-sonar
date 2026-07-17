@@ -156,10 +156,13 @@ End to end, a fetch through the scheduler goes:
    lane is empty it falls through to the next lane in descending priority, so **no lane starves**
    while slots remain.
 
-3. **Coalesce.** A key is computed from URL + method + headers (`FetchKeyData::generate`) plus the
-   `auto_decode` flag. If an entry with that key already exists in `inflight_map`, this caller
-   becomes a **follower**: it just registers a listener and returns. Otherwise it becomes the
-   **leader** and creates a `FetchInflightEntry`.
+3. **Upgrade & coalesce.** If [HSTS](#hsts) applies to the request URL it is rewritten to `https`
+   before anything else, so an `http` and an `https` request for the same armed host share one
+   entry instead of keying differently and running as two fetches; this also fixes the origin used
+   for the per-origin limit below. A key is then computed from URL + method + headers
+   (`FetchRequest::generate_request_key`) plus the `auto_decode` flag. If an entry with that key
+   already exists in `inflight_map`, this caller becomes a **follower**: it just registers a
+   listener and returns. Otherwise it becomes the **leader** and creates a `FetchInflightEntry`.
 
 4. **Acquire slots.** The leader spawns a fetch task that first acquires a global concurrency slot
    (`global_slots`, default 32) and then a per-origin slot (`h1_per_origin` = 6 for HTTP/1,
@@ -302,6 +305,8 @@ enforced in the read loops of `fetch_response_complete` and the `ProgressReader`
 - **`url_allowed`** — consulted for the initial URL *and every redirect target*; the place to
   implement SSRF guards, allow/block lists. Wired to `FetcherContext::is_url_allowed`.
 - **`cookies_for`** — supplies the `Cookie` header per origin from the host's jar.
+- **`hsts`** — the [HSTS](#hsts) store, consulted to upgrade each hop and updated from each hop's
+  response. Set from `FetcherConfig::hsts` rather than `FetcherContext`; `None` disables HSTS.
 
 Redirects are handled manually in `get_with_redirects` (up to `MAX_REDIRECTS` = 20 hops) with
 browser-matching semantics:
@@ -310,6 +315,63 @@ browser-matching semantics:
 - `Authorization` and `Cookie` (`SENSITIVE_REDIRECT_HEADERS`) are stripped on cross-origin
   redirects (RFC 9110 §15.4), and the cookie jar is re-queried for the new origin.
 - Only `http`/`https` targets are followed.
+- Each hop is upgraded to `https` if HSTS applies, *before* `url_allowed` is consulted, so the
+  hook sees the URL that will actually be requested and no plaintext request is ever opened.
+- Every hop's response is checked for `Strict-Transport-Security`, not just the final one.
+
+> reqwest's own redirect following must stay disabled (`Policy::none()` in `build_client`). If it
+> is re-enabled, reqwest resolves each 3xx internally and `get_with_redirects` only ever sees the
+> final response, so none of the above runs. Pinned by
+> `fetcher_url_policy_is_applied_to_redirect_targets`.
+
+---
+
+## HSTS
+
+A site that sends `Strict-Transport-Security` over HTTPS is recorded; later `http://` requests to
+it are rewritten to `https://` before any connection is opened. RFC 6797, dynamic part only — no
+preload list.
+
+`net::hsts` owns the protocol: header parsing, host matching, expiry, and the URL rewrite. An
+embedder implements `HstsStore` (`load` / `store` / `remove`, keyed by host) and nothing else. The
+store is a plain map; the crate ignores entries past `expires_at` even if `load` returns them.
+
+```rust
+// In-memory store, enforced by default.
+let cfg = FetcherConfig::default();
+
+// Persist across restarts.
+let cfg = FetcherConfig { hsts: Some(Arc::new(MyStore::open(&profile)?)), ..Default::default() };
+
+// Private browsing: nothing consulted, nothing recorded.
+let cfg = FetcherConfig { hsts: None, ..Default::default() };
+```
+
+`load` runs once per host label on every hop of every request, so it must not block — keep an
+in-memory map and persist asynchronously.
+
+Semantics, each covered by a test in `hsts.rs`:
+
+- `includeSubDomains` gates inherited matches only; an exact match ignores it. Per §8.2 a host is
+  a Known HSTS Host given a congruent match *or* any superdomain match asserting the flag, so a
+  nearer non-matching entry does not shadow a permissive ancestor.
+- A header received over plaintext is ignored (§8.1).
+- `max-age=0` deletes the entry rather than storing an expired one (§6.1.1).
+- An implicit port or `:80` becomes 443; any other explicit port is preserved (§8.3), so
+  `http://x:8080/` upgrades to `https://x:8080/`.
+- IP literals never match.
+
+Upgrades happen in `Fetcher::run` before the coalescing key is derived
+([lifecycle](#request-lifecycle) step 3), and in `get_with_redirects` per hop before the URL policy
+check ([security & policy](#security--policy)).
+
+Native-only: on wasm32 the browser's `fetch()` applies its own HSTS, and CORS filtering hides the
+response header.
+
+Testing: HSTS ignores plaintext responses and IP-literal hosts, so the plain mock server on
+127.0.0.1 cannot arm a store. `TestServer::tls(domain)` serves HTTPS with a generated certificate —
+trust it via `cert_pem()` and point the client at `socket_addr()` with reqwest's `resolve`. An
+`#[ignore]`d live check runs against `hsts.badssl.com` (`cargo test -- --ignored hsts_live`).
 
 ---
 

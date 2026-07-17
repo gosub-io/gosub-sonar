@@ -1577,8 +1577,8 @@ mod tests {
         shutdown.cancel();
     }
 
-    /// Records every URL the policy is shown, so a test can observe the URL the fetcher settled
-    /// on. With `allow: false` nothing is ever connected to, keeping tests off the network.
+    /// Records every URL the policy is shown. With `allow: false` nothing is connected to, so a
+    /// test can read back the URL the fetcher settled on without touching the network.
     struct RecordingPolicy {
         seen: parking_lot::Mutex<Vec<String>>,
         allow: bool,
@@ -1649,10 +1649,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn hsts_upgrades_url_before_key_and_policy_check() {
-        // The policy is consulted in the run loop after the coalescing key is derived and before
-        // any connection, so seeing https here means the upgrade landed early enough to key on —
-        // and that the plaintext request was never made. The host does not resolve; blocking
-        // keeps the test off the network entirely.
+        // The policy runs after the key is derived and before any connection, so https here means
+        // the upgrade landed early enough to key on and no plaintext request was made.
         let seen = urls_seen_for(
             Some(armed_store("hsts.example", false)),
             "http://hsts.example/p",
@@ -1688,13 +1686,9 @@ mod tests {
         assert_eq!(seen, vec!["http://hsts.example/p".to_string()]);
     }
 
-    /// Live round trip against hsts.badssl.com, which exists to serve this header.
-    ///
-    /// The hermetic tests above cannot cover the harvest path: `TestServer` is plain HTTP on
-    /// 127.0.0.1, and HSTS ignores both plaintext responses and IP literals, so nothing local can
-    /// arm a store. Until `TestServer` speaks TLS this is the only check that a real response
-    /// arms anything. Ignored by default — it needs the network and trusts a third party to keep
-    /// serving the header.
+    /// Live round trip against hsts.badssl.com, the one check against a real header and a real CA
+    /// chain. Ignored by default: it needs the network and trusts a third party to keep serving
+    /// the header.
     ///
     ///     cargo test --features test-support -- --ignored hsts_live
     #[tokio::test(flavor = "current_thread")]

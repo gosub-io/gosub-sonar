@@ -426,13 +426,9 @@ impl TestServer {
 
     /// Serve HTTPS with a self-signed certificate for `domain` instead of plain HTTP.
     ///
-    /// The server still listens on 127.0.0.1; `domain` is only the name in the certificate and
-    /// in [`TestServerHandle::url`]. A client must be pointed at it explicitly — see
-    /// [`TestServerHandle::socket_addr`] and [`TestServerHandle::cert_pem`].
-    ///
-    /// Needed because some behaviour is HTTPS-only and cannot be reached over the plain server:
-    /// HSTS ignores both plaintext responses and IP-literal hosts, so a domain-named TLS server
-    /// is the only way to exercise it locally.
+    /// The server still listens on 127.0.0.1; `domain` is only the name in the certificate and in
+    /// [`TestServerHandle::url`]. Point a client at it with [`TestServerHandle::socket_addr`] and
+    /// [`TestServerHandle::cert_pem`].
     pub fn tls(mut self, domain: &str) -> Self {
         self.tls_domain = Some(domain.to_string());
         self
@@ -501,8 +497,7 @@ impl TestServer {
 
                         tokio::spawn(async move {
                             match acceptor {
-                                // A failed handshake is a client-side concern: the test asserts on
-                                // what the client saw, so just drop the connection.
+                                // The client observes a failed handshake; nothing to do here.
                                 Some(acceptor) => {
                                     if let Ok(tls_stream) = acceptor.accept(stream).await {
                                         handle_conn(tls_stream, routes, default, hits, base).await

@@ -74,6 +74,42 @@ over the reply channel and request handle use `fetcher.submit(req, handle, tx)`.
 
 See the `examples/` directory for runnable versions.
 
+### HSTS
+
+HTTP Strict Transport Security (RFC 6797) is on by default: a site that sends
+`Strict-Transport-Security` over HTTPS is recorded, and later `http://` requests to it are
+rewritten to `https://` before any connection is opened. The default store is in-memory, so
+policies last for the life of the process and need no setup.
+
+To persist across restarts, implement `HstsStore` — a host-keyed map. The crate handles `max-age`,
+`includeSubDomains` matching, and expiry, so the store interprets nothing:
+
+```rust
+use gosub_sonar::{HstsEntry, HstsStore, FetcherConfig};
+
+struct ProfileStore { /* in-memory map + async write-through to disk */ }
+
+impl HstsStore for ProfileStore {
+    fn load(&self, host: &str) -> Option<HstsEntry> { /* ... */ }
+    fn store(&self, host: &str, entry: HstsEntry) { /* ... */ }
+    fn remove(&self, host: &str) { /* ... */ }
+}
+
+let cfg = FetcherConfig {
+    hsts: Some(Arc::new(ProfileStore::open(&profile_dir)?)),
+    ..Default::default()
+};
+```
+
+`load` runs on every hop of every request, so it must not block — keep an in-memory map and
+persist in the background.
+
+Set `hsts: None` to disable HSTS: nothing consulted, nothing recorded. This is what a
+private-browsing session wants.
+
+There is no preload list. On wasm32 the browser's `fetch()` applies its own HSTS, so the field does
+not exist there.
+
 ## Examples
 
 ```text
