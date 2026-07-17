@@ -505,23 +505,6 @@ impl Fetcher {
     }
 }
 
-/// Build a [`RequestInit`] from a [`FetchRequest`], injecting a `Content-Type` header from
-/// the body descriptor when the headers don't already contain one.
-fn make_request_init(req: &FetchRequest) -> RequestInit {
-    let mut headers = req.headers.clone();
-    let body = req.body.as_ref().map(|b| {
-        if let Some(ref ct) = b.content_type {
-            if !headers.contains_key(header::CONTENT_TYPE) {
-                if let Ok(val) = ct.parse() {
-                    headers.insert(header::CONTENT_TYPE, val);
-                }
-            }
-        }
-        b.bytes.clone()
-    });
-    RequestInit::new(req.method.clone(), headers, body)
-}
-
 /// Build a reqwest client from `FetcherConfig`.
 ///
 /// When `decode` is `true` the client automatically decompresses `gzip`, `brotli`, and `deflate`
@@ -583,7 +566,7 @@ async fn perform_streaming(
     } = fetch_response_top(
         Arc::new(client.clone()),
         req.url.clone(),
-        make_request_init(req),
+        RequestInit::from(req),
         cancel.clone(),
         observer.clone(),
         policy,
@@ -626,7 +609,7 @@ async fn perform_buffered(
     let (meta, body) = fetch_response_complete(
         Arc::new(client.clone()),
         req.url.clone(),
-        make_request_init(req),
+        RequestInit::from(req),
         cancel.clone(),
         observer,
         req.max_bytes,

@@ -5,6 +5,7 @@ use crate::net::fetcher_context::FetcherContext;
 use crate::net::observer::NetObserver;
 use crate::net::types::{FetchResultMeta, NetError};
 use crate::types::PeekBuf;
+use crate::FetchRequest;
 use anyhow::{anyhow, Context};
 use bytes::{Bytes, BytesMut};
 use futures_util::{stream, StreamExt, TryStreamExt};
@@ -121,6 +122,25 @@ impl RequestInit {
             headers,
             body,
         }
+    }
+}
+
+/// Build a [`RequestInit`] from a [`FetchRequest`], injecting a `Content-Type` header from
+/// the body descriptor when the headers don't already contain one.
+impl From<&FetchRequest> for RequestInit {
+    fn from(value: &FetchRequest) -> Self {
+        let mut headers = value.headers.clone();
+        let body = value.body.as_ref().map(|b| {
+            if let Some(ref ct) = b.content_type {
+                if !headers.contains_key(header::CONTENT_TYPE) {
+                    if let Ok(val) = ct.parse() {
+                        headers.insert(header::CONTENT_TYPE, val);
+                    }
+                }
+            }
+            b.bytes.clone()
+        });
+        RequestInit::new(value.method.clone(), headers, body)
     }
 }
 
