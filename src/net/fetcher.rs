@@ -4,6 +4,8 @@ use crate::net::fetch::{
     fetch_response_complete, fetch_response_top, NetPolicy, RequestInit, ResponseTop,
 };
 use crate::net::fetcher_context::FetcherContext;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::hsts::{self, HstsStore, InMemoryHstsStore};
 use crate::net::observer::NetObserver;
 use crate::net::shared_body::{ReaderOptions, SharedBody};
 use crate::net::types::{FetchRequest, FetchResult, NetError, Priority};
@@ -48,6 +50,14 @@ pub struct FetcherConfig {
     /// `None` falls back to reqwest's built-in default (`reqwest/VERSION`).
     /// For a browser engine use something like `"Mozilla/5.0 (compatible; MyBrowser/1.0)"`.
     pub user_agent: Option<String>,
+
+    /// Store backing HTTP Strict Transport Security.
+    ///
+    /// Defaults to an [`InMemoryHstsStore`], so HSTS is enforced without any setup; supply your
+    /// own [`HstsStore`] to persist policies across restarts. `None` disables HSTS — appropriate
+    /// for a private-browsing session, which must not consult or add to a persistent store.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub hsts: Option<Arc<dyn HstsStore>>,
 }
 
 impl Default for FetcherConfig {
@@ -61,6 +71,8 @@ impl Default for FetcherConfig {
             read_idle_timeout: Duration::from_secs(15),
             total_body_timeout: Some(Duration::from_secs(180)),
             user_agent: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            hsts: Some(Arc::new(InMemoryHstsStore::new())),
         }
     }
 }
@@ -318,8 +330,10 @@ impl Fetcher {
                 self.pick_lane(&mut high, &mut norm, &mut low, &mut idle, &mut lane_counter)
             };
 
+            // `req` is only reassigned by the HSTS upgrade below, which is native-only.
+            #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
             let Some(QueueItem {
-                req,
+                mut req,
                 cancel,
                 reply: reply_tx,
             }) = next
@@ -330,6 +344,16 @@ impl Fetcher {
                 }
                 continue;
             };
+
+            // Upgrade before the key is derived, or an http:// and an https:// request for the
+            // same HSTS host hash to different keys and run as two fetches instead of coalescing
+            // onto one. Also fixes the origin used for the per-origin limit below.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(ref store) = self.cfg.hsts {
+                if hsts::should_upgrade(store.as_ref(), &req.url, chrono::Utc::now()) {
+                    req.url = hsts::upgrade(&req.url);
+                }
+            }
 
             let key_opt = req.generate_request_key();
             let key_str = {
@@ -569,6 +593,9 @@ async fn perform_streaming(
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
 ) -> Result<FetchResult, NetError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let policy = NetPolicy::from_context(&ctx).with_hsts(cfg.hsts.clone());
+    #[cfg(target_arch = "wasm32")]
     let policy = NetPolicy::from_context(&ctx);
 
     let ResponseTop {
@@ -616,6 +643,9 @@ async fn perform_buffered(
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
 ) -> Result<FetchResult, NetError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let policy = NetPolicy::from_context(&ctx).with_hsts(cfg.hsts.clone());
+    #[cfg(target_arch = "wasm32")]
     let policy = NetPolicy::from_context(&ctx);
 
     let (meta, body) = fetch_response_complete(
@@ -1545,6 +1575,109 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    /// Records every URL the policy is shown and blocks all of them, so a test can observe the
+    /// URL the fetcher settled on without any connection being attempted.
+    struct RecordingBlocker {
+        seen: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl FetcherContext for RecordingBlocker {
+        fn observer_for(
+            &self,
+            _: RequestReference,
+            _: RequestId,
+            _: ResourceKind,
+            _: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            Arc::new(crate::net::null_emitter::NullEmitter)
+        }
+        fn on_ref_active(&self, _: RequestReference) {}
+        fn on_ref_done(&self, _: RequestReference) {}
+        fn is_url_allowed(&self, url: &Url) -> bool {
+            self.seen.lock().push(url.as_str().to_string());
+            false
+        }
+    }
+
+    async fn urls_seen_for(hsts: Option<Arc<dyn HstsStore>>, request: &str) -> Vec<String> {
+        let ctx = Arc::new(RecordingBlocker {
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let cfg = FetcherConfig {
+            hsts,
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let (req, handle) = make_req(Url::parse(request).unwrap(), Priority::Normal);
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, handle, tx).await;
+        let _ = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .unwrap();
+
+        shutdown.cancel();
+        let seen = ctx.seen.lock().clone();
+        seen
+    }
+
+    fn armed_store(host: &str, include_subdomains: bool) -> Arc<InMemoryHstsStore> {
+        let store = Arc::new(InMemoryHstsStore::new());
+        store.store(
+            host,
+            crate::net::hsts::HstsEntry {
+                expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+                include_subdomains,
+            },
+        );
+        store
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_upgrades_url_before_key_and_policy_check() {
+        // The policy is consulted in the run loop after the coalescing key is derived and before
+        // any connection, so seeing https here means the upgrade landed early enough to key on —
+        // and that the plaintext request was never made. The host does not resolve; blocking
+        // keeps the test off the network entirely.
+        let seen = urls_seen_for(
+            Some(armed_store("hsts.example", false)),
+            "http://hsts.example/p",
+        )
+        .await;
+        assert_eq!(seen, vec!["https://hsts.example/p".to_string()]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_upgrades_subdomain_of_armed_host() {
+        let seen = urls_seen_for(
+            Some(armed_store("hsts.example", true)),
+            "http://sub.hsts.example/p",
+        )
+        .await;
+        assert_eq!(seen, vec!["https://sub.hsts.example/p".to_string()]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_leaves_unarmed_host_alone() {
+        let seen = urls_seen_for(
+            Some(armed_store("other.example", true)),
+            "http://hsts.example/p",
+        )
+        .await;
+        assert_eq!(seen, vec!["http://hsts.example/p".to_string()]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_none_disables_upgrading() {
+        // A private-browsing fetcher passes None and must not upgrade even for an armed host.
+        let seen = urls_seen_for(None, "http://hsts.example/p").await;
+        assert_eq!(seen, vec!["http://hsts.example/p".to_string()]);
     }
 
     fn make_req_with_decode(

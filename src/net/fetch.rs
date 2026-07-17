@@ -2,6 +2,8 @@
 
 use crate::net::events::NetEvent;
 use crate::net::fetcher_context::FetcherContext;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::hsts::{self, HstsStore};
 use crate::net::observer::NetObserver;
 use crate::net::types::{FetchResultMeta, NetError};
 use crate::types::PeekBuf;
@@ -48,6 +50,10 @@ pub struct NetPolicy {
     /// mid-chain (e.g. a session cookie on a login 302) reach the jar before the next hop.
     /// The final response's cookies are reported by the fetcher, not here.
     pub on_cookies: CookieSinkFn,
+    /// HSTS store consulted to upgrade each hop, and updated from each hop's response.
+    /// `None` disables HSTS. Set via [`NetPolicy::with_hsts`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub hsts: Option<Arc<dyn HstsStore>>,
 }
 
 impl Default for NetPolicy {
@@ -56,6 +62,8 @@ impl Default for NetPolicy {
             url_allowed: Box::new(|_| true),
             cookies_for: Box::new(|_| None),
             on_cookies: Box::new(|_, _| {}),
+            #[cfg(not(target_arch = "wasm32"))]
+            hsts: None,
         }
     }
 }
@@ -70,7 +78,16 @@ impl NetPolicy {
             url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
             cookies_for: Box::new(move |url| ctx_cookies.cookies_for(url)),
             on_cookies: Box::new(move |url, values| ctx_sink.on_cookies_received(url, values)),
+            #[cfg(not(target_arch = "wasm32"))]
+            hsts: None,
         }
+    }
+
+    /// Attaches the HSTS store this policy should consult and update. `None` disables HSTS.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_hsts(mut self, store: Option<Arc<dyn HstsStore>>) -> Self {
+        self.hsts = store;
+        self
     }
 }
 
@@ -549,6 +566,15 @@ async fn get_with_redirects(
             ))));
         }
 
+        // HSTS upgrade, before the policy check so the hook sees the URL that will actually be
+        // requested, and before any connection is opened so the plaintext request never happens.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref store) = policy.hsts {
+            if hsts::should_upgrade(store.as_ref(), &url, chrono::Utc::now()) {
+                url = hsts::upgrade(&url);
+            }
+        }
+
         // Policy check (SSRF / blocklist hook)
         if !(policy.url_allowed)(&url) {
             return Err(NetError::Redirect(Arc::new(anyhow!(
@@ -584,6 +610,13 @@ async fn get_with_redirects(
             }
             r = &mut fut => r.context("net.get_with_redirects request failed").map_err(|e| NetError::Read(Arc::new(e)))?
         };
+
+        // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
+        // a site first arms it, and that response is consumed below.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref store) = policy.hsts {
+            hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
+        }
 
         if !resp.status().is_redirection() {
             return Ok(resp);

@@ -59,6 +59,8 @@ pub mod types;
 pub use net::events::NetEvent;
 pub use net::fetcher::{Fetcher, FetcherConfig};
 pub use net::fetcher_context::{FetcherContext, NullContext};
+#[cfg(not(target_arch = "wasm32"))]
+pub use net::hsts::{HstsEntry, HstsStore, InMemoryHstsStore};
 pub use net::null_emitter::NullEmitter;
 pub use net::observer::NetObserver;
 pub use net::request_ref::RequestReference;
