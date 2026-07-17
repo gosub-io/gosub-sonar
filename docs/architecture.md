@@ -45,7 +45,8 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::fetcher` | `src/net/fetcher.rs` | **The scheduler.** Priority queues, coalescing, concurrency limits, task spawning. `Fetcher::{new, run, submit}`. |
 | `net::fetch` | `src/net/fetch.rs` | Low-level fetch primitives: `fetch_response_top`, `fetch_response_complete`, redirect handling, `ProgressReader`, `NetPolicy`. |
 | `net::fetcher_context` | `src/net/fetcher_context.rs` | `FetcherContext` trait — the host's hook into the fetch lifecycle (observers, ref tracking, URL policy, cookies). |
-| `net::types` | `src/net/types.rs` | Core data model: `FetchRequest`(+builder), `FetchResult`, `FetchKeyData`, `FetchHandle`, `Priority`, `NetError`, `BodyStream`, … |
+| `net::hsts` | `src/net/hsts.rs` | HTTP Strict Transport Security (RFC 6797): header parsing, host matching, expiry, URL upgrade. `HstsStore` / `InMemoryHstsStore`. Native-only. |
+| `net::types` | `src/net/types.rs` | Core data model: `FetchRequest`(+builder), `FetchResult`, `FetchResultMeta`, `Priority`, `NetError`, `BodyStream`, … |
 | `net::shared_body` | `src/net/shared_body.rs` | `SharedBody` — bounded fan-out byte stream with drop-on-lag per-subscriber queues. |
 | `net::pump` | `src/net/pump.rs` | Drains an `AsyncRead` into a `SharedBody` and/or a file on disk (atomic temp-file + rename). |
 | `net::utils` | `src/net/utils.rs` | `Waiter` (result fan-out to listeners), `stream_to_bytes`, `spawn_named`. |
@@ -122,7 +123,7 @@ flowchart TD
     shared["SharedBody<br/>◄ pump / ProgressReader"]
     waiter["Waiter.finish (fan-out)"]
 
-    caller -->|"submit(FetchRequest, FetchHandle, oneshot::Sender)"| queues
+    caller -->|"submit(FetchRequest, CancellationToken, oneshot::Sender)"| queues
     slots -->|"spawn task"| buffered["perform_buffered"]
     slots -->|"spawn task"| streaming["perform_streaming"]
 
@@ -135,8 +136,9 @@ flowchart TD
 
 > If your Markdown viewer doesn't render Mermaid, see the pre-rendered
 > [architecture.svg](architecture.svg), or the same flow in words under
-> [Request lifecycle](#request-lifecycle) below. The SVG is generated from the block above with
-> `mmdc -i architecture.mmd -o architecture.svg`.
+> [Request lifecycle](#request-lifecycle) below. To regenerate the SVG, copy the block above into
+> a scratch `architecture.mmd` and run `mmdc -i architecture.mmd -o architecture.svg -b transparent`.
+> The block above is the source of truth; the `.mmd` is not kept.
 
 ---
 
@@ -183,9 +185,7 @@ Defined in `src/net/types.rs` (and `src/types.rs`):
 
 | Type | Role |
 |------|------|
-| `FetchRequest` | Everything about a request: `key_data` (URL/method/headers), `priority`, `streaming`, `auto_decode`, `body`, `max_bytes`, plus correlation fields (`reference`, `req_id`, `kind`, `initiator`). Build via `FetchRequest::builder(method, url)`. |
-| `FetchKeyData` | The `{url, method, headers}` triple used as the **coalescing key**; `generate()` produces the string key, and `Hash`/`Display` are derived from it. |
-| `FetchHandle` | Per-subscriber handle carrying that caller's `CancellationToken` — cancelling one caller does not cancel the shared fetch unless *all* callers cancel. |
+| `FetchRequest` | Everything about a request: `url`, `method`, `headers`, `priority`, `streaming`, `auto_decode`, `body`, `max_bytes`, plus correlation fields (`reference`, `req_id`, `kind`, `initiator`). Build via `FetchRequest::builder(method, url)`. `generate_request_key()` derives the **coalescing key** from url/method/headers; it returns `None` for methods other than GET/HEAD, which are never coalesced. |
 | `FetchResult` | The outcome sent back: `Stream { meta, peek_buf, shared }`, `Buffered { meta, body }`, or `Error(NetError)`. |
 | `FetchResultMeta` | Response metadata: `final_url`, `status`, `status_text`, `headers`, `content_length`, `content_type`, `has_body`. |
 | `Priority` | `High` / `Normal` (default) / `Low` / `Idle`. |
@@ -280,8 +280,9 @@ file on disk — writing to a temp file and atomically renaming on success (see 
 
 Cancellation is layered with `tokio_util::sync::CancellationToken`:
 
-- Each subscriber's `FetchHandle` carries its own token; when a caller cancels, its listener is
-  removed and the subscriber count drops.
+- Each subscriber passes its own `CancellationToken` to `submit`; when a caller cancels, its
+  listener is removed and the subscriber count drops. Cancelling one caller does not cancel the
+  shared fetch.
 - The `FetchInflightEntry::parent_cancel` fires only when the *last* subscriber cancels, aborting
   the shared fetch.
 - A `shutdown` token passed to `Fetcher::run` stops the whole scheduler and unblocks pending
