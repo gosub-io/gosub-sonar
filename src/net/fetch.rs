@@ -740,6 +740,128 @@ mod tests {
         )
     }
 
+    /// A TLS `TestServer` plus a client pointed at it: the certificate is trusted explicitly and
+    /// the domain resolved to the loopback listener, so no DNS or public CA is involved.
+    async fn tls_server_and_client(
+        routes: Vec<(&str, RouteConfig)>,
+    ) -> (
+        crate::net::test_support::TestServerHandle,
+        Arc<reqwest::Client>,
+    ) {
+        let mut srv = TestServer::new().tls("hsts.test");
+        for (path, cfg) in routes {
+            srv = srv.route(path, cfg);
+        }
+        let srv = srv.start().await;
+
+        let cert = reqwest::Certificate::from_pem(srv.cert_pem().unwrap()).unwrap();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(cert)
+            .resolve(srv.tls_domain().unwrap(), srv.socket_addr())
+            .build()
+            .unwrap();
+        (srv, Arc::new(client))
+    }
+
+    /// A real HTTPS response must arm the store. This is the one path the hermetic HTTP tests
+    /// cannot reach: HSTS ignores plaintext responses and IP-literal hosts alike.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_is_recorded_from_a_real_https_response() {
+        let (srv, client) = tls_server_and_client(vec![(
+            "/",
+            RouteConfig::ok_with_headers(
+                &[(
+                    "Strict-Transport-Security",
+                    "max-age=31536000; includeSubDomains",
+                )],
+                b"hello".to_vec(),
+            ),
+        )])
+        .await;
+
+        let store = Arc::new(crate::net::hsts::InMemoryHstsStore::new());
+        let res = fetch_response_top(
+            client,
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default().with_hsts(Some(store.clone())),
+        )
+        .await;
+        assert!(res.is_ok(), "tls fetch failed: {:?}", res.err());
+
+        let entry = crate::net::hsts::HstsStore::load(store.as_ref(), "hsts.test")
+            .expect("an https response carrying the header must arm the store");
+        assert!(entry.include_subdomains);
+        assert!(!entry.is_expired(chrono::Utc::now()));
+    }
+
+    /// The header must be ignored unless it arrived over TLS, so the same response served over
+    /// plain HTTP arms nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_is_not_recorded_over_plaintext() {
+        let srv = TestServer::new()
+            .route(
+                "/",
+                RouteConfig::ok_with_headers(
+                    &[("Strict-Transport-Security", "max-age=31536000")],
+                    b"hello".to_vec(),
+                ),
+            )
+            .start()
+            .await;
+
+        let store = Arc::new(crate::net::hsts::InMemoryHstsStore::new());
+        let res = fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default().with_hsts(Some(store.clone())),
+        )
+        .await;
+        assert!(res.is_ok());
+        assert!(store.is_empty(), "plaintext must never arm HSTS");
+    }
+
+    /// max-age=0 over TLS disarms a host that was previously armed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_max_age_zero_disarms_over_tls() {
+        let (srv, client) = tls_server_and_client(vec![(
+            "/",
+            RouteConfig::ok_with_headers(
+                &[("Strict-Transport-Security", "max-age=0")],
+                b"bye".to_vec(),
+            ),
+        )])
+        .await;
+
+        let store = Arc::new(crate::net::hsts::InMemoryHstsStore::new());
+        crate::net::hsts::HstsStore::store(
+            store.as_ref(),
+            "hsts.test",
+            crate::net::hsts::HstsEntry {
+                expires_at: chrono::Utc::now() + chrono::Duration::days(30),
+                include_subdomains: false,
+            },
+        );
+
+        let res = fetch_response_top(
+            client,
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default().with_hsts(Some(store.clone())),
+        )
+        .await;
+        assert!(res.is_ok(), "tls fetch failed: {:?}", res.err());
+        assert!(store.is_empty(), "max-age=0 must remove the entry");
+    }
+
     async fn server() -> crate::net::test_support::TestServerHandle {
         // 64 KiB pattern, chunked so the body arrives in many pieces with no Content-Length.
         let big = pattern(64 * 1024);
