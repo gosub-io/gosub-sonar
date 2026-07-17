@@ -533,6 +533,11 @@ fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Cl
     #[cfg(not(target_arch = "wasm32"))]
     {
         let mut b = reqwest::Client::builder()
+            // `get_with_redirects` follows redirects itself so that the URL policy, cookie jar,
+            // and cross-origin header stripping are applied at every hop. reqwest's own redirect
+            // following must stay disabled or it swallows each 3xx internally and none of that
+            // runs — see `fetcher_url_policy_is_applied_to_redirect_targets`.
+            .redirect(reqwest::redirect::Policy::none())
             .connection_verbose(false)
             .http2_adaptive_window(true)
             .connect_timeout(cfg.connect_timeout)
@@ -1466,6 +1471,79 @@ mod tests {
             }
             other => panic!("expected Buffered, got {:?}", other),
         }
+        shutdown.cancel();
+    }
+
+    /// Records every URL passed to `is_url_allowed` and blocks any whose path contains `/blocked`.
+    struct RecordingUrlPolicy {
+        seen: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl FetcherContext for RecordingUrlPolicy {
+        fn observer_for(
+            &self,
+            _: RequestReference,
+            _: RequestId,
+            _: ResourceKind,
+            _: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            Arc::new(crate::net::null_emitter::NullEmitter)
+        }
+        fn on_ref_active(&self, _: RequestReference) {}
+        fn on_ref_done(&self, _: RequestReference) {}
+        fn is_url_allowed(&self, url: &Url) -> bool {
+            self.seen.lock().push(url.path().to_string());
+            !url.path().contains("/blocked")
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_url_policy_is_applied_to_redirect_targets() {
+        // The URL policy must be consulted for every redirect target, not just the initial URL —
+        // otherwise a redirect to an internal address walks straight past an embedder's SSRF
+        // guard. This requires reqwest's own redirect following to stay disabled so that
+        // `get_with_redirects` sees each 3xx itself; if it is ever re-enabled, reqwest follows
+        // the hop internally and the policy check below never runs.
+        let srv = TestServer::new()
+            .route("/start", RouteConfig::redirect_to("/blocked"))
+            .route("/blocked", RouteConfig::ok(b"SHOULD NEVER BE FETCHED"))
+            .start()
+            .await;
+
+        let ctx = Arc::new(RecordingUrlPolicy {
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let (req, handle) = make_req(srv.url("/start"), Priority::Normal);
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, handle, tx).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            ctx.seen.lock().iter().any(|p| p == "/blocked"),
+            "redirect target must be passed to is_url_allowed, saw: {:?}",
+            ctx.seen.lock()
+        );
+        assert_eq!(
+            srv.hit_count("/blocked"),
+            0,
+            "a blocked redirect target must never be requested"
+        );
+        assert!(
+            matches!(result, FetchResult::Error(NetError::Redirect(_))),
+            "blocked redirect must surface as NetError::Redirect, got {:?}",
+            result
+        );
+
         shutdown.cancel();
     }
 
