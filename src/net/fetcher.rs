@@ -305,17 +305,19 @@ impl Fetcher {
     /// Spawn this on a Tokio runtime before calling [`fetch`](Self::fetch).
     pub async fn run(&self, shutdown: CancellationToken) {
         let mut lane_counter: u8 = 0;
-        let start_time = Instant::now();
+
+        // let start_time = Instant::now();
         loop {
             if shutdown.is_cancelled() {
                 break;
             }
-            if let Some(tbt) = self.cfg.total_body_timeout {
-                println!("I am here");
-                if start_time.elapsed() >= tbt {
-                    break;
-                }
-            }
+
+            // if let Some(tbt) = self.cfg.total_body_timeout {
+            //     println!("I am here");
+            //     if start_time.elapsed() >= tbt {
+            //         break;
+            //     }
+            // }
 
             let next = {
                 let mut high = self.q_high.lock().await;

@@ -468,6 +468,7 @@ pub async fn fetch_response_complete(
         // Check if we hit the total body timeout
         if let Some(total) = total_body_timeout {
             if started.elapsed() > total {
+                println!("I am elapsiiing");
                 return Err(NetError::Timeout("total body timeout".into()));
             }
         }

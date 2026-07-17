@@ -10,6 +10,7 @@ use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, ReadBuf};
 use url::Url;
 
@@ -309,6 +310,13 @@ pub struct FetchRequest {
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
     /// `None` for GET and HEAD requests.
     pub body: Option<RequestBody>,
+    /// Timeout for the TCP + TLS handshake.  Applies before any bytes are sent.
+    pub connect_timeout: Duration,
+    /// Timeout from sending the first request byte until the response headers arrive.
+    pub req_timeout: Duration,
+    /// Wall-clock deadline for receiving the entire response body after headers.
+    /// `None` disables the deadline (useful for very large downloads).
+    pub total_body_timeout: Option<Duration>,
 }
 
 impl FetchRequest {
@@ -377,6 +385,9 @@ pub struct FetchRequestBuilder {
     headers: HeaderMap,
     url: Url,
     body: Option<RequestBody>,
+    connect_timeout: Duration,
+    req_timeout: Duration,
+    total_body_timeout: Option<Duration>,
 }
 
 impl FetchRequestBuilder {
@@ -395,6 +406,10 @@ impl FetchRequestBuilder {
             auto_decode: false,
             max_bytes: None,
             body: None,
+            // TODO: check original values
+            connect_timeout: Duration::from_secs(5),
+            req_timeout: Duration::from_secs(60),
+            total_body_timeout: Some(Duration::from_secs(10)),
         }
     }
 
@@ -470,6 +485,24 @@ impl FetchRequestBuilder {
         self
     }
 
+    /// Sets Connection Timeout for the request
+    pub fn with_connection_timeout(mut self, connection_timeout: Duration) -> Self {
+        self.connect_timeout = connection_timeout;
+        self
+    }
+
+    /// Sets Request Timeout for the request.
+    pub fn with_request_timeout(mut self, req_timeout: Duration) -> Self {
+        self.req_timeout = req_timeout;
+        self
+    }
+
+    /// Sets the Total Body Timeout for the request
+    pub fn with_total_body_timeout(mut self, total_body_timeout: Duration) -> Self {
+        self.total_body_timeout = Some(total_body_timeout);
+        self
+    }
+
     /// Builds the [`FetchRequest`]
     pub fn build(self) -> FetchRequest {
         FetchRequest {
@@ -485,6 +518,9 @@ impl FetchRequestBuilder {
             method: self.method,
             url: self.url,
             body: self.body,
+            connect_timeout: self.connect_timeout,
+            req_timeout: self.req_timeout,
+            total_body_timeout: self.total_body_timeout,
         }
     }
 }
