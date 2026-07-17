@@ -1577,13 +1577,23 @@ mod tests {
         shutdown.cancel();
     }
 
-    /// Records every URL the policy is shown and blocks all of them, so a test can observe the
-    /// URL the fetcher settled on without any connection being attempted.
-    struct RecordingBlocker {
+    /// Records every URL the policy is shown, so a test can observe the URL the fetcher settled
+    /// on. With `allow: false` nothing is ever connected to, keeping tests off the network.
+    struct RecordingPolicy {
         seen: parking_lot::Mutex<Vec<String>>,
+        allow: bool,
     }
 
-    impl FetcherContext for RecordingBlocker {
+    impl RecordingPolicy {
+        fn new(allow: bool) -> Self {
+            Self {
+                seen: parking_lot::Mutex::new(Vec::new()),
+                allow,
+            }
+        }
+    }
+
+    impl FetcherContext for RecordingPolicy {
         fn observer_for(
             &self,
             _: RequestReference,
@@ -1597,14 +1607,12 @@ mod tests {
         fn on_ref_done(&self, _: RequestReference) {}
         fn is_url_allowed(&self, url: &Url) -> bool {
             self.seen.lock().push(url.as_str().to_string());
-            false
+            self.allow
         }
     }
 
     async fn urls_seen_for(hsts: Option<Arc<dyn HstsStore>>, request: &str) -> Vec<String> {
-        let ctx = Arc::new(RecordingBlocker {
-            seen: parking_lot::Mutex::new(Vec::new()),
-        });
+        let ctx = Arc::new(RecordingPolicy::new(false));
         let cfg = FetcherConfig {
             hsts,
             ..test_config()
@@ -1678,6 +1686,77 @@ mod tests {
         // A private-browsing fetcher passes None and must not upgrade even for an armed host.
         let seen = urls_seen_for(None, "http://hsts.example/p").await;
         assert_eq!(seen, vec!["http://hsts.example/p".to_string()]);
+    }
+
+    /// Live round trip against hsts.badssl.com, which exists to serve this header.
+    ///
+    /// The hermetic tests above cannot cover the harvest path: `TestServer` is plain HTTP on
+    /// 127.0.0.1, and HSTS ignores both plaintext responses and IP literals, so nothing local can
+    /// arm a store. Until `TestServer` speaks TLS this is the only check that a real response
+    /// arms anything. Ignored by default — it needs the network and trusts a third party to keep
+    /// serving the header.
+    ///
+    ///     cargo test --features test-support -- --ignored hsts_live
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires network access to hsts.badssl.com"]
+    async fn hsts_live_round_trip_against_badssl() {
+        let store = Arc::new(InMemoryHstsStore::new());
+        let ctx = Arc::new(RecordingPolicy::new(true));
+        let cfg = FetcherConfig {
+            hsts: Some(store.clone()),
+            ..FetcherConfig::default()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        assert!(store.load("hsts.badssl.com").is_none());
+
+        // Harvest: a real HTTPS response must arm the store.
+        let req =
+            FetchRequest::builder(Method::GET, Url::parse("https://hsts.badssl.com/").unwrap())
+                .build();
+        let res = fetcher.fetch(req).await;
+        assert!(
+            !matches!(res, FetchResult::Error(_)),
+            "live fetch failed: {res:?}"
+        );
+        let entry = store
+            .load("hsts.badssl.com")
+            .expect("a live HSTS response must arm the store");
+        assert!(entry.include_subdomains);
+        assert!(!entry.is_expired(chrono::Utc::now()));
+
+        // Upgrade: a plaintext request for the now-armed host must go out over https.
+        ctx.seen.lock().clear();
+        let req =
+            FetchRequest::builder(Method::GET, Url::parse("http://hsts.badssl.com/").unwrap())
+                .build();
+        let _ = fetcher.fetch(req).await;
+        let seen = ctx.seen.lock().clone();
+        assert!(!seen.is_empty(), "policy should have seen the request");
+        assert!(
+            seen.iter().all(|u| u.starts_with("https://")),
+            "plaintext must never be requested for an armed host, saw: {seen:?}"
+        );
+
+        // The live entry asserts includeSubDomains, so a subdomain inherits it.
+        ctx.seen.lock().clear();
+        let req = FetchRequest::builder(
+            Method::GET,
+            Url::parse("http://sub.hsts.badssl.com/").unwrap(),
+        )
+        .build();
+        let _ = fetcher.fetch(req).await;
+        let seen = ctx.seen.lock().clone();
+        assert!(
+            seen.iter().all(|u| u.starts_with("https://")),
+            "subdomain of an includeSubDomains host must upgrade, saw: {seen:?}"
+        );
+
+        shutdown.cancel();
     }
 
     fn make_req_with_decode(
