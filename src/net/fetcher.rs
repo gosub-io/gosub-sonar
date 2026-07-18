@@ -324,7 +324,6 @@ impl Fetcher {
         };
         lane.push_back(QueueItem {
             req,
-            // handle: req_handle,\
             cancel,
             reply: reply_tx,
         });
@@ -828,6 +827,15 @@ mod tests {
     fn dummy_item(priority: Priority) -> QueueItem {
         let url = Url::parse("http://example.com/").unwrap();
         let req_id = RequestId::new();
+        let req = FetchRequest::builder(Method::GET, url)
+            .with_req_id(req_id)
+            .with_headers(HeaderMap::new())
+            .with_priority(priority)
+            .with_initiator(Initiator::Other)
+            .with_kind(ResourceKind::Primary)
+            .with_streaming(false)
+            .with_auto_decode(true)
+            .build();
         let (tx, _rx) = oneshot::channel();
         QueueItem {
             req: FetchRequest {
