@@ -544,8 +544,6 @@ pub async fn fetch_response_complete(
     total_body_timeout: Option<Duration>,
     policy: NetPolicy,
 ) -> Result<(FetchResultMeta, Bytes), NetError> {
-    let started = Instant::now();
-
     let ResponseTop {
         meta,
         peek_buf,
@@ -574,6 +572,8 @@ pub async fn fetch_response_complete(
     let mut body_buf = BytesMut::with_capacity(initial_cap);
     body_buf.extend_from_slice(peek_buf.as_slice());
 
+    // timer for total_body_timeout should start after recieving Headers
+    let started = Instant::now();
     loop {
         // Check if we hit the total body timeout
         if let Some(total) = total_body_timeout {
