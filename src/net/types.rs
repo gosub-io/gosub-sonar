@@ -1,5 +1,6 @@
 //! Core types for fetch requests, responses, errors, and priorities.
 
+use crate::net::mixed_content::{is_origin_potentially_trustworthy, MixedContentPolicy};
 use crate::net::request_ref::RequestReference;
 use crate::net::shared_body::SharedBody;
 use crate::net::utils::{normalize_url, short_hash, BytesAsyncReader};
@@ -11,7 +12,7 @@ use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, ReadBuf};
-use url::Url;
+use url::{Origin, Url};
 
 /// Priority of the scheduled request. Documents usually have high priority, while images have low.
 /// Currently, the scheduler uses a round-robin system to load resources
@@ -90,9 +91,46 @@ pub struct FetchResultMeta {
     pub has_body: bool,
 }
 
+/// Why a request hop was refused. The refused hop is never sent.
+///
+/// Carried by [`NetError::Blocked`] and [`NetEvent::Blocked`](crate::net::events::NetEvent::Blocked)
+/// so callers can distinguish a deliberate refusal from a transport failure without matching on
+/// error strings.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub enum BlockReason {
+    /// An insecure sub-resource was requested by a secure document.
+    /// See [`mixed_content`](crate::net::mixed_content).
+    MixedContent,
+    /// Rejected by [`FetcherContext::is_url_allowed`](crate::net::fetcher_context::FetcherContext::is_url_allowed).
+    UrlPolicy,
+    /// The URL scheme is not `http` or `https`.
+    UnsupportedScheme,
+}
+
+impl Display for BlockReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            BlockReason::MixedContent => "mixed content",
+            BlockReason::UrlPolicy => "blocked by URL policy",
+            BlockReason::UnsupportedScheme => "unsupported URL scheme",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Network-level errors.
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum NetError {
+    /// Request hop refused by policy. Applies to the initial URL and to every redirect target.
+    #[error("net error: blocked: {reason}: {url}")]
+    Blocked {
+        /// Why the request was refused
+        reason: BlockReason,
+        /// URL that was refused. On a redirect chain this is the hop that was blocked,
+        /// not the URL originally requested.
+        url: Url,
+    },
+
     /// Error reported by the underlying HTTP client
     #[error("net error: reqwest: {0}")]
     Reqwest(#[from] Arc<reqwest::Error>),
@@ -400,6 +438,15 @@ pub struct FetchRequest {
     pub method: Method,
     /// Target Url
     pub url: Url,
+    /// Origin of the document that initiated this request, used for mixed content checks.
+    ///
+    /// `None` means "no document context", which disables mixed content blocking for this
+    /// request entirely — set it whenever a request is made on behalf of a page.
+    /// See [`mixed_content`](crate::net::mixed_content).
+    pub origin: Option<Origin>,
+    /// Overrides [`FetcherConfig::mixed_content`](crate::net::fetcher::FetcherConfig::mixed_content)
+    /// for this one request; `None` uses the fetcher-wide setting. Requires `origin`.
+    pub mixed_content: Option<MixedContentPolicy>,
     /// HTTP Headers (unified).
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
@@ -449,9 +496,46 @@ impl FetchRequest {
             .map(|v| format!("{:x}", short_hash(v.as_bytes())))
             .unwrap_or_default();
 
+        // Requests are only interchangeable if they reach the same mixed content verdict —
+        // otherwise a permitted fetch would be handed to a subscriber that should have been
+        // blocked.
+        //
+        // This must NOT be narrowed by inspecting `self.url`: enforcement is per-hop, and a
+        // trustworthy https URL can 302 onto plain http. Bucketing an https request as
+        // "mixed content cannot apply" would let a leader with no origin follow that redirect
+        // and hand the http body to a secure-origin follower that asked to be blocked.
+        let mixed_content = if !self
+            .origin
+            .as_ref()
+            .is_some_and(is_origin_potentially_trustworthy)
+        {
+            // No secure document to protect, so every hop of this request resolves to Allow
+            // whatever the policy says. All such requests share one bucket.
+            "n"
+        } else {
+            // The fetcher-wide default is constant across one fetcher, so the per-request
+            // policy is all that can distinguish two verdicts here. The fetcher resolves
+            // `None` to the effective policy before keying; it only survives for requests
+            // keyed outside the scheduler.
+            match self.mixed_content {
+                None => "default",
+                Some(MixedContentPolicy::Allow) => "allow",
+                Some(MixedContentPolicy::Upgrade) => "upgrade",
+                Some(MixedContentPolicy::Block) => "block",
+            }
+        };
+
         Some(format!(
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={}",
-            self.method, url, range, accept, accept_lang, accept_enc, auth_hash, cookie_hash
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={}",
+            self.method,
+            url,
+            range,
+            accept,
+            accept_lang,
+            accept_enc,
+            auth_hash,
+            cookie_hash,
+            mixed_content
         ))
     }
 }
@@ -472,6 +556,8 @@ pub struct FetchRequestBuilder {
     method: Method,
     headers: HeaderMap,
     url: Url,
+    origin: Option<Origin>,
+    mixed_content: Option<MixedContentPolicy>,
     body: Option<RequestBody>,
 }
 
@@ -490,6 +576,8 @@ impl FetchRequestBuilder {
             streaming: false,
             auto_decode: false,
             max_bytes: None,
+            origin: None,
+            mixed_content: None,
             body: None,
         }
     }
@@ -554,6 +642,22 @@ impl FetchRequestBuilder {
         self
     }
 
+    /// Sets the origin of the document initiating the request, enabling mixed content checks.
+    ///
+    /// Typically `document_url.origin()`. Leaving this unset disables mixed content blocking
+    /// for the request — see [`mixed_content`](crate::net::mixed_content).
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+
+    /// Overrides the fetcher-wide mixed content policy. Use [`MixedContentPolicy::Allow`] for
+    /// optionally-blockable resources; requires [`with_origin`](Self::with_origin).
+    pub fn with_mixed_content(mut self, policy: MixedContentPolicy) -> Self {
+        self.mixed_content = Some(policy);
+        self
+    }
+
     /// Sets the HTTP method of the request
     pub fn with_method(mut self, method: Method) -> Self {
         self.method = method;
@@ -580,6 +684,8 @@ impl FetchRequestBuilder {
             headers: self.headers,
             method: self.method,
             url: self.url,
+            origin: self.origin,
+            mixed_content: self.mixed_content,
             body: self.body,
         }
     }
@@ -705,13 +811,93 @@ mod tests {
         let auth_hash = format!("{:x}", short_hash(b"Bearer abc"));
         let cookie_hash = format!("{:x}", short_hash(b"a=1; b=2"));
         let expected = format!(
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={}",
+            // MC=n: an https target can never be mixed content, so the policy is irrelevant.
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n",
             fr.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash
         );
 
         assert_eq!(key, expected);
         assert!(key.starts_with("M=GET;U=https://example.org/a/b"));
         assert!(!key.contains("#frag"));
+    }
+
+    /// Two documents fetching the same insecure URL must not coalesce when only one of them is
+    /// a secure context — otherwise the insecure document's allowed fetch would be handed to the
+    /// secure one, silently defeating mixed content blocking.
+    #[test]
+    fn coalescing_key_separates_secure_from_insecure_initiators() {
+        let target = Url::parse("http://cdn.example.org/a.js").unwrap();
+        let key_for = |origin: Option<&str>| {
+            let mut b = FetchRequest::builder(Method::GET, target.clone());
+            if let Some(o) = origin {
+                b = b.with_origin(Url::parse(o).unwrap().origin());
+            }
+            b.build().generate_request_key().unwrap()
+        };
+
+        let secure = key_for(Some("https://a.example.com"));
+        let insecure = key_for(Some("http://b.example.com"));
+        let none = key_for(None);
+
+        assert_ne!(secure, insecure);
+        // No origin means no document to protect, so it shares the insecure verdict.
+        assert_eq!(insecure, none);
+        // Two different secure origins reach the same verdict and should still coalesce,
+        // otherwise every document would get its own connection for shared assets.
+        assert_eq!(secure, key_for(Some("https://c.example.com")));
+    }
+
+    /// A permitted image and a blocked script can target the same insecure URL from the same
+    /// page. They must not coalesce, or the script would inherit the image's fetched body.
+    #[test]
+    fn coalescing_key_separates_per_request_policy_overrides() {
+        let target = Url::parse("http://cdn.example.org/a.js").unwrap();
+        let origin = Url::parse("https://example.com").unwrap().origin();
+        let key_for = |policy: Option<MixedContentPolicy>| {
+            let mut b =
+                FetchRequest::builder(Method::GET, target.clone()).with_origin(origin.clone());
+            if let Some(p) = policy {
+                b = b.with_mixed_content(p);
+            }
+            b.build().generate_request_key().unwrap()
+        };
+
+        let keys = [
+            key_for(None),
+            key_for(Some(MixedContentPolicy::Allow)),
+            key_for(Some(MixedContentPolicy::Upgrade)),
+            key_for(Some(MixedContentPolicy::Block)),
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b, "each policy reaches a different verdict");
+            }
+        }
+    }
+
+    /// Regression: an `https` target must NOT be treated as "mixed content cannot apply".
+    ///
+    /// Enforcement is per-hop, so an https URL that 302s onto plain http is still a mixed
+    /// content decision. Bucketing on the initial URL's scheme let a leader with no origin
+    /// follow that redirect and hand the http body to a secure-origin follower that had asked
+    /// to be blocked — defeating the feature entirely.
+    #[test]
+    fn coalescing_key_does_not_trust_an_https_initial_url() {
+        let target = Url::parse("https://redirector.example.org/r").unwrap();
+        let key = |origin: Option<&str>| {
+            let mut b = FetchRequest::builder(Method::GET, target.clone());
+            if let Some(o) = origin {
+                b = b.with_origin(Url::parse(o).unwrap().origin());
+            }
+            b.build().generate_request_key().unwrap()
+        };
+
+        assert_ne!(
+            key(Some("https://example.com")),
+            key(None),
+            "a secure-origin request must not share a bucket with an unprotected one, \
+             however trustworthy the initial URL looks"
+        );
     }
 
     #[test]

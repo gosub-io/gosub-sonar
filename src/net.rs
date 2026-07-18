@@ -18,6 +18,7 @@ pub mod fetcher_context;
 pub(crate) mod fs_utils;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod hsts;
+pub mod mixed_content;
 pub mod null_emitter;
 pub mod observer;
 #[cfg(not(target_arch = "wasm32"))]

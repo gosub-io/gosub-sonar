@@ -23,10 +23,13 @@
 // unwrap/expect/panic denial only exempts cfg(test), not the `test-support` feature build.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use crate::net::events::NetEvent;
+use crate::net::observer::NetObserver;
+use crate::net::types::BlockReason;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
@@ -78,6 +81,9 @@ pub enum RouteConfig {
     /// 307 redirect to another `path` on this server. Unlike the 302 variants, the client
     /// must preserve the method and replay the request body.
     Redirect307(String),
+    /// 302 redirect to a verbatim absolute URL, which may point off this server.
+    /// Use to exercise cross-origin and cross-scheme redirect handling.
+    RedirectAbsolute(String),
     /// 302 redirect to the same path on every request — creates an infinite redirect loop.
     RedirectSelf,
     /// 302 without a Location header (malformed redirect).
@@ -153,6 +159,10 @@ impl RouteConfig {
     /// Shorthand for [`RouteConfig::Redirect307`]
     pub fn redirect_307(path: impl Into<String>) -> Self {
         Self::Redirect307(path.into())
+    }
+    /// Shorthand for [`RouteConfig::RedirectAbsolute`]
+    pub fn redirect_absolute(target: impl Into<String>) -> Self {
+        Self::RedirectAbsolute(target.into())
     }
     /// Shorthand for [`RouteConfig::GzipOk`]
     pub fn gzip_ok(body: impl Into<Vec<u8>>) -> Self {
@@ -302,6 +312,13 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             let hdr = format!(
                 "HTTP/1.1 307 Temporary Redirect\r\nLocation: {}{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 base, target
+            );
+            let _ = stream.write_all(hdr.as_bytes()).await;
+        }
+        RouteConfig::RedirectAbsolute(target) => {
+            let hdr = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                target
             );
             let _ = stream.write_all(hdr.as_bytes()).await;
         }
@@ -599,5 +616,60 @@ impl TestServerHandle {
 impl Drop for TestServerHandle {
     fn drop(&mut self) {
         self.shutdown.cancel();
+    }
+}
+
+/// A [`NetObserver`] that records every event it receives, for tests that need to assert on
+/// the event stream rather than just the final result.
+///
+/// Some behaviour is only observable this way: a mixed content *upgrade* rewrites the URL and
+/// then fetches normally, so the returned result looks identical whether or not the rewrite
+/// happened. The emitted event is the only evidence.
+#[derive(Default)]
+pub struct RecordingObserver {
+    events: Mutex<Vec<NetEvent>>,
+}
+
+impl RecordingObserver {
+    /// Create an observer with an empty event log.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The reason of the first [`NetEvent::Blocked`] recorded, if any.
+    pub fn blocked_reason(&self) -> Option<BlockReason> {
+        self.events.lock().unwrap().iter().find_map(|e| match e {
+            NetEvent::Blocked { reason, .. } => Some(*reason),
+            _ => None,
+        })
+    }
+
+    /// Every [`NetEvent::Warning`] message recorded, in order.
+    pub fn warnings(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Warning { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Number of events recorded so far.
+    pub fn len(&self) -> usize {
+        self.events.lock().unwrap().len()
+    }
+
+    /// True when no events have been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl NetObserver for RecordingObserver {
+    fn on_event(&self, ev: NetEvent) {
+        self.events.lock().unwrap().push(ev);
     }
 }

@@ -61,6 +61,7 @@ pub use net::fetcher::{Fetcher, FetcherConfig};
 pub use net::fetcher_context::{FetcherContext, NullContext};
 #[cfg(not(target_arch = "wasm32"))]
 pub use net::hsts::{HstsEntry, HstsStore, InMemoryHstsStore};
+pub use net::mixed_content::MixedContentPolicy;
 pub use net::null_emitter::NullEmitter;
 pub use net::observer::NetObserver;
 pub use net::request_ref::RequestReference;
@@ -69,7 +70,7 @@ pub use net::simple::simple_get;
 #[cfg(not(target_arch = "wasm32"))]
 pub use net::simple::{sync_fetch, sync_get};
 pub use net::types::{
-    BoxedAsyncRead, FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta, Initiator,
-    NetError, Priority, RequestBody, ResourceKind,
+    BlockReason, BoxedAsyncRead, FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta,
+    Initiator, NetError, Priority, RequestBody, ResourceKind,
 };
 pub use types::{PeekBuf, RequestId};

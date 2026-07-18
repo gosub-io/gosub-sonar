@@ -4,8 +4,9 @@ use crate::net::events::NetEvent;
 use crate::net::fetcher_context::FetcherContext;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::hsts::{self, HstsStore};
+use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
 use crate::net::observer::NetObserver;
-use crate::net::types::{FetchResultMeta, NetError, RequestBody};
+use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody};
 use crate::types::PeekBuf;
 use anyhow::{anyhow, Context};
 use bytes::{Bytes, BytesMut};
@@ -18,10 +19,61 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::timeout;
 use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
-use url::Url;
+use url::{Origin, Url};
 
 /// Headers that must be stripped when following a redirect to a different origin (RFC 9110 §15.4).
 const SENSITIVE_REDIRECT_HEADERS: &[header::HeaderName] = &[header::AUTHORIZATION, header::COOKIE];
+
+/// Emit the block event and build the matching error, so the two can never drift apart.
+pub(crate) fn blocked(
+    observer: &Arc<dyn NetObserver + Send + Sync>,
+    url: Url,
+    reason: BlockReason,
+) -> NetError {
+    observer.on_event(NetEvent::Blocked {
+        url: url.clone(),
+        reason,
+    });
+    NetError::Blocked { reason, url }
+}
+
+/// What [`preflight`] decided about one hop.
+pub(crate) enum Preflight {
+    /// Send the request to this URL, which may be an upgraded form of the one checked.
+    Proceed(Url),
+    /// Refuse the request.
+    Reject(BlockReason),
+}
+
+/// Apply the pre-dispatch checks to a single hop: scheme allowlist, mixed content, then the
+/// embedder's URL allowlist.
+///
+/// Both the scheduler's pre-dispatch check and the per-hop redirect loop call this, so the two
+/// cannot reach different conclusions about the same URL. Order matters: a mixed content upgrade
+/// rewrites the URL, and `url_allowed` must vet the URL that will actually be sent — an embedder
+/// that rejects `http://` should not see a request the upgrade would have made `https://`.
+pub(crate) fn preflight(
+    url: &Url,
+    mixed_content: MixedContentPolicy,
+    origin: Option<&Origin>,
+    url_allowed: &dyn Fn(&Url) -> bool,
+) -> Preflight {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Preflight::Reject(BlockReason::UnsupportedScheme);
+    }
+
+    let target = match mixed_content::evaluate(mixed_content, origin, url) {
+        MixedContentAction::Allow => url.clone(),
+        MixedContentAction::Upgrade(upgraded) => upgraded,
+        MixedContentAction::Block => return Preflight::Reject(BlockReason::MixedContent),
+    };
+
+    if !url_allowed(&target) {
+        return Preflight::Reject(BlockReason::UrlPolicy);
+    }
+
+    Preflight::Proceed(target)
+}
 
 /// Callback type for the URL allowlist check.
 pub type UrlFilter = Box<dyn Fn(&Url) -> bool + Send + Sync>;
@@ -104,6 +156,12 @@ pub struct RequestInit {
     /// Optional body. `None` for GET/HEAD.
     /// Automatically dropped when a 301, 302, or 303 redirect requires a method downgrade.
     pub body: Option<RequestBody>,
+    /// Origin of the document that initiated this request. `None` disables mixed content
+    /// checks; see [`mixed_content`](mod@crate::net::mixed_content).
+    pub origin: Option<Origin>,
+    /// How to treat an insecure hop requested by a secure `origin`. Applied to the initial URL
+    /// and re-applied to every redirect target.
+    pub mixed_content: MixedContentPolicy,
 }
 
 impl Default for RequestInit {
@@ -115,29 +173,40 @@ impl Default for RequestInit {
 impl RequestInit {
     /// Plain GET request with the given headers and no body.
     pub fn get(headers: HeaderMap) -> Self {
-        Self {
-            method: Method::GET,
-            headers,
-            body: None,
-        }
+        Self::new(Method::GET, headers, None)
     }
 
     /// POST request with the given headers and body bytes.
     pub fn post(headers: HeaderMap, body: impl Into<Bytes>) -> Self {
-        Self {
-            method: Method::POST,
-            headers,
-            body: Some(RequestBody::bytes(body.into())),
-        }
+        Self::new(Method::POST, headers, Some(RequestBody::bytes(body.into())))
     }
 
     /// Request with an explicit method, headers, and optional body.
+    ///
+    /// Mixed content checks are off until an origin is supplied — see
+    /// [`with_mixed_content`](Self::with_mixed_content).
     pub fn new(method: Method, headers: HeaderMap, body: Option<RequestBody>) -> Self {
         Self {
             method,
             headers,
             body,
+            origin: None,
+            mixed_content: MixedContentPolicy::default(),
         }
+    }
+
+    /// Attach the initiating document's origin and the policy to apply to insecure hops.
+    ///
+    /// With `origin` set to `None` the policy has no effect: mixed content is defined relative
+    /// to a document, and without one there is nothing to protect.
+    pub fn with_mixed_content(
+        mut self,
+        origin: Option<Origin>,
+        policy: MixedContentPolicy,
+    ) -> Self {
+        self.origin = origin;
+        self.mixed_content = policy;
+        self
     }
 }
 
@@ -541,6 +610,8 @@ pub async fn fetch_response_complete(
 /// - `Authorization` and `Cookie` are stripped on cross-origin redirects (RFC 9110 §15.4);
 ///   the cookie jar is re-queried for the new origin.
 /// - Only `http` and `https` targets are followed; other schemes are rejected.
+/// - Insecure hops requested by a secure `init.origin` are blocked or upgraded per
+///   `init.mixed_content`, re-evaluated at every hop so a redirect cannot escape the check.
 /// - `policy.url_allowed` and `policy.cookies_for` are called at every hop.
 /// - `Set-Cookie` values on 3xx responses are reported via `policy.on_cookies` and the jar is
 ///   re-queried for the next hop; the final response's cookies are the caller's responsibility.
@@ -556,18 +627,14 @@ async fn get_with_redirects(
     let mut current_method = init.method;
     let mut current_headers = init.headers;
     let mut current_body = init.body;
+    let origin = init.origin;
 
     for _ in 0..MAX_REDIRECTS {
-        // Scheme allowlist — only http/https are safe to follow
-        if !matches!(url.scheme(), "http" | "https") {
-            return Err(NetError::Redirect(Arc::new(anyhow!(
-                "unsupported URL scheme '{}': only http and https are allowed",
-                url.scheme()
-            ))));
-        }
-
-        // HSTS upgrade, before the policy check so the hook sees the URL that will actually be
-        // requested, and before any connection is opened so the plaintext request never happens.
+        // HSTS upgrade first: a stored policy forces `https` for a known host regardless of the
+        // mixed-content setting. `preflight` then re-checks the scheme and mixed content on the
+        // (possibly upgraded) URL and runs `url_allowed` last, so the policy hook always vets the
+        // URL actually sent. All of this re-runs on every hop: an https document may be redirected
+        // onto plain http, which the caller cannot see and so cannot check for itself.
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ref store) = policy.hsts {
             if hsts::should_upgrade(store.as_ref(), &url, chrono::Utc::now()) {
@@ -575,12 +642,19 @@ async fn get_with_redirects(
             }
         }
 
-        // Policy check (SSRF / blocklist hook)
-        if !(policy.url_allowed)(&url) {
-            return Err(NetError::Redirect(Arc::new(anyhow!(
-                "URL blocked by policy: {}",
-                url
-            ))));
+        match preflight(&url, init.mixed_content, origin.as_ref(), &|u| {
+            (policy.url_allowed)(u)
+        }) {
+            Preflight::Reject(reason) => return Err(blocked(&observer, url, reason)),
+            Preflight::Proceed(target) => {
+                if target != url {
+                    observer.on_event(NetEvent::Warning {
+                        url: url.clone(),
+                        message: format!("upgraded insecure request to {target}"),
+                    });
+                    url = target;
+                }
+            }
         }
 
         // Inject cookies from the jar for this hop's origin.
@@ -717,9 +791,10 @@ async fn get_with_redirects(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::net::test_support::{RouteConfig, TestServer};
+    use crate::net::test_support::{RecordingObserver, RouteConfig, TestServer};
     use cow_utils::CowUtils;
     use http::HeaderMap;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
@@ -1320,8 +1395,235 @@ mod tests {
             },
         )
         .await;
+        assert!(matches!(
+            res.err(),
+            Some(NetError::Blocked {
+                reason: BlockReason::UrlPolicy,
+                ..
+            })
+        ));
+    }
+
+    /// A secure document must not reach a plain-http sub-resource. No server is needed — the
+    /// block happens before any connection is attempted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_content_blocks_insecure_subresource() {
+        let res = super::fetch_response_top(
+            client(),
+            Url::parse("http://insecure.example.com/a.js").unwrap(),
+            RequestInit::get(HeaderMap::new()).with_mixed_content(
+                Some(Url::parse("https://example.com").unwrap().origin()),
+                MixedContentPolicy::Block,
+            ),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default(),
+        )
+        .await;
+        assert!(matches!(
+            res.err(),
+            Some(NetError::Blocked {
+                reason: BlockReason::MixedContent,
+                ..
+            })
+        ));
+    }
+
+    /// The test server binds to loopback, which is potentially trustworthy — the same request
+    /// must go through. Guards against over-blocking, not under-blocking.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_content_allows_loopback_subresource() {
+        let srv = server().await;
+        assert!(srv.url("/big").host_str().unwrap().contains("127.0.0.1"));
+        let ResponseTop { meta, .. } = super::fetch_response_top(
+            client(),
+            srv.url("/big"),
+            RequestInit::get(HeaderMap::new()).with_mixed_content(
+                Some(Url::parse("https://example.com").unwrap().origin()),
+                MixedContentPolicy::Block,
+            ),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+    }
+
+    /// An insecure document has nothing to downgrade, so the check must not fire for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_content_ignores_insecure_initiator() {
+        let srv = server().await;
+        let ResponseTop { meta, .. } = super::fetch_response_top(
+            client(),
+            srv.url("/big"),
+            RequestInit::get(HeaderMap::new()).with_mixed_content(
+                Some(Url::parse("http://example.com").unwrap().origin()),
+                MixedContentPolicy::Block,
+            ),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+    }
+
+    /// The case an embedder cannot check for itself: the initial URL is fine, and the *redirect
+    /// target* is the insecure hop. Enforcement has to live inside the redirect loop to catch it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_content_blocks_insecure_redirect_target() {
+        // Loopback is trustworthy, so redirect off-box to get a genuinely insecure hop.
+        let srv = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute("http://insecure.example.com/a.js"),
+            )
+            .start()
+            .await;
+
+        let res = super::fetch_response_top(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()).with_mixed_content(
+                Some(Url::parse("https://example.com").unwrap().origin()),
+                MixedContentPolicy::Block,
+            ),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default(),
+        )
+        .await;
+
+        match res.err() {
+            Some(NetError::Blocked { reason, url }) => {
+                assert_eq!(reason, BlockReason::MixedContent);
+                // The blocked hop is reported, not the URL originally requested.
+                assert_eq!(url.as_str(), "http://insecure.example.com/a.js");
+            }
+            other => panic!("expected a mixed content block, got {other:?}"),
+        }
+    }
+
+    /// Under `Upgrade` the same redirect is rewritten to https instead of blocked.
+    ///
+    /// Asserting only "did not block" would be worthless here: an `Upgrade` silently degraded to
+    /// `Allow` would send plain http to a host that does not resolve and fail identically. The
+    /// emitted warning naming the https URL is the only evidence the rewrite actually happened.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_content_upgrades_insecure_redirect_target() {
+        let srv = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute("http://insecure.invalid/a.js"),
+            )
+            .start()
+            .await;
+
+        let rec = Arc::new(RecordingObserver::new());
+        let res = super::fetch_response_top(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()).with_mixed_content(
+                Some(Url::parse("https://example.com").unwrap().origin()),
+                MixedContentPolicy::Upgrade,
+            ),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await;
+
+        assert_eq!(
+            rec.warnings(),
+            vec!["upgraded insecure request to https://insecure.invalid/a.js"],
+            "the hop must be rewritten to https"
+        );
+        assert!(
+            !matches!(res.as_ref().err(), Some(NetError::Blocked { .. })),
+            "upgrade must rewrite the hop, not block it"
+        );
+        assert_eq!(rec.blocked_reason(), None);
+    }
+
+    /// A block must be observable, not just returned. Devtools has no other way to report why a
+    /// resource never loaded, and nothing else in the test suite asserts the event is emitted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_emits_a_blocked_event() {
+        let rec = Arc::new(RecordingObserver::new());
+        let res = super::fetch_response_top(
+            client(),
+            Url::parse("http://insecure.example.com/a.js").unwrap(),
+            RequestInit::get(HeaderMap::new()).with_mixed_content(
+                Some(Url::parse("https://example.com").unwrap().origin()),
+                MixedContentPolicy::Block,
+            ),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await;
+
         assert!(res.is_err());
-        assert!(res.err().unwrap().to_string().contains("blocked"));
+        assert_eq!(rec.blocked_reason(), Some(BlockReason::MixedContent));
+    }
+
+    /// The URL allowlist rejection must be observable too — same helper, same guarantee.
+    #[tokio::test(flavor = "current_thread")]
+    async fn url_filter_block_emits_a_blocked_event() {
+        let srv = server().await;
+        let rec = Arc::new(RecordingObserver::new());
+        let res = super::fetch_response_top(
+            client(),
+            srv.url("/big"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy {
+                url_allowed: Box::new(|_| false),
+                ..NetPolicy::default()
+            },
+        )
+        .await;
+
+        assert!(res.is_err());
+        assert_eq!(rec.blocked_reason(), Some(BlockReason::UrlPolicy));
+    }
+
+    /// Regression: `url_allowed` must see the post-upgrade URL. An embedder that rejects plain
+    /// http would otherwise kill a request the upgrade would have made https — and the two check
+    /// sites (scheduler pre-flight and redirect loop) must agree on that.
+    #[tokio::test(flavor = "current_thread")]
+    async fn url_allowlist_vets_the_upgraded_url() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+
+        let _ = super::fetch_response_top(
+            client(),
+            Url::parse("http://insecure.invalid/a.js").unwrap(),
+            RequestInit::get(HeaderMap::new()).with_mixed_content(
+                Some(Url::parse("https://example.com").unwrap().origin()),
+                MixedContentPolicy::Upgrade,
+            ),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy {
+                url_allowed: Box::new(move |u| {
+                    seen_cb.lock().unwrap().push(u.to_string());
+                    true
+                }),
+                ..NetPolicy::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["https://insecure.invalid/a.js"],
+            "the allowlist must be shown the upgraded URL, never the http original"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
