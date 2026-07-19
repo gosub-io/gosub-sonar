@@ -573,6 +573,7 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
     });
     RequestInit::new(req.method.clone(), headers, body)
         .with_mixed_content(req.origin.clone(), effective_mixed_content(req, cfg))
+        .with_referrer(req.referrer.clone(), req.referrer_policy)
 }
 
 /// Build a reqwest client from `FetcherConfig`.
@@ -796,6 +797,8 @@ mod tests {
             kind: ResourceKind::Primary,
             origin: None,
             mixed_content: None,
+            referrer: None,
+            referrer_policy: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -821,6 +824,8 @@ mod tests {
                 kind: ResourceKind::Primary,
                 origin: None,
                 mixed_content: None,
+                referrer: None,
+                referrer_policy: Default::default(),
                 streaming: false,
                 auto_decode: true,
                 max_bytes: None,
@@ -1038,6 +1043,8 @@ mod tests {
             kind: ResourceKind::Primary,
             origin: None,
             mixed_content: None,
+            referrer: None,
+            referrer_policy: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1149,6 +1156,8 @@ mod tests {
             kind: ResourceKind::Primary,
             origin: None,
             mixed_content: None,
+            referrer: None,
+            referrer_policy: Default::default(),
             streaming: true,
             auto_decode: true,
             max_bytes: None,
@@ -1588,6 +1597,8 @@ mod tests {
             kind: ResourceKind::Primary,
             origin: None,
             mixed_content: None,
+            referrer: None,
+            referrer_policy: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1946,6 +1957,8 @@ mod tests {
             kind: ResourceKind::Primary,
             origin: None,
             mixed_content: None,
+            referrer: None,
+            referrer_policy: Default::default(),
             streaming: false,
             auto_decode,
             max_bytes: None,

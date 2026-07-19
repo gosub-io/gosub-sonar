@@ -99,6 +99,18 @@ pub enum RouteConfig {
     /// Respond 200 with the request's `Cookie` header value as the body (empty if absent).
     /// Use to verify which cookies a request actually carried.
     EchoCookieHeader,
+    /// Respond 200 with the request's `Referer` header value as the body, or the literal
+    /// `<absent>` when there is no such header — so a missing header is distinguishable from a
+    /// present but empty one. Use to verify what referrer a request actually carried.
+    EchoRefererHeader,
+    /// 302 redirect to `target` that also carries a `Referrer-Policy: policy` header.
+    /// Use to verify a policy change applied mid-redirect-chain.
+    RedirectWithReferrerPolicy {
+        /// Path to redirect to
+        target: String,
+        /// Value sent in the `Referrer-Policy` header
+        policy: String,
+    },
     /// Accept the TCP connection but never send any data.
     /// Use to trigger `req_timeout` (the client's request timeout).
     HangAfterConnect,
@@ -190,6 +202,20 @@ impl RouteConfig {
     /// Shorthand for [`RouteConfig::EchoCookieHeader`]
     pub fn echo_cookie_header() -> Self {
         Self::EchoCookieHeader
+    }
+    /// Shorthand for [`RouteConfig::EchoRefererHeader`]
+    pub fn echo_referer_header() -> Self {
+        Self::EchoRefererHeader
+    }
+    /// Shorthand for [`RouteConfig::RedirectWithReferrerPolicy`]
+    pub fn redirect_with_referrer_policy(
+        target: impl Into<String>,
+        policy: impl Into<String>,
+    ) -> Self {
+        Self::RedirectWithReferrerPolicy {
+            target: target.into(),
+            policy: policy.into(),
+        }
     }
     /// Shorthand for [`RouteConfig::HangAfterConnect`]
     pub fn hang_after_connect() -> Self {
@@ -348,6 +374,21 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
                 .unwrap_or_default();
             send_response(&mut stream, 200, cookie.as_bytes()).await;
+        }
+        RouteConfig::RedirectWithReferrerPolicy { target, policy } => {
+            let hdr = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {}{}\r\nReferrer-Policy: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                base, target, policy
+            );
+            let _ = stream.write_all(hdr.as_bytes()).await;
+        }
+        RouteConfig::EchoRefererHeader => {
+            let referer = req
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("referer:"))
+                .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+                .unwrap_or_else(|| "<absent>".to_string());
+            send_response(&mut stream, 200, referer.as_bytes()).await;
         }
         RouteConfig::HangAfterConnect => {
             // Hold the connection open without sending anything.

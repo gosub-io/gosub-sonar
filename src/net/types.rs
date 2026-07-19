@@ -1,6 +1,7 @@
 //! Core types for fetch requests, responses, errors, and priorities.
 
 use crate::net::mixed_content::{is_origin_potentially_trustworthy, MixedContentPolicy};
+use crate::net::referrer::{self, ReferrerPolicy};
 use crate::net::request_ref::RequestReference;
 use crate::net::shared_body::SharedBody;
 use crate::net::utils::{normalize_url, short_hash, BytesAsyncReader};
@@ -447,6 +448,13 @@ pub struct FetchRequest {
     /// Overrides [`FetcherConfig::mixed_content`](crate::net::fetcher::FetcherConfig::mixed_content)
     /// for this one request; `None` uses the fetcher-wide setting. Requires `origin`.
     pub mixed_content: Option<MixedContentPolicy>,
+    /// URL of the document that initiated this request, used to compute the `Referer` header.
+    ///
+    /// `None` sends no `Referer` at all. Any `Referer` set by hand in `headers` is overwritten
+    /// when this is set. See [`referrer`](mod@crate::net::referrer).
+    pub referrer: Option<Url>,
+    /// How much of `referrer` to reveal. Ignored when `referrer` is `None`.
+    pub referrer_policy: ReferrerPolicy,
     /// HTTP Headers (unified).
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
@@ -525,8 +533,50 @@ impl FetchRequest {
             }
         };
 
+        // Servers vary on `Referer` — hotlink protection is the common case — so requests that
+        // would send different values must not share a response.
+        //
+        // Keyed on the *inputs* rather than the value computed for `self.url`: the header is
+        // recomputed at every hop, so two requests that agree on the first hop can still diverge
+        // after a redirect.
+        let referrer = match self.referrer.as_ref() {
+            Some(r) if !referrer::never_sends(r, self.referrer_policy) => {
+                // Under an origin-only policy the path can never be revealed on any hop, so
+                // every page on one origin sends byte-identical values and can share a bucket.
+                // The rest must split on the full URL.
+                let source = match self.referrer_policy {
+                    ReferrerPolicy::Origin | ReferrerPolicy::StrictOrigin => {
+                        r.origin().ascii_serialization()
+                    }
+                    _ => r.as_str().to_string(),
+                };
+                // An explicit token rather than `{:?}`, so renaming a variant cannot silently
+                // change how requests bucket.
+                let policy = match self.referrer_policy {
+                    ReferrerPolicy::NoReferrer => "no-referrer",
+                    ReferrerPolicy::NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
+                    ReferrerPolicy::SameOrigin => "same-origin",
+                    ReferrerPolicy::Origin => "origin",
+                    ReferrerPolicy::StrictOrigin => "strict-origin",
+                    ReferrerPolicy::OriginWhenCrossOrigin => "origin-when-cross-origin",
+                    ReferrerPolicy::StrictOriginWhenCrossOrigin => {
+                        "strict-origin-when-cross-origin"
+                    }
+                    ReferrerPolicy::UnsafeUrl => "unsafe-url",
+                };
+                format!("{:x}:{}", short_hash(source.as_bytes()), policy)
+            }
+            // No referrer of our own to send. A hand-set `Referer` still goes out verbatim on the
+            // first hop, and it varies the response just as a computed one would, so it has to
+            // vary the key too.
+            _ => match self.headers.get(header::REFERER) {
+                Some(manual) => format!("h{:x}", short_hash(manual.as_bytes())),
+                None => "n".to_string(),
+            },
+        };
+
         Some(format!(
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={}",
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={}",
             self.method,
             url,
             range,
@@ -535,7 +585,8 @@ impl FetchRequest {
             accept_enc,
             auth_hash,
             cookie_hash,
-            mixed_content
+            mixed_content,
+            referrer
         ))
     }
 }
@@ -558,6 +609,8 @@ pub struct FetchRequestBuilder {
     url: Url,
     origin: Option<Origin>,
     mixed_content: Option<MixedContentPolicy>,
+    referrer: Option<Url>,
+    referrer_policy: ReferrerPolicy,
     body: Option<RequestBody>,
 }
 
@@ -578,6 +631,8 @@ impl FetchRequestBuilder {
             max_bytes: None,
             origin: None,
             mixed_content: None,
+            referrer: None,
+            referrer_policy: ReferrerPolicy::default(),
             body: None,
         }
     }
@@ -658,6 +713,19 @@ impl FetchRequestBuilder {
         self
     }
 
+    /// Sets the URL of the initiating document, enabling the `Referer` header.
+    /// Unset sends no referrer. See [`referrer`](mod@crate::net::referrer).
+    pub fn with_referrer(mut self, referrer: Url) -> Self {
+        self.referrer = Some(referrer);
+        self
+    }
+
+    /// Sets how much of the referrer to reveal. Requires [`with_referrer`](Self::with_referrer).
+    pub fn with_referrer_policy(mut self, policy: ReferrerPolicy) -> Self {
+        self.referrer_policy = policy;
+        self
+    }
+
     /// Sets the HTTP method of the request
     pub fn with_method(mut self, method: Method) -> Self {
         self.method = method;
@@ -686,6 +754,8 @@ impl FetchRequestBuilder {
             url: self.url,
             origin: self.origin,
             mixed_content: self.mixed_content,
+            referrer: self.referrer,
+            referrer_policy: self.referrer_policy,
             body: self.body,
         }
     }
@@ -811,8 +881,8 @@ mod tests {
         let auth_hash = format!("{:x}", short_hash(b"Bearer abc"));
         let cookie_hash = format!("{:x}", short_hash(b"a=1; b=2"));
         let expected = format!(
-            // MC=n: an https target can never be mixed content, so the policy is irrelevant.
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n",
+            // MC=n: no secure initiating origin. Ref=n: no referrer set, so none is ever sent.
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n",
             fr.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash
         );
 
@@ -897,6 +967,94 @@ mod tests {
             key(None),
             "a secure-origin request must not share a bucket with an unprotected one, \
              however trustworthy the initial URL looks"
+        );
+    }
+
+    /// Two documents fetching the same URL send different `Referer` values, and servers vary on
+    /// it (hotlink protection). They must not share one response.
+    #[test]
+    fn coalescing_key_separates_different_referrers() {
+        let target = Url::parse("https://cdn.example.org/a.js").unwrap();
+        let key = |referrer: Option<&str>, policy: ReferrerPolicy| {
+            let mut b =
+                FetchRequest::builder(Method::GET, target.clone()).with_referrer_policy(policy);
+            if let Some(r) = referrer {
+                b = b.with_referrer(Url::parse(r).unwrap());
+            }
+            b.build().generate_request_key().unwrap()
+        };
+        let default = ReferrerPolicy::default();
+
+        assert_ne!(
+            key(Some("https://a.example.com/x"), default),
+            key(Some("https://b.example.com/y"), default)
+        );
+        // Same source, different policy — different amounts of it get revealed.
+        assert_ne!(
+            key(Some("https://a.example.com/x"), default),
+            key(Some("https://a.example.com/x"), ReferrerPolicy::UnsafeUrl)
+        );
+        // Identical inputs coalesce, which is the common case: one page, many sub-resources.
+        assert_eq!(
+            key(Some("https://a.example.com/x"), default),
+            key(Some("https://a.example.com/x"), default)
+        );
+        // Anything that never sends a header shares one bucket, whatever the source.
+        assert_eq!(key(None, default), key(None, ReferrerPolicy::UnsafeUrl));
+        assert_eq!(
+            key(None, default),
+            key(Some("https://a.example.com/x"), ReferrerPolicy::NoReferrer)
+        );
+    }
+
+    /// The key must not be derived from the value computed for the request's own URL.
+    ///
+    /// Two pages on one origin agree on what to send cross-origin (the bare origin), then differ
+    /// the moment a redirect lands back home and the full path is revealed. Keying on the hop-0
+    /// value would coalesce them and send one page's path on the other's behalf.
+    #[test]
+    fn coalescing_key_is_not_derived_from_the_first_hop_value() {
+        let target = Url::parse("https://other.example.org/r").unwrap();
+        let key = |referrer: &str| {
+            FetchRequest::builder(Method::GET, target.clone())
+                .with_referrer(Url::parse(referrer).unwrap())
+                .build()
+                .generate_request_key()
+                .unwrap()
+        };
+
+        let (a, b) = ("https://example.com/page-a", "https://example.com/page-b");
+        // Both send the bare origin to this cross-origin target, so hop 0 is identical...
+        let policy = ReferrerPolicy::default();
+        let hop0 = |r: &str| {
+            referrer::determine(&Url::parse(r).unwrap(), policy, &target).map(|u| u.to_string())
+        };
+        assert_eq!(hop0(a), hop0(b));
+        // ...but the keys must still differ, because a redirect home would diverge.
+        assert_ne!(key(a), key(b));
+    }
+
+    /// A hand-set `Referer` goes out verbatim, so it varies the response just as a computed one
+    /// would and must vary the key too.
+    #[test]
+    fn coalescing_key_accounts_for_a_hand_set_referer_header() {
+        let target = Url::parse("https://cdn.example.org/a.js").unwrap();
+        let key = |manual: Option<&str>| {
+            let mut req = FetchRequest::builder(Method::GET, target.clone()).build();
+            if let Some(value) = manual {
+                req.headers.insert(header::REFERER, value.parse().unwrap());
+            }
+            req.generate_request_key().unwrap()
+        };
+
+        assert_ne!(key(Some("https://a.example.com/x")), key(None));
+        assert_ne!(
+            key(Some("https://a.example.com/x")),
+            key(Some("https://b.example.com/y"))
+        );
+        assert_eq!(
+            key(Some("https://a.example.com/x")),
+            key(Some("https://a.example.com/x"))
         );
     }
 

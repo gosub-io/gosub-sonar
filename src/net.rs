@@ -23,6 +23,7 @@ pub mod null_emitter;
 pub mod observer;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod pump;
+pub mod referrer;
 pub mod request_ref;
 pub mod shared_body;
 pub mod simple;
