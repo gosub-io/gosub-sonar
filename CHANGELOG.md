@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per send attempt, so 307/308 redirects can replay the body), and
   `RequestBody::file` streams a file from disk without buffering it. Native
   targets only.
+- Connection-pool tuning in `FetcherConfig`: `pool_max_idle_per_host`
+  (default 6), `pool_idle_timeout` (default 90s), and `tcp_keepalive`
+  (default 60s). Previously reqwest's defaults applied: an unbounded idle
+  pool and no keepalive.
 - `test-support`: the mock server can now serve HTTPS — `TestServer::tls(domain)` with
   `TestServerHandle::{cert_pem, socket_addr, tls_domain}` — `RouteConfig::ok_with_headers`
   responds 200 with arbitrary extra response headers, and `RouteConfig::redirect_307`
