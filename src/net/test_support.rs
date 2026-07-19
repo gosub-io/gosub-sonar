@@ -75,6 +75,9 @@ pub enum RouteConfig {
     },
     /// 302 redirect to another `path` on this server.
     RedirectTo(String),
+    /// 307 redirect to another `path` on this server. Unlike the 302 variants, the client
+    /// must preserve the method and replay the request body.
+    Redirect307(String),
     /// 302 redirect to the same path on every request — creates an infinite redirect loop.
     RedirectSelf,
     /// 302 without a Location header (malformed redirect).
@@ -146,6 +149,10 @@ impl RouteConfig {
     /// Shorthand for [`RouteConfig::RedirectTo`]
     pub fn redirect_to(path: impl Into<String>) -> Self {
         Self::RedirectTo(path.into())
+    }
+    /// Shorthand for [`RouteConfig::Redirect307`]
+    pub fn redirect_307(path: impl Into<String>) -> Self {
+        Self::Redirect307(path.into())
     }
     /// Shorthand for [`RouteConfig::GzipOk`]
     pub fn gzip_ok(body: impl Into<Vec<u8>>) -> Self {
@@ -287,6 +294,13 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         RouteConfig::RedirectTo(target) => {
             let hdr = format!(
                 "HTTP/1.1 302 Found\r\nLocation: {}{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                base, target
+            );
+            let _ = stream.write_all(hdr.as_bytes()).await;
+        }
+        RouteConfig::Redirect307(target) => {
+            let hdr = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {}{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 base, target
             );
             let _ = stream.write_all(hdr.as_bytes()).await;

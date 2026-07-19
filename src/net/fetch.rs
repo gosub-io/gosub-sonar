@@ -5,7 +5,7 @@ use crate::net::fetcher_context::FetcherContext;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::hsts::{self, HstsStore};
 use crate::net::observer::NetObserver;
-use crate::net::types::{FetchResultMeta, NetError};
+use crate::net::types::{FetchResultMeta, NetError, RequestBody};
 use crate::types::PeekBuf;
 use anyhow::{anyhow, Context};
 use bytes::{Bytes, BytesMut};
@@ -101,9 +101,9 @@ pub struct RequestInit {
     /// Request headers. The policy's cookie jar and any `Content-Type` derived from the body
     /// are injected before the request is sent.
     pub headers: HeaderMap,
-    /// Optional body bytes. `None` for GET/HEAD.
+    /// Optional body. `None` for GET/HEAD.
     /// Automatically dropped when a 301, 302, or 303 redirect requires a method downgrade.
-    pub body: Option<Bytes>,
+    pub body: Option<RequestBody>,
 }
 
 impl Default for RequestInit {
@@ -127,12 +127,12 @@ impl RequestInit {
         Self {
             method: Method::POST,
             headers,
-            body: Some(body.into()),
+            body: Some(RequestBody::bytes(body.into())),
         }
     }
 
     /// Request with an explicit method, headers, and optional body.
-    pub fn new(method: Method, headers: HeaderMap, body: Option<Bytes>) -> Self {
+    pub fn new(method: Method, headers: HeaderMap, body: Option<RequestBody>) -> Self {
         Self {
             method,
             headers,
@@ -598,7 +598,14 @@ async fn get_with_redirects(
             .request(current_method.clone(), url.clone())
             .headers(current_headers.clone());
         if let Some(ref body) = current_body {
-            req_builder = req_builder.body(body.clone());
+            // Built fresh per hop so a streamed body can be replayed on 307/308.
+            let (hop_body, explicit_len) = body.to_reqwest_body()?;
+            if let Some(len) = explicit_len {
+                if !current_headers.contains_key(header::CONTENT_LENGTH) {
+                    req_builder = req_builder.header(header::CONTENT_LENGTH, len);
+                }
+            }
+            req_builder = req_builder.body(hop_body);
         }
         let fut = req_builder.send();
         tokio::pin!(fut);
@@ -951,6 +958,109 @@ mod tests {
         assert_eq!(meta.status, 200);
         assert_eq!(body.len(), 12 * 1024);
         assert!(meta.has_body);
+    }
+
+    /// The open-count proves a 307 replays the body by opening a fresh reader.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_body_is_uploaded_and_replayed_on_307() {
+        use crate::net::types::BoxedAsyncRead;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let srv = TestServer::new()
+            .route("/hop", RouteConfig::redirect_307("/echo"))
+            .route("/echo", RouteConfig::echo_body())
+            .start()
+            .await;
+
+        const PAYLOAD: &[u8] = b"streamed payload";
+        let opened = Arc::new(AtomicUsize::new(0));
+        let counter = opened.clone();
+        let body = RequestBody::stream(
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(PAYLOAD) as BoxedAsyncRead)
+            },
+            Some(PAYLOAD.len() as u64),
+        );
+
+        let (meta, echoed) = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            RequestInit::new(Method::POST, HeaderMap::new(), Some(body)),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&echoed[..], PAYLOAD);
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            2,
+            "307 must replay the body by opening a fresh reader"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_body_streams_from_disk() {
+        let srv = TestServer::new()
+            .route("/echo", RouteConfig::echo_body())
+            .start()
+            .await;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), b"file payload").unwrap();
+        let body = RequestBody::file(tmp.path()).unwrap();
+
+        let (meta, echoed) = super::fetch_response_complete(
+            client(),
+            srv.url("/echo"),
+            RequestInit::new(Method::POST, HeaderMap::new(), Some(body)),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&echoed[..], b"file payload");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_body_open_failure_fails_the_request() {
+        let srv = TestServer::new()
+            .route("/echo", RouteConfig::echo_body())
+            .start()
+            .await;
+
+        let body = RequestBody::stream(|| Err(std::io::Error::other("source is gone")), None);
+
+        let res = super::fetch_response_complete(
+            client(),
+            srv.url("/echo"),
+            RequestInit::new(Method::POST, HeaderMap::new(), Some(body)),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await;
+
+        assert!(
+            matches!(res, Err(NetError::Io(_))),
+            "factory failure must surface as NetError::Io, got {res:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

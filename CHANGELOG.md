@@ -23,9 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a store only has to behave like a map. No preload list. Native-only: on wasm32 the
   browser's `fetch()` applies its own HSTS.
 - `NetPolicy::with_hsts` for callers using the low-level `fetch` API directly.
+- Streaming uploads: `RequestBody::stream` takes a reader factory (opened once
+  per send attempt, so 307/308 redirects can replay the body), and
+  `RequestBody::file` streams a file from disk without buffering it. Native
+  targets only.
 - `test-support`: the mock server can now serve HTTPS — `TestServer::tls(domain)` with
-  `TestServerHandle::{cert_pem, socket_addr, tls_domain}` — and `RouteConfig::ok_with_headers`
-  responds 200 with arbitrary extra response headers.
+  `TestServerHandle::{cert_pem, socket_addr, tls_domain}` — `RouteConfig::ok_with_headers`
+  responds 200 with arbitrary extra response headers, and `RouteConfig::redirect_307`
+  issues a 307 that preserves the method and body.
+
+### Changed
+
+- `RequestBody`'s `bytes` field is private; use `RequestBody::as_bytes()`.
+  `len()` now returns `Option<u64>` (`None` for a stream without a declared
+  length).
 
 ### Fixed
 
