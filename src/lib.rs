@@ -56,6 +56,7 @@ pub mod http;
 pub mod net;
 pub mod types;
 
+pub use net::events::NetEvent;
 pub use net::fetcher::{Fetcher, FetcherConfig};
 pub use net::fetcher_context::{FetcherContext, NullContext};
 pub use net::null_emitter::NullEmitter;
