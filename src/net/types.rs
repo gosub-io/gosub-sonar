@@ -462,11 +462,11 @@ pub struct FetchRequest {
     /// `None` for GET and HEAD requests.
     pub body: Option<RequestBody>,
     /// Timeout for the TCP + TLS handshake.  Applies before any bytes are sent.
-    pub connect_timeout: Duration,
+    pub connect_timeout: Option<Duration>,
     /// Timeout from sending the first request byte until the response headers arrive.
-    pub req_timeout: Duration,
+    pub req_timeout: Option<Duration>,
     /// Maximum silence between consecutive body chunks before the read is aborted.
-    pub read_idle_timeout: Duration,
+    pub read_idle_timeout: Option<Duration>,
     /// Wall-clock deadline for receiving the entire response body after headers.
     /// `None` disables the deadline (useful for very large downloads).
     pub total_body_timeout: Option<Duration>,
@@ -622,9 +622,9 @@ pub struct FetchRequestBuilder {
     referrer: Option<Url>,
     referrer_policy: ReferrerPolicy,
     body: Option<RequestBody>,
-    connect_timeout: Duration,
-    req_timeout: Duration,
-    read_idle_timeout: Duration,
+    connect_timeout: Option<Duration>,
+    req_timeout: Option<Duration>,
+    read_idle_timeout: Option<Duration>,
     total_body_timeout: Option<Duration>,
 }
 
@@ -648,10 +648,10 @@ impl FetchRequestBuilder {
             referrer: None,
             referrer_policy: ReferrerPolicy::default(),
             body: None,
-            connect_timeout: Duration::from_secs(5),
-            req_timeout: Duration::from_secs(60),
-            read_idle_timeout: Duration::from_secs(15),
-            total_body_timeout: Some(Duration::from_secs(180)),
+            connect_timeout: None,
+            req_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
         }
     }
 
@@ -758,19 +758,19 @@ impl FetchRequestBuilder {
 
     /// Sets the connection_timeout for the request
     pub fn with_connection_timeout(mut self, connection_timeout: Duration) -> Self {
-        self.connect_timeout = connection_timeout;
+        self.connect_timeout = Some(connection_timeout);
         self
     }
 
     /// Sets the req_timeout for the request
     pub fn with_req_timeout(mut self, req_timeout: Duration) -> Self {
-        self.req_timeout = req_timeout;
+        self.req_timeout = Some(req_timeout);
         self
     }
 
     /// Sets the read_idle_timeout for the request
     pub fn with_read_idle_timeout(mut self, read_idle_timeout: Duration) -> Self {
-        self.read_idle_timeout = read_idle_timeout;
+        self.read_idle_timeout = Some(read_idle_timeout);
         self
     }
 

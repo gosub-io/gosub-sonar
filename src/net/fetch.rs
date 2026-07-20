@@ -9,9 +9,11 @@ use crate::net::observer::NetObserver;
 use crate::net::referrer::{self, ReferrerPolicy};
 use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody};
 use crate::types::PeekBuf;
+use crate::FetchRequest;
 use anyhow::{anyhow, Context};
 use bytes::{Bytes, BytesMut};
 use futures_util::{stream, StreamExt, TryStreamExt};
+use http::header::CONTENT_TYPE;
 use http::{header, HeaderMap, Method};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -184,6 +186,49 @@ impl Default for RequestInit {
     }
 }
 
+impl From<FetchRequest> for RequestInit {
+    fn from(value: FetchRequest) -> Self {
+        let FetchRequest {
+            headers,
+            body,
+            max_bytes,
+            ..
+        } = value;
+        let mut req_init_headers = headers;
+        if let Some(body) = &body {
+            if let Some(content_type) = &body.content_type {
+                if !req_init_headers.contains_key(CONTENT_TYPE) {
+                    if let Ok(val) = content_type.parse() {
+                        req_init_headers.insert(CONTENT_TYPE, val);
+                    }
+                }
+            }
+        }
+
+        // let body = value.body.as_ref().map(|b| {
+        //     if let Some(ref ct) = b.content_type {
+        //         if !headers.contains_key(header::CONTENT_TYPE) {
+        //             if let Ok(val) = ct.parse() {
+        //                 headers.insert(header::CONTENT_TYPE, val);
+        //             }
+        //         }
+        //     }
+        //     b.bytes.clone()
+        // }
+
+        let body_bytes = match body {
+            Some(b) => Some(b.bytes),
+            None => None,
+        };
+        RequestInit {
+            method: value.method,
+            headers: req_init_headers,
+            body: body_bytes,
+            max_bytes,
+        }
+    }
+}
+
 impl RequestInit {
     /// Plain GET request with the given headers and no body.
     pub fn get(headers: HeaderMap) -> Self {
@@ -271,6 +316,7 @@ pub async fn fetch_response_top(
     observer: Arc<dyn NetObserver + Send + Sync>,
     policy: NetPolicy,
 ) -> Result<ResponseTop, NetError> {
+    todo!("split this to GET headers and then recieve the body or (5KB) of the Body");
     let started = Instant::now();
     observer.on_event(NetEvent::Started { url: url.clone() });
 
@@ -537,13 +583,14 @@ pub async fn fetch_response_complete(
     cancel: CancellationToken,
     observer: Arc<dyn NetObserver + Send + Sync>,
     // We can cap the amount of bytes we want to read (None for unlimited)
-    max_bytes: Option<usize>,
+    // max_bytes: Option<usize>,
     // Maximum time allowed between reads
     read_idle_timeout: Duration,
     // Total time of read allowed (if any)
     total_body_timeout: Option<Duration>,
     policy: NetPolicy,
 ) -> Result<(FetchResultMeta, Bytes), NetError> {
+    let max_bytes = init.max_bytes;
     let ResponseTop {
         meta,
         peek_buf,
