@@ -532,7 +532,7 @@ fn make_request_init(req: &FetchRequest) -> RequestInit {
                 }
             }
         }
-        b.bytes.clone()
+        b.clone()
     });
     RequestInit::new(req.method.clone(), headers, body)
 }

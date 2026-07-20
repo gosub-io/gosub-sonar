@@ -223,25 +223,59 @@ impl AsyncRead for BodyStream {
     }
 }
 
+/// Opens a fresh reader over the body contents, once per send attempt: a 307/308 redirect
+/// replays the body by calling it again, which a one-shot reader could not survive.
+#[cfg(not(target_arch = "wasm32"))]
+pub type BodyStreamFactory =
+    Arc<dyn Fn() -> std::io::Result<BoxedAsyncRead> + Send + Sync + 'static>;
+
 /// Body sent with a non-GET request (POST, PUT, PATCH, …).
 ///
-/// The `content_type` field is automatically injected as a `Content-Type` header when the
-/// request headers do not already contain one. The caller is responsible for encoding the body
-/// correctly (JSON, form-encoding, multipart, etc.).
-#[derive(Debug, Clone, Default)]
+/// Either buffered bytes or a stream opened at send time (see [`RequestBody::stream`] and
+/// [`RequestBody::file`]). The `content_type` field is automatically injected as a
+/// `Content-Type` header when the request headers do not already contain one. The caller is
+/// responsible for encoding the body correctly (JSON, form-encoding, multipart, etc.).
+#[derive(Clone, Default)]
 pub struct RequestBody {
-    /// Raw bytes to send.
-    pub bytes: Bytes,
+    payload: Payload,
     /// Optional `Content-Type` value to inject (e.g. `"application/json"`).
     /// Ignored if the request headers already set `Content-Type`.
     pub content_type: Option<String>,
+}
+
+#[derive(Clone)]
+enum Payload {
+    Bytes(Bytes),
+    #[cfg(not(target_arch = "wasm32"))]
+    Stream {
+        open: BodyStreamFactory,
+        len: Option<u64>,
+    },
+}
+
+impl Default for Payload {
+    fn default() -> Self {
+        Payload::Bytes(Bytes::new())
+    }
+}
+
+impl Debug for RequestBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("RequestBody");
+        match &self.payload {
+            Payload::Bytes(b) => d.field("bytes", &b.len()),
+            #[cfg(not(target_arch = "wasm32"))]
+            Payload::Stream { len, .. } => d.field("stream", len),
+        };
+        d.field("content_type", &self.content_type).finish()
+    }
 }
 
 impl RequestBody {
     /// Plain byte body with no automatic `Content-Type`.
     pub fn bytes(b: impl Into<Bytes>) -> Self {
         Self {
-            bytes: b.into(),
+            payload: Payload::Bytes(b.into()),
             content_type: None,
         }
     }
@@ -249,35 +283,97 @@ impl RequestBody {
     /// `application/json` body.
     pub fn json(b: impl Into<Bytes>) -> Self {
         Self {
-            bytes: b.into(),
             content_type: Some("application/json".into()),
+            ..Self::bytes(b)
         }
     }
 
     /// `application/x-www-form-urlencoded` body.
     pub fn form(b: impl Into<Bytes>) -> Self {
         Self {
-            bytes: b.into(),
             content_type: Some("application/x-www-form-urlencoded".into()),
+            ..Self::bytes(b)
         }
     }
 
     /// `text/plain; charset=utf-8` body.
     pub fn text(s: impl Into<String>) -> Self {
         Self {
-            bytes: Bytes::from(s.into().into_bytes()),
             content_type: Some("text/plain; charset=utf-8".into()),
+            ..Self::bytes(s.into().into_bytes())
         }
     }
 
-    /// Returns true when the body contains no bytes
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
+    /// Body streamed from a reader opened at send time, without buffering it in memory.
+    ///
+    /// With `len` set, `Content-Length` is sent; without it the transfer is chunked. The
+    /// fetcher's `req_timeout` covers the upload, so large bodies may need a higher value.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn stream(
+        open: impl Fn() -> std::io::Result<BoxedAsyncRead> + Send + Sync + 'static,
+        len: Option<u64>,
+    ) -> Self {
+        Self {
+            payload: Payload::Stream {
+                open: Arc::new(open),
+                len,
+            },
+            content_type: None,
+        }
     }
 
-    /// Returns the number of bytes in the body
-    pub fn len(&self) -> usize {
-        self.bytes.len()
+    /// Body streamed from a file on disk, opened at send time.
+    ///
+    /// `Content-Length` is taken from its current size, so the file must not change until
+    /// the request completes.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn file(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
+        let path = path.into();
+        let len = std::fs::metadata(&path)?.len();
+        Ok(Self::stream(
+            move || {
+                let f = std::fs::File::open(&path)?;
+                Ok(Box::pin(tokio::fs::File::from_std(f)) as BoxedAsyncRead)
+            },
+            Some(len),
+        ))
+    }
+
+    /// The buffered bytes, or `None` when the body is streamed.
+    pub fn as_bytes(&self) -> Option<&Bytes> {
+        match &self.payload {
+            Payload::Bytes(b) => Some(b),
+            #[cfg(not(target_arch = "wasm32"))]
+            Payload::Stream { .. } => None,
+        }
+    }
+
+    /// Number of body bytes, or `None` for a stream without a declared length.
+    pub fn len(&self) -> Option<u64> {
+        match &self.payload {
+            Payload::Bytes(b) => Some(b.len() as u64),
+            #[cfg(not(target_arch = "wasm32"))]
+            Payload::Stream { len, .. } => *len,
+        }
+    }
+
+    /// Returns true when the body is known to contain no bytes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == Some(0)
+    }
+
+    /// Build the reqwest body for one hop. The returned length, when present, must be sent
+    /// as an explicit `Content-Length`: a wrapped stream is unsized as far as reqwest knows.
+    pub(crate) fn to_reqwest_body(&self) -> std::io::Result<(reqwest::Body, Option<u64>)> {
+        match &self.payload {
+            Payload::Bytes(b) => Ok((reqwest::Body::from(b.clone()), None)),
+            #[cfg(not(target_arch = "wasm32"))]
+            Payload::Stream { open, len } => {
+                let reader = open()?;
+                let stream = tokio_util::io::ReaderStream::new(reader);
+                Ok((reqwest::Body::wrap_stream(stream), *len))
+            }
+        }
     }
 }
 
@@ -565,6 +661,22 @@ mod tests {
 
         let n = s.read(&mut [0u8; 8]).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn stream_body_reports_len_and_no_bytes() {
+        let sized = RequestBody::stream(|| Ok(Box::pin(&b""[..]) as BoxedAsyncRead), Some(3));
+        assert_eq!(sized.len(), Some(3));
+        assert!(sized.as_bytes().is_none());
+        assert!(!sized.is_empty());
+
+        let unsized_body = RequestBody::stream(|| Ok(Box::pin(&b""[..]) as BoxedAsyncRead), None);
+        assert_eq!(unsized_body.len(), None);
+        assert!(!unsized_body.is_empty());
+
+        let buffered = RequestBody::bytes(&b"abc"[..]);
+        assert_eq!(buffered.len(), Some(3));
+        assert_eq!(buffered.as_bytes().map(|b| b.len()), Some(3));
     }
 
     #[test]

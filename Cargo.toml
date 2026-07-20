@@ -33,7 +33,7 @@ flate2 = { version = "1", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tempfile = "3.21.0"
-tokio = { version = "1.52.3", features = ["rt", "io-util", "sync", "time", "macros", "net"] }
+tokio = { version = "1.52.3", features = ["rt", "io-util", "sync", "time", "macros", "net", "fs"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 reqwest = { version = "0.13.3", features = ["rustls", "stream", "blocking", "gzip", "brotli", "deflate"] }
