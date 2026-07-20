@@ -65,6 +65,10 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
 name = "fetcher_harness"
 required-features = ["test-support"]
 
+[[test]]
+name = "e2e"
+required-features = ["test-support"]
+
 [package.metadata.docs.rs]
 all-features = true
 

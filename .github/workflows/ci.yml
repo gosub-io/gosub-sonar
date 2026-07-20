@@ -37,7 +37,7 @@ jobs:
 
       - name: cargo clippy
         # --all-targets covers lib, bins, examples, tests, and benchmarks.
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets --features test-support
 
       - name: cargo doc
         run: cargo doc --no-deps
@@ -80,7 +80,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: cargo test
-        run: cargo test
+        run: cargo test --features test-support
 
   msrv:
     name: MSRV (1.88)
@@ -100,4 +100,4 @@ jobs:
           key: msrv-1.88
 
       - name: cargo test
-        run: cargo test
+        run: cargo test --features test-support

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tests/e2e.rs`: integration tests exercising the crate through its public API
+  only, as a downstream consumer would — including an externally implemented
+  `FetcherContext`. Gated on the `test-support` feature; CI now enables it.
+- `NetEvent` is re-exported at the crate root; implementing `NetObserver`
+  previously required the `net::events` path.
+
 ## [0.1.0] - 2026-07-04
 
 Initial release. gosub-sonar is the network stack of the [Gosub](https://gosub.io)

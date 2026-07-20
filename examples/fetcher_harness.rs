@@ -15,10 +15,10 @@
 
 use gosub_sonar::net::test_support::{RouteConfig, TestServer, TestServerHandle};
 use gosub_sonar::{
-    FetchRequest, FetchResult, Fetcher, FetcherConfig, Initiator, NullContext, Priority, RequestId,
+    FetchRequest, FetchResult, Fetcher, FetcherConfig, Initiator, NullContext, Priority,
     RequestReference, ResourceKind,
 };
-use http::{HeaderMap, Method};
+use http::Method;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
