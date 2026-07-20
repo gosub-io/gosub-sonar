@@ -16,6 +16,8 @@ pub mod fetcher;
 pub mod fetcher_context;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod fs_utils;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod hsts;
 pub mod null_emitter;
 pub mod observer;
 #[cfg(not(target_arch = "wasm32"))]

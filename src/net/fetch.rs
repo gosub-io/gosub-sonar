@@ -2,6 +2,8 @@
 
 use crate::net::events::NetEvent;
 use crate::net::fetcher_context::FetcherContext;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::hsts::{self, HstsStore};
 use crate::net::observer::NetObserver;
 use crate::net::types::{FetchResultMeta, NetError};
 use crate::types::PeekBuf;
@@ -48,6 +50,10 @@ pub struct NetPolicy {
     /// mid-chain (e.g. a session cookie on a login 302) reach the jar before the next hop.
     /// The final response's cookies are reported by the fetcher, not here.
     pub on_cookies: CookieSinkFn,
+    /// HSTS store consulted to upgrade each hop, and updated from each hop's response.
+    /// `None` disables HSTS. Set via [`NetPolicy::with_hsts`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub hsts: Option<Arc<dyn HstsStore>>,
 }
 
 impl Default for NetPolicy {
@@ -56,6 +62,8 @@ impl Default for NetPolicy {
             url_allowed: Box::new(|_| true),
             cookies_for: Box::new(|_| None),
             on_cookies: Box::new(|_, _| {}),
+            #[cfg(not(target_arch = "wasm32"))]
+            hsts: None,
         }
     }
 }
@@ -70,7 +78,16 @@ impl NetPolicy {
             url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
             cookies_for: Box::new(move |url| ctx_cookies.cookies_for(url)),
             on_cookies: Box::new(move |url, values| ctx_sink.on_cookies_received(url, values)),
+            #[cfg(not(target_arch = "wasm32"))]
+            hsts: None,
         }
+    }
+
+    /// Attaches the HSTS store this policy should consult and update. `None` disables HSTS.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_hsts(mut self, store: Option<Arc<dyn HstsStore>>) -> Self {
+        self.hsts = store;
+        self
     }
 }
 
@@ -549,6 +566,15 @@ async fn get_with_redirects(
             ))));
         }
 
+        // HSTS upgrade, before the policy check so the hook sees the URL that will actually be
+        // requested, and before any connection is opened so the plaintext request never happens.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref store) = policy.hsts {
+            if hsts::should_upgrade(store.as_ref(), &url, chrono::Utc::now()) {
+                url = hsts::upgrade(&url);
+            }
+        }
+
         // Policy check (SSRF / blocklist hook)
         if !(policy.url_allowed)(&url) {
             return Err(NetError::Redirect(Arc::new(anyhow!(
@@ -584,6 +610,13 @@ async fn get_with_redirects(
             }
             r = &mut fut => r.context("net.get_with_redirects request failed").map_err(|e| NetError::Read(Arc::new(e)))?
         };
+
+        // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
+        // a site first arms it, and that response is consumed below.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref store) = policy.hsts {
+            hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
+        }
 
         if !resp.status().is_redirection() {
             return Ok(resp);
@@ -705,6 +738,127 @@ mod tests {
                 .build()
                 .unwrap(),
         )
+    }
+
+    /// A TLS `TestServer` plus a client that trusts its certificate and resolves its domain to
+    /// the loopback listener. No DNS or public CA involved.
+    async fn tls_server_and_client(
+        routes: Vec<(&str, RouteConfig)>,
+    ) -> (
+        crate::net::test_support::TestServerHandle,
+        Arc<reqwest::Client>,
+    ) {
+        let mut srv = TestServer::new().tls("hsts.test");
+        for (path, cfg) in routes {
+            srv = srv.route(path, cfg);
+        }
+        let srv = srv.start().await;
+
+        let cert = reqwest::Certificate::from_pem(srv.cert_pem().unwrap()).unwrap();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(cert)
+            .resolve(srv.tls_domain().unwrap(), srv.socket_addr())
+            .build()
+            .unwrap();
+        (srv, Arc::new(client))
+    }
+
+    /// The plain mock server cannot cover this: HSTS ignores plaintext responses and IP-literal
+    /// hosts, so only a TLS server with a domain name can arm a store.
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_is_recorded_from_a_real_https_response() {
+        let (srv, client) = tls_server_and_client(vec![(
+            "/",
+            RouteConfig::ok_with_headers(
+                &[(
+                    "Strict-Transport-Security",
+                    "max-age=31536000; includeSubDomains",
+                )],
+                b"hello".to_vec(),
+            ),
+        )])
+        .await;
+
+        let store = Arc::new(crate::net::hsts::InMemoryHstsStore::new());
+        let res = fetch_response_top(
+            client,
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default().with_hsts(Some(store.clone())),
+        )
+        .await;
+        assert!(res.is_ok(), "tls fetch failed: {:?}", res.err());
+
+        let entry = crate::net::hsts::HstsStore::load(store.as_ref(), "hsts.test")
+            .expect("an https response carrying the header must arm the store");
+        assert!(entry.include_subdomains);
+        assert!(!entry.is_expired(chrono::Utc::now()));
+    }
+
+    /// The same header over plain HTTP must arm nothing (§8.1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_is_not_recorded_over_plaintext() {
+        let srv = TestServer::new()
+            .route(
+                "/",
+                RouteConfig::ok_with_headers(
+                    &[("Strict-Transport-Security", "max-age=31536000")],
+                    b"hello".to_vec(),
+                ),
+            )
+            .start()
+            .await;
+
+        let store = Arc::new(crate::net::hsts::InMemoryHstsStore::new());
+        let res = fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default().with_hsts(Some(store.clone())),
+        )
+        .await;
+        assert!(res.is_ok());
+        assert!(store.is_empty(), "plaintext must never arm HSTS");
+    }
+
+    /// max-age=0 disarms a previously armed host (§6.1.1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_max_age_zero_disarms_over_tls() {
+        let (srv, client) = tls_server_and_client(vec![(
+            "/",
+            RouteConfig::ok_with_headers(
+                &[("Strict-Transport-Security", "max-age=0")],
+                b"bye".to_vec(),
+            ),
+        )])
+        .await;
+
+        let store = Arc::new(crate::net::hsts::InMemoryHstsStore::new());
+        crate::net::hsts::HstsStore::store(
+            store.as_ref(),
+            "hsts.test",
+            crate::net::hsts::HstsEntry {
+                expires_at: chrono::Utc::now() + chrono::Duration::days(30),
+                include_subdomains: false,
+            },
+        );
+
+        let res = fetch_response_top(
+            client,
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default().with_hsts(Some(store.clone())),
+        )
+        .await;
+        assert!(res.is_ok(), "tls fetch failed: {:?}", res.err());
+        assert!(store.is_empty(), "max-age=0 must remove the entry");
     }
 
     async fn server() -> crate::net::test_support::TestServerHandle {
