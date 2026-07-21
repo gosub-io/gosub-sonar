@@ -35,12 +35,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TestServerHandle::{cert_pem, socket_addr, tls_domain}` — `RouteConfig::ok_with_headers`
   responds 200 with arbitrary extra response headers, and `RouteConfig::redirect_307`
   issues a 307 that preserves the method and body.
+- Mixed content blocking (#5) — insecure sub-resources requested by a secure
+  document are blocked, or upgraded to `https`, at every redirect hop:
+  - `net::mixed_content` — `MixedContentPolicy` (`Allow` / `Upgrade` / `Block`)
+    and the secure-context predicates
+  - `FetcherConfig::mixed_content` — fetcher-wide default (`Block`)
+  - `FetchRequest::origin` — the initiating document; unset leaves the check inert
+  - `FetchRequest::mixed_content` — per-request override, to permit images
+    while still blocking scripts
+- `NetError::Blocked` / `NetEvent::Blocked`, with a typed `BlockReason`
+- `test_support`: `RouteConfig::RedirectAbsolute`, `RecordingObserver`
 
 ### Changed
 
 - `RequestBody`'s `bytes` field is private; use `RequestBody::as_bytes()`.
   `len()` now returns `Option<u64>` (`None` for a stream without a declared
   length).
+- **Breaking:** scheme and `is_url_allowed` rejections now return
+  `NetError::Blocked` instead of `NetError::Redirect` / `NetError::Other`
+- `is_url_allowed` now runs after a mixed content upgrade, so it vets the URL
+  actually sent
+- Request coalescing accounts for the mixed content verdict, so requests that
+  resolve differently no longer share a result
 
 ### Fixed
 
