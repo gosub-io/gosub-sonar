@@ -1,11 +1,13 @@
 //! Priority-scheduled fetcher with request coalescing and per-origin concurrency limits.
 
 use crate::net::fetch::{
-    fetch_response_complete, fetch_response_top, NetPolicy, RequestInit, ResponseTop,
+    blocked, fetch_response_complete, fetch_response_top, preflight, NetPolicy, Preflight,
+    RequestInit, ResponseTop,
 };
 use crate::net::fetcher_context::FetcherContext;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::hsts::{self, HstsStore, InMemoryHstsStore};
+use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
 use crate::net::shared_body::{ReaderOptions, SharedBody};
 use crate::net::types::{FetchRequest, FetchResult, NetError, Priority};
@@ -58,6 +60,11 @@ pub struct FetcherConfig {
     /// for a private-browsing session, which must not consult or add to a persistent store.
     #[cfg(not(target_arch = "wasm32"))]
     pub hsts: Option<Arc<dyn HstsStore>>,
+
+    /// What to do when a request carrying a secure [`FetchRequest::origin`] targets an insecure
+    /// URL. Defaults to [`MixedContentPolicy::Block`], and is overridable per request via
+    /// [`FetchRequest::mixed_content`]. See [`mixed_content`](mod@crate::net::mixed_content).
+    pub mixed_content: MixedContentPolicy,
 }
 
 impl Default for FetcherConfig {
@@ -73,6 +80,7 @@ impl Default for FetcherConfig {
             user_agent: None,
             #[cfg(not(target_arch = "wasm32"))]
             hsts: Some(Arc::new(InMemoryHstsStore::new())),
+            mixed_content: MixedContentPolicy::default(),
         }
     }
 }
@@ -355,6 +363,11 @@ impl Fetcher {
                 }
             }
 
+            // Pin the mixed-content policy to its resolved value before keying, so a request that
+            // inherits the fetcher default and one that names the same policy explicitly land in
+            // the same coalescing bucket instead of needlessly splitting.
+            req.mixed_content = Some(effective_mixed_content(&req, &self.cfg));
+
             let key_opt = req.generate_request_key();
             let key_str = {
                 let base = match key_opt {
@@ -418,19 +431,6 @@ impl Fetcher {
                     .store(true, Ordering::Relaxed);
             }
 
-            // URL policy check — only the leader makes the actual request
-            if is_leader && !self.ctx.is_url_allowed(&req.url) {
-                let err = FetchResult::Error(NetError::Other(std::sync::Arc::new(
-                    anyhow::anyhow!("URL blocked by policy: {}", req.url),
-                )));
-                // Remove before finish — see the registration comment above for the ordering.
-                self.inflight_map.remove(&key_str);
-                inflight_entry.waiter.finish(err).await;
-                inflight_entry.done.cancel();
-                self.ctx.on_ref_done(req.reference);
-                continue;
-            }
-
             if !is_leader {
                 continue;
             }
@@ -438,6 +438,32 @@ impl Fetcher {
             let observer =
                 self.ctx
                     .observer_for(req.reference, req.req_id, req.kind, req.initiator);
+
+            // Pre-flight checks. Only the leader ever sends bytes, so only the leader evaluates
+            // them; rejecting here avoids waiting on a connection slot for a request that will
+            // never go out. The same `preflight` runs per hop inside `get_with_redirects`, which
+            // is what catches redirect targets — so this cannot reject anything the enforcement
+            // path would have allowed. The upgraded URL is discarded here; the redirect loop
+            // recomputes and applies it.
+            let reject = match preflight(
+                &req.url,
+                effective_mixed_content(&req, &self.cfg),
+                req.origin.as_ref(),
+                &|u| self.ctx.is_url_allowed(u),
+            ) {
+                Preflight::Reject(reason) => Some(reason),
+                Preflight::Proceed(_) => None,
+            };
+
+            if let Some(reason) = reject {
+                let err = FetchResult::Error(blocked(&observer, req.url.clone(), reason));
+                // Remove before finish — see the registration comment above for the ordering.
+                self.inflight_map.remove(&key_str);
+                inflight_entry.waiter.finish(err).await;
+                inflight_entry.done.cancel();
+                self.ctx.on_ref_done(req.reference);
+                continue;
+            }
 
             let client = if req.auto_decode {
                 self.client.clone()
@@ -520,9 +546,20 @@ impl Fetcher {
     }
 }
 
+/// The mixed content policy in force for `req`: its own override if it set one, otherwise the
+/// fetcher-wide default.
+///
+/// Must stay consistent with the discriminator built into
+/// [`FetchRequest::generate_request_key`] — two requests that resolve to different policies have
+/// to land in different coalescing buckets, or one could inherit the other's verdict.
+fn effective_mixed_content(req: &FetchRequest, cfg: &FetcherConfig) -> MixedContentPolicy {
+    req.mixed_content.unwrap_or(cfg.mixed_content)
+}
+
 /// Build a [`RequestInit`] from a [`FetchRequest`], injecting a `Content-Type` header from
-/// the body descriptor when the headers don't already contain one.
-fn make_request_init(req: &FetchRequest) -> RequestInit {
+/// the body descriptor when the headers don't already contain one, and carrying the request's
+/// initiating origin plus the fetcher's mixed content policy down to the redirect loop.
+fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
     let mut headers = req.headers.clone();
     let body = req.body.as_ref().map(|b| {
         if let Some(ref ct) = b.content_type {
@@ -535,6 +572,7 @@ fn make_request_init(req: &FetchRequest) -> RequestInit {
         b.clone()
     });
     RequestInit::new(req.method.clone(), headers, body)
+        .with_mixed_content(req.origin.clone(), effective_mixed_content(req, cfg))
 }
 
 /// Build a reqwest client from `FetcherConfig`.
@@ -545,6 +583,11 @@ fn make_request_init(req: &FetchRequest) -> RequestInit {
 fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Client> {
     // The browser's fetch() owns TLS, connection management, timeouts, and transparent
     // decompression; none of the tuning knobs below exist in reqwest's wasm backend.
+    //
+    // It also owns redirects: there is no way to ask for them un-followed, so on wasm32
+    // `get_with_redirects` only ever sees the final response and the per-hop checks run once,
+    // on the initial URL. The browser applies its own mixed content blocking to the hops we
+    // cannot see, so this is a loss of reporting rather than of enforcement.
     #[cfg(target_arch = "wasm32")]
     {
         let _ = decode;
@@ -557,10 +600,11 @@ fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Cl
     #[cfg(not(target_arch = "wasm32"))]
     {
         let mut b = reqwest::Client::builder()
-            // `get_with_redirects` follows redirects itself so that the URL policy, cookie jar,
-            // and cross-origin header stripping are applied at every hop. reqwest's own redirect
-            // following must stay disabled or it swallows each 3xx internally and none of that
-            // runs — see `fetcher_url_policy_is_applied_to_redirect_targets`.
+            // `get_with_redirects` follows redirects itself so that the per-hop mixed content
+            // check, HSTS upgrade, SSRF/URL policy, cookie jar, cross-origin header stripping,
+            // and `NetEvent::Redirected` all apply at every hop. reqwest's own redirect following
+            // must stay disabled or it swallows each 3xx internally and none of that runs — see
+            // `fetcher_url_policy_is_applied_to_redirect_targets`.
             .redirect(reqwest::redirect::Policy::none())
             .connection_verbose(false)
             .http2_adaptive_window(true)
@@ -605,7 +649,7 @@ async fn perform_streaming(
     } = fetch_response_top(
         Arc::new(client.clone()),
         req.url.clone(),
-        make_request_init(req),
+        make_request_init(req, cfg),
         cancel.clone(),
         observer.clone(),
         policy,
@@ -651,7 +695,7 @@ async fn perform_buffered(
     let (meta, body) = fetch_response_complete(
         Arc::new(client.clone()),
         req.url.clone(),
-        make_request_init(req),
+        make_request_init(req, cfg),
         cancel.clone(),
         observer,
         req.max_bytes,
@@ -687,7 +731,7 @@ mod tests {
     use crate::net::fetcher_context::NullContext;
     use crate::net::request_ref::RequestReference;
     use crate::net::test_support::{RouteConfig, TestServer};
-    use crate::net::types::{FetchRequest, Initiator, ResourceKind};
+    use crate::net::types::{BlockReason, FetchRequest, Initiator, ResourceKind};
     use crate::types::RequestId;
     use http::{HeaderMap, Method};
     use std::sync::Arc;
@@ -750,6 +794,8 @@ mod tests {
             priority,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
+            origin: None,
+            mixed_content: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -773,6 +819,8 @@ mod tests {
                 priority,
                 initiator: Initiator::Other,
                 kind: ResourceKind::Primary,
+                origin: None,
+                mixed_content: None,
                 streaming: false,
                 auto_decode: true,
                 max_bytes: None,
@@ -988,6 +1036,8 @@ mod tests {
             priority: Priority::Normal,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
+            origin: None,
+            mixed_content: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1097,6 +1147,8 @@ mod tests {
             priority: Priority::Normal,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
+            origin: None,
+            mixed_content: None,
             streaming: true,
             auto_decode: true,
             max_bytes: None,
@@ -1403,6 +1455,122 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// Drive one request through a fetcher configured with `cfg_policy`, where the request
+    /// itself carries `req_policy`, and report whether it was blocked.
+    async fn mixed_content_blocked(
+        cfg_policy: MixedContentPolicy,
+        req_policy: Option<MixedContentPolicy>,
+    ) -> bool {
+        let fetcher = Arc::new(
+            Fetcher::new(
+                FetcherConfig {
+                    mixed_content: cfg_policy,
+                    ..test_config()
+                },
+                Arc::new(NullContext),
+            )
+            .unwrap(),
+        );
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        // `.invalid` is reserved and never resolves, so an unblocked request fails in the
+        // transport instead — distinguishable from a block. Blocked cases short-circuit before
+        // any I/O; unblocked ones do issue a DNS query.
+        let (mut req, handle) = make_req(
+            Url::parse("http://insecure.invalid/a.js").unwrap(),
+            Priority::Normal,
+        );
+        req.origin = Some(Url::parse("https://example.com").unwrap().origin());
+        req.mixed_content = req_policy;
+
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, handle, tx).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.cancel();
+
+        matches!(
+            result,
+            FetchResult::Error(NetError::Blocked {
+                reason: BlockReason::MixedContent,
+                ..
+            })
+        )
+    }
+
+    /// A request override must win over the fetcher-wide default in both directions — that is
+    /// what lets an embedder permit an image while still blocking a script on the same page.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mixed_content_request_override_beats_config() {
+        assert!(
+            mixed_content_blocked(MixedContentPolicy::Block, None).await,
+            "no override should fall back to the fetcher-wide Block"
+        );
+        assert!(
+            !mixed_content_blocked(MixedContentPolicy::Block, Some(MixedContentPolicy::Allow))
+                .await,
+            "a per-request Allow must override a Block config"
+        );
+        assert!(
+            mixed_content_blocked(MixedContentPolicy::Allow, Some(MixedContentPolicy::Block)).await,
+            "a per-request Block must override an Allow config"
+        );
+        assert!(
+            !mixed_content_blocked(MixedContentPolicy::Allow, None).await,
+            "no override should fall back to the fetcher-wide Allow"
+        );
+    }
+
+    /// End-to-end through the real `Fetcher`, not `fetch_response_top` directly: an https page
+    /// requests a loopback URL that 302s onto plain http. The per-hop check must catch it.
+    ///
+    /// This is the headline guarantee of the feature — an embedder cannot see redirect targets —
+    /// and every other redirect test builds its own client, so only this one exercises the
+    /// client the fetcher actually ships.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_blocks_mixed_content_on_redirect_target() {
+        let srv = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute("http://insecure.example.com/a.js"),
+            )
+            .start()
+            .await;
+
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let (mut req, handle) = make_req(srv.url("/hop"), Priority::Normal);
+        req.origin = Some(Url::parse("https://example.com").unwrap().origin());
+
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, handle, tx).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.cancel();
+
+        assert!(
+            matches!(
+                result,
+                FetchResult::Error(NetError::Blocked {
+                    reason: BlockReason::MixedContent,
+                    ..
+                })
+            ),
+            "insecure redirect target must be blocked, got {result:?}"
+        );
+    }
+
     fn make_post_req(
         url: Url,
         body: crate::net::types::RequestBody,
@@ -1418,6 +1586,8 @@ mod tests {
             priority: Priority::Normal,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
+            origin: None,
+            mixed_content: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1569,8 +1739,14 @@ mod tests {
             "a blocked redirect target must never be requested"
         );
         assert!(
-            matches!(result, FetchResult::Error(NetError::Redirect(_))),
-            "blocked redirect must surface as NetError::Redirect, got {:?}",
+            matches!(
+                result,
+                FetchResult::Error(NetError::Blocked {
+                    reason: crate::net::types::BlockReason::UrlPolicy,
+                    ..
+                })
+            ),
+            "blocked redirect must surface as NetError::Blocked(UrlPolicy), got {:?}",
             result
         );
 
@@ -1768,6 +1944,8 @@ mod tests {
             priority,
             initiator: Initiator::Other,
             kind: ResourceKind::Primary,
+            origin: None,
+            mixed_content: None,
             streaming: false,
             auto_decode,
             max_bytes: None,

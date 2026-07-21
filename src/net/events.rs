@@ -1,5 +1,6 @@
 //! Events emitted by the fetch stack to observers during a request lifecycle.
 
+use crate::net::types::BlockReason;
 use http::HeaderMap;
 use std::time::Duration;
 use url::Url;
@@ -66,6 +67,13 @@ pub enum NetEvent {
         url: Url,
         /// Error that caused the failure
         error: anyhow::Error,
+    },
+    /// A request hop was refused by policy and never sent
+    Blocked {
+        /// The refused hop (see [`NetError::Blocked`](crate::net::types::NetError::Blocked))
+        url: Url,
+        /// Why the request was refused
+        reason: BlockReason,
     },
     /// Resource fetching was cancelled
     Cancelled {
