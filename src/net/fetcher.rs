@@ -46,6 +46,17 @@ pub struct FetcherConfig {
     /// `None` disables the deadline (useful for very large downloads).
     pub total_body_timeout: Option<Duration>,
 
+    /// Maximum idle connections kept in the pool **per host**.
+    /// Without a cap, reqwest keeps every connection ever opened until it idles out.
+    pub pool_max_idle_per_host: usize,
+    /// How long an idle connection stays in the pool before being closed.
+    /// `None` keeps idle connections around indefinitely.
+    pub pool_idle_timeout: Option<Duration>,
+    /// Interval for TCP keepalive probes on pooled connections, so dead peers
+    /// (e.g. behind a NAT that dropped the mapping) are detected instead of
+    /// failing the next request. `None` disables keepalive.
+    pub tcp_keepalive: Option<Duration>,
+
     /// `User-Agent` header sent with every request made by this fetcher.
     ///
     /// Set this to identify your application to servers and CDNs.
@@ -77,6 +88,9 @@ impl Default for FetcherConfig {
             req_timeout: Duration::from_secs(60),
             read_idle_timeout: Duration::from_secs(15),
             total_body_timeout: Some(Duration::from_secs(180)),
+            pool_max_idle_per_host: 6,
+            pool_idle_timeout: Some(Duration::from_secs(90)),
+            tcp_keepalive: Some(Duration::from_secs(60)),
             user_agent: None,
             #[cfg(not(target_arch = "wasm32"))]
             hsts: Some(Arc::new(InMemoryHstsStore::new())),
@@ -610,6 +624,9 @@ fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Cl
             .http2_adaptive_window(true)
             .connect_timeout(cfg.connect_timeout)
             .timeout(cfg.req_timeout)
+            .pool_max_idle_per_host(cfg.pool_max_idle_per_host)
+            .pool_idle_timeout(cfg.pool_idle_timeout)
+            .tcp_keepalive(cfg.tcp_keepalive)
             .use_rustls_tls()
             .gzip(decode)
             .brotli(decode)
