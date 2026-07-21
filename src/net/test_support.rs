@@ -634,8 +634,10 @@ impl TestServerHandle {
 
     /// The server's self-signed certificate in PEM form, or `None` if TLS is not enabled.
     ///
-    /// Pass to `reqwest::Certificate::from_pem` and `ClientBuilder::add_root_certificate` so the
-    /// client trusts this server.
+    /// Pass to `reqwest::Certificate::from_pem` and `ClientBuilder::tls_certs_only` so the client
+    /// trusts this server. Prefer `tls_certs_only` over `add_root_certificate`: the latter keeps
+    /// the platform certificate verifier, which on Windows and macOS consults the OS trust store
+    /// and rejects a CA generated in-process.
     pub fn cert_pem(&self) -> Option<&[u8]> {
         self.tls.as_ref().map(|t| t.cert_pem.as_slice())
     }
