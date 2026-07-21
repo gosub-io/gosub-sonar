@@ -40,11 +40,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `net::mixed_content` — `MixedContentPolicy` (`Allow` / `Upgrade` / `Block`)
     and the secure-context predicates
   - `FetcherConfig::mixed_content` — fetcher-wide default (`Block`)
-  - `FetchRequest::origin` — the initiating document; unset leaves the check inert
+  - `FetchRequest::origin` — the initiating document's origin; unset leaves the
+    check inert
   - `FetchRequest::mixed_content` — per-request override, to permit images
     while still blocking scripts
+- Referrer policy (#6) — a `Referer` header computed per the Referrer Policy
+  spec, recomputed at every redirect hop and retargeted mid-chain by a
+  `Referrer-Policy` response header:
+  - `net::referrer` — all eight `ReferrerPolicy` values, defaulting to
+    `strict-origin-when-cross-origin`
+  - `FetchRequest::referrer` — the initiating document's URL; unset sends no header
+  - `FetchRequest::referrer_policy` — how much of it to reveal
 - `NetError::Blocked` / `NetEvent::Blocked`, with a typed `BlockReason`
-- `test_support`: `RouteConfig::RedirectAbsolute`, `RecordingObserver`
+- `test_support`: `RouteConfig::RedirectAbsolute`, `EchoRefererHeader`,
+  `RedirectWithReferrerPolicy`, and `RecordingObserver`
 
 ### Changed
 
@@ -53,10 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   length).
 - **Breaking:** scheme and `is_url_allowed` rejections now return
   `NetError::Blocked` instead of `NetError::Redirect` / `NetError::Other`
-- `is_url_allowed` now runs after a mixed content upgrade, so it vets the URL
-  actually sent
-- Request coalescing accounts for the mixed content verdict, so requests that
-  resolve differently no longer share a result
+- **Breaking:** `NetError` and `NetEvent` gain a `Blocked` variant, and
+  `FetchRequest` and `RequestInit` gain public fields — exhaustive `match`es and
+  struct-literal construction need updating
+- Request coalescing now also keys on the mixed content verdict and the
+  referrer, so fewer requests share a response
 
 ### Fixed
 
@@ -67,6 +77,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its documentation — a redirect to an internal address bypassed an embedder's SSRF guard. The
   `Set-Cookie`-on-3xx jar reporting and the cross-origin `Authorization`/`Cookie` stripping were
   inert for the same reason and are now live.
+- `Referer` is now stripped on cross-origin redirects, alongside `Authorization`
+  and `Cookie`, so a hand-set one cannot leak to a third-party host
 
 ## [0.1.0] - 2026-07-04
 

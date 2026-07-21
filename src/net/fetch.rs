@@ -6,6 +6,7 @@ use crate::net::fetcher_context::FetcherContext;
 use crate::net::hsts::{self, HstsStore};
 use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
 use crate::net::observer::NetObserver;
+use crate::net::referrer::{self, ReferrerPolicy};
 use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody};
 use crate::types::PeekBuf;
 use anyhow::{anyhow, Context};
@@ -22,7 +23,16 @@ use tokio_util::sync::CancellationToken;
 use url::{Origin, Url};
 
 /// Headers that must be stripped when following a redirect to a different origin (RFC 9110 §15.4).
-const SENSITIVE_REDIRECT_HEADERS: &[header::HeaderName] = &[header::AUTHORIZATION, header::COOKIE];
+///
+/// `Referer` is included so a hand-set one cannot leak to a third-party host. When the caller
+/// supplies a referrer instead, the value is recomputed for each hop anyway, so removing it here
+/// costs nothing.
+const SENSITIVE_REDIRECT_HEADERS: &[header::HeaderName] =
+    &[header::AUTHORIZATION, header::COOKIE, header::REFERER];
+
+/// `Referrer-Policy` is not in `http`'s well-known header set, so name it once here rather than
+/// repeating a string literal at the use site.
+static REFERRER_POLICY: header::HeaderName = header::HeaderName::from_static("referrer-policy");
 
 /// Emit the block event and build the matching error, so the two can never drift apart.
 pub(crate) fn blocked(
@@ -162,6 +172,10 @@ pub struct RequestInit {
     /// How to treat an insecure hop requested by a secure `origin`. Applied to the initial URL
     /// and re-applied to every redirect target.
     pub mixed_content: MixedContentPolicy,
+    /// URL of the initiating document, used to compute `Referer`. `None` sends no referrer.
+    pub referrer: Option<Url>,
+    /// How much of `referrer` to reveal. Ignored when `referrer` is `None`.
+    pub referrer_policy: ReferrerPolicy,
 }
 
 impl Default for RequestInit {
@@ -192,7 +206,17 @@ impl RequestInit {
             body,
             origin: None,
             mixed_content: MixedContentPolicy::default(),
+            referrer: None,
+            referrer_policy: ReferrerPolicy::default(),
         }
+    }
+
+    /// Attach the initiating document's URL and the policy controlling how much of it is sent
+    /// in the `Referer` header. `None` sends no referrer.
+    pub fn with_referrer(mut self, referrer: Option<Url>, policy: ReferrerPolicy) -> Self {
+        self.referrer = referrer;
+        self.referrer_policy = policy;
+        self
     }
 
     /// Attach the initiating document's origin and the policy to apply to insecure hops.
@@ -612,6 +636,9 @@ pub async fn fetch_response_complete(
 /// - Only `http` and `https` targets are followed; other schemes are rejected.
 /// - Insecure hops requested by a secure `init.origin` are blocked or upgraded per
 ///   `init.mixed_content`, re-evaluated at every hop so a redirect cannot escape the check.
+/// - `Referer` is recomputed from `init.referrer` and `init.referrer_policy` at every hop, since
+///   the same-origin and downgrade determinations change as the chain moves. A `Referrer-Policy`
+///   header on a 3xx response replaces the policy for the remaining hops.
 /// - `policy.url_allowed` and `policy.cookies_for` are called at every hop.
 /// - `Set-Cookie` values on 3xx responses are reported via `policy.on_cookies` and the jar is
 ///   re-queried for the next hop; the final response's cookies are the caller's responsibility.
@@ -628,6 +655,8 @@ async fn get_with_redirects(
     let mut current_headers = init.headers;
     let mut current_body = init.body;
     let origin = init.origin;
+    // A redirect may replace this for the remaining hops (Fetch, HTTP-redirect fetch).
+    let mut referrer_policy = init.referrer_policy;
 
     for _ in 0..MAX_REDIRECTS {
         // HSTS upgrade first: a stored policy forces `https` for a known host regardless of the
@@ -653,6 +682,25 @@ async fn get_with_redirects(
                         message: format!("upgraded insecure request to {target}"),
                     });
                     url = target;
+                }
+            }
+        }
+
+        // Recomputed per hop; see the note on this function.
+        if let Some(ref source) = init.referrer {
+            match referrer::determine(source, referrer_policy, &url) {
+                Some(value) => match value.as_str().parse() {
+                    Ok(header_value) => {
+                        current_headers.insert(header::REFERER, header_value);
+                    }
+                    // A URL that will not go into a header is not worth failing the request over.
+                    Err(_) => {
+                        current_headers.remove(header::REFERER);
+                    }
+                },
+                // Drop any value from an earlier hop: this one is not allowed a referrer.
+                None => {
+                    current_headers.remove(header::REFERER);
                 }
             }
         }
@@ -706,6 +754,20 @@ async fn get_with_redirects(
         // 3xx — resolve the Location header
         let status = resp.status().as_u16();
         let from = resp.url().clone();
+
+        // A redirect may tighten (or loosen) the policy for the rest of the chain. Read every
+        // field line, not just the first: a server may split the list across lines, and the
+        // last token we understand wins across all of them.
+        if let Some(updated) = resp
+            .headers()
+            .get_all(&REFERRER_POLICY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .filter_map(ReferrerPolicy::parse_header)
+            .next_back()
+        {
+            referrer_policy = updated;
+        }
 
         // Report Set-Cookie values on this hop to the jar before following the redirect —
         // login flows commonly set the session cookie on a 302. Dropping our Cookie header
@@ -791,6 +853,7 @@ async fn get_with_redirects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::referrer::ReferrerPolicy;
     use crate::net::test_support::{RecordingObserver, RouteConfig, TestServer};
     use cow_utils::CowUtils;
     use http::HeaderMap;
@@ -1546,6 +1609,139 @@ mod tests {
             "upgrade must rewrite the hop, not block it"
         );
         assert_eq!(rec.blocked_reason(), None);
+    }
+
+    /// Fetch `path` on `srv` with the given referrer and return the `Referer` the server saw.
+    async fn referer_seen_by_server(
+        srv: &crate::net::test_support::TestServerHandle,
+        path: &str,
+        referrer: Option<&str>,
+        policy: ReferrerPolicy,
+    ) -> String {
+        let (_, body) = super::fetch_response_complete(
+            client(),
+            srv.url(path),
+            RequestInit::get(HeaderMap::new())
+                .with_referrer(referrer.map(|r| Url::parse(r).unwrap()), policy),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            None,
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+        String::from_utf8_lossy(&body).to_string()
+    }
+
+    /// The default policy sends the bare origin to a cross-origin target.
+    #[tokio::test(flavor = "current_thread")]
+    async fn referer_header_is_sent() {
+        let srv = TestServer::new()
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+
+        // The server is on loopback (trustworthy), so this is not a downgrade; cross-origin
+        // under the default policy means the bare origin.
+        assert_eq!(
+            referer_seen_by_server(
+                &srv,
+                "/echo",
+                Some("https://example.com/page?q=1#frag"),
+                ReferrerPolicy::default(),
+            )
+            .await,
+            "https://example.com/"
+        );
+    }
+
+    /// No referrer configured must mean no header at all, not an empty one — the echo route
+    /// reports `<absent>` only when the header is genuinely missing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_referrer_sends_no_header() {
+        let srv = TestServer::new()
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+
+        assert_eq!(
+            referer_seen_by_server(&srv, "/echo", None, ReferrerPolicy::default()).await,
+            "<absent>"
+        );
+        assert_eq!(
+            referer_seen_by_server(
+                &srv,
+                "/echo",
+                Some("https://example.com/page"),
+                ReferrerPolicy::NoReferrer,
+            )
+            .await,
+            "<absent>"
+        );
+    }
+
+    /// The header is recomputed per hop: leaving the referrer's origin reveals only that origin,
+    /// then a redirect landing back home may reveal the full path.
+    ///
+    /// Two servers are required. One server cannot express "cross-origin then same-origin", so
+    /// both hops would compute the same value and the test would pass even if the header were
+    /// computed once up front.
+    #[tokio::test(flavor = "current_thread")]
+    async fn referer_is_recomputed_after_a_redirect() {
+        let home = TestServer::new()
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+        // A different port is a different origin, and loopback keeps it out of downgrade rules.
+        let away = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute(home.url("/echo").as_str()),
+            )
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+
+        let doc = format!("{}page?q=1", home.base_url());
+        let policy = ReferrerPolicy::default();
+
+        // Leaving home is cross-origin, so only the bare origin is revealed.
+        assert_eq!(
+            referer_seen_by_server(&away, "/echo", Some(&doc), policy).await,
+            home.base_url().as_str()
+        );
+
+        // Redirected back home it is same-origin, so the full path is revealed. Computing the
+        // header once up front would still be sending the bare origin here.
+        assert_eq!(
+            referer_seen_by_server(&away, "/hop", Some(&doc), policy).await,
+            doc
+        );
+    }
+
+    /// A `Referrer-Policy` header on a redirect replaces the policy for the remaining hops.
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_referrer_policy_header_applies_to_later_hops() {
+        let srv = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_with_referrer_policy("/echo", "no-referrer"),
+            )
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+
+        // Same-origin with the server, so without the header the full URL would be sent.
+        let doc = format!("{}page?q=1", srv.base_url());
+        let seen =
+            referer_seen_by_server(&srv, "/hop", Some(&doc), ReferrerPolicy::default()).await;
+
+        assert_eq!(
+            seen, "<absent>",
+            "the redirect's no-referrer policy must suppress the header on the next hop"
+        );
     }
 
     /// A block must be observable, not just returned. Devtools has no other way to report why a
