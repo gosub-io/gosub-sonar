@@ -103,6 +103,10 @@ pub enum RouteConfig {
     /// `<absent>` when there is no such header — so a missing header is distinguishable from a
     /// present but empty one. Use to verify what referrer a request actually carried.
     EchoRefererHeader,
+    /// Respond 200 with the named request header's value as the body, or the literal `<absent>`
+    /// when there is no such header. The name is matched case-insensitively. Use to verify any
+    /// header a request carried, e.g. `User-Agent` or one the caller supplied by hand.
+    EchoRequestHeader(String),
     /// 302 redirect to `target` that also carries a `Referrer-Policy: policy` header.
     /// Use to verify a policy change applied mid-redirect-chain.
     RedirectWithReferrerPolicy {
@@ -206,6 +210,10 @@ impl RouteConfig {
     /// Shorthand for [`RouteConfig::EchoRefererHeader`]
     pub fn echo_referer_header() -> Self {
         Self::EchoRefererHeader
+    }
+    /// Shorthand for [`RouteConfig::EchoRequestHeader`]
+    pub fn echo_request_header(name: impl Into<String>) -> Self {
+        Self::EchoRequestHeader(name.into())
     }
     /// Shorthand for [`RouteConfig::RedirectWithReferrerPolicy`]
     pub fn redirect_with_referrer_policy(
@@ -389,6 +397,15 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
                 .unwrap_or_else(|| "<absent>".to_string());
             send_response(&mut stream, 200, referer.as_bytes()).await;
+        }
+        RouteConfig::EchoRequestHeader(name) => {
+            let prefix = format!("{}:", name.to_ascii_lowercase());
+            let value = req
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with(&prefix))
+                .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+                .unwrap_or_else(|| "<absent>".to_string());
+            send_response(&mut stream, 200, value.as_bytes()).await;
         }
         RouteConfig::HangAfterConnect => {
             // Hold the connection open without sending anything.

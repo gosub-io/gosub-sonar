@@ -38,6 +38,24 @@ use url::Url;
 let bytes = simple_get(&Url::parse("https://example.org")?).await?;
 ```
 
+To send headers, a `User-Agent`, or cookies, use `simple_get_with` (and likewise
+`sync_get_with` / `sync_fetch_with`) with a `SimpleOptions`:
+
+```rust
+use gosub_sonar::{simple_get_with, SimpleOptions};
+
+let opts = SimpleOptions::default()
+    .with_user_agent("MyBrowser/1.0")
+    .with_cookies("session=abc; theme=dark");
+
+let bytes = simple_get_with(&Url::parse("https://example.org")?, &opts).await?;
+```
+
+`SimpleOptions` also carries the timeouts, the body cap, and the proxy. These remain
+*one-shot* helpers: each call builds its own client, so there is no connection reuse and no
+cookie jar between calls — `sync_fetch` hands back the response's cookies, but carrying them
+to the next request is the caller's job. Use `Fetcher` when you want a real jar and pooling.
+
 ### Priority scheduler
 
 ```rust
