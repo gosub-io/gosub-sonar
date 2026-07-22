@@ -902,7 +902,11 @@ mod tests {
         let cert = reqwest::Certificate::from_pem(srv.cert_pem().unwrap()).unwrap();
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .add_root_certificate(cert)
+            // Not `add_root_certificate`: that leaves reqwest on the platform verifier and
+            // passes this CA as an *extra* root, which on Windows and macOS still defers to
+            // the OS trust store and rejects a CA generated in-process. `tls_certs_only`
+            // replaces the roots outright, so verification is pure rustls WebPKI.
+            .tls_certs_only([cert])
             .resolve(srv.tls_domain().unwrap(), srv.socket_addr())
             .build()
             .unwrap();

@@ -37,10 +37,15 @@ jobs:
 
       - name: cargo clippy
         # --all-targets covers lib, bins, examples, tests, and benchmarks.
-        run: cargo clippy --all-targets --features test-support
+        # --all-features additionally builds `test-support`, which is a different code path
+        # from the `cfg(test)` one and is what downstream consumers actually compile. It also
+        # pulls in examples gated behind `required-features`.
+        run: cargo clippy --all-targets --all-features
 
       - name: cargo doc
-        run: cargo doc --no-deps
+        # Matches docs.rs, which builds with all-features (see package.metadata.docs.rs).
+        # Without this a broken link in feature-gated code fails the publish, not the PR.
+        run: cargo doc --no-deps --all-features
 
   wasm:
     name: Check (wasm32)
@@ -79,8 +84,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
+      # Both configurations are needed: `test_support` compiles under `cfg(test)` whether or
+      # not the feature is on, and each build activates dependencies the other does not.
       - name: cargo test
         run: cargo test --features test-support
+
+      - name: cargo test (all features)
+        run: cargo test --all-features
 
   msrv:
     name: MSRV (1.88)
