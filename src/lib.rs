@@ -64,6 +64,8 @@ pub use net::hsts::{HstsEntry, HstsStore, InMemoryHstsStore};
 pub use net::mixed_content::MixedContentPolicy;
 pub use net::null_emitter::NullEmitter;
 pub use net::observer::NetObserver;
+#[cfg(not(target_arch = "wasm32"))]
+pub use net::proxy::{ProxyAuth, ProxyConfig, ProxyRule, ProxyScope};
 pub use net::referrer::ReferrerPolicy;
 pub use net::request_ref::RequestReference;
 pub use net::shared_body::SharedBody;

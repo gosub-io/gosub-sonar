@@ -22,6 +22,8 @@ pub mod mixed_content;
 pub mod null_emitter;
 pub mod observer;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod proxy;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod pump;
 pub mod referrer;
 pub mod request_ref;
