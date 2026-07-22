@@ -9,6 +9,8 @@ use crate::net::fetcher_context::FetcherContext;
 use crate::net::hsts::{self, HstsStore, InMemoryHstsStore};
 use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::proxy::ProxyConfig;
 use crate::net::shared_body::{ReaderOptions, SharedBody};
 use crate::net::types::{FetchRequest, FetchResult, NetError, Priority};
 use crate::net::utils::{short_url, spawn_named, Waiter};
@@ -76,6 +78,17 @@ pub struct FetcherConfig {
     /// URL. Defaults to [`MixedContentPolicy::Block`], and is overridable per request via
     /// [`FetchRequest::mixed_content`]. See [`mixed_content`](mod@crate::net::mixed_content).
     pub mixed_content: MixedContentPolicy,
+
+    /// Which proxy outgoing requests go through.
+    ///
+    /// Defaults to [`ProxyConfig::System`], which reads `HTTP_PROXY` and friends from the
+    /// environment. Set [`ProxyConfig::Rules`] to configure proxies programmatically, or
+    /// [`ProxyConfig::Disabled`] to connect directly and ignore the environment. See
+    /// [`proxy`](mod@crate::net::proxy).
+    ///
+    /// Native-only: on wasm32 the browser's `fetch()` uses the user's own proxy settings.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub proxy: ProxyConfig,
 }
 
 impl Default for FetcherConfig {
@@ -95,6 +108,8 @@ impl Default for FetcherConfig {
             #[cfg(not(target_arch = "wasm32"))]
             hsts: Some(Arc::new(InMemoryHstsStore::new())),
             mixed_content: MixedContentPolicy::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            proxy: ProxyConfig::default(),
         }
     }
 }
@@ -596,7 +611,7 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
 /// response bodies and sends the corresponding `Accept-Encoding` request header.
 /// When `false` neither header is added nor is any decompression performed.
 fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Client> {
-    // The browser's fetch() owns TLS, connection management, timeouts, and transparent
+    // The browser's fetch() owns TLS, connection management, timeouts, proxying, and transparent
     // decompression; none of the tuning knobs below exist in reqwest's wasm backend.
     //
     // It also owns redirects: there is no way to ask for them un-followed, so on wasm32
@@ -635,6 +650,7 @@ fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Cl
         if let Some(ref ua) = cfg.user_agent {
             b = b.user_agent(ua);
         }
+        b = cfg.proxy.apply(b)?;
         Ok(b.build()?)
     }
 }
@@ -747,6 +763,7 @@ fn notify_cookies(ctx: &Arc<dyn FetcherContext>, meta: &crate::net::types::Fetch
 mod tests {
     use super::*;
     use crate::net::fetcher_context::NullContext;
+    use crate::net::proxy::ProxyRule;
     use crate::net::request_ref::RequestReference;
     use crate::net::test_support::{RouteConfig, TestServer};
     use crate::net::types::{BlockReason, FetchRequest, Initiator, ResourceKind};
@@ -2106,5 +2123,102 @@ mod tests {
             "decode and raw must not be coalesced"
         );
         shutdown.cancel();
+    }
+
+    /// The mock server routes on the verbatim request-target, and a proxied request carries the
+    /// absolute URI there rather than a path — so registering the whole `http://host/path` as a
+    /// route makes the mock server stand in for a forward proxy. A hit on that route proves the
+    /// request was sent to the proxy instead of resolved against `unroutable.invalid`, which has
+    /// no DNS entry and would fail outright.
+    const PROXIED_URL: &str = "http://unroutable.invalid/resource";
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_routes_requests_through_configured_proxy() {
+        let srv = TestServer::new()
+            .route(PROXIED_URL, RouteConfig::ok(b"served by proxy"))
+            .start()
+            .await;
+
+        let cfg = FetcherConfig {
+            proxy: ProxyConfig::single(srv.base_url().as_str()),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let (req, cancel) = make_req(Url::parse(PROXIED_URL).unwrap(), Priority::Normal);
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, cancel, tx).await;
+
+        match tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            FetchResult::Buffered { body, .. } => assert_eq!(&body[..], b"served by proxy"),
+            other => panic!("expected Buffered, got {:?}", other),
+        }
+        assert_eq!(srv.hit_count(PROXIED_URL), 1, "proxy should have seen it");
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_proxy_bypass_list_is_honoured() {
+        let srv = TestServer::new()
+            .route(PROXIED_URL, RouteConfig::ok(b"served by proxy"))
+            .route("/direct", RouteConfig::ok(b"served directly"))
+            .start()
+            .await;
+
+        // Everything goes through the proxy except the server's own host, which is reached
+        // directly — the same connection, but with an origin-form request-target.
+        let cfg = FetcherConfig {
+            proxy: ProxyConfig::Rules(vec![ProxyRule::all(srv.base_url().as_str())
+                .bypassing(srv.socket_addr().ip().to_string())]),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let (req, cancel) = make_req(srv.url("/direct"), Priority::Normal);
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, cancel, tx).await;
+
+        match tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            FetchResult::Buffered { body, .. } => assert_eq!(&body[..], b"served directly"),
+            other => panic!("expected Buffered, got {:?}", other),
+        }
+        assert_eq!(
+            srv.hit_count("/direct"),
+            1,
+            "bypassed host should be requested in origin-form, not as an absolute URI"
+        );
+        shutdown.cancel();
+    }
+
+    #[test]
+    fn fetcher_new_rejects_an_unusable_proxy_url() {
+        let cfg = FetcherConfig {
+            proxy: ProxyConfig::single("not a url"),
+            ..test_config()
+        };
+        let err = match Fetcher::new(cfg, Arc::new(NullContext)) {
+            Err(e) => e,
+            Ok(_) => panic!("an unparseable proxy URL must not build a fetcher"),
+        };
+        assert!(
+            err.to_string().contains("not a url"),
+            "error should name the offending proxy URL, got: {err}"
+        );
     }
 }

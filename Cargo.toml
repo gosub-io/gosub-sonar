@@ -57,6 +57,9 @@ uuid = { version = "1", features = ["v4", "js"] }
 # Expose the in-process mock HTTP server (net::test_support) to downstream
 # integration tests and examples. Native-only: the mock server needs real sockets.
 test-support = ["dep:flate2", "dep:rcgen", "dep:tokio-rustls"]
+# Accept `socks4://`, `socks5://`, and `socks5h://` URLs in `FetcherConfig::proxy`.
+# Off by default: it pulls in an extra transport most embedders never point a proxy at.
+socks = ["reqwest/socks"]
 
 [dev-dependencies]
 cow-utils = "0.1.3"

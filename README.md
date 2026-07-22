@@ -110,6 +110,30 @@ private-browsing session wants.
 There is no preload list. On wasm32 the browser's `fetch()` applies its own HSTS, so the field does
 not exist there.
 
+### Proxies
+
+By default the fetcher reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` from the
+environment. `FetcherConfig::proxy` replaces that with your own settings:
+
+```rust
+use gosub_sonar::{FetcherConfig, ProxyConfig, ProxyRule};
+
+let cfg = FetcherConfig {
+    proxy: ProxyConfig::Rules(vec![
+        ProxyRule::all("http://proxy.corp:8080")
+            .with_basic_auth("alice", "hunter2")
+            .bypassing("localhost, 10.0.0.0/8, .internal.corp"),
+    ]),
+    ..Default::default()
+};
+```
+
+Rules are matched in order; each carries a scope (`http`, `https`, or all), optional credentials,
+and an optional `NO_PROXY`-syntax bypass list. Anything other than `ProxyConfig::System` ignores
+the environment entirely, so `ProxyConfig::Disabled` guarantees a direct connection. `socks4`,
+`socks5`, and `socks5h` proxy URLs need the `socks` feature. On wasm32 the browser's `fetch()`
+uses the user's own proxy settings, so the field does not exist there.
+
 ## Examples
 
 ```text
