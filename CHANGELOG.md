@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   struct-literal construction need updating
 - Request coalescing now also keys on the mixed content verdict and the
   referrer, so fewer requests share a response
+- `FetchRequest::builder()` now defaults to `auto_decode: true`, matching the
+  simple API and the wasm32 build. Use `.with_auto_decode(false)` for raw bytes.
+- With decoding on, `max_bytes` caps the decompressed size, and the early
+  `Content-Length` rejection no longer applies (reqwest strips the header
+  when it decodes).
 
 ### Fixed
 

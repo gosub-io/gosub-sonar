@@ -593,7 +593,7 @@ impl FetchRequest {
 
 /// Builder for [`FetchRequest`], created via [`FetchRequest::builder`].
 ///
-/// All settings are optional; `build()` produces a buffered, non-decoding request
+/// All settings are optional; `build()` produces a buffered, decoding request
 /// with [`Priority::Normal`] unless configured otherwise.
 pub struct FetchRequestBuilder {
     reference: RequestReference,
@@ -627,7 +627,7 @@ impl FetchRequestBuilder {
             initiator: Initiator::default(),
             kind: ResourceKind::default(),
             streaming: false,
-            auto_decode: false,
+            auto_decode: true,
             max_bytes: None,
             origin: None,
             mixed_content: None,
@@ -673,7 +673,10 @@ impl FetchRequestBuilder {
         self
     }
 
-    /// Sets whether to transparently decode compressed responses (default: false)
+    /// Sets whether to transparently decode compressed responses (default: true).
+    ///
+    /// With decoding on, [`with_max_bytes`](Self::with_max_bytes) caps the decompressed
+    /// size; set `false` to cap bytes as they arrive on the wire.
     pub fn with_auto_decode(mut self, auto_decode: bool) -> Self {
         self.auto_decode = auto_decode;
         self
@@ -853,6 +856,13 @@ mod tests {
         let buffered = RequestBody::bytes(&b"abc"[..]);
         assert_eq!(buffered.len(), Some(3));
         assert_eq!(buffered.as_bytes().map(|b| b.len()), Some(3));
+    }
+
+    #[test]
+    fn builder_decodes_by_default() {
+        let fr =
+            FetchRequest::builder(Method::GET, Url::parse("https://example.org").unwrap()).build();
+        assert!(fr.auto_decode);
     }
 
     #[test]
