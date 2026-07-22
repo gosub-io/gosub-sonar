@@ -80,6 +80,7 @@ pub struct FetcherConfig {
 
 impl Default for FetcherConfig {
     fn default() -> Self {
+        todo!("keep timeouts as defaults and give clients option to overwrite in FetchRequest");
         Self {
             global_slots: 32,
             h1_per_origin: 6,
@@ -324,7 +325,6 @@ impl Fetcher {
         };
         lane.push_back(QueueItem {
             req,
-            // handle: req_handle,\
             cancel,
             reply: reply_tx,
         });
@@ -522,7 +522,7 @@ impl Fetcher {
                     perform_streaming(
                         &client,
                         observer.clone(),
-                        &req_for_task,
+                        req_for_task,
                         &cfg,
                         cancel_parent.clone(),
                         ctx_clone.clone(),
@@ -532,7 +532,7 @@ impl Fetcher {
                     perform_buffered(
                         &client,
                         observer.clone(),
-                        &req_for_task,
+                        req_for_task,
                         &cfg,
                         cancel_parent.clone(),
                         ctx_clone.clone(),
@@ -650,7 +650,7 @@ fn per_origin_limit_for(cfg: &FetcherConfig, url: &Url) -> usize {
 async fn perform_streaming(
     client: &reqwest::Client,
     observer: Arc<dyn NetObserver + Send + Sync>,
-    req: &FetchRequest,
+    req: FetchRequest,
     cfg: &FetcherConfig,
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
@@ -659,6 +659,7 @@ async fn perform_streaming(
     let policy = NetPolicy::from_context(&ctx).with_hsts(cfg.hsts.clone());
     #[cfg(target_arch = "wasm32")]
     let policy = NetPolicy::from_context(&ctx);
+    let max_bytes = req.max_bytes;
 
     let ResponseTop {
         meta,
@@ -685,9 +686,7 @@ async fn perform_streaming(
         total_timeout: cfg.total_body_timeout,
         // The reader counts only post-peek bytes — the peek was already read off the stream —
         // so subtract it from the budget. A body of exactly max_bytes is delivered in full.
-        max_size: req
-            .max_bytes
-            .map(|max| max.saturating_sub(peek_buf.len()) as u64),
+        max_size: max_bytes.map(|max| max.saturating_sub(peek_buf.len()) as u64),
     };
 
     Ok(FetchResult::Stream {
@@ -700,7 +699,7 @@ async fn perform_streaming(
 async fn perform_buffered(
     client: &reqwest::Client,
     observer: Arc<dyn NetObserver + Send + Sync>,
-    req: &FetchRequest,
+    req: FetchRequest,
     cfg: &FetcherConfig,
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
@@ -716,7 +715,7 @@ async fn perform_buffered(
         make_request_init(req, cfg),
         cancel.clone(),
         observer,
-        req.max_bytes,
+        // req.max_bytes,
         cfg.read_idle_timeout,
         cfg.total_body_timeout,
         policy,
@@ -828,6 +827,15 @@ mod tests {
     fn dummy_item(priority: Priority) -> QueueItem {
         let url = Url::parse("http://example.com/").unwrap();
         let req_id = RequestId::new();
+        let req = FetchRequest::builder(Method::GET, url)
+            .with_req_id(req_id)
+            .with_headers(HeaderMap::new())
+            .with_priority(priority)
+            .with_initiator(Initiator::Other)
+            .with_kind(ResourceKind::Primary)
+            .with_streaming(false)
+            .with_auto_decode(true)
+            .build();
         let (tx, _rx) = oneshot::channel();
         QueueItem {
             req: FetchRequest {

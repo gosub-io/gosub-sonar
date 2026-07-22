@@ -12,6 +12,7 @@ use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, ReadBuf};
 use url::{Origin, Url};
 
@@ -460,6 +461,15 @@ pub struct FetchRequest {
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
     /// `None` for GET and HEAD requests.
     pub body: Option<RequestBody>,
+    /// Timeout for the TCP + TLS handshake.  Applies before any bytes are sent.
+    pub connect_timeout: Option<Duration>,
+    /// Timeout from sending the first request byte until the response headers arrive.
+    pub req_timeout: Option<Duration>,
+    /// Maximum silence between consecutive body chunks before the read is aborted.
+    pub read_idle_timeout: Option<Duration>,
+    /// Wall-clock deadline for receiving the entire response body after headers.
+    /// `None` disables the deadline (useful for very large downloads).
+    pub total_body_timeout: Option<Duration>,
 }
 
 impl FetchRequest {
@@ -612,6 +622,10 @@ pub struct FetchRequestBuilder {
     referrer: Option<Url>,
     referrer_policy: ReferrerPolicy,
     body: Option<RequestBody>,
+    connect_timeout: Option<Duration>,
+    req_timeout: Option<Duration>,
+    read_idle_timeout: Option<Duration>,
+    total_body_timeout: Option<Duration>,
 }
 
 impl FetchRequestBuilder {
@@ -634,6 +648,10 @@ impl FetchRequestBuilder {
             referrer: None,
             referrer_policy: ReferrerPolicy::default(),
             body: None,
+            connect_timeout: None,
+            req_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
         }
     }
 
@@ -738,6 +756,30 @@ impl FetchRequestBuilder {
         self
     }
 
+    /// Sets the connection_timeout for the request
+    pub fn with_connection_timeout(mut self, connection_timeout: Duration) -> Self {
+        self.connect_timeout = Some(connection_timeout);
+        self
+    }
+
+    /// Sets the req_timeout for the request
+    pub fn with_req_timeout(mut self, req_timeout: Duration) -> Self {
+        self.req_timeout = Some(req_timeout);
+        self
+    }
+
+    /// Sets the read_idle_timeout for the request
+    pub fn with_read_idle_timeout(mut self, read_idle_timeout: Duration) -> Self {
+        self.read_idle_timeout = Some(read_idle_timeout);
+        self
+    }
+
+    /// Sets the total_body_timeout for the request
+    pub fn with_total_body_timeout(mut self, total_body_timeout: Duration) -> Self {
+        self.total_body_timeout = Some(total_body_timeout);
+        self
+    }
+
     /// Builds the [`FetchRequest`]
     pub fn build(self) -> FetchRequest {
         FetchRequest {
@@ -757,6 +799,10 @@ impl FetchRequestBuilder {
             referrer: self.referrer,
             referrer_policy: self.referrer_policy,
             body: self.body,
+            connect_timeout: self.connect_timeout,
+            req_timeout: self.req_timeout,
+            read_idle_timeout: self.read_idle_timeout,
+            total_body_timeout: self.total_body_timeout,
         }
     }
 }
