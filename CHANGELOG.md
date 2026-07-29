@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Headers, `User-Agent`, and cookies in the simple API (#13) — `SimpleOptions` plus
+  `simple_get_with`, `sync_get_with`, and `sync_fetch_with`. It carries `headers`,
+  `user_agent`, `cookies` (a `Cookie` header value; a hand-written `Cookie` in `headers`
+  wins), `connect_timeout`, `timeout`, `max_body`, and `proxy`. `simple_get`, `sync_get`,
+  and `sync_fetch` are unchanged, and now delegate to the `_with` forms with
+  `SimpleOptions::default()`. Still one-shot: a client per call, no connection reuse and no
+  cookie jar between calls — use `Fetcher` for those.
+- `SimpleOptions::max_body` makes the 10 MiB body cap configurable, and applies it to
+  `file://` reads and `sync_fetch`, which previously hardcoded their own copy of the limit.
+- `test-support`: `RouteConfig::echo_request_header(name)` responds 200 with that request
+  header's value, or `<absent>` — the generic form of the existing cookie/referer echo routes.
+
 - Proxy configuration (#12) — `FetcherConfig::proxy` takes a `ProxyConfig`, so an embedder
   can point the fetcher at a proxy from its own settings instead of the process environment:
   - `ProxyConfig::System` (the default) keeps the previous behaviour, reading `HTTP_PROXY`,
