@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Proxy configuration (#12) — `FetcherConfig::proxy` takes a `ProxyConfig`, so an embedder
+  can point the fetcher at a proxy from its own settings instead of the process environment:
+  - `ProxyConfig::System` (the default) keeps the previous behaviour, reading `HTTP_PROXY`,
+    `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY`
+  - `ProxyConfig::Disabled` connects directly and ignores those variables
+  - `ProxyConfig::Rules` uses only the rules given. A `ProxyRule` carries a `ProxyScope`
+    (`Http` / `Https` / `All`), the proxy URL, optional `ProxyAuth` (`Basic` or a verbatim
+    `Proxy-Authorization` value), and an optional `NO_PROXY`-syntax bypass list
+  - an unusable proxy URL or auth header is reported by `Fetcher::new`
+  - new `socks` cargo feature to accept `socks4`/`socks5`/`socks5h` proxy URLs
+  - native-only: on wasm32 the browser's `fetch()` applies the user's own proxy settings
+
 - `tests/e2e.rs`: integration tests exercising the crate through its public API
   only, as a downstream consumer would — including an externally implemented
   `FetcherContext`. Gated on the `test-support` feature; CI now enables it.

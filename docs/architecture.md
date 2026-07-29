@@ -213,7 +213,8 @@ and two layers of semaphores:
   via ALPN).
 
 `FetcherConfig` (in `fetcher.rs`) also carries `connect_timeout` (5s), `req_timeout` (60s),
-`read_idle_timeout` (15s), `total_body_timeout` (180s), and an optional `user_agent`. The fetcher
+`read_idle_timeout` (15s), `total_body_timeout` (180s), an optional `user_agent`, and a `proxy`
+(`proxy.rs`) that defaults to reading `HTTP_PROXY` and friends from the environment. The fetcher
 builds **two** `reqwest` clients: one with automatic gzip/brotli/deflate decoding (`auto_decode:
 true`) and one that returns raw bytes (`auto_decode: false`); the flag is part of the coalescing
 key so decoded and raw requests never merge.
