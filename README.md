@@ -22,7 +22,7 @@ Add to your `Cargo.toml` (the scheduler API also uses these companion crates dir
 
 ```toml
 [dependencies]
-gosub-sonar = "0.1"
+gosub-sonar = "0.2"
 http = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
 tokio-util = "0.7"
@@ -70,7 +70,7 @@ shutdown.cancel();
 ```
 
 For per-subscriber cancellation use `fetcher.fetch_with_cancel(req, token)`; for full control
-over the reply channel and request handle use `fetcher.submit(req, handle, tx)`.
+over the reply channel use `fetcher.submit(req, cancel, reply_tx)`.
 
 See the `examples/` directory for runnable versions.
 
