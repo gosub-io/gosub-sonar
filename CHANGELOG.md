@@ -7,8 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-01
+
 ### Added
 
+- wasm32 support: the crate now compiles for `wasm32-unknown-unknown`, where the
+  browser's `fetch()` provides the transport. The async API (`Fetcher`,
+  `simple_get`) is available there; native-only pieces — the blocking helpers
+  (`sync_get`, `sync_fetch`), `file://` URLs, HSTS, proxy configuration, the
+  DNS resolver, and streaming uploads — are compiled out, with the browser
+  applying its own equivalents where they exist. CI builds the wasm32 target.
+- Pluggable DNS resolution — `FetcherConfig::dns_resolver` takes a
+  `DnsResolver` implementation which becomes the *only* resolver the underlying
+  client consults: every lookup, including each redirect hop, goes through it,
+  and connections go to exactly the addresses it returns. Lookups happen per
+  connection, not per request, so a rebound DNS name cannot redirect a pooled
+  connection (DNS rebinding). Return `Err` to refuse a host — the shape of an
+  SSRF policy that classifies resolved addresses rather than URLs.
+  `DnsResolver`, `DnsError`, and `Resolving` are re-exported at the crate root.
+  Native-only: on wasm32 the browser owns name resolution.
 - Proxy configuration (#12) — `FetcherConfig::proxy` takes a `ProxyConfig`, so an embedder
   can point the fetcher at a proxy from its own settings instead of the process environment:
   - `ProxyConfig::System` (the default) keeps the previous behaviour, reading `HTTP_PROXY`,
@@ -85,6 +102,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Content-Length` rejection no longer applies (reqwest strips the header
   when it decodes).
 
+### Removed
+
+- **Breaking:** `FetchHandle` and `FetchKeyData` are no longer part of the
+  public API. The request-coalescing key is an internal detail of the fetcher,
+  and everything the handle carried is available from `FetchResult` /
+  `FetchResultMeta`.
+
 ### Fixed
 
 - **The URL policy is now applied to redirect targets.** `build_client` never disabled reqwest's
@@ -135,5 +159,6 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/gosub-io/gosub-sonar/releases/tag/v0.1.0
