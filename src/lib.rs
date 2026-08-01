@@ -56,6 +56,8 @@ pub mod http;
 pub mod net;
 pub mod types;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use net::dns::{DnsError, DnsResolver, Resolving};
 pub use net::events::NetEvent;
 pub use net::fetcher::{Fetcher, FetcherConfig};
 pub use net::fetcher_context::{FetcherContext, NullContext};

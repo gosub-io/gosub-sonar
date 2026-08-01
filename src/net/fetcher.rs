@@ -1,5 +1,7 @@
 //! Priority-scheduled fetcher with request coalescing and per-origin concurrency limits.
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::dns::DnsResolver;
 use crate::net::fetch::{
     blocked, fetch_response_complete, fetch_response_top, preflight, NetPolicy, Preflight,
     RequestInit, ResponseTop,
@@ -89,6 +91,19 @@ pub struct FetcherConfig {
     /// Native-only: on wasm32 the browser's `fetch()` uses the user's own proxy settings.
     #[cfg(not(target_arch = "wasm32"))]
     pub proxy: ProxyConfig,
+
+    /// Resolver for hostname lookups on outgoing connections.
+    ///
+    /// Defaults to `None`, which uses the system resolver. When set, it is the *only*
+    /// resolver the underlying client consults — every lookup, including each redirect hop,
+    /// passes through it, and connections go to exactly the addresses it returns. This makes
+    /// it the enforcement point for SSRF policies (reject internal or link-local ranges by
+    /// returning an error) and for address pinning against DNS rebinding. See
+    /// [`dns`](mod@crate::net::dns).
+    ///
+    /// Native-only: on wasm32 the browser's `fetch()` owns name resolution.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub dns_resolver: Option<Arc<dyn DnsResolver>>,
 }
 
 impl Default for FetcherConfig {
@@ -110,6 +125,8 @@ impl Default for FetcherConfig {
             mixed_content: MixedContentPolicy::default(),
             #[cfg(not(target_arch = "wasm32"))]
             proxy: ProxyConfig::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            dns_resolver: None,
         }
     }
 }
@@ -649,6 +666,9 @@ fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Cl
             .deflate(decode);
         if let Some(ref ua) = cfg.user_agent {
             b = b.user_agent(ua);
+        }
+        if let Some(ref resolver) = cfg.dns_resolver {
+            b = b.dns_resolver(Arc::new(crate::net::dns::ReqwestResolver(resolver.clone())));
         }
         b = cfg.proxy.apply(b)?;
         Ok(b.build()?)

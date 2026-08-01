@@ -10,6 +10,8 @@
 #[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
 pub mod test_support;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dns;
 pub mod events;
 pub mod fetch;
 pub mod fetcher;
