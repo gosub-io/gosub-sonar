@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The default `User-Agent` is now `gosub-sonar/<crate version>` instead of no header at all
+  (#38). The value is available as `DEFAULT_USER_AGENT`; set `FetcherConfig::user_agent` to
+  override it, or to `None` to send no `User-Agent` header.
+
 ### Added
 
 - `Origin` and `Sec-Fetch-*` fetch metadata headers (#47):
