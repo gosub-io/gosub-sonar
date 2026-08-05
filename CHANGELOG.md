@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Origin` and `Sec-Fetch-*` fetch metadata headers (#47):
+  - `Sec-Fetch-Dest`, `Sec-Fetch-Mode`, and `Sec-Fetch-Site` are sent on every request,
+    driven by the new `FetchRequest::destination` and `FetchRequest::mode` fields
+    (`RequestDestination` / `RequestMode`, re-exported at the crate root);
+    `Sec-Fetch-User: ?1` is sent on user-activated navigations (`Initiator::User`)
+  - `Origin` is sent on non-GET/HEAD requests and on cross-origin CORS/WebSocket
+    requests, computed from the existing `FetchRequest::origin` field
+  - like `Referer`, the values are recomputed at every redirect hop and only sent to
+    potentially trustworthy targets; `Sec-Fetch-Site` can only degrade across a chain,
+    and `Origin` becomes `null` after a tainting cross-origin redirect
+  - no public suffix list yet, so sibling subdomains report `cross-site` instead of
+    `same-site` (#60); same host on another port reports `same-site`
+  - inert on wasm32, where the browser owns these headers
+
 ## [0.2.0] - 2026-08-01
 
 ### Added

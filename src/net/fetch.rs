@@ -1,6 +1,7 @@
 //! Low-level fetch functions used by the [`super::fetcher::Fetcher`].
 
 use crate::net::events::NetEvent;
+use crate::net::fetch_metadata::{self, RequestDestination, RequestMode, SecFetchSite};
 use crate::net::fetcher_context::FetcherContext;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::hsts::{self, HstsStore};
@@ -24,11 +25,15 @@ use url::{Origin, Url};
 
 /// Headers that must be stripped when following a redirect to a different origin (RFC 9110 §15.4).
 ///
-/// `Referer` is included so a hand-set one cannot leak to a third-party host. When the caller
-/// supplies a referrer instead, the value is recomputed for each hop anyway, so removing it here
-/// costs nothing.
-const SENSITIVE_REDIRECT_HEADERS: &[header::HeaderName] =
-    &[header::AUTHORIZATION, header::COOKIE, header::REFERER];
+/// `Referer` and `Origin` are included so hand-set values cannot leak to a third-party host.
+/// When the caller supplies a referrer or an initiating origin instead, the values are
+/// recomputed for each hop anyway, so removing them here costs nothing.
+const SENSITIVE_REDIRECT_HEADERS: &[header::HeaderName] = &[
+    header::AUTHORIZATION,
+    header::COOKIE,
+    header::REFERER,
+    header::ORIGIN,
+];
 
 /// `Referrer-Policy` is not in `http`'s well-known header set, so name it once here rather than
 /// repeating a string literal at the use site.
@@ -176,6 +181,14 @@ pub struct RequestInit {
     pub referrer: Option<Url>,
     /// How much of `referrer` to reveal. Ignored when `referrer` is `None`.
     pub referrer_policy: ReferrerPolicy,
+    /// What the resource will be used as, sent in `Sec-Fetch-Dest`.
+    /// See [`fetch_metadata`](mod@crate::net::fetch_metadata).
+    pub destination: RequestDestination,
+    /// The request's mode, sent in `Sec-Fetch-Mode` and shaping the `Origin` header.
+    pub mode: RequestMode,
+    /// Whether the request stems from a user action. Sends `Sec-Fetch-User: ?1` when the mode
+    /// is [`RequestMode::Navigate`]; ignored for other modes.
+    pub user_activated: bool,
 }
 
 impl Default for RequestInit {
@@ -208,6 +221,9 @@ impl RequestInit {
             mixed_content: MixedContentPolicy::default(),
             referrer: None,
             referrer_policy: ReferrerPolicy::default(),
+            destination: RequestDestination::default(),
+            mode: RequestMode::default(),
+            user_activated: false,
         }
     }
 
@@ -216,6 +232,21 @@ impl RequestInit {
     pub fn with_referrer(mut self, referrer: Option<Url>, policy: ReferrerPolicy) -> Self {
         self.referrer = referrer;
         self.referrer_policy = policy;
+        self
+    }
+
+    /// Attach the request's destination and mode for the `Sec-Fetch-*` headers, and whether it
+    /// stems from a user action (`Sec-Fetch-User`, navigations only).
+    /// See [`fetch_metadata`](mod@crate::net::fetch_metadata).
+    pub fn with_fetch_metadata(
+        mut self,
+        destination: RequestDestination,
+        mode: RequestMode,
+        user_activated: bool,
+    ) -> Self {
+        self.destination = destination;
+        self.mode = mode;
+        self.user_activated = user_activated;
         self
     }
 
@@ -639,6 +670,10 @@ pub async fn fetch_response_complete(
 /// - `Referer` is recomputed from `init.referrer` and `init.referrer_policy` at every hop, since
 ///   the same-origin and downgrade determinations change as the chain moves. A `Referrer-Policy`
 ///   header on a 3xx response replaces the policy for the remaining hops.
+/// - `Origin` and the `Sec-Fetch-*` headers are likewise recomputed at every hop from
+///   `init.origin`, `init.destination`, and `init.mode`. `Sec-Fetch-Site` only degrades across
+///   the chain, and `Origin` collapses to `null` once the chain redirects away from an origin
+///   the request had already left — see [`fetch_metadata`](mod@crate::net::fetch_metadata).
 /// - `policy.url_allowed` and `policy.cookies_for` are called at every hop.
 /// - `Set-Cookie` values on 3xx responses are reported via `policy.on_cookies` and the jar is
 ///   re-queried for the next hop; the final response's cookies are the caller's responsibility.
@@ -657,6 +692,13 @@ async fn get_with_redirects(
     let origin = init.origin;
     // A redirect may replace this for the remaining hops (Fetch, HTTP-redirect fetch).
     let mut referrer_policy = init.referrer_policy;
+    // `Sec-Fetch-Site` describes the whole chain, not the current hop: it starts at same-origin
+    // and can only degrade, so a detour through a foreign site is still visible when the chain
+    // lands back home.
+    let mut site = SecFetchSite::SameOrigin;
+    // The tainted origin flag (Fetch, HTTP-redirect fetch): once set, `Origin` is sent as the
+    // literal `null` for every remaining hop.
+    let mut origin_tainted = false;
 
     for _ in 0..MAX_REDIRECTS {
         // HSTS upgrade first: a stored policy forces `https` for a known host regardless of the
@@ -701,6 +743,46 @@ async fn get_with_redirects(
                 // Drop any value from an earlier hop: this one is not allowed a referrer.
                 None => {
                     current_headers.remove(header::REFERER);
+                }
+            }
+        }
+
+        // Origin and Sec-Fetch-* are likewise recomputed per hop.
+        let hop_site = match origin {
+            Some(ref o) => {
+                site = site.min(fetch_metadata::classify_site(o, &url));
+                site
+            }
+            // No initiating origin means the request was not triggered by web content.
+            None => SecFetchSite::None,
+        };
+        fetch_metadata::apply_sec_fetch_headers(
+            &mut current_headers,
+            &url,
+            init.destination,
+            init.mode,
+            hop_site,
+            init.user_activated,
+        );
+
+        // Without an initiating origin there is nothing to compute; a hand-set `Origin`
+        // header then goes out verbatim, like a hand-set `Referer`.
+        if let Some(ref o) = origin {
+            match fetch_metadata::origin_header_value(
+                o,
+                origin_tainted,
+                &current_method,
+                init.mode,
+                referrer_policy,
+                &url,
+            )
+            .and_then(|v| v.parse().ok())
+            {
+                Some(value) => {
+                    current_headers.insert(header::ORIGIN, value);
+                }
+                None => {
+                    current_headers.remove(header::ORIGIN);
                 }
             }
         }
@@ -835,6 +917,15 @@ async fn get_with_redirects(
         if from.origin() != to.origin() {
             for h in SENSITIVE_REDIRECT_HEADERS {
                 current_headers.remove(h);
+            }
+        }
+
+        // A cross-origin redirect from a hop the request's own origin had already left taints
+        // the Origin header for the rest of the chain (Fetch, HTTP-redirect fetch). The first
+        // cross-origin hop still sends the real origin, which CORS depends on.
+        if let Some(ref o) = origin {
+            if to.origin() != from.origin() && *o != from.origin() {
+                origin_tainted = true;
             }
         }
 
@@ -1746,6 +1837,196 @@ mod tests {
             seen, "<absent>",
             "the redirect's no-referrer policy must suppress the header on the next hop"
         );
+    }
+
+    /// Fetch `path` on `srv` with `init` and return the response body as text. Pair with
+    /// [`RouteConfig::echo_request_header`] to see a header exactly as the server received it.
+    async fn header_seen_by_server(
+        srv: &crate::net::test_support::TestServerHandle,
+        path: &str,
+        init: RequestInit,
+    ) -> String {
+        let (_, body) = super::fetch_response_complete(
+            client(),
+            srv.url(path),
+            init,
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            None,
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+        String::from_utf8_lossy(&body).to_string()
+    }
+
+    /// Even a bare request carries fetch metadata: empty destination, no-cors mode, and a
+    /// site of `none` when no initiating origin is set. `Sec-Fetch-User` must be absent,
+    /// not `?0`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sec_fetch_headers_are_sent_by_default() {
+        let srv = TestServer::new()
+            .route("/dest", RouteConfig::echo_request_header("sec-fetch-dest"))
+            .route("/mode", RouteConfig::echo_request_header("sec-fetch-mode"))
+            .route("/site", RouteConfig::echo_request_header("sec-fetch-site"))
+            .route("/user", RouteConfig::echo_request_header("sec-fetch-user"))
+            .start()
+            .await;
+
+        let cases = [
+            ("/dest", "empty"),
+            ("/mode", "no-cors"),
+            ("/site", "none"),
+            ("/user", "<absent>"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                header_seen_by_server(&srv, path, RequestInit::get(HeaderMap::new())).await,
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    /// `Sec-Fetch-Site` reports the target's relation to the initiating origin. The server is
+    /// on loopback, so its own origin is same-origin, the same host on another port is
+    /// same-site, and a foreign host is cross-site.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sec_fetch_site_reflects_the_initiating_origin() {
+        let srv = TestServer::new()
+            .route("/site", RouteConfig::echo_request_header("sec-fetch-site"))
+            .start()
+            .await;
+
+        let mut other_port = srv.base_url();
+        other_port.set_port(Some(1)).unwrap();
+
+        let cases = [
+            (srv.base_url(), "same-origin"),
+            (other_port, "same-site"),
+            (Url::parse("https://example.com").unwrap(), "cross-site"),
+        ];
+        for (initiator, expected) in cases {
+            let init = RequestInit::get(HeaderMap::new())
+                .with_mixed_content(Some(initiator.origin()), MixedContentPolicy::default());
+            assert_eq!(
+                header_seen_by_server(&srv, "/site", init).await,
+                expected,
+                "{initiator}"
+            );
+        }
+    }
+
+    /// The site relation covers the whole redirect chain: a detour through a foreign origin
+    /// degrades the value for good, even when the chain lands back on the initiator's own
+    /// origin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sec_fetch_site_degrades_across_redirects() {
+        let home = TestServer::new()
+            .route("/site", RouteConfig::echo_request_header("sec-fetch-site"))
+            .start()
+            .await;
+        // Both servers are on 127.0.0.1, so the detour through `away` (another port) is a
+        // same-site hop; loopback cannot express a cross-site one.
+        let away = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute(home.url("/site").as_str()),
+            )
+            .start()
+            .await;
+
+        let init = RequestInit::get(HeaderMap::new()).with_mixed_content(
+            Some(home.base_url().origin()),
+            MixedContentPolicy::default(),
+        );
+        assert_eq!(
+            header_seen_by_server(&away, "/hop", init).await,
+            "same-site",
+            "the foreign hop must cap the value even though the final hop is same-origin"
+        );
+    }
+
+    /// `Sec-Fetch-User: ?1` is only sent on user-activated navigations; everything else
+    /// omits the header.
+    #[tokio::test(flavor = "current_thread")]
+    async fn sec_fetch_user_marks_user_navigations() {
+        let srv = TestServer::new()
+            .route("/user", RouteConfig::echo_request_header("sec-fetch-user"))
+            .start()
+            .await;
+
+        let cases = [
+            (RequestMode::Navigate, true, "?1"),
+            (RequestMode::Navigate, false, "<absent>"),
+            (RequestMode::NoCors, true, "<absent>"),
+        ];
+        for (mode, activated, expected) in cases {
+            let init = RequestInit::get(HeaderMap::new()).with_fetch_metadata(
+                RequestDestination::Document,
+                mode,
+                activated,
+            );
+            assert_eq!(
+                header_seen_by_server(&srv, "/user", init).await,
+                expected,
+                "{mode:?} activated={activated}"
+            );
+        }
+    }
+
+    /// A POST carries an `Origin` header; a plain no-cors GET does not, even with an
+    /// initiating origin configured.
+    #[tokio::test(flavor = "current_thread")]
+    async fn origin_header_is_sent_for_post_but_not_plain_get() {
+        let srv = TestServer::new()
+            .route("/origin", RouteConfig::echo_request_header("origin"))
+            .start()
+            .await;
+        let initiator = srv.base_url().origin();
+
+        let post = RequestInit::post(HeaderMap::new(), b"x".to_vec())
+            .with_mixed_content(Some(initiator.clone()), MixedContentPolicy::default());
+        assert_eq!(
+            header_seen_by_server(&srv, "/origin", post).await,
+            initiator.ascii_serialization()
+        );
+
+        let get = RequestInit::get(HeaderMap::new())
+            .with_mixed_content(Some(initiator), MixedContentPolicy::default());
+        assert_eq!(
+            header_seen_by_server(&srv, "/origin", get).await,
+            "<absent>"
+        );
+    }
+
+    /// After a tainting cross-origin redirect the final server sees the literal `null`,
+    /// not the initiator and not a missing header.
+    #[tokio::test(flavor = "current_thread")]
+    async fn origin_header_becomes_null_after_a_cross_origin_redirect() {
+        let home = TestServer::new()
+            .route("/origin", RouteConfig::echo_request_header("origin"))
+            .start()
+            .await;
+        let away = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute(home.url("/origin").as_str()),
+            )
+            .start()
+            .await;
+
+        // CORS mode so the cross-origin GET carries an Origin header at all. The chain is
+        // home → away → home: away redirecting elsewhere is the tainting hop.
+        let init = RequestInit::get(HeaderMap::new())
+            .with_fetch_metadata(RequestDestination::Empty, RequestMode::Cors, false)
+            .with_mixed_content(
+                Some(home.base_url().origin()),
+                MixedContentPolicy::default(),
+            );
+        assert_eq!(header_seen_by_server(&away, "/hop", init).await, "null");
     }
 
     /// A block must be observable, not just returned. Devtools has no other way to report why a

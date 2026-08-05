@@ -5,8 +5,8 @@
 use gosub_sonar::net::test_support::{RouteConfig, TestServer};
 use gosub_sonar::{
     simple_get, FetchRequest, FetchResult, Fetcher, FetcherConfig, FetcherContext, Initiator,
-    NetObserver, NullContext, NullEmitter, RequestBody, RequestId, RequestReference, ResourceKind,
-    SharedBody,
+    NetObserver, NullContext, NullEmitter, RequestBody, RequestDestination, RequestId, RequestMode,
+    RequestReference, ResourceKind, SharedBody,
 };
 use http::Method;
 use std::sync::Arc;
@@ -133,6 +133,32 @@ async fn external_context_supplies_cookies() {
     match fetcher.fetch(req).await {
         FetchResult::Buffered { body, .. } => assert_eq!(&body[..], b"session=e2e"),
         other => panic!("expected Buffered, got {other:?}"),
+    }
+    shutdown.cancel();
+}
+
+/// The destination and mode set on a request must reach the server as `Sec-Fetch-*` headers
+/// when going through the full scheduler.
+#[tokio::test]
+async fn fetch_metadata_reaches_the_server() {
+    let srv = TestServer::new()
+        .route("/dest", RouteConfig::echo_request_header("sec-fetch-dest"))
+        .route("/mode", RouteConfig::echo_request_header("sec-fetch-mode"))
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+
+    for (path, expected) in [("/dest", "script"), ("/mode", "cors")] {
+        let req = FetchRequest::builder(Method::GET, srv.url(path))
+            .with_destination(RequestDestination::Script)
+            .with_mode(RequestMode::Cors)
+            .build();
+        match fetcher.fetch(req).await {
+            FetchResult::Buffered { body, .. } => {
+                assert_eq!(String::from_utf8_lossy(&body), expected, "{path}")
+            }
+            other => panic!("expected Buffered, got {other:?}"),
+        }
     }
     shutdown.cancel();
 }

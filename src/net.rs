@@ -14,6 +14,7 @@ pub mod test_support;
 pub mod dns;
 pub mod events;
 pub mod fetch;
+pub mod fetch_metadata;
 pub mod fetcher;
 pub mod fetcher_context;
 #[cfg(not(target_arch = "wasm32"))]

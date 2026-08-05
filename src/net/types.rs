@@ -1,5 +1,6 @@
 //! Core types for fetch requests, responses, errors, and priorities.
 
+use crate::net::fetch_metadata::{RequestDestination, RequestMode};
 use crate::net::mixed_content::{is_origin_potentially_trustworthy, MixedContentPolicy};
 use crate::net::referrer::{self, ReferrerPolicy};
 use crate::net::request_ref::RequestReference;
@@ -60,8 +61,10 @@ pub enum ResourceKind {
 
 /// Who or what triggered the fetch.
 ///
-/// Used for logging and passed back through [`crate::net::fetcher_context::FetcherContext::observer_for`];
-/// the net crate does not alter scheduling based on this value.
+/// Passed back through [`crate::net::fetcher_context::FetcherContext::observer_for`], and
+/// [`User`](Initiator::User) marks a [`RequestMode::Navigate`] request as user-activated,
+/// which sends `Sec-Fetch-User: ?1` — see [`fetch_metadata`](crate::net::fetch_metadata).
+/// The net crate does not alter scheduling based on this value.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum Initiator {
     /// Triggered by a user action (e.g. address bar, link click, button)
@@ -439,11 +442,14 @@ pub struct FetchRequest {
     pub method: Method,
     /// Target Url
     pub url: Url,
-    /// Origin of the document that initiated this request, used for mixed content checks.
+    /// Origin of the document that initiated this request, used for mixed content checks and
+    /// to compute the `Origin` and `Sec-Fetch-Site` headers.
     ///
-    /// `None` means "no document context", which disables mixed content blocking for this
-    /// request entirely — set it whenever a request is made on behalf of a page.
-    /// See [`mixed_content`](crate::net::mixed_content).
+    /// `None` means "no document context": mixed content blocking is disabled for this request
+    /// entirely, no `Origin` header is computed, and `Sec-Fetch-Site` reports `none` (a request
+    /// not triggered by web content). Set it whenever a request is made on behalf of a page.
+    /// See [`mixed_content`](crate::net::mixed_content) and
+    /// [`fetch_metadata`](crate::net::fetch_metadata).
     pub origin: Option<Origin>,
     /// Overrides [`FetcherConfig::mixed_content`](crate::net::fetcher::FetcherConfig::mixed_content)
     /// for this one request; `None` uses the fetcher-wide setting. Requires `origin`.
@@ -455,6 +461,12 @@ pub struct FetchRequest {
     pub referrer: Option<Url>,
     /// How much of `referrer` to reveal. Ignored when `referrer` is `None`.
     pub referrer_policy: ReferrerPolicy,
+    /// What the resource will be used as, sent in `Sec-Fetch-Dest`.
+    /// See [`fetch_metadata`](crate::net::fetch_metadata).
+    pub destination: RequestDestination,
+    /// The request's mode, sent in `Sec-Fetch-Mode` and shaping the `Origin` header.
+    /// See [`fetch_metadata`](crate::net::fetch_metadata).
+    pub mode: RequestMode,
     /// HTTP Headers (unified).
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
@@ -575,8 +587,36 @@ impl FetchRequest {
             },
         };
 
+        // `Origin` and `Sec-Fetch-*` vary the response (CORS allowlists, resource isolation
+        // policies), so requests that would send different values must not share one. Like the
+        // referrer, `Sec-Fetch-Site` and `Origin` are recomputed at every hop, so this keys on
+        // the initiating origin itself rather than on the values computed for the first hop.
+        let fetch_meta = {
+            let origin = match self.origin.as_ref() {
+                Some(o) => format!("{:x}", short_hash(o.ascii_serialization().as_bytes())),
+                // A hand-set `Origin` header goes out verbatim on the first hop, so it has to
+                // vary the key just like a computed one — mirroring the referrer above.
+                None => match self.headers.get(header::ORIGIN) {
+                    Some(manual) => format!("h{:x}", short_hash(manual.as_bytes())),
+                    None => "n".to_string(),
+                },
+            };
+            let user = if self.mode == RequestMode::Navigate && self.initiator == Initiator::User {
+                "u"
+            } else {
+                "-"
+            };
+            format!(
+                "{}:{}:{}:{}",
+                self.destination.as_str(),
+                self.mode.as_str(),
+                origin,
+                user
+            )
+        };
+
         Some(format!(
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={}",
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={}",
             self.method,
             url,
             range,
@@ -586,7 +626,8 @@ impl FetchRequest {
             auth_hash,
             cookie_hash,
             mixed_content,
-            referrer
+            referrer,
+            fetch_meta
         ))
     }
 }
@@ -611,6 +652,8 @@ pub struct FetchRequestBuilder {
     mixed_content: Option<MixedContentPolicy>,
     referrer: Option<Url>,
     referrer_policy: ReferrerPolicy,
+    destination: RequestDestination,
+    mode: RequestMode,
     body: Option<RequestBody>,
 }
 
@@ -633,6 +676,8 @@ impl FetchRequestBuilder {
             mixed_content: None,
             referrer: None,
             referrer_policy: ReferrerPolicy::default(),
+            destination: RequestDestination::default(),
+            mode: RequestMode::default(),
             body: None,
         }
     }
@@ -729,6 +774,20 @@ impl FetchRequestBuilder {
         self
     }
 
+    /// Sets what the resource will be used as, sent in `Sec-Fetch-Dest`.
+    /// See [`fetch_metadata`](crate::net::fetch_metadata).
+    pub fn with_destination(mut self, destination: RequestDestination) -> Self {
+        self.destination = destination;
+        self
+    }
+
+    /// Sets the request's mode, sent in `Sec-Fetch-Mode` and shaping the `Origin` header.
+    /// See [`fetch_metadata`](crate::net::fetch_metadata).
+    pub fn with_mode(mut self, mode: RequestMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
     /// Sets the HTTP method of the request
     pub fn with_method(mut self, method: Method) -> Self {
         self.method = method;
@@ -759,6 +818,8 @@ impl FetchRequestBuilder {
             mixed_content: self.mixed_content,
             referrer: self.referrer,
             referrer_policy: self.referrer_policy,
+            destination: self.destination,
+            mode: self.mode,
             body: self.body,
         }
     }
@@ -892,7 +953,8 @@ mod tests {
         let cookie_hash = format!("{:x}", short_hash(b"a=1; b=2"));
         let expected = format!(
             // MC=n: no secure initiating origin. Ref=n: no referrer set, so none is ever sent.
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n",
+            // FM: default destination and mode, no initiating origin, no user navigation.
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-",
             fr.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash
         );
 
@@ -920,11 +982,10 @@ mod tests {
         let none = key_for(None);
 
         assert_ne!(secure, insecure);
-        // No origin means no document to protect, so it shares the insecure verdict.
-        assert_eq!(insecure, none);
-        // Two different secure origins reach the same verdict and should still coalesce,
-        // otherwise every document would get its own connection for shared assets.
-        assert_eq!(secure, key_for(Some("https://c.example.com")));
+        // Distinct initiating origins no longer coalesce at all: they send different
+        // Sec-Fetch-Site values, if not on the first hop then after a redirect.
+        assert_ne!(insecure, none);
+        assert_ne!(secure, key_for(Some("https://c.example.com")));
     }
 
     /// A permitted image and a blocked script can target the same insecure URL from the same
@@ -1065,6 +1126,80 @@ mod tests {
         assert_eq!(
             key(Some("https://a.example.com/x")),
             key(Some("https://a.example.com/x"))
+        );
+    }
+
+    /// `Sec-Fetch-Dest`, `Sec-Fetch-Mode`, and `Sec-Fetch-Site` vary the response (resource
+    /// isolation policies), so requests that would send different values must not share one.
+    #[test]
+    fn coalescing_key_accounts_for_fetch_metadata() {
+        let target = Url::parse("https://cdn.example.org/a.js").unwrap();
+        let key = |dest: RequestDestination, mode: RequestMode, origin: Option<&str>| {
+            let mut b = FetchRequest::builder(Method::GET, target.clone())
+                .with_destination(dest)
+                .with_mode(mode);
+            if let Some(o) = origin {
+                b = b.with_origin(Url::parse(o).unwrap().origin());
+            }
+            b.build().generate_request_key().unwrap()
+        };
+
+        let (dest, mode) = (RequestDestination::default(), RequestMode::default());
+        // A script and an image request for one URL send different Sec-Fetch-Dest values.
+        assert_ne!(
+            key(RequestDestination::Script, mode, None),
+            key(RequestDestination::Image, mode, None)
+        );
+        assert_ne!(
+            key(dest, RequestMode::NoCors, None),
+            key(dest, RequestMode::Cors, None)
+        );
+        // Different initiating origins diverge on Sec-Fetch-Site — if not on the first hop,
+        // then after a redirect — so they must not share a bucket.
+        assert_ne!(
+            key(dest, mode, Some("https://a.example.com")),
+            key(dest, mode, Some("https://b.example.com"))
+        );
+        assert_ne!(
+            key(dest, mode, Some("https://a.example.com")),
+            key(dest, mode, None)
+        );
+        // Identical inputs coalesce.
+        assert_eq!(
+            key(
+                RequestDestination::Script,
+                mode,
+                Some("https://a.example.com")
+            ),
+            key(
+                RequestDestination::Script,
+                mode,
+                Some("https://a.example.com")
+            )
+        );
+    }
+
+    /// A hand-set `Origin` goes out verbatim on the first hop, so it varies the key like a
+    /// hand-set `Referer` does.
+    #[test]
+    fn coalescing_key_accounts_for_a_hand_set_origin_header() {
+        let target = Url::parse("https://cdn.example.org/a.js").unwrap();
+        let key = |manual: Option<&str>| {
+            let mut req = FetchRequest::builder(Method::GET, target.clone()).build();
+            if let Some(value) = manual {
+                req.headers.insert(header::ORIGIN, value.parse().unwrap());
+            }
+            req.generate_request_key().unwrap()
+        };
+
+        assert_ne!(key(Some("https://a.example.com")), key(None));
+        assert_ne!(
+            key(Some("https://a.example.com")),
+            key(Some("https://b.example.com"))
+        );
+        assert_eq!(
+            key(Some("https://a.example.com")),
+            key(Some("https://a.example.com"))
         );
     }
 

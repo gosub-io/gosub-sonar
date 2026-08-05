@@ -14,7 +14,7 @@ use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::proxy::ProxyConfig;
 use crate::net::shared_body::{ReaderOptions, SharedBody};
-use crate::net::types::{FetchRequest, FetchResult, NetError, Priority};
+use crate::net::types::{FetchRequest, FetchResult, Initiator, NetError, Priority};
 use crate::net::utils::{short_url, spawn_named, Waiter};
 use dashmap::{DashMap, Entry};
 use http::header;
@@ -620,6 +620,7 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
     RequestInit::new(req.method.clone(), headers, body)
         .with_mixed_content(req.origin.clone(), effective_mixed_content(req, cfg))
         .with_referrer(req.referrer.clone(), req.referrer_policy)
+        .with_fetch_metadata(req.destination, req.mode, req.initiator == Initiator::User)
 }
 
 /// Build a reqwest client from `FetcherConfig`.
@@ -853,6 +854,8 @@ mod tests {
             mixed_content: None,
             referrer: None,
             referrer_policy: Default::default(),
+            destination: Default::default(),
+            mode: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -880,6 +883,8 @@ mod tests {
                 mixed_content: None,
                 referrer: None,
                 referrer_policy: Default::default(),
+                destination: Default::default(),
+                mode: Default::default(),
                 streaming: false,
                 auto_decode: true,
                 max_bytes: None,
@@ -1099,6 +1104,8 @@ mod tests {
             mixed_content: None,
             referrer: None,
             referrer_policy: Default::default(),
+            destination: Default::default(),
+            mode: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1212,6 +1219,8 @@ mod tests {
             mixed_content: None,
             referrer: None,
             referrer_policy: Default::default(),
+            destination: Default::default(),
+            mode: Default::default(),
             streaming: true,
             auto_decode: true,
             max_bytes: None,
@@ -1653,6 +1662,8 @@ mod tests {
             mixed_content: None,
             referrer: None,
             referrer_policy: Default::default(),
+            destination: Default::default(),
+            mode: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -2013,6 +2024,8 @@ mod tests {
             mixed_content: None,
             referrer: None,
             referrer_policy: Default::default(),
+            destination: Default::default(),
+            mode: Default::default(),
             streaming: false,
             auto_decode,
             max_bytes: None,
