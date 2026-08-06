@@ -6,7 +6,7 @@ use gosub_sonar::net::test_support::{RouteConfig, TestServer};
 use gosub_sonar::{
     simple_get, FetchRequest, FetchResult, Fetcher, FetcherConfig, FetcherContext, Initiator,
     NetObserver, NullContext, NullEmitter, RequestBody, RequestDestination, RequestId, RequestMode,
-    RequestReference, ResourceKind, SharedBody,
+    RequestReference, ResourceKind, SharedBody, DEFAULT_USER_AGENT,
 };
 use http::Method;
 use std::sync::Arc;
@@ -159,6 +159,25 @@ async fn fetch_metadata_reaches_the_server() {
             }
             other => panic!("expected Buffered, got {other:?}"),
         }
+    }
+    shutdown.cancel();
+}
+
+/// Without an explicit override, requests must identify themselves as `gosub-sonar/<version>`.
+#[tokio::test]
+async fn default_user_agent_reaches_the_server() {
+    let srv = TestServer::new()
+        .route("/ua", RouteConfig::echo_request_header("user-agent"))
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/ua")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { body, .. } => {
+            assert_eq!(String::from_utf8_lossy(&body), DEFAULT_USER_AGENT)
+        }
+        other => panic!("expected Buffered, got {other:?}"),
     }
     shutdown.cancel();
 }

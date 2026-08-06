@@ -26,6 +26,12 @@ use url::Url;
 
 const SHARED_MAX_CAPACITY: usize = 32;
 
+/// `User-Agent` value sent by default: `gosub-sonar/<crate version>`.
+///
+/// The version comes from `Cargo.toml` at compile time, so it tracks releases automatically.
+pub const DEFAULT_USER_AGENT: &str =
+    concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
 /// Configuration for the priority-scheduled [`Fetcher`].
 ///
 /// All timeouts apply per individual request, not to the fetcher as a whole.
@@ -63,8 +69,8 @@ pub struct FetcherConfig {
 
     /// `User-Agent` header sent with every request made by this fetcher.
     ///
-    /// Set this to identify your application to servers and CDNs.
-    /// `None` falls back to reqwest's built-in default (`reqwest/VERSION`).
+    /// Defaults to [`DEFAULT_USER_AGENT`] (`gosub-sonar/<crate version>`); override it to
+    /// identify your application to servers and CDNs. `None` sends no `User-Agent` header.
     /// For a browser engine use something like `"Mozilla/5.0 (compatible; MyBrowser/1.0)"`.
     pub user_agent: Option<String>,
 
@@ -119,7 +125,7 @@ impl Default for FetcherConfig {
             pool_max_idle_per_host: 6,
             pool_idle_timeout: Some(Duration::from_secs(90)),
             tcp_keepalive: Some(Duration::from_secs(60)),
-            user_agent: None,
+            user_agent: Some(DEFAULT_USER_AGENT.to_string()),
             #[cfg(not(target_arch = "wasm32"))]
             hsts: Some(Arc::new(InMemoryHstsStore::new())),
             mixed_content: MixedContentPolicy::default(),
