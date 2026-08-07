@@ -715,9 +715,13 @@ async fn perform_streaming(
     ctx: Arc<dyn FetcherContext>,
 ) -> Result<FetchResult, NetError> {
     #[cfg(not(target_arch = "wasm32"))]
-    let policy = NetPolicy::from_context(&ctx)
-        .with_hsts(cfg.hsts.clone())
-        .with_cors_preflight_cache(cfg.cors_preflight_cache.clone());
+    let policy = {
+        let policy = NetPolicy::from_context(&ctx).with_hsts(cfg.hsts.clone());
+        match cfg.cors_preflight_cache.clone() {
+            Some(cache) => policy.with_cors_preflight_cache(cache),
+            None => policy,
+        }
+    };
     #[cfg(target_arch = "wasm32")]
     let policy = NetPolicy::from_context(&ctx);
 
@@ -767,9 +771,13 @@ async fn perform_buffered(
     ctx: Arc<dyn FetcherContext>,
 ) -> Result<FetchResult, NetError> {
     #[cfg(not(target_arch = "wasm32"))]
-    let policy = NetPolicy::from_context(&ctx)
-        .with_hsts(cfg.hsts.clone())
-        .with_cors_preflight_cache(cfg.cors_preflight_cache.clone());
+    let policy = {
+        let policy = NetPolicy::from_context(&ctx).with_hsts(cfg.hsts.clone());
+        match cfg.cors_preflight_cache.clone() {
+            Some(cache) => policy.with_cors_preflight_cache(cache),
+            None => policy,
+        }
+    };
     #[cfg(target_arch = "wasm32")]
     let policy = NetPolicy::from_context(&ctx);
 

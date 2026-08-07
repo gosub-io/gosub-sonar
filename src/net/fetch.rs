@@ -175,7 +175,10 @@ impl NetPolicy {
         self.cors_preflight = Some(cache);
         self
     }
-    
+
+    /// Drops the CORS preflight cache: preflights still run when required, but no grant is
+    /// remembered between them.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn clear_preflight_cache(mut self) -> Self {
         self.cors_preflight = None;
         self
