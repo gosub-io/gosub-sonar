@@ -171,8 +171,13 @@ impl NetPolicy {
     /// Attaches the CORS preflight cache this policy should consult and update.
     /// `None` still preflights when required, without caching the grants.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn with_cors_preflight_cache(mut self, cache: Option<Arc<dyn CorsPreflightCache>>) -> Self {
-        self.cors_preflight = cache;
+    pub fn with_cors_preflight_cache(mut self, cache: Arc<dyn CorsPreflightCache>) -> Self {
+        self.cors_preflight = Some(cache);
+        self
+    }
+    
+    pub fn clear_preflight_cache(mut self) -> Self {
+        self.cors_preflight = None;
         self
     }
 }
