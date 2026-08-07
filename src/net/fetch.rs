@@ -1,5 +1,8 @@
 //! Low-level fetch functions used by the [`super::fetcher::Fetcher`].
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::cors::CorsPreflightCache;
+use crate::net::cors::{self, CorsError, ResponseTainting};
 use crate::net::events::NetEvent;
 use crate::net::fetch_metadata::{self, RequestDestination, RequestMode, SecFetchSite};
 use crate::net::fetcher_context::FetcherContext;
@@ -8,7 +11,7 @@ use crate::net::hsts::{self, HstsStore};
 use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
 use crate::net::observer::NetObserver;
 use crate::net::referrer::{self, ReferrerPolicy};
-use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody};
+use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody, RequestCredentials};
 use crate::types::PeekBuf;
 use anyhow::{anyhow, Context};
 use bytes::{Bytes, BytesMut};
@@ -52,8 +55,8 @@ pub(crate) fn blocked(
     NetError::Blocked { reason, url }
 }
 
-/// What [`preflight`] decided about one hop.
-pub(crate) enum Preflight {
+/// What [`hop_checks`] decided about one hop.
+pub(crate) enum HopCheck {
     /// Send the request to this URL, which may be an upgraded form of the one checked.
     Proceed(Url),
     /// Refuse the request.
@@ -67,27 +70,27 @@ pub(crate) enum Preflight {
 /// cannot reach different conclusions about the same URL. Order matters: a mixed content upgrade
 /// rewrites the URL, and `url_allowed` must vet the URL that will actually be sent — an embedder
 /// that rejects `http://` should not see a request the upgrade would have made `https://`.
-pub(crate) fn preflight(
+pub(crate) fn hop_checks(
     url: &Url,
     mixed_content: MixedContentPolicy,
     origin: Option<&Origin>,
     url_allowed: &dyn Fn(&Url) -> bool,
-) -> Preflight {
+) -> HopCheck {
     if !matches!(url.scheme(), "http" | "https") {
-        return Preflight::Reject(BlockReason::UnsupportedScheme);
+        return HopCheck::Reject(BlockReason::UnsupportedScheme);
     }
 
     let target = match mixed_content::evaluate(mixed_content, origin, url) {
         MixedContentAction::Allow => url.clone(),
         MixedContentAction::Upgrade(upgraded) => upgraded,
-        MixedContentAction::Block => return Preflight::Reject(BlockReason::MixedContent),
+        MixedContentAction::Block => return HopCheck::Reject(BlockReason::MixedContent),
     };
 
     if !url_allowed(&target) {
-        return Preflight::Reject(BlockReason::UrlPolicy);
+        return HopCheck::Reject(BlockReason::UrlPolicy);
     }
 
-    Preflight::Proceed(target)
+    HopCheck::Proceed(target)
 }
 
 /// Callback type for the URL allowlist check.
@@ -121,6 +124,10 @@ pub struct NetPolicy {
     /// `None` disables HSTS. Set via [`NetPolicy::with_hsts`].
     #[cfg(not(target_arch = "wasm32"))]
     pub hsts: Option<Arc<dyn HstsStore>>,
+    /// Cache of CORS preflight grants. `None` still preflights when the spec requires it,
+    /// asking the server every time. Set via [`NetPolicy::with_cors_preflight_cache`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub cors_preflight: Option<Arc<dyn CorsPreflightCache>>,
 }
 
 impl Default for NetPolicy {
@@ -131,6 +138,8 @@ impl Default for NetPolicy {
             on_cookies: Box::new(|_, _| {}),
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            cors_preflight: None,
         }
     }
 }
@@ -147,6 +156,8 @@ impl NetPolicy {
             on_cookies: Box::new(move |url, values| ctx_sink.on_cookies_received(url, values)),
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            cors_preflight: None,
         }
     }
 
@@ -154,6 +165,14 @@ impl NetPolicy {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_hsts(mut self, store: Option<Arc<dyn HstsStore>>) -> Self {
         self.hsts = store;
+        self
+    }
+
+    /// Attaches the CORS preflight cache this policy should consult and update.
+    /// `None` still preflights when required, without caching the grants.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_cors_preflight_cache(mut self, cache: Option<Arc<dyn CorsPreflightCache>>) -> Self {
+        self.cors_preflight = cache;
         self
     }
 }
@@ -184,11 +203,15 @@ pub struct RequestInit {
     /// What the resource will be used as, sent in `Sec-Fetch-Dest`.
     /// See [`fetch_metadata`](mod@crate::net::fetch_metadata).
     pub destination: RequestDestination,
-    /// The request's mode, sent in `Sec-Fetch-Mode` and shaping the `Origin` header.
+    /// The request's mode, sent in `Sec-Fetch-Mode` and selecting the CORS regime.
+    /// See [`cors`](mod@crate::net::cors).
     pub mode: RequestMode,
     /// Whether the request stems from a user action. Sends `Sec-Fetch-User: ?1` when the mode
     /// is [`RequestMode::Navigate`]; ignored for other modes.
     pub user_activated: bool,
+    /// Whether cookies from the policy's jar ride along, and how strict the credentialed CORS
+    /// rules are. See [`RequestCredentials`].
+    pub credentials: RequestCredentials,
 }
 
 impl Default for RequestInit {
@@ -224,6 +247,7 @@ impl RequestInit {
             destination: RequestDestination::default(),
             mode: RequestMode::default(),
             user_activated: false,
+            credentials: RequestCredentials::default(),
         }
     }
 
@@ -261,6 +285,12 @@ impl RequestInit {
     ) -> Self {
         self.origin = origin;
         self.mixed_content = policy;
+        self
+    }
+
+    /// Attach the request's credentials mode (default: [`RequestCredentials::Include`]).
+    pub fn with_credentials(mut self, credentials: RequestCredentials) -> Self {
+        self.credentials = credentials;
         self
     }
 }
@@ -305,7 +335,7 @@ pub async fn fetch_response_top(
     let started = Instant::now();
     observer.on_event(NetEvent::Started { url: url.clone() });
 
-    let resp = get_with_redirects(
+    let (resp, tainting) = get_with_redirects(
         client.clone(),
         url.clone(),
         init,
@@ -317,6 +347,7 @@ pub async fn fetch_response_top(
 
     // Response is received, setup our meta structure
     let mut meta = FetchResultMeta {
+        tainting,
         final_url: resp.url().clone(),
         status: resp.status().as_u16(),
         status_text: resp.status().canonical_reason().unwrap_or("").to_string(),
@@ -677,6 +708,11 @@ pub async fn fetch_response_complete(
 /// - `policy.url_allowed` and `policy.cookies_for` are called at every hop.
 /// - `Set-Cookie` values on 3xx responses are reported via `policy.on_cookies` and the jar is
 ///   re-queried for the next hop; the final response's cookies are the caller's responsibility.
+/// - CORS is enforced per hop when `init.origin` is set — the same-origin/no-cors mode rules
+///   before sending, a preflight (with `policy.cors_preflight` as its cache) when the method or
+///   headers need one, and the CORS check on every response of a cors-tainted chain. The chain's
+///   final [`ResponseTainting`] is returned beside the response — see
+///   [`cors`](mod@crate::net::cors).
 async fn get_with_redirects(
     client: Arc<reqwest::Client>,
     url: Url,
@@ -684,7 +720,7 @@ async fn get_with_redirects(
     cancel: CancellationToken,
     observer: Arc<dyn NetObserver + Send + Sync>,
     policy: NetPolicy,
-) -> Result<reqwest::Response, NetError> {
+) -> Result<(reqwest::Response, ResponseTainting), NetError> {
     let mut url = url;
     let mut current_method = init.method;
     let mut current_headers = init.headers;
@@ -699,10 +735,19 @@ async fn get_with_redirects(
     // The tainted origin flag (Fetch, HTTP-redirect fetch): once set, `Origin` is sent as the
     // literal `null` for every remaining hop.
     let mut origin_tainted = false;
+    // Response tainting (Fetch §2.2.5): basic until the chain leaves the initiating origin,
+    // then cors/opaque per the request mode — and it stays there even if a detour redirects
+    // back home, which is why the CORS check below keys on this and not on the hop's URL.
+    let mut tainting = ResponseTainting::Basic;
+    // The credentialed CORS rules key on the request's credentials *mode*, not on whether
+    // cookies were actually attached on a given hop. Only the native checks consult it — on
+    // wasm32 the browser enforces the credentialed rules itself.
+    #[cfg(not(target_arch = "wasm32"))]
+    let credentials_include = init.credentials == RequestCredentials::Include;
 
     for _ in 0..MAX_REDIRECTS {
         // HSTS upgrade first: a stored policy forces `https` for a known host regardless of the
-        // mixed-content setting. `preflight` then re-checks the scheme and mixed content on the
+        // mixed-content setting. `hop_checks` then re-checks the scheme and mixed content on the
         // (possibly upgraded) URL and runs `url_allowed` last, so the policy hook always vets the
         // URL actually sent. All of this re-runs on every hop: an https document may be redirected
         // onto plain http, which the caller cannot see and so cannot check for itself.
@@ -713,17 +758,58 @@ async fn get_with_redirects(
             }
         }
 
-        match preflight(&url, init.mixed_content, origin.as_ref(), &|u| {
+        match hop_checks(&url, init.mixed_content, origin.as_ref(), &|u| {
             (policy.url_allowed)(u)
         }) {
-            Preflight::Reject(reason) => return Err(blocked(&observer, url, reason)),
-            Preflight::Proceed(target) => {
+            HopCheck::Reject(reason) => return Err(blocked(&observer, url, reason)),
+            HopCheck::Proceed(target) => {
                 if target != url {
                     observer.on_event(NetEvent::Warning {
                         url: url.clone(),
                         message: format!("upgraded insecure request to {target}"),
                     });
                     url = target;
+                }
+            }
+        }
+
+        // CORS regime for this hop (Fetch, main fetch). Only a request with a document context
+        // is subject to it, and only once the chain has left the initiating origin — a tainted
+        // chain counts as having left even when a detour lands back home. Navigations are not
+        // CORS-checked, and a WebSocket server opts in via its own handshake instead.
+        if let Some(ref o) = origin {
+            let has_left_origin = origin_tainted || *o != url.origin();
+            if has_left_origin {
+                match init.mode {
+                    RequestMode::SameOrigin => {
+                        return Err(blocked(
+                            &observer,
+                            url,
+                            BlockReason::Cors(CorsError::SameOriginMode),
+                        ));
+                    }
+                    // A no-cors request may go cross-origin, but only in the shape markup can
+                    // produce: safelisted method, no headers the fetcher does not own. The
+                    // response becomes opaque.
+                    RequestMode::NoCors => {
+                        tainting = ResponseTainting::Opaque;
+                        if !cors::is_cors_safelisted_method(&current_method) {
+                            return Err(blocked(
+                                &observer,
+                                url,
+                                BlockReason::Cors(CorsError::UnsafeMethodForNoCors),
+                            ));
+                        }
+                        if !cors::unsafe_request_header_names(&current_headers).is_empty() {
+                            return Err(blocked(
+                                &observer,
+                                url,
+                                BlockReason::Cors(CorsError::UnsafeHeaderForNoCors),
+                            ));
+                        }
+                    }
+                    RequestMode::Cors => tainting = ResponseTainting::Cors,
+                    RequestMode::Navigate | RequestMode::Websocket => {}
                 }
             }
         }
@@ -787,10 +873,93 @@ async fn get_with_redirects(
             }
         }
 
-        // Inject cookies from the jar for this hop's origin.
+        // CORS preflight (Fetch §4.9): a cross-origin cors-mode request whose method or headers
+        // markup could not produce must be approved by the server before it is sent. Running
+        // this per hop is what modern browsers do after a redirect moves the target — the
+        // grant is per (origin, URL), so a new URL needs its own, usually served from the
+        // cache. The OPTIONS goes out credential-less and never follows redirects (the client
+        // has redirects disabled; a 3xx fails the ok-status test).
+        //
+        // Native-only: on wasm32 the browser preflights itself and does not surface the
+        // `Access-Control-*` response headers this validation would need.
+        #[cfg(not(target_arch = "wasm32"))]
+        if init.mode == RequestMode::Cors && tainting == ResponseTainting::Cors {
+            if let Some(ref o) = origin {
+                let unsafe_names = cors::unsafe_request_header_names(&current_headers);
+                if !cors::is_cors_safelisted_method(&current_method) || !unsafe_names.is_empty() {
+                    let serialized = cors::serialize_origin(o, origin_tainted);
+                    let now = chrono::Utc::now();
+                    let granted = policy
+                        .cors_preflight
+                        .as_ref()
+                        .and_then(|c| c.get(&serialized, &url, credentials_include, now))
+                        .is_some_and(|allows| {
+                            allows
+                                .permits(&current_method, &unsafe_names, credentials_include)
+                                .is_ok()
+                        });
+                    if !granted {
+                        let mut pf_headers =
+                            cors::preflight_request_headers(&current_method, &unsafe_names);
+                        if let Ok(v) = serialized.parse() {
+                            pf_headers.insert(header::ORIGIN, v);
+                        }
+                        fetch_metadata::apply_sec_fetch_headers(
+                            &mut pf_headers,
+                            &url,
+                            init.destination,
+                            init.mode,
+                            hop_site,
+                            false,
+                        );
+                        observer.on_event(NetEvent::CorsPreflight { url: url.clone() });
+                        let fut = client
+                            .request(Method::OPTIONS, url.clone())
+                            .headers(pf_headers)
+                            .send();
+                        tokio::pin!(fut);
+                        let pf_resp = tokio::select! {
+                            _ = cancel.cancelled() => {
+                                observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled during CORS preflight" });
+                                return Err(NetError::Cancelled("cancelled during CORS preflight".into()));
+                            }
+                            r = &mut fut => r.context("CORS preflight request failed").map_err(|e| NetError::Read(Arc::new(e)))?
+                        };
+                        let allows = cors::validate_preflight_response(
+                            pf_resp.status().as_u16(),
+                            pf_resp.headers(),
+                            o,
+                            origin_tainted,
+                            credentials_include,
+                        )
+                        .and_then(|allows| {
+                            allows
+                                .permits(&current_method, &unsafe_names, credentials_include)
+                                .map(|()| allows)
+                        })
+                        .map_err(|e| blocked(&observer, url.clone(), BlockReason::Cors(e)))?;
+                        if let Some(cache) = policy.cors_preflight.as_ref() {
+                            cache.put(&serialized, &url, credentials_include, allows, now);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Inject cookies from the jar for this hop's origin — but only when the request's
+        // credentials mode says this hop gets credentials at all.
         // Only applied when no Cookie header is already set; this naturally handles cross-origin
         // redirects: the cookie was stripped above, so the jar is re-queried for the new origin.
-        if !current_headers.contains_key(header::COOKIE) {
+        let attach_cookies = match init.credentials {
+            RequestCredentials::Include => true,
+            RequestCredentials::Omit => false,
+            // Without a document origin to compare against, "same-origin" has no meaning and
+            // the request is first-party tooling; it keeps its cookies.
+            RequestCredentials::SameOrigin => origin
+                .as_ref()
+                .is_none_or(|o| !origin_tainted && *o == url.origin()),
+        };
+        if attach_cookies && !current_headers.contains_key(header::COOKIE) {
             if let Some(cookie_str) = (policy.cookies_for)(&url) {
                 if let Ok(val) = cookie_str.parse() {
                     current_headers.insert(header::COOKIE, val);
@@ -829,8 +998,22 @@ async fn get_with_redirects(
             hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
         }
 
+        // The CORS check (Fetch §4.10.3) runs on *every* response of a cors-tainted chain —
+        // redirects included, and also a final same-origin hop reached through a cross-origin
+        // detour. Native-only: on wasm32 the browser has already enforced this.
+        #[cfg(not(target_arch = "wasm32"))]
+        if tainting == ResponseTainting::Cors {
+            if let Some(ref o) = origin {
+                if let Err(e) =
+                    cors::cors_check(o, origin_tainted, credentials_include, resp.headers())
+                {
+                    return Err(blocked(&observer, url, BlockReason::Cors(e)));
+                }
+            }
+        }
+
         if !resp.status().is_redirection() {
-            return Ok(resp);
+            return Ok((resp, tainting));
         }
 
         // 3xx — resolve the Location header
@@ -879,6 +1062,19 @@ async fn get_with_redirects(
         let to = from.join(loc).map_err(|e| {
             NetError::Redirect(Arc::new(anyhow!("invalid redirect URL '{}': {}", loc, e)))
         })?;
+
+        // A `Location` with embedded `user:password` is refused for a cors-mode request, and
+        // for any request when it points at another origin (Fetch §4.4 steps 9–10): following
+        // it would replay attacker-chosen credentials against the new target.
+        if (!to.username().is_empty() || to.password().is_some())
+            && (init.mode == RequestMode::Cors || from.origin() != to.origin())
+        {
+            return Err(blocked(
+                &observer,
+                to,
+                BlockReason::Cors(CorsError::CredentialedRedirect),
+            ));
+        }
 
         // Method and body semantics per RFC 7231 §6.4
         match status {
@@ -2018,10 +2214,12 @@ mod tests {
             .start()
             .await;
 
-        // CORS mode so the cross-origin GET carries an Origin header at all. The chain is
-        // home → away → home: away redirecting elsewhere is the tainting hop.
+        // Websocket mode: cors-like, so the cross-origin GET carries an Origin header at all,
+        // but exempt from CORS response checks — the mock routes here grant nothing, and this
+        // test is about the Origin *value*, not enforcement. The chain is home → away → home:
+        // away redirecting elsewhere is the tainting hop.
         let init = RequestInit::get(HeaderMap::new())
-            .with_fetch_metadata(RequestDestination::Empty, RequestMode::Cors, false)
+            .with_fetch_metadata(RequestDestination::Empty, RequestMode::Websocket, false)
             .with_mixed_content(
                 Some(home.base_url().origin()),
                 MixedContentPolicy::default(),

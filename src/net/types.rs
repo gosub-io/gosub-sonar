@@ -1,5 +1,6 @@
 //! Core types for fetch requests, responses, errors, and priorities.
 
+use crate::net::cors::{self, CorsError, ResponseTainting};
 use crate::net::fetch_metadata::{RequestDestination, RequestMode};
 use crate::net::mixed_content::{is_origin_potentially_trustworthy, MixedContentPolicy};
 use crate::net::referrer::{self, ReferrerPolicy};
@@ -93,6 +94,27 @@ pub struct FetchResultMeta {
     pub content_type: Option<String>,
     /// True if the response has a body (e.g. HEAD requests do not)
     pub has_body: bool,
+    /// How much of this response the initiating document's scripts may read. The fetcher
+    /// annotates; enforcing the visibility boundary is the embedder's job — see
+    /// [`readable_headers`](Self::readable_headers) and [`cors`].
+    ///
+    /// Always [`Basic`](ResponseTainting::Basic) on wasm32, where the browser has already
+    /// filtered what its `fetch()` exposes.
+    pub tainting: ResponseTainting,
+}
+
+impl FetchResultMeta {
+    /// The header view scripts may read, per this response's [`tainting`](Self::tainting):
+    /// everything but `Set-Cookie` for a basic response, the CORS-safelisted set plus
+    /// `Access-Control-Expose-Headers` for a CORS response, nothing for an opaque one.
+    ///
+    /// `credentials_include` is whether the request was made with
+    /// [`RequestCredentials::Include`] — it decides whether a `*` in
+    /// `Access-Control-Expose-Headers` counts as a wildcard. [`headers`](Self::headers)
+    /// itself stays complete either way.
+    pub fn readable_headers(&self, credentials_include: bool) -> HeaderMap {
+        cors::readable_headers(self.tainting, &self.headers, credentials_include)
+    }
 }
 
 /// Why a request hop was refused. The refused hop is never sent.
@@ -109,6 +131,9 @@ pub enum BlockReason {
     UrlPolicy,
     /// The URL scheme is not `http` or `https`.
     UnsupportedScheme,
+    /// Refused by CORS — the carried [`CorsError`] says which rule.
+    /// See [`cors`].
+    Cors(CorsError),
 }
 
 impl Display for BlockReason {
@@ -117,6 +142,7 @@ impl Display for BlockReason {
             BlockReason::MixedContent => "mixed content",
             BlockReason::UrlPolicy => "blocked by URL policy",
             BlockReason::UnsupportedScheme => "unsupported URL scheme",
+            BlockReason::Cors(err) => return write!(f, "CORS: {err}"),
         };
         f.write_str(s)
     }
@@ -419,6 +445,32 @@ impl RequestBody {
     }
 }
 
+/// Whether credentials — cookies from the
+/// [`FetcherContext`](crate::net::fetcher_context::FetcherContext) jar — ride along with a
+/// request
+/// ([Fetch §2.2.5], *credentials mode*).
+///
+/// This gates only what the fetcher itself attaches; headers set by hand in
+/// [`FetchRequest::headers`] (e.g. `Authorization`) are the embedder's own decision and go out
+/// regardless. Beyond cookies, the mode also drives the CORS rules: a credentialed cross-origin
+/// request needs `Access-Control-Allow-Credentials` and cannot be authorized by a wildcard.
+///
+/// [Fetch §2.2.5]: https://fetch.spec.whatwg.org/#concept-request-credentials-mode
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
+pub enum RequestCredentials {
+    /// Never attach credentials.
+    Omit,
+    /// Attach credentials only on hops to the initiating origin. Without a
+    /// [`FetchRequest::origin`] there is no origin to compare against, so this behaves as
+    /// [`Include`](Self::Include).
+    SameOrigin,
+    /// Always attach credentials. The default, matching how browsers load markup
+    /// subresources (the fetcher's default [`RequestMode::NoCors`]); use
+    /// [`SameOrigin`](Self::SameOrigin) for `fetch()`-style requests.
+    #[default]
+    Include,
+}
+
 /// A fetch request defines what needs to be fetched, how and where to send the result to
 #[derive(Debug, Clone)]
 pub struct FetchRequest {
@@ -464,9 +516,12 @@ pub struct FetchRequest {
     /// What the resource will be used as, sent in `Sec-Fetch-Dest`.
     /// See [`fetch_metadata`](crate::net::fetch_metadata).
     pub destination: RequestDestination,
-    /// The request's mode, sent in `Sec-Fetch-Mode` and shaping the `Origin` header.
-    /// See [`fetch_metadata`](crate::net::fetch_metadata).
+    /// The request's mode, sent in `Sec-Fetch-Mode` and selecting the CORS regime.
+    /// See [`fetch_metadata`](crate::net::fetch_metadata) and [`cors`].
     pub mode: RequestMode,
+    /// Whether cookies from the context's jar ride along, and how strict the CORS
+    /// credentialed rules are. See [`RequestCredentials`].
+    pub credentials: RequestCredentials,
     /// HTTP Headers (unified).
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
@@ -615,8 +670,17 @@ impl FetchRequest {
             )
         };
 
+        // The credentials mode decides whether the jar's cookies are attached on each hop —
+        // after the Cookie hash above is computed — so requests that differ on it must not
+        // share a response. It also varies the CORS verdict (wildcard vs credentialed rules).
+        let credentials = match self.credentials {
+            RequestCredentials::Omit => "omit",
+            RequestCredentials::SameOrigin => "same-origin",
+            RequestCredentials::Include => "include",
+        };
+
         Some(format!(
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={}",
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={}",
             self.method,
             url,
             range,
@@ -627,7 +691,8 @@ impl FetchRequest {
             cookie_hash,
             mixed_content,
             referrer,
-            fetch_meta
+            fetch_meta,
+            credentials
         ))
     }
 }
@@ -654,6 +719,7 @@ pub struct FetchRequestBuilder {
     referrer_policy: ReferrerPolicy,
     destination: RequestDestination,
     mode: RequestMode,
+    credentials: RequestCredentials,
     body: Option<RequestBody>,
 }
 
@@ -678,6 +744,7 @@ impl FetchRequestBuilder {
             referrer_policy: ReferrerPolicy::default(),
             destination: RequestDestination::default(),
             mode: RequestMode::default(),
+            credentials: RequestCredentials::default(),
             body: None,
         }
     }
@@ -781,10 +848,17 @@ impl FetchRequestBuilder {
         self
     }
 
-    /// Sets the request's mode, sent in `Sec-Fetch-Mode` and shaping the `Origin` header.
-    /// See [`fetch_metadata`](crate::net::fetch_metadata).
+    /// Sets the request's mode, sent in `Sec-Fetch-Mode` and selecting the CORS regime.
+    /// See [`fetch_metadata`](crate::net::fetch_metadata) and [`cors`].
     pub fn with_mode(mut self, mode: RequestMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Sets whether cookies from the context's jar ride along (default:
+    /// [`RequestCredentials::Include`]). See [`RequestCredentials`].
+    pub fn with_credentials(mut self, credentials: RequestCredentials) -> Self {
+        self.credentials = credentials;
         self
     }
 
@@ -820,6 +894,7 @@ impl FetchRequestBuilder {
             referrer_policy: self.referrer_policy,
             destination: self.destination,
             mode: self.mode,
+            credentials: self.credentials,
             body: self.body,
         }
     }
@@ -954,7 +1029,8 @@ mod tests {
         let expected = format!(
             // MC=n: no secure initiating origin. Ref=n: no referrer set, so none is ever sent.
             // FM: default destination and mode, no initiating origin, no user navigation.
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-",
+            // Cred: the default credentials mode.
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include",
             fr.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash
         );
 
@@ -1270,6 +1346,7 @@ mod tests {
             content_length: None,
             content_type: None,
             has_body: false,
+            tainting: ResponseTainting::Basic,
         };
 
         let buffered = FetchResult::Buffered {

@@ -1,9 +1,11 @@
 //! Priority-scheduled fetcher with request coalescing and per-origin concurrency limits.
 
 #[cfg(not(target_arch = "wasm32"))]
+use crate::net::cors::{CorsPreflightCache, InMemoryPreflightCache};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::net::dns::DnsResolver;
 use crate::net::fetch::{
-    blocked, fetch_response_complete, fetch_response_top, preflight, NetPolicy, Preflight,
+    blocked, fetch_response_complete, fetch_response_top, hop_checks, HopCheck, NetPolicy,
     RequestInit, ResponseTop,
 };
 use crate::net::fetcher_context::FetcherContext;
@@ -87,6 +89,17 @@ pub struct FetcherConfig {
     /// [`FetchRequest::mixed_content`]. See [`mixed_content`](mod@crate::net::mixed_content).
     pub mixed_content: MixedContentPolicy,
 
+    /// Cache of CORS preflight grants, consulted before sending a preflight `OPTIONS` and
+    /// updated from its response.
+    ///
+    /// Defaults to an [`InMemoryPreflightCache`]; supply your own [`CorsPreflightCache`] to
+    /// share or inspect grants. `None` keeps CORS fully enforced but preflights every time.
+    /// See [`cors`](mod@crate::net::cors).
+    ///
+    /// Native-only: on wasm32 the browser preflights (and caches) itself.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub cors_preflight_cache: Option<Arc<dyn CorsPreflightCache>>,
+
     /// Which proxy outgoing requests go through.
     ///
     /// Defaults to [`ProxyConfig::System`], which reads `HTTP_PROXY` and friends from the
@@ -129,6 +142,8 @@ impl Default for FetcherConfig {
             #[cfg(not(target_arch = "wasm32"))]
             hsts: Some(Arc::new(InMemoryHstsStore::new())),
             mixed_content: MixedContentPolicy::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            cors_preflight_cache: Some(Arc::new(InMemoryPreflightCache::new())),
             #[cfg(not(target_arch = "wasm32"))]
             proxy: ProxyConfig::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -493,18 +508,18 @@ impl Fetcher {
 
             // Pre-flight checks. Only the leader ever sends bytes, so only the leader evaluates
             // them; rejecting here avoids waiting on a connection slot for a request that will
-            // never go out. The same `preflight` runs per hop inside `get_with_redirects`, which
+            // never go out. The same `hop_checks` runs per hop inside `get_with_redirects`, which
             // is what catches redirect targets — so this cannot reject anything the enforcement
             // path would have allowed. The upgraded URL is discarded here; the redirect loop
             // recomputes and applies it.
-            let reject = match preflight(
+            let reject = match hop_checks(
                 &req.url,
                 effective_mixed_content(&req, &self.cfg),
                 req.origin.as_ref(),
                 &|u| self.ctx.is_url_allowed(u),
             ) {
-                Preflight::Reject(reason) => Some(reason),
-                Preflight::Proceed(_) => None,
+                HopCheck::Reject(reason) => Some(reason),
+                HopCheck::Proceed(_) => None,
             };
 
             if let Some(reason) = reject {
@@ -627,6 +642,7 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
         .with_mixed_content(req.origin.clone(), effective_mixed_content(req, cfg))
         .with_referrer(req.referrer.clone(), req.referrer_policy)
         .with_fetch_metadata(req.destination, req.mode, req.initiator == Initiator::User)
+        .with_credentials(req.credentials)
 }
 
 /// Build a reqwest client from `FetcherConfig`.
@@ -699,7 +715,9 @@ async fn perform_streaming(
     ctx: Arc<dyn FetcherContext>,
 ) -> Result<FetchResult, NetError> {
     #[cfg(not(target_arch = "wasm32"))]
-    let policy = NetPolicy::from_context(&ctx).with_hsts(cfg.hsts.clone());
+    let policy = NetPolicy::from_context(&ctx)
+        .with_hsts(cfg.hsts.clone())
+        .with_cors_preflight_cache(cfg.cors_preflight_cache.clone());
     #[cfg(target_arch = "wasm32")]
     let policy = NetPolicy::from_context(&ctx);
 
@@ -749,7 +767,9 @@ async fn perform_buffered(
     ctx: Arc<dyn FetcherContext>,
 ) -> Result<FetchResult, NetError> {
     #[cfg(not(target_arch = "wasm32"))]
-    let policy = NetPolicy::from_context(&ctx).with_hsts(cfg.hsts.clone());
+    let policy = NetPolicy::from_context(&ctx)
+        .with_hsts(cfg.hsts.clone())
+        .with_cors_preflight_cache(cfg.cors_preflight_cache.clone());
     #[cfg(target_arch = "wasm32")]
     let policy = NetPolicy::from_context(&ctx);
 
@@ -862,6 +882,7 @@ mod tests {
             referrer_policy: Default::default(),
             destination: Default::default(),
             mode: Default::default(),
+            credentials: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -891,6 +912,7 @@ mod tests {
                 referrer_policy: Default::default(),
                 destination: Default::default(),
                 mode: Default::default(),
+                credentials: Default::default(),
                 streaming: false,
                 auto_decode: true,
                 max_bytes: None,
@@ -1112,6 +1134,7 @@ mod tests {
             referrer_policy: Default::default(),
             destination: Default::default(),
             mode: Default::default(),
+            credentials: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1227,6 +1250,7 @@ mod tests {
             referrer_policy: Default::default(),
             destination: Default::default(),
             mode: Default::default(),
+            credentials: Default::default(),
             streaming: true,
             auto_decode: true,
             max_bytes: None,
@@ -1670,6 +1694,7 @@ mod tests {
             referrer_policy: Default::default(),
             destination: Default::default(),
             mode: Default::default(),
+            credentials: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -2032,6 +2057,7 @@ mod tests {
             referrer_policy: Default::default(),
             destination: Default::default(),
             mode: Default::default(),
+            credentials: Default::default(),
             streaming: false,
             auto_decode,
             max_bytes: None,
