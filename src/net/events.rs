@@ -75,6 +75,13 @@ pub enum NetEvent {
         /// Why the request was refused
         reason: BlockReason,
     },
+    /// A CORS preflight `OPTIONS` is about to be sent for this hop, because the request's
+    /// method or headers need the server's approval and no cached grant covered them.
+    /// See [`cors`](crate::net::cors).
+    CorsPreflight {
+        /// The hop being preflighted
+        url: Url,
+    },
     /// Resource fetching was cancelled
     Cancelled {
         /// URL whose fetch was cancelled

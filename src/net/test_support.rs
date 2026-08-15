@@ -84,6 +84,20 @@ pub enum RouteConfig {
     /// 302 redirect to a verbatim absolute URL, which may point off this server.
     /// Use to exercise cross-origin and cross-scheme redirect handling.
     RedirectAbsolute(String),
+    /// Like [`RedirectAbsolute`](Self::RedirectAbsolute), with extra `(name, value)` response
+    /// headers on the 302 — e.g. the `Access-Control-Allow-Origin` a CORS-checked redirect hop
+    /// needs.
+    RedirectAbsoluteWithHeaders {
+        /// Extra response headers on the 302
+        headers: Vec<(String, String)>,
+        /// Verbatim absolute redirect target
+        target: String,
+    },
+    /// CORS-aware route: answers an `OPTIONS` preflight with 204 plus the configured grant
+    /// headers, and any other method with 200, `body`, and the allow-origin/credentials
+    /// headers. Preflight hits are counted separately — see
+    /// [`TestServerHandle::hit_count`].
+    Cors(CorsRouteOptions),
     /// 302 redirect to the same path on every request — creates an infinite redirect loop.
     RedirectSelf,
     /// 302 without a Location header (malformed redirect).
@@ -137,10 +151,64 @@ pub enum RouteConfig {
     EchoBody,
 }
 
+/// What a [`RouteConfig::Cors`] route sends. The defaults describe the most permissive
+/// credential-less server: `Access-Control-Allow-Origin: *`, everything else absent.
+#[derive(Clone, Debug)]
+pub struct CorsRouteOptions {
+    /// `Access-Control-Allow-Origin` on both the preflight and the actual response.
+    pub allow_origin: String,
+    /// `Access-Control-Allow-Methods` on the preflight response, when set.
+    pub allow_methods: Option<String>,
+    /// `Access-Control-Allow-Headers` on the preflight response, when set.
+    pub allow_headers: Option<String>,
+    /// Send `Access-Control-Allow-Credentials: true` on both responses.
+    pub allow_credentials: bool,
+    /// `Access-Control-Max-Age` on the preflight response, when set.
+    pub max_age: Option<u64>,
+    /// `Access-Control-Expose-Headers` on the actual response, when set.
+    pub expose_headers: Option<String>,
+    /// Extra `(name, value)` headers on the actual response.
+    pub extra_headers: Vec<(String, String)>,
+    /// Body of the actual (non-`OPTIONS`) response.
+    pub body: Vec<u8>,
+}
+
+impl Default for CorsRouteOptions {
+    fn default() -> Self {
+        Self {
+            allow_origin: "*".to_string(),
+            allow_methods: None,
+            allow_headers: None,
+            allow_credentials: false,
+            max_age: None,
+            expose_headers: None,
+            extra_headers: Vec::new(),
+            body: b"cors ok".to_vec(),
+        }
+    }
+}
+
 impl RouteConfig {
     /// Shorthand for [`RouteConfig::Ok`]
     pub fn ok(body: impl Into<Vec<u8>>) -> Self {
         Self::Ok(body.into())
+    }
+    /// Shorthand for [`RouteConfig::Cors`]
+    pub fn cors(options: CorsRouteOptions) -> Self {
+        Self::Cors(options)
+    }
+    /// Shorthand for [`RouteConfig::RedirectAbsoluteWithHeaders`]
+    pub fn redirect_absolute_with_headers(
+        headers: &[(&str, &str)],
+        target: impl Into<String>,
+    ) -> Self {
+        Self::RedirectAbsoluteWithHeaders {
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            target: target.into(),
+        }
     }
     /// Shorthand for [`RouteConfig::OkWithHeaders`]
     pub fn ok_with_headers(headers: &[(&str, &str)], body: impl Into<Vec<u8>>) -> Self {
@@ -267,15 +335,20 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).await.unwrap_or(0);
     let req = std::str::from_utf8(&buf[..n]).unwrap_or("");
-    let raw_path = req
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .unwrap_or("/");
+    let request_line = req.lines().next().unwrap_or("");
+    let method = request_line.split_whitespace().next().unwrap_or("GET");
+    let raw_path = request_line.split_whitespace().nth(1).unwrap_or("/");
     // Strip query string so routes are matched and counted by path only.
     let path = raw_path.split('?').next().unwrap_or(raw_path).to_string();
 
-    hits.entry(path.clone())
+    // OPTIONS requests — CORS preflights — are counted under `OPTIONS <path>` instead of the
+    // path itself, so a test can tell "the preflight ran" and "the actual request ran" apart.
+    let hit_key = if method == "OPTIONS" {
+        format!("OPTIONS {path}")
+    } else {
+        path.clone()
+    };
+    hits.entry(hit_key)
         .or_insert_with(|| AtomicUsize::new(0))
         .fetch_add(1, Ordering::Relaxed);
 
@@ -355,6 +428,52 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 target
             );
             let _ = stream.write_all(hdr.as_bytes()).await;
+        }
+        RouteConfig::RedirectAbsoluteWithHeaders { headers, target } => {
+            let extra: String = headers
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}\r\n"))
+                .collect();
+            let hdr = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {}\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n",
+                target, extra
+            );
+            let _ = stream.write_all(hdr.as_bytes()).await;
+        }
+        RouteConfig::Cors(opts) => {
+            let mut extra = format!("Access-Control-Allow-Origin: {}\r\n", opts.allow_origin);
+            if opts.allow_credentials {
+                extra.push_str("Access-Control-Allow-Credentials: true\r\n");
+            }
+            if method == "OPTIONS" {
+                if let Some(ref m) = opts.allow_methods {
+                    extra.push_str(&format!("Access-Control-Allow-Methods: {m}\r\n"));
+                }
+                if let Some(ref h) = opts.allow_headers {
+                    extra.push_str(&format!("Access-Control-Allow-Headers: {h}\r\n"));
+                }
+                if let Some(age) = opts.max_age {
+                    extra.push_str(&format!("Access-Control-Max-Age: {age}\r\n"));
+                }
+                let hdr = format!(
+                    "HTTP/1.1 204 No Content\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(hdr.as_bytes()).await;
+            } else {
+                if let Some(ref e) = opts.expose_headers {
+                    extra.push_str(&format!("Access-Control-Expose-Headers: {e}\r\n"));
+                }
+                for (k, v) in &opts.extra_headers {
+                    extra.push_str(&format!("{k}: {v}\r\n"));
+                }
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    extra,
+                    opts.body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes()).await;
+                let _ = stream.write_all(&opts.body).await;
+            }
         }
         RouteConfig::RedirectSelf => {
             let hdr = format!(
@@ -665,6 +784,9 @@ impl TestServerHandle {
     }
 
     /// Number of times `path` has been requested since the server started.
+    ///
+    /// `OPTIONS` requests — CORS preflights — are counted separately: ask for them with
+    /// `hit_count("OPTIONS /path")`.
     pub fn hit_count(&self, path: &str) -> usize {
         self.hits
             .get(path)

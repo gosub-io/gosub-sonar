@@ -45,6 +45,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::fetcher` | `src/net/fetcher.rs` | **The scheduler.** Priority queues, coalescing, concurrency limits, task spawning. `Fetcher::{new, run, submit}`. |
 | `net::fetch` | `src/net/fetch.rs` | Low-level fetch primitives: `fetch_response_top`, `fetch_response_complete`, redirect handling, `ProgressReader`, `NetPolicy`. |
 | `net::fetcher_context` | `src/net/fetcher_context.rs` | `FetcherContext` trait — the host's hook into the fetch lifecycle (observers, ref tracking, URL policy, cookies). |
+| `net::cors` | `src/net/cors.rs` | CORS (WHATWG Fetch): safelist predicates, the CORS check, preflight validation, response tainting/filtering. `CorsPreflightCache` / `InMemoryPreflightCache`. Enforcement is native-only. |
 | `net::hsts` | `src/net/hsts.rs` | HTTP Strict Transport Security (RFC 6797): header parsing, host matching, expiry, URL upgrade. `HstsStore` / `InMemoryHstsStore`. Native-only. |
 | `net::types` | `src/net/types.rs` | Core data model: `FetchRequest`(+builder), `FetchResult`, `FetchResultMeta`, `Priority`, `NetError`, `BodyStream`, … |
 | `net::shared_body` | `src/net/shared_body.rs` | `SharedBody` — bounded fan-out byte stream with drop-on-lag per-subscriber queues. |
@@ -309,6 +310,9 @@ enforced in the read loops of `fetch_response_complete` and the `ProgressReader`
 - **`cookies_for`** — supplies the `Cookie` header per origin from the host's jar.
 - **`hsts`** — the [HSTS](#hsts) store, consulted to upgrade each hop and updated from each hop's
   response. Set from `FetcherConfig::hsts` rather than `FetcherContext`; `None` disables HSTS.
+- **`cors_preflight`** — the [CORS](#cors) preflight-grant cache, consulted before sending a
+  preflight `OPTIONS` and updated from its response. Set from
+  `FetcherConfig::cors_preflight_cache`; `None` keeps CORS enforced but preflights every time.
 
 Redirects are handled manually in `get_with_redirects` (up to `MAX_REDIRECTS` = 20 hops) with
 browser-matching semantics:
@@ -320,11 +324,48 @@ browser-matching semantics:
 - Each hop is upgraded to `https` if HSTS applies, *before* `url_allowed` is consulted, so the
   hook sees the URL that will actually be requested and no plaintext request is ever opened.
 - Every hop's response is checked for `Strict-Transport-Security`, not just the final one.
+- [CORS](#cors) is enforced per hop when the request carries an initiating origin: mode rules
+  before sending, a preflight when the method/headers need one, the CORS check on every response
+  of a cors-tainted chain, and a refusal of `Location` targets with embedded credentials.
 
 > reqwest's own redirect following must stay disabled (`Policy::none()` in `build_client`). If it
 > is re-enabled, reqwest resolves each 3xx internally and `get_with_redirects` only ever sees the
 > final response, so none of the above runs. Pinned by
 > `fetcher_url_policy_is_applied_to_redirect_targets`.
+
+---
+
+## CORS
+
+`net::cors` implements Cross-Origin Resource Sharing per the WHATWG Fetch spec. The crate owns
+the *mechanism* because only the redirect loop sees intermediate hops — the CORS check must run
+on every one of them. The embedder owns the *policy* through request fields:
+
+- **Inert without an origin.** No `FetchRequest::origin` → no CORS anywhere, same rule as mixed
+  content. A CLI embedder never meets it.
+- **`RequestMode` selects the regime.** `SameOrigin` refuses cross-origin targets; `NoCors` (the
+  default) allows cross-origin loads only in the shape markup can produce (safelisted method, no
+  custom headers) and marks the response opaque; `Cors` runs the full check plus preflight;
+  `Navigate` and `Websocket` are exempt.
+- **`RequestCredentials`** (`Omit` / `SameOrigin` / `Include`, default `Include`) gates the
+  cookie-jar injection per hop and selects the credentialed CORS rules (exact origin echo +
+  `Access-Control-Allow-Credentials`, no wildcards).
+- **Preflights** (`OPTIONS` + `Access-Control-Request-*`) are sent per hop when the method or
+  headers need approval, and their grants cached in `FetcherConfig::cors_preflight_cache`
+  (`CorsPreflightCache` trait, in-memory default, `Access-Control-Max-Age` honored with a 2h
+  cap). Re-preflighting after a redirect matches modern browser behaviour.
+- **Tainting is annotated, never enforced by hiding data.** `FetchResultMeta::tainting` says
+  what scripts may read (`Basic`/`Cors`/`Opaque`); `readable_headers()` computes that view. The
+  full response always reaches the embedder — it must render opaque `<img>`s and can build
+  body-sniffing policies (ORB) on top of the annotation. Enforcing script visibility is the
+  embedder's job.
+
+Failures surface as `NetError::Blocked { reason: BlockReason::Cors(CorsError), .. }` with a
+typed `CorsError` naming the violated rule, and a `NetEvent::CorsPreflight` event announces each
+preflight for devtools-style observability.
+
+Enforcement is native-only: on wasm32 the browser's `fetch()` enforces CORS itself and hides the
+`Access-Control-*` response headers the checks would need.
 
 ---
 

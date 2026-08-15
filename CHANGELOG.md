@@ -7,14 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- The default `User-Agent` is now `gosub-sonar/<crate version>` instead of no header at all
-  (#38). The value is available as `DEFAULT_USER_AGENT`; set `FetcherConfig::user_agent` to
-  override it, or to `None` to send no `User-Agent` header.
-
 ### Added
 
+- CORS per WHATWG Fetch (#2), enforced per redirect hop whenever a request carries
+  `FetchRequest::origin`; without one CORS is entirely inert, like mixed content:
+  - `RequestMode` is now enforced: `SameOrigin` refuses cross-origin targets, `NoCors` (the
+    default) only allows cross-origin loads in the shape markup can produce and marks the
+    response opaque, `Cors` runs the CORS check on every response of the chain — redirect
+    hops included
+  - preflights: an `OPTIONS` round-trip when the method or headers need server approval,
+    re-run per hop after redirects; grants cached per (origin, URL, credentials) honoring
+    `Access-Control-Max-Age` via `FetcherConfig::cors_preflight_cache` (`CorsPreflightCache`
+    trait, in-memory default)
+  - `FetchRequest::credentials` (`RequestCredentials`, default `Include` — the old behaviour)
+    gates cookie-jar injection per hop and selects the credentialed CORS rules
+  - response tainting is annotated, not enforced: `FetchResultMeta::tainting` +
+    `readable_headers()` compute the script-visible view; the embedder owns the boundary
+  - failures surface as `BlockReason::Cors(CorsError)`, preflights as
+    `NetEvent::CorsPreflight`; redirect `Location`s with embedded credentials are refused
+  - inert on wasm32; `test-support` gains `RouteConfig::Cors` and separate `OPTIONS` hit
+    counts
 - `Origin` and `Sec-Fetch-*` fetch metadata headers (#47):
   - `Sec-Fetch-Dest`, `Sec-Fetch-Mode`, and `Sec-Fetch-Site` are sent on every request,
     driven by the new `FetchRequest::destination` and `FetchRequest::mode` fields
@@ -28,6 +40,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - no public suffix list yet, so sibling subdomains report `cross-site` instead of
     `same-site` (#60); same host on another port reports `same-site`
   - inert on wasm32, where the browser owns these headers
+
+### Changed
+
+- **Breaking:** `FetchRequest` gains the `credentials` field, `FetchResultMeta` gains
+  `tainting`, `BlockReason` gains `Cors(CorsError)`, and `NetEvent` gains `CorsPreflight` —
+  struct-literal construction and exhaustive `match`es need updating. Requests built through
+  `FetchRequest::builder()` keep their previous behaviour (mode `NoCors` restrictions aside)
+- Request coalescing now also keys on the credentials mode, so requests that would attach
+  different cookies never share a response
+- The default `User-Agent` is now `gosub-sonar/<crate version>` instead of no header at all
+  (#38). The value is available as `DEFAULT_USER_AGENT`; set `FetcherConfig::user_agent` to
+  override it, or to `None` to send no `User-Agent` header.
 
 ## [0.2.0] - 2026-08-01
 
