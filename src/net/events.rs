@@ -69,12 +69,12 @@ pub enum NetEvent {
         /// Error that caused the failure
         error: anyhow::Error,
     },
-    /// The TLS handshake for a hop failed. The request fails with
-    /// [`NetError::Tls`](crate::net::types::NetError::Tls) carrying the same error.
+    /// TLS handshake failed for this hop. The request fails with the same error as
+    /// [`NetError::Tls`](crate::net::types::NetError::Tls).
     TlsFailed {
-        /// The hop whose handshake failed
+        /// URL of the hop
         url: Url,
-        /// What went wrong
+        /// The error
         error: TlsError,
     },
     /// A request hop was refused by policy and never sent

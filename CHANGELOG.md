@@ -9,13 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Structured TLS errors (#4): a failed handshake now fails the request with
-  `NetError::Tls(TlsError)` instead of an opaque client error. `TlsError` carries a
-  `TlsErrorKind` (`Expired`, `NotYetValid`, `UnknownIssuer`, `HostnameMismatch`, `Revoked`,
-  `InvalidCertificate`, `Handshake`, `Other`), the host and port, and the underlying message;
-  `NetEvent::TlsFailed` reports the same to observers. `TlsError` and `TlsErrorKind` are
-  re-exported at the crate root. Native-only: the browser does TLS on wasm32. A user-override
-  hook (accept this certificate anyway) is not part of this yet.
+- TLS errors (#4): a failed handshake now returns `NetError::Tls(TlsError)` instead of an
+  opaque client error. `TlsError` has a `TlsErrorKind` (`Expired`, `NotYetValid`,
+  `UnknownIssuer`, `HostnameMismatch`, `Revoked`, `InvalidCertificate`, `Handshake`, `Other`),
+  host, port and the rustls message. Observers get `NetEvent::TlsFailed`. Native-only. No
+  user override ("accept anyway") yet.
 - CORS per WHATWG Fetch (#2), enforced per redirect hop whenever a request carries
   `FetchRequest::origin`; without one CORS is entirely inert, like mixed content:
   - `RequestMode` is now enforced: `SameOrigin` refuses cross-origin targets, `NoCors` (the

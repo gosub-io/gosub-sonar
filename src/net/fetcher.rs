@@ -1577,8 +1577,6 @@ mod tests {
         shutdown.cancel();
     }
 
-    /// End to end through the scheduler: a server whose certificate we don't trust fails the
-    /// request with `NetError::Tls`, not a generic error.
     #[tokio::test(flavor = "current_thread")]
     async fn fetcher_reports_untrusted_certificate_as_tls_error() {
         struct Loopback(std::net::SocketAddr);

@@ -839,7 +839,7 @@ impl RecordingObserver {
             .collect()
     }
 
-    /// Every [`NetEvent::TlsFailed`] error recorded, in order.
+    /// All [`NetEvent::TlsFailed`] errors recorded, in order.
     pub fn tls_errors(&self) -> Vec<crate::net::tls::TlsError> {
         self.events
             .lock()

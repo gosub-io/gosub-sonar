@@ -166,8 +166,8 @@ pub enum NetError {
     #[error("net error: reqwest: {0}")]
     Reqwest(#[from] Arc<reqwest::Error>),
 
-    /// TLS handshake failed: expired certificate, unknown issuer, wrong host name, ...
-    /// See [`TlsError`]. Never produced on wasm32.
+    /// TLS handshake failed (expired certificate, unknown issuer, wrong host name, ...).
+    /// Native only.
     #[error("net error: tls: {0}")]
     Tls(TlsError),
 

@@ -711,8 +711,8 @@ pub async fn fetch_response_complete(
     Ok((meta, body_buf.freeze()))
 }
 
-/// Turn a failed `send()` into a `NetError`. TLS handshake failures become `NetError::Tls`
-/// (and emit `NetEvent::TlsFailed`); anything else keeps the old opaque `Read` wrapping.
+/// Map a failed `send()` to a `NetError`: TLS handshake failures become `NetError::Tls` (plus a
+/// `NetEvent::TlsFailed`), everything else is wrapped in `Read` as before.
 fn send_error(
     e: reqwest::Error,
     url: &Url,
@@ -1258,7 +1258,7 @@ mod tests {
             .route("/", RouteConfig::ok(b"x".to_vec()))
             .start()
             .await;
-        // A client that does not trust the server's self-signed certificate.
+        // client that doesn't trust the self-signed cert
         let client = reqwest::Client::builder()
             .use_rustls_tls()
             .resolve(srv.tls_domain().unwrap(), srv.socket_addr())
@@ -1294,7 +1294,7 @@ mod tests {
             .route("/", RouteConfig::ok(b"x".to_vec()))
             .start()
             .await;
-        // Trust the certificate, but connect under a name it was not issued for.
+        // trust the cert, but connect with a name it wasn't issued for
         let cert = reqwest::Certificate::from_pem(srv.cert_pem().unwrap()).unwrap();
         let client = reqwest::Client::builder()
             .tls_certs_only([cert])

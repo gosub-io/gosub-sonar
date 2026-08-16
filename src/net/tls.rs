@@ -1,43 +1,41 @@
-//! Structured TLS errors.
+//! TLS errors.
 //!
-//! A failed TLS handshake comes out of reqwest as a chain of wrapped errors with a
-//! `rustls::Error` at the bottom. [`TlsError`] pulls out the part callers care about — did the
-//! certificate expire, is it for another host, is the issuer unknown — so an embedder can show
-//! the right warning instead of a generic connection error. The fetch layer returns it as
+//! reqwest reports a failed handshake as a chain of wrapped errors with a `rustls::Error` at
+//! the bottom. [`TlsError`] extracts the useful part (expired, unknown issuer, wrong host name,
+//! ...) so a caller can show a proper certificate warning. Returned as
 //! [`NetError::Tls`](crate::net::types::NetError::Tls).
 //!
-//! Only the classification runs on native targets; on wasm32 the browser does TLS and never
-//! hands us the details, so `NetError::Tls` is never produced there.
+//! Native only. On wasm32 the browser does TLS and we never see the error details.
 
 use std::fmt;
 
-/// What went wrong in the TLS handshake.
+/// Why the TLS handshake failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TlsErrorKind {
-    /// The certificate's validity period has ended.
+    /// Certificate has expired.
     Expired,
-    /// The certificate's validity period has not started yet.
+    /// Certificate is not valid yet.
     NotYetValid,
-    /// The chain does not lead to a trusted root. Self-signed certificates end up here.
+    /// Chain does not lead to a trusted root (includes self-signed certificates).
     UnknownIssuer,
-    /// The certificate is not valid for the host name we connected to.
+    /// Certificate is not valid for the host name we connected to.
     HostnameMismatch,
-    /// The certificate has been revoked.
+    /// Certificate has been revoked.
     Revoked,
-    /// The certificate could not be parsed or verified for some other reason (bad encoding,
-    /// bad signature, unsupported algorithm, wrong purpose, ...).
+    /// Certificate is invalid for another reason (bad encoding, bad signature, unsupported
+    /// algorithm, wrong purpose, ...).
     InvalidCertificate,
-    /// The handshake failed before or without a certificate problem: alert from the peer,
-    /// no protocol version or cipher suite in common, malformed messages.
+    /// Handshake failed without a certificate problem: alert from the peer, no common
+    /// protocol version or cipher suite, malformed messages.
     Handshake,
-    /// A TLS error we could not classify further.
+    /// Anything else.
     Other,
 }
 
 impl TlsErrorKind {
-    /// Whether this is a certificate verification failure, as opposed to a protocol-level
-    /// handshake failure. Only these make sense to offer a "proceed anyway" override for.
+    /// True for certificate verification failures, i.e. the ones a user could choose to
+    /// override; false for protocol-level handshake failures.
     pub fn is_certificate_error(self) -> bool {
         matches!(
             self,
@@ -66,17 +64,16 @@ impl fmt::Display for TlsErrorKind {
     }
 }
 
-/// A TLS handshake failure against one host.
+/// A failed TLS handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TlsError {
-    /// What went wrong.
+    /// Why it failed.
     pub kind: TlsErrorKind,
-    /// Host we were connecting to (the URL host, i.e. the name the certificate was checked
-    /// against).
+    /// Host name from the URL, which is what the certificate was checked against.
     pub host: String,
-    /// Port we were connecting to.
+    /// Port we connected to.
     pub port: u16,
-    /// The underlying error, as reported by the TLS library.
+    /// The underlying rustls error message.
     pub message: String,
 }
 
@@ -92,10 +89,10 @@ impl fmt::Display for TlsError {
 
 impl std::error::Error for TlsError {}
 
-/// Find the `rustls::Error` behind a request error, if there is one, and classify it.
+/// Find the `rustls::Error` behind a request error, if there is one.
 ///
-/// Walks the `source()` chain. `std::io::Error::source()` skips the io error's own payload,
-/// so those are stepped into with `get_ref()`; that is where hyper hides the rustls error.
+/// Walks the `source()` chain. Note that `io::Error::source()` skips the io error's own
+/// payload, so we step into those with `get_ref()`; that's where hyper puts the rustls error.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn classify(
     err: &(dyn std::error::Error + 'static),
@@ -154,8 +151,7 @@ mod tests {
     use rustls::{AlertDescription, CertificateError};
     use url::Url;
 
-    /// Wrap a rustls error the way hyper/reqwest deliver it: io::Error(Other) around
-    /// io::Error(InvalidData) around the rustls error, behind a plain error on top.
+    // Same nesting as hyper/reqwest produce: io::Error(Other) > io::Error(InvalidData) > rustls
     fn wrapped(e: rustls::Error) -> anyhow::Error {
         let inner = std::io::Error::new(std::io::ErrorKind::InvalidData, e);
         let outer = std::io::Error::other(inner);

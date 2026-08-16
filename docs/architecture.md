@@ -47,7 +47,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::fetcher_context` | `src/net/fetcher_context.rs` | `FetcherContext` trait — the host's hook into the fetch lifecycle (observers, ref tracking, URL policy, cookies). |
 | `net::cors` | `src/net/cors.rs` | CORS (WHATWG Fetch): safelist predicates, the CORS check, preflight validation, response tainting/filtering. `CorsPreflightCache` / `InMemoryPreflightCache`. Enforcement is native-only. |
 | `net::hsts` | `src/net/hsts.rs` | HTTP Strict Transport Security (RFC 6797): header parsing, host matching, expiry, URL upgrade. `HstsStore` / `InMemoryHstsStore`. Native-only. |
-| `net::tls` | `src/net/tls.rs` | `TlsError` / `TlsErrorKind`: what went wrong in a failed handshake (expired, unknown issuer, wrong host name, ...), pulled out of the rustls error behind a failed `send()`. Native-only. |
+| `net::tls` | `src/net/tls.rs` | `TlsError` / `TlsErrorKind`: why a handshake failed (expired, unknown issuer, wrong host name, ...), extracted from the rustls error. Native-only. |
 | `net::types` | `src/net/types.rs` | Core data model: `FetchRequest`(+builder), `FetchResult`, `FetchResultMeta`, `Priority`, `NetError`, `BodyStream`, … |
 | `net::shared_body` | `src/net/shared_body.rs` | `SharedBody` — bounded fan-out byte stream with drop-on-lag per-subscriber queues. |
 | `net::pump` | `src/net/pump.rs` | Drains an `AsyncRead` into a `SharedBody` and/or a file on disk (atomic temp-file + rename). |
@@ -458,7 +458,7 @@ error can fan out to many listeners:
 | Variant | Meaning |
 |---------|---------|
 | `Reqwest` | Underlying `reqwest` client error. |
-| `Tls` | TLS handshake failed; carries a `TlsError` with the kind (expired, unknown issuer, host name mismatch, ...), host and port. Also emitted as `NetEvent::TlsFailed`. Native-only. |
+| `Tls` | TLS handshake failed. Carries a `TlsError` (kind, host, port, message); also emitted as `NetEvent::TlsFailed`. Native-only. |
 | `Redirect` | Redirect resolution failed (missing `Location`, bad scheme, too many hops, blocked). |
 | `Io` | I/O error reading the body. |
 | `Cancelled` | Request cancelled. |
