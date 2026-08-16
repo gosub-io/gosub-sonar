@@ -135,6 +135,11 @@ first thing it does is to acquire a slot from a global semaphore, and then a per
 HTTP/1 (`h1_per_origin`) or 16 for HTTP/2 (`h2_per_origin`). This is to avoid overloading the server, and to avoid 
 running into issues with browsers that limit the number of connections to a single origin.
 
+We can't know which protocol an origin speaks until ALPN has run, so every origin starts at the HTTP/1 limit and 
+is raised to the HTTP/2 limit once we've seen an HTTP/2 (or HTTP/3) response from it. Each hop of a redirect chain 
+reports its version through `NetPolicy::on_protocol`, so intermediate origins are picked up as well. Simply 
+assuming HTTP/2 for every `https` origin would give an HTTP/1.1-only server 16 connections instead of 6.
+
 In total, the fetcher will limit the total amount of connections that can be open at the same time, as well as the 
 amount of connections that can be open to a single origin.
 

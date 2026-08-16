@@ -167,8 +167,8 @@ End to end, a fetch through the scheduler goes:
 
 4. **Acquire slots.** The leader spawns a fetch task that first acquires a global concurrency slot
    (`global_slots`, default 32) and then a per-origin slot (`h1_per_origin` = 6 for HTTP/1,
-   `h2_per_origin` = 16 for HTTP/2). Both are semaphores; acquisition races against the shutdown
-   token.
+   `h2_per_origin` = 16 once we've seen an HTTP/2 or HTTP/3 response from that origin). Both are
+   semaphores; acquisition races against the shutdown token.
 
 5. **Perform.** If **any** coalesced subscriber wants streaming, the task runs `perform_streaming`
    (→ `FetchResult::Stream` backed by a `SharedBody`); otherwise `perform_buffered`
@@ -209,9 +209,10 @@ The `Fetcher` holds four `VecDeque` lanes behind mutexes (`q_high`, `q_norm`, `q
 and two layers of semaphores:
 
 - **`global_slots`** — a single `Semaphore` capping total concurrent fetches (default 32).
-- **`per_origin`** — a `DashMap<origin, Semaphore>`, created on first use per origin, capping
-  concurrent fetches to one origin (6 for HTTP/1, 16 for HTTP/2 — only HTTPS can negotiate HTTP/2
-  via ALPN).
+- **`per_origin`** — an `OriginTable` (`DashMap<origin, OriginSlots>`), created on first use per
+  origin, capping concurrent fetches to one origin. Starts at the HTTP/1 limit (6) and is grown
+  to the HTTP/2 limit (16) once an HTTP/2 or HTTP/3 response has been seen from that origin
+  (reported per hop via `NetPolicy::on_protocol`).
 
 `FetcherConfig` (in `fetcher.rs`) also carries `connect_timeout` (5s), `req_timeout` (60s),
 `read_idle_timeout` (15s), `total_body_timeout` (180s), a `user_agent` (defaults to

@@ -102,6 +102,9 @@ pub type CookieJarFn = Box<dyn Fn(&Url) -> Option<String> + Send + Sync>;
 /// Callback type for reporting `Set-Cookie` values received on a response.
 pub type CookieSinkFn = Box<dyn Fn(&Url, &[&str]) + Send + Sync>;
 
+/// Callback type for reporting the HTTP version of a response.
+pub type ProtocolSinkFn = Box<dyn Fn(&Url, http::Version) + Send + Sync>;
+
 /// Network-level request policies threaded through the fetch stack.
 ///
 /// Bundles the URL allowlist check and the cookie-jar query so both can be applied at
@@ -120,6 +123,11 @@ pub struct NetPolicy {
     /// mid-chain (e.g. a session cookie on a login 302) reach the jar before the next hop.
     /// The final response's cookies are reported by the fetcher, not here.
     pub on_cookies: CookieSinkFn,
+    /// Called with the URL and HTTP version of every response in the chain, redirects included.
+    /// The fetcher uses this to pick the h1 or h2 per-origin connection limit. Not called on
+    /// wasm32 (the browser's `fetch()` doesn't expose the version). Set via
+    /// [`NetPolicy::with_protocol_sink`].
+    pub on_protocol: ProtocolSinkFn,
     /// HSTS store consulted to upgrade each hop, and updated from each hop's response.
     /// `None` disables HSTS. Set via [`NetPolicy::with_hsts`].
     #[cfg(not(target_arch = "wasm32"))]
@@ -136,6 +144,7 @@ impl Default for NetPolicy {
             url_allowed: Box::new(|_| true),
             cookies_for: Box::new(|_| None),
             on_cookies: Box::new(|_, _| {}),
+            on_protocol: Box::new(|_, _| {}),
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -154,11 +163,18 @@ impl NetPolicy {
             url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
             cookies_for: Box::new(move |url| ctx_cookies.cookies_for(url)),
             on_cookies: Box::new(move |url, values| ctx_sink.on_cookies_received(url, values)),
+            on_protocol: Box::new(|_, _| {}),
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
             cors_preflight: None,
         }
+    }
+
+    /// Attaches a callback that receives the URL and HTTP version of every response.
+    pub fn with_protocol_sink(mut self, sink: ProtocolSinkFn) -> Self {
+        self.on_protocol = sink;
+        self
     }
 
     /// Attaches the HSTS store this policy should consult and update. `None` disables HSTS.
@@ -998,6 +1014,12 @@ async fn get_with_redirects(
             }
             r = &mut fut => r.context("net.get_with_redirects request failed").map_err(|e| NetError::Read(Arc::new(e)))?
         };
+
+        // Report the HTTP version of every hop, not just the final response, so the fetcher's
+        // per-origin limits also learn about intermediate origins. reqwest's wasm Response has
+        // no version().
+        #[cfg(not(target_arch = "wasm32"))]
+        (policy.on_protocol)(resp.url(), resp.version());
 
         // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
         // a site first arms it, and that response is consumed below.
@@ -2552,6 +2574,43 @@ mod tests {
         assert_eq!(received.len(), 1);
         assert_eq!(received[0].0.path(), "/login");
         assert_eq!(received[0].1, vec!["session=abc123; Path=/".to_string()]);
+    }
+
+    /// `on_protocol` is called for every hop (the 302 and the final 200), with that hop's URL.
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_reports_protocol_of_every_hop() {
+        let srv = server().await;
+        let seen: Arc<std::sync::Mutex<Vec<(String, http::Version)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let policy = NetPolicy::default().with_protocol_sink(Box::new(move |url, version| {
+            sink.lock().unwrap().push((url.path().to_string(), version));
+        }));
+
+        let (meta, _) = super::fetch_response_complete(
+            client(),
+            srv.url("/login"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+
+        let seen = seen.lock().unwrap();
+        // test server is plain http, so 1.1 on both hops
+        assert_eq!(
+            *seen,
+            vec![
+                ("/login".to_string(), http::Version::HTTP_11),
+                ("/whoami".to_string(), http::Version::HTTP_11),
+            ]
+        );
     }
 
     /// When a redirect hop sets cookies but no jar is wired up, the pre-existing Cookie header is
