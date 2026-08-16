@@ -37,8 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - like `Referer`, the values are recomputed at every redirect hop and only sent to
     potentially trustworthy targets; `Sec-Fetch-Site` can only degrade across a chain,
     and `Origin` becomes `null` after a tainting cross-origin redirect
-  - no public suffix list yet, so sibling subdomains report `cross-site` instead of
-    `same-site` (#60); same host on another port reports `same-site`
+  - `same-site` compares registrable domains using the public suffix list (`psl` crate,
+    native only) (#60); same host on another port reports `same-site`
   - inert on wasm32, where the browser owns these headers
 
 ### Changed
