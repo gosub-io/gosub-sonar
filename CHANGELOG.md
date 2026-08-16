@@ -9,11 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- TLS errors (#4): a failed handshake now returns `NetError::Tls(TlsError)` instead of an
-  opaque client error. `TlsError` has a `TlsErrorKind` (`Expired`, `NotYetValid`,
-  `UnknownIssuer`, `HostnameMismatch`, `Revoked`, `InvalidCertificate`, `Handshake`, `Other`),
-  host, port and the rustls message. Observers get `NetEvent::TlsFailed`. Native-only. No
-  user override ("accept anyway") yet.
+- TLS errors and certificate overrides (#4):
+  - a failed handshake now returns `NetError::Tls(TlsError)` instead of an opaque client
+    error. `TlsError` has a `TlsErrorKind` (`Expired`, `NotYetValid`, `UnknownIssuer`,
+    `HostnameMismatch`, `Revoked`, `InvalidCertificate`, `Handshake`, `Other`), the host and
+    the rustls message. Observers get `NetEvent::TlsFailed`.
+  - `FetcherConfig::tls_overrides` takes a `TlsOverrideStore` (in-memory default:
+    `InMemoryTlsOverrideStore`) and enables browser-style "proceed anyway": the error then
+    carries the certificate and its fingerprint, `store.accept(host, fingerprint)` lets the
+    next connection through, and `FetcherContext::tls_override` can accept on the spot.
+    Per (host, certificate); refused for HSTS hosts and for non-certificate failures.
+  - native-only; on wasm32 the browser does TLS
 - CORS per WHATWG Fetch (#2), enforced per redirect hop whenever a request carries
   `FetchRequest::origin`; without one CORS is entirely inert, like mixed content:
   - `RequestMode` is now enforced: `SameOrigin` refuses cross-origin targets, `NoCors` (the

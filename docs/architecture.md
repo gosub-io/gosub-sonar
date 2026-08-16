@@ -47,7 +47,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::fetcher_context` | `src/net/fetcher_context.rs` | `FetcherContext` trait — the host's hook into the fetch lifecycle (observers, ref tracking, URL policy, cookies). |
 | `net::cors` | `src/net/cors.rs` | CORS (WHATWG Fetch): safelist predicates, the CORS check, preflight validation, response tainting/filtering. `CorsPreflightCache` / `InMemoryPreflightCache`. Enforcement is native-only. |
 | `net::hsts` | `src/net/hsts.rs` | HTTP Strict Transport Security (RFC 6797): header parsing, host matching, expiry, URL upgrade. `HstsStore` / `InMemoryHstsStore`. Native-only. |
-| `net::tls` | `src/net/tls.rs` | `TlsError` / `TlsErrorKind`: why a handshake failed (expired, unknown issuer, wrong host name, ...), extracted from the rustls error. Native-only. |
+| `net::tls` | `src/net/tls.rs` | `TlsError` / `TlsErrorKind`: why a handshake failed (expired, unknown issuer, wrong host name, ...), extracted from the rustls error. Certificate overrides: `TlsOverrideStore` / `InMemoryTlsOverrideStore` and the verifier that consults them. Native-only. |
 | `net::types` | `src/net/types.rs` | Core data model: `FetchRequest`(+builder), `FetchResult`, `FetchResultMeta`, `Priority`, `NetError`, `BodyStream`, … |
 | `net::shared_body` | `src/net/shared_body.rs` | `SharedBody` — bounded fan-out byte stream with drop-on-lag per-subscriber queues. |
 | `net::pump` | `src/net/pump.rs` | Drains an `AsyncRead` into a `SharedBody` and/or a file on disk (atomic temp-file + rename). |
@@ -421,6 +421,37 @@ trust it via `cert_pem()` and point the client at `socket_addr()` with reqwest's
 
 ---
 
+## TLS errors & overrides
+
+A failed handshake fails the request with `NetError::Tls(TlsError)`: kind (`Expired`,
+`UnknownIssuer`, `HostnameMismatch`, ...), host and the rustls message, taken from the
+`rustls::Error` at the bottom of reqwest's error chain. Observers get `NetEvent::TlsFailed`.
+
+Set `FetcherConfig::tls_overrides` to a `TlsOverrideStore` to allow "proceed anyway". The
+fetcher then builds its own rustls config (`tls::client_config`) with a verifier wrapping the
+platform one. When verification fails it:
+
+1. gives up unless it's a certificate error (`TlsErrorKind::is_certificate_error`);
+2. refuses if the host is a known HSTS host (RFC 6797 §12.1);
+3. accepts if the store has this (host, fingerprint);
+4. otherwise asks `FetcherContext::tls_override(&error)`, and records a `true` in the store.
+
+The `TlsError` from this path includes the certificate (DER) and its SHA-256 fingerprint. Usual
+flow: request fails, show the certificate, on "proceed" call `store.accept(host, fingerprint)`
+and retry. Overrides are per (host, certificate); revoking only affects new connections.
+
+```rust
+let overrides = Arc::new(InMemoryTlsOverrideStore::new());
+let cfg = FetcherConfig { tls_overrides: Some(overrides.clone()), ..Default::default() };
+// ... on NetError::Tls(e) and the user clicking through:
+overrides.accept(&e.host, e.fingerprint.unwrap());
+```
+
+Native-only. Testing: `TestServer::tls` is self-signed, so the platform verifier rejects it;
+`cert_der()` gives the certificate to compare fingerprints against.
+
+---
+
 ## Observability
 
 Two traits decouple the net stack from the host's event system:
@@ -444,9 +475,13 @@ Implemented by the host and passed to `Fetcher::new`. The bridge between schedul
   into `NetPolicy::cookies_for`.
 - `on_cookies_received(final_url, set_cookie_values)` — called after a response carrying
   `Set-Cookie` headers, so the host can update its jar.
+- `tls_override(error)` — whether to accept a certificate that failed verification (default:
+  no). Only used with `FetcherConfig::tls_overrides`; see
+  [TLS errors & overrides](#tls-errors--overrides).
 
-All of `is_url_allowed`, `cookies_for`, and `on_cookies_received` have default implementations, so a
-minimal context only has to provide `observer_for`, `on_ref_active`, and `on_ref_done`.
+All of `is_url_allowed`, `cookies_for`, `on_cookies_received`, and `tls_override` have default
+implementations, so a minimal context only has to provide `observer_for`, `on_ref_active`, and
+`on_ref_done`.
 
 ---
 

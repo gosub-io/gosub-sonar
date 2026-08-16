@@ -1283,7 +1283,7 @@ mod tests {
         };
         assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::UnknownIssuer);
         assert_eq!(tls.host, "tls.test");
-        assert_eq!(tls.port, srv.socket_addr().port());
+        assert!(tls.certificate.is_none());
         assert_eq!(rec.tls_errors(), vec![tls]);
     }
 

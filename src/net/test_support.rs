@@ -664,6 +664,7 @@ impl TestServer {
         let tls = self.tls_domain.as_ref().map(|domain| {
             let ck = rcgen::generate_simple_self_signed(vec![domain.clone()]).unwrap();
             let cert_pem = ck.cert.pem().into_bytes();
+            let cert_der = ck.cert.der().to_vec();
             let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::try_from(
                 rcgen::KeyPair::serialize_der(&ck.signing_key),
             )
@@ -675,12 +676,13 @@ impl TestServer {
             (
                 domain.clone(),
                 cert_pem,
+                cert_der,
                 tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
             )
         });
 
         let base = Arc::new(match &tls {
-            Some((domain, _, _)) => format!("https://{}:{}", domain, addr.port()),
+            Some((domain, _, _, _)) => format!("https://{}:{}", domain, addr.port()),
             None => format!("http://127.0.0.1:{}", addr.port()),
         });
 
@@ -688,7 +690,7 @@ impl TestServer {
         let default = Arc::new(self.default);
         let hits_srv = hits.clone();
         let shutdown_srv = shutdown.clone();
-        let acceptor = tls.as_ref().map(|(_, _, a)| a.clone());
+        let acceptor = tls.as_ref().map(|(_, _, _, a)| a.clone());
         let base_srv = base.clone();
 
         tokio::spawn(async move {
@@ -723,7 +725,11 @@ impl TestServer {
             addr,
             hits,
             shutdown,
-            tls: tls.map(|(domain, cert_pem, _)| TlsInfo { domain, cert_pem }),
+            tls: tls.map(|(domain, cert_pem, cert_der, _)| TlsInfo {
+                domain,
+                cert_pem,
+                cert_der,
+            }),
         }
     }
 }
@@ -732,6 +738,7 @@ impl TestServer {
 struct TlsInfo {
     domain: String,
     cert_pem: Vec<u8>,
+    cert_der: Vec<u8>,
 }
 
 /// Handle to a running [`TestServer`]. Cancels the server when dropped.
@@ -776,6 +783,11 @@ impl TestServerHandle {
     /// and rejects a CA generated in-process.
     pub fn cert_pem(&self) -> Option<&[u8]> {
         self.tls.as_ref().map(|t| t.cert_pem.as_slice())
+    }
+
+    /// The server's self-signed certificate in DER form, or `None` if TLS is not enabled.
+    pub fn cert_der(&self) -> Option<&[u8]> {
+        self.tls.as_ref().map(|t| t.cert_der.as_slice())
     }
 
     /// The domain in the server's certificate, or `None` if TLS is not enabled.
