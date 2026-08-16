@@ -1,0 +1,5 @@
+# Disable CodeRabbit's automatic PR reviews for this repository.
+# The app is installed org-wide; this keeps it quiet here.
+reviews:
+  auto_review:
+    enabled: false
