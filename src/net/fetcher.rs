@@ -1577,6 +1577,47 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// End to end through the scheduler: a server whose certificate we don't trust fails the
+    /// request with `NetError::Tls`, not a generic error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_reports_untrusted_certificate_as_tls_error() {
+        struct Loopback(std::net::SocketAddr);
+        impl DnsResolver for Loopback {
+            fn resolve(&self, _host: &str) -> crate::net::dns::Resolving {
+                let addr = self.0;
+                Box::pin(async move { Ok(vec![addr]) })
+            }
+        }
+
+        let srv = TestServer::new()
+            .tls("tls.test")
+            .route("/", RouteConfig::ok(b"x".to_vec()))
+            .start()
+            .await;
+        let cfg = FetcherConfig {
+            dns_resolver: Some(Arc::new(Loopback(srv.socket_addr()))),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let (req, _) = make_req(srv.url("/"), Priority::Normal);
+        let result = tokio::time::timeout(Duration::from_secs(5), fetcher.fetch(req))
+            .await
+            .unwrap();
+        match result {
+            FetchResult::Error(NetError::Tls(tls)) => {
+                assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::UnknownIssuer);
+                assert_eq!(tls.host, "tls.test");
+            }
+            other => panic!("expected NetError::Tls, got {other:?}"),
+        }
+        shutdown.cancel();
+    }
+
     /// The `fetch` convenience must deliver the same result as the manual
     /// submit/handle/oneshot ritual, and a stopped fetcher must resolve to an error
     /// rather than hanging.

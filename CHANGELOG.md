@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Structured TLS errors (#4): a failed handshake now fails the request with
+  `NetError::Tls(TlsError)` instead of an opaque client error. `TlsError` carries a
+  `TlsErrorKind` (`Expired`, `NotYetValid`, `UnknownIssuer`, `HostnameMismatch`, `Revoked`,
+  `InvalidCertificate`, `Handshake`, `Other`), the host and port, and the underlying message;
+  `NetEvent::TlsFailed` reports the same to observers. `TlsError` and `TlsErrorKind` are
+  re-exported at the crate root. Native-only: the browser does TLS on wasm32. A user-override
+  hook (accept this certificate anyway) is not part of this yet.
 - CORS per WHATWG Fetch (#2), enforced per redirect hop whenever a request carries
   `FetchRequest::origin`; without one CORS is entirely inert, like mixed content:
   - `RequestMode` is now enforced: `SameOrigin` refuses cross-origin targets, `NoCors` (the
@@ -44,8 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking:** `FetchRequest` gains the `credentials` field, `FetchResultMeta` gains
-  `tainting`, `BlockReason` gains `Cors(CorsError)`, and `NetEvent` gains `CorsPreflight` —
-  struct-literal construction and exhaustive `match`es need updating. Requests built through
+  `tainting`, `BlockReason` gains `Cors(CorsError)`, `NetEvent` gains `CorsPreflight` and
+  `TlsFailed`, and `NetError` gains `Tls` — struct-literal construction and exhaustive
+  `match`es need updating. Requests built through
   `FetchRequest::builder()` keep their previous behaviour (mode `NoCors` restrictions aside)
 - Request coalescing now also keys on the credentials mode, so requests that would attach
   different cookies never share a response

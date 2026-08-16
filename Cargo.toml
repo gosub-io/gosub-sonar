@@ -45,6 +45,9 @@ tokio-rustls = { version = "0.26", optional = true }
 # Public suffix list, for the registrable-domain comparison behind `Sec-Fetch-Site: same-site`.
 # Compiled in; not needed on wasm32 where the browser sets these headers itself.
 psl = "2"
+# Only for downcasting the error behind a failed handshake into `TlsError`. Must stay on the
+# same major as reqwest's rustls or the downcast silently never matches.
+rustls = { version = "0.23", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # tokio's wasm32-supported feature subset — "net" needs mio, which cannot build for

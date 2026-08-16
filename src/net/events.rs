@@ -1,5 +1,6 @@
 //! Events emitted by the fetch stack to observers during a request lifecycle.
 
+use crate::net::tls::TlsError;
 use crate::net::types::BlockReason;
 use http::HeaderMap;
 use std::time::Duration;
@@ -67,6 +68,14 @@ pub enum NetEvent {
         url: Url,
         /// Error that caused the failure
         error: anyhow::Error,
+    },
+    /// The TLS handshake for a hop failed. The request fails with
+    /// [`NetError::Tls`](crate::net::types::NetError::Tls) carrying the same error.
+    TlsFailed {
+        /// The hop whose handshake failed
+        url: Url,
+        /// What went wrong
+        error: TlsError,
     },
     /// A request hop was refused by policy and never sent
     Blocked {

@@ -33,5 +33,6 @@ pub mod referrer;
 pub mod request_ref;
 pub mod shared_body;
 pub mod simple;
+pub mod tls;
 pub mod types;
 pub(crate) mod utils;

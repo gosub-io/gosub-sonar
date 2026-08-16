@@ -839,6 +839,19 @@ impl RecordingObserver {
             .collect()
     }
 
+    /// Every [`NetEvent::TlsFailed`] error recorded, in order.
+    pub fn tls_errors(&self) -> Vec<crate::net::tls::TlsError> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::TlsFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Number of events recorded so far.
     pub fn len(&self) -> usize {
         self.events.lock().unwrap().len()

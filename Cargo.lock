@@ -562,6 +562,7 @@ dependencies = [
  "psl",
  "rcgen",
  "reqwest",
+ "rustls",
  "tempfile",
  "thiserror",
  "tokio",

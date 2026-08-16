@@ -6,6 +6,7 @@ use crate::net::mixed_content::{is_origin_potentially_trustworthy, MixedContentP
 use crate::net::referrer::{self, ReferrerPolicy};
 use crate::net::request_ref::RequestReference;
 use crate::net::shared_body::SharedBody;
+use crate::net::tls::TlsError;
 use crate::net::utils::{normalize_url, short_hash, BytesAsyncReader};
 use crate::types::{PeekBuf, RequestId};
 use bytes::Bytes;
@@ -164,6 +165,11 @@ pub enum NetError {
     /// Error reported by the underlying HTTP client
     #[error("net error: reqwest: {0}")]
     Reqwest(#[from] Arc<reqwest::Error>),
+
+    /// TLS handshake failed: expired certificate, unknown issuer, wrong host name, ...
+    /// See [`TlsError`]. Never produced on wasm32.
+    #[error("net error: tls: {0}")]
+    Tls(TlsError),
 
     /// Redirect could not be followed (e.g. too many redirects, invalid target)
     #[error("net error: redirect: {0}")]
