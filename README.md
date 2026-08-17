@@ -16,6 +16,28 @@ gosub-sonar provides two fetching APIs:
 
 The library has no dependency on any browser engine and can be used standalone.
 
+## Features
+
+- Scheduling: four priority lanes, global and per-origin connection limits (h1/h2 aware),
+  coalescing of identical in-flight requests with fan-out to all subscribers, per-subscriber
+  cancellation.
+- Bodies: buffered or streamed (`SharedBody`), automatic decompression, `max_bytes`, idle and
+  total-body timeouts, request bodies for POST/PUT.
+- Web platform policies, applied on every redirect hop: CORS (preflights, response tainting),
+  referrer policy, mixed content, `Origin` and `Sec-Fetch-*` headers, HSTS, cookie hooks,
+  `Authorization`/`Cookie` stripped on cross-origin redirects.
+- Transport: TLS errors with user overrides, pluggable DNS (for SSRF policies), proxy
+  configuration, default `User-Agent` of `gosub-sonar/<version>` (`FetcherConfig::user_agent`).
+- `NetEvent`s per request (started, redirected, headers, progress, blocked, preflight, TLS
+  failure, finished) via `NetObserver`; typed `NetError` / `BlockReason`.
+- Compiles for `wasm32-unknown-unknown` on top of the browser's `fetch()`. HSTS, DNS, proxies,
+  TLS, the blocking helpers and `file://` are native only.
+
+The policies are documented in their modules on [docs.rs](https://docs.rs/gosub-sonar)
+(`net::cors`, `net::referrer`, `net::mixed_content`, `net::fetch_metadata`, `net::hsts`,
+`net::tls`, `net::dns`, `net::proxy`); [docs/architecture.md](docs/architecture.md) has the
+overall picture.
+
 ## Usage
 
 Add to your `Cargo.toml` (the scheduler API also uses these companion crates directly):
@@ -140,6 +162,40 @@ error. Known HSTS hosts can't be overridden, nor can handshake failures that are
 certificate. For a policy rather than a dialog (say, trust self-signed certificates on your dev
 hosts) implement `FetcherContext::tls_override`; it is asked synchronously during the handshake,
 after the store. See `examples/tls_override.rs`. Native only.
+
+### DNS and SSRF
+
+`FetcherConfig::dns_resolver` replaces the system resolver. It is used for every connection,
+redirect hops included, and the connection goes to exactly the addresses it returns. Return `Err`
+to refuse a host, e.g. for an SSRF policy on resolved addresses:
+
+```rust
+use std::sync::Arc;
+use gosub_sonar::{DnsResolver, FetcherConfig, Resolving};
+
+struct PublicOnly;
+
+impl DnsResolver for PublicOnly {
+    fn resolve(&self, host: &str) -> Resolving {
+        let host = host.to_owned();
+        Box::pin(async move {
+            let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            if addrs.iter().any(|a| a.ip().is_loopback()) {
+                return Err(format!("{host} resolves to loopback").into());
+            }
+            Ok(addrs)
+        })
+    }
+}
+
+let cfg = FetcherConfig {
+    dns_resolver: Some(Arc::new(PublicOnly)),
+    ..Default::default()
+};
+```
+
+`FetcherContext::is_url_allowed` is the URL-level counterpart; it sees the initial URL and every
+redirect target before they are fetched. Native only.
 
 ### Proxies
 

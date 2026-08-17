@@ -35,6 +35,12 @@
 //! The most common types are re-exported at the crate root; the full API remains
 //! available under [`net`].
 //!
+//! # Policies
+//!
+//! Each web platform policy has its own module: [`net::cors`], [`net::referrer`],
+//! [`net::mixed_content`], [`net::fetch_metadata`], and (native only) `net::hsts`, `net::tls`,
+//! `net::dns` and `net::proxy`. All are applied on every redirect hop.
+//!
 //! # Examples
 //!
 //! Runnable examples are in the `examples/` directory:

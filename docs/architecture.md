@@ -46,6 +46,11 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::fetch` | `src/net/fetch.rs` | Low-level fetch primitives: `fetch_response_top`, `fetch_response_complete`, redirect handling, `ProgressReader`, `NetPolicy`. |
 | `net::fetcher_context` | `src/net/fetcher_context.rs` | `FetcherContext` trait — the host's hook into the fetch lifecycle (observers, ref tracking, URL policy, cookies). |
 | `net::cors` | `src/net/cors.rs` | CORS (WHATWG Fetch): safelist predicates, the CORS check, preflight validation, response tainting/filtering. `CorsPreflightCache` / `InMemoryPreflightCache`. Enforcement is native-only. |
+| `net::referrer` | `src/net/referrer.rs` | `Referer` header from a `ReferrerPolicy` (W3C Referrer Policy), recomputed per redirect hop. |
+| `net::mixed_content` | `src/net/mixed_content.rs` | Blocking/upgrading insecure sub-resources of a secure document (W3C Mixed Content), checked per hop. `MixedContentPolicy`. |
+| `net::fetch_metadata` | `src/net/fetch_metadata.rs` | `Origin` and `Sec-Fetch-Dest/Mode/Site/User` headers (W3C Fetch Metadata). `RequestDestination`, `RequestMode`, `SecFetchSite`. |
+| `net::dns` | `src/net/dns.rs` | `DnsResolver` — pluggable name resolution (SSRF policies, pinned addresses). Native-only. |
+| `net::proxy` | `src/net/proxy.rs` | `ProxyConfig` / `ProxyRule` — proxy settings, replacing the `*_PROXY` environment. Native-only. |
 | `net::hsts` | `src/net/hsts.rs` | HTTP Strict Transport Security (RFC 6797): header parsing, host matching, expiry, URL upgrade. `HstsStore` / `InMemoryHstsStore`. Native-only. |
 | `net::tls` | `src/net/tls.rs` | `TlsError` / `TlsErrorKind`: why a handshake failed (expired, unknown issuer, wrong host name, ...), extracted from the rustls error. Certificate overrides: `TlsOverrideStore` / `InMemoryTlsOverrideStore` and the verifier that consults them. Native-only. |
 | `net::types` | `src/net/types.rs` | Core data model: `FetchRequest`(+builder), `FetchResult`, `FetchResultMeta`, `Priority`, `NetError`, `BodyStream`, … |
@@ -317,6 +322,12 @@ enforced in the read loops of `fetch_response_complete` and the `ProgressReader`
   preflight `OPTIONS` and updated from its response. Set from
   `FetcherConfig::cors_preflight_cache`; `None` keeps CORS enforced but preflights every time.
 
+`FetcherConfig::dns_resolver` (`net::dns`) is the other SSRF hook, outside `NetPolicy`. When set
+it is the only resolver the client uses, for every connection including redirect hops, and the
+connection goes to exactly the addresses it returns (a rebound name can't redirect a pooled
+connection). Return `Err` to refuse a host. `url_allowed` checks URLs, the resolver checks
+addresses; a policy usually wants both. Native-only.
+
 Redirects are handled manually in `get_with_redirects` (up to `MAX_REDIRECTS` = 20 hops) with
 browser-matching semantics:
 
@@ -330,6 +341,8 @@ browser-matching semantics:
 - [CORS](#cors) is enforced per hop when the request carries an initiating origin: mode rules
   before sending, a preflight when the method/headers need one, the CORS check on every response
   of a cors-tainted chain, and a refusal of `Location` targets with embedded credentials.
+- `Referer`, `Origin` and the `Sec-Fetch-*` headers are recomputed per hop, and the
+  [mixed content](#referrer-mixed-content--fetch-metadata) check runs per hop.
 
 > reqwest's own redirect following must stay disabled (`Policy::none()` in `build_client`). If it
 > is re-enabled, reqwest resolves each 3xx internally and `get_with_redirects` only ever sees the
@@ -369,6 +382,36 @@ preflight for devtools-style observability.
 
 Enforcement is native-only: on wasm32 the browser's `fetch()` enforces CORS itself and hides the
 `Access-Control-*` response headers the checks would need.
+
+---
+
+## Referrer, mixed content & fetch metadata
+
+Three smaller policies next to CORS. Like CORS they need `FetchRequest::origin` (the initiating
+document) and do nothing without it, and they are recomputed on every redirect hop in
+`get_with_redirects`, since same-origin, same-site and downgrade depend on the target.
+
+**Referrer policy** (`net::referrer`). `FetchRequest::referrer` is the initiating document's URL
+and `FetchRequest::referrer_policy` its policy; the `Referer` header is computed from those per
+hop. Default is `strict-origin-when-cross-origin` like browsers: full URL within the origin, only
+the origin when leaving it, nothing on an https → http downgrade. A `Referrer-Policy` header on a
+3xx response replaces the policy for the rest of the chain.
+
+**Mixed content** (`net::mixed_content`). A request from a secure origin to an insecure URL is
+blocked (`BlockReason::MixedContent`) or upgraded to https, per `FetcherConfig::mixed_content`
+(default `Block`) or the per-request `FetchRequest::mixed_content`. Sonar only does the per-hop
+check, which the caller can't do itself: a check before `fetch()` never sees an `https://a` →
+`http://b` redirect. Whether an image counts as optionally-blockable and may go through with
+`MixedContentPolicy::Allow` is up to the embedder.
+
+**Fetch metadata** (`net::fetch_metadata`). `Sec-Fetch-Dest`, `-Mode`, `-Site` and `-User` are
+set from `FetchRequest::destination`, `::mode` and `Initiator::User`; `Origin` is sent on
+non-GET/HEAD and cross-origin CORS requests. `Sec-Fetch-Site` compares registrable domains (public
+suffix list, `psl` crate) and can only degrade across a chain; `Origin` becomes `null` after a
+tainting cross-origin redirect. The fetcher overwrites hand-set values for these headers, like
+browsers do for forbidden header names.
+
+On wasm32 all three are inert: the browser follows redirects itself and applies its own policies.
 
 ---
 
