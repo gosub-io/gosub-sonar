@@ -85,6 +85,18 @@ tokio-rustls = "0.26"
 name = "fetcher_harness"
 required-features = ["test-support"]
 
+[[example]]
+name = "fetcher_context"
+required-features = ["test-support"]
+
+[[example]]
+name = "streaming"
+required-features = ["test-support"]
+
+[[example]]
+name = "document_fetch"
+required-features = ["test-support"]
+
 [[test]]
 name = "e2e"
 required-features = ["test-support"]
