@@ -138,7 +138,9 @@ running into issues with browsers that limit the number of connections to a sing
 We can't know which protocol an origin speaks until ALPN has run, so every origin starts at the HTTP/1 limit and 
 is raised to the HTTP/2 limit once we've seen an HTTP/2 (or HTTP/3) response from it. Each hop of a redirect chain 
 reports its version through `NetPolicy::on_protocol`, so intermediate origins are picked up as well. Simply 
-assuming HTTP/2 for every `https` origin would give an HTTP/1.1-only server 16 connections instead of 6.
+assuming HTTP/2 for every `https` origin would give an HTTP/1.1-only server 16 connections instead of 6. Not on 
+wasm32: the browser's `fetch()` doesn't expose the version, so origins stay at the HTTP/1 limit there (the browser 
+manages the actual connections anyway).
 
 In total, the fetcher will limit the total amount of connections that can be open at the same time, as well as the 
 amount of connections that can be open to a single origin.

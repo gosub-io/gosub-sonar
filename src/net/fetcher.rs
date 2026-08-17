@@ -46,8 +46,9 @@ pub struct FetcherConfig {
     /// Maximum concurrent connections **per origin** for HTTP/1.x.
     /// HTTP/1 pipelines poorly, so browsers cap this at 6.
     ///
-    /// Also used for https origins until we've seen an HTTP/2 or HTTP/3 response from them,
-    /// after which `h2_per_origin` applies.
+    /// Every origin starts at this limit, whatever the scheme, since the protocol is only known
+    /// after the first response. Once an HTTP/2 or HTTP/3 response arrives from an origin,
+    /// `h2_per_origin` applies to it.
     pub h1_per_origin: usize,
     /// Maximum concurrent streams **per origin** for HTTP/2 and HTTP/3 (multiplexed).
     pub h2_per_origin: usize,
@@ -560,7 +561,7 @@ impl Fetcher {
                     return;
                 }
 
-                let h = tokio::select! { p = slots.sem.clone().acquire_owned() => Some(p), _ = shutdown_child.cancelled() => None };
+                let h = tokio::select! { p = slots.sem.acquire() => Some(p), _ = shutdown_child.cancelled() => None };
                 if h.is_none() {
                     return;
                 }
@@ -703,7 +704,7 @@ fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Cl
 /// Once an HTTP/2 (or HTTP/3) response comes in from the origin, the semaphore is grown to the
 /// h2 limit. It is never shrunk again.
 struct OriginSlots {
-    sem: Arc<Semaphore>,
+    sem: Semaphore,
     h2: AtomicBool,
 }
 
@@ -726,7 +727,7 @@ impl OriginTable {
             .entry(Fetcher::origin_key(url))
             .or_insert_with(|| {
                 Arc::new(OriginSlots {
-                    sem: Arc::new(Semaphore::new(self.cfg.h1_per_origin)),
+                    sem: Semaphore::new(self.cfg.h1_per_origin),
                     h2: AtomicBool::new(false),
                 })
             })
@@ -760,7 +761,9 @@ impl OriginTable {
 }
 
 /// Build the `NetPolicy` for a fetcher request: context hooks, HSTS, CORS preflight cache and
-/// the protocol sink that updates the per-origin limits.
+/// the protocol sink that updates the per-origin limits. On wasm32 the sink is never called
+/// (reqwest's wasm Response has no version), so origins stay at the h1 limit there; the browser
+/// does the actual connection management anyway.
 fn build_policy(
     cfg: &FetcherConfig,
     ctx: &Arc<dyn FetcherContext>,
@@ -1313,6 +1316,21 @@ mod tests {
         );
         t.observe(&a, http::Version::HTTP_11);
         assert_eq!(t.slots_for(&a).sem.available_permits(), 8);
+    }
+
+    /// The extra permits must land on the semaphore that requests are already waiting on.
+    #[test]
+    fn origin_table_growth_reaches_blocked_acquirers() {
+        let t = origin_table();
+        let url = Url::parse("https://a.example/x").unwrap();
+        let slots = t.slots_for(&url);
+
+        let held: Vec<_> = (0..3).map(|_| slots.sem.try_acquire().unwrap()).collect();
+        assert!(slots.sem.try_acquire().is_err());
+
+        t.observe(&url, http::Version::HTTP_2);
+        assert!(slots.sem.try_acquire().is_ok());
+        drop(held);
     }
 
     #[tokio::test(flavor = "current_thread")]

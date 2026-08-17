@@ -212,7 +212,7 @@ and two layers of semaphores:
 - **`per_origin`** — an `OriginTable` (`DashMap<origin, OriginSlots>`), created on first use per
   origin, capping concurrent fetches to one origin. Starts at the HTTP/1 limit (6) and is grown
   to the HTTP/2 limit (16) once an HTTP/2 or HTTP/3 response has been seen from that origin
-  (reported per hop via `NetPolicy::on_protocol`).
+  (reported per hop via `NetPolicy::on_protocol`; native only, wasm32 stays at the HTTP/1 limit).
 
 `FetcherConfig` (in `fetcher.rs`) also carries `connect_timeout` (5s), `req_timeout` (60s),
 `read_idle_timeout` (15s), `total_body_timeout` (180s), a `user_agent` (defaults to
