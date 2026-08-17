@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::StreamReader;
 use tokio_util::sync::CancellationToken;
@@ -46,7 +46,9 @@ use tokio_util::sync::CancellationToken;
 ///
 /// Subscribers see **only future chunks** from the moment they subscribe
 /// (no replay). Useful to tee a response body to multiple consumers such as
-/// the HTML parser, a download writer, and a progress UI.
+/// the HTML parser, a download writer, and a progress UI. A body driven by
+/// [`from_reader`](Self::from_reader) waits for the first subscriber before it
+/// starts reading, so that one sees everything.
 ///
 /// # Examples
 ///
@@ -85,6 +87,12 @@ struct State {
     max_queue: usize,
     /// If true, any additional push() is ignored. The stream is closed.
     closed: bool,
+    /// Signalled once, when the first subscriber attaches. `from_reader` waits for this before
+    /// it starts reading, so nothing is pushed while there is nobody to receive it.
+    first_subscriber: Arc<Notify>,
+    has_subscriber: bool,
+    /// The error the body ended with, if any; handed to subscribers that attach after the end.
+    error: Option<NetError>,
 }
 
 impl SharedBody {
@@ -101,6 +109,9 @@ impl SharedBody {
                 next_id: AtomicU64::new(1),
                 max_queue,
                 closed: false,
+                first_subscriber: Arc::new(Notify::new()),
+                has_subscriber: false,
+                error: None,
             })),
         }
     }
@@ -153,7 +164,7 @@ impl SharedBody {
     /// After this call:
     /// - The next item each subscriber receives is `Err(e.clone())`.
     /// - The stream then ends (`None`).
-    /// - New subscribers will see an **empty** stream.
+    /// - New subscribers get the same `Err(e)` and then the end.
     pub fn error(&self, e: NetError) {
         // drain and drop under lock; send error outside the lock
         let senders: Vec<mpsc::Sender<Result<Bytes, NetError>>> = {
@@ -162,6 +173,7 @@ impl SharedBody {
                 return;
             }
             st.closed = true;
+            st.error = Some(e.clone());
             st.subs.drain().map(|(_, tx)| tx).collect()
         };
 
@@ -190,7 +202,10 @@ impl SharedBody {
 
     /// Subscribes **from now on**, returning a stream of body chunks.
     ///
-    /// Chunks produced **before** subscribing are **not** replayed.
+    /// Chunks produced **before** subscribing are **not** replayed. A body from
+    /// [`from_reader`](Self::from_reader) doesn't start reading until the first subscriber
+    /// attaches, so the first subscriber always sees the whole body; later ones only what
+    /// follows. Subscribing after the body ended yields the error it ended with, or nothing.
     ///
     /// See also [`subscribe_stream`](Self::subscribe_stream) for using the
     /// default capacity configured at `SharedBody` creation.
@@ -201,7 +216,10 @@ impl SharedBody {
         let (rx, id) = {
             let mut st = self.inner.lock();
             if st.closed {
-                return stream::empty::<Result<Bytes, NetError>>().boxed();
+                return match st.error.clone() {
+                    Some(e) => stream::once(async move { Err(e) }).boxed(),
+                    None => stream::empty::<Result<Bytes, NetError>>().boxed(),
+                };
             }
 
             let (tx, rx) = mpsc::channel(max_queue);
@@ -209,6 +227,11 @@ impl SharedBody {
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             st.subs.insert(id, tx);
+            if !st.has_subscriber {
+                st.has_subscriber = true;
+                // notify_one stores a permit if the pump isn't waiting yet
+                st.first_subscriber.notify_one();
+            }
             (rx, id)
         };
 
@@ -314,8 +337,10 @@ impl SharedBody {
     /// - On EOF: calls [`finish`](Self::finish).
     /// - On I/O error or policy violation: calls [`error`](Self::error).
     ///
-    /// The returned `Arc<SharedBody>` can be subscribed to immediately; chunks
-    /// will arrive as the background task reads.
+    /// Reading starts when the first subscriber attaches, so that subscriber gets the whole
+    /// body even if it subscribes a while after this returns. If nobody subscribes within
+    /// `idle_timeout` (or `total_timeout` / cancellation hits first) the body ends with that
+    /// error instead of holding the connection open.
     ///
     /// # Examples
     /// Wrap a `reqwest` body (converted to `AsyncRead`) and tee it:
@@ -384,6 +409,41 @@ impl SharedBody {
             if let Err(e) = check_total_deadline(tokio::time::Instant::now()) {
                 sb_clone.error(e);
                 return;
+            }
+
+            // Don't read until someone is listening: subscribers only get chunks pushed after
+            // they attach, so anything read before that would be lost. The reader typically
+            // already holds bytes (the part of the first chunk beyond the peek buffer), and the
+            // caller gets the SharedBody through a channel before it can subscribe. Same
+            // limits as a read while waiting, so an abandoned result doesn't hold the
+            // connection forever.
+            let first_subscriber = sb_clone.inner.lock().first_subscriber.clone();
+            let idle_sleep = async {
+                match idle_timeout {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => std::future::pending().await,
+                }
+            };
+            let deadline_sleep = async {
+                match deadline {
+                    Some(dl) => tokio::time::sleep_until(dl).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = first_subscriber.notified() => {}
+                _ = cancel.cancelled() => {
+                    sb_clone.error(NetError::Cancelled("read cancelled".to_string()));
+                    return;
+                }
+                _ = idle_sleep => {
+                    sb_clone.error(NetError::Timeout("no subscriber attached before read idle timeout".to_string()));
+                    return;
+                }
+                _ = deadline_sleep => {
+                    sb_clone.error(NetError::Timeout("total read timeout".to_string()));
+                    return;
+                }
             }
 
             loop {
@@ -656,6 +716,49 @@ mod tests {
             ReaderOptions::default(),
         );
         assert_eq!(drain_result(&sb).await.unwrap(), b"hello reader");
+    }
+
+    /// The pump must not read before anyone subscribes: a subscriber that attaches late still
+    /// gets everything, including bytes the reader had ready from the start.
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_reader_waits_for_first_subscriber() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let sb = SharedBody::from_reader(
+            std::io::Cursor::new(data.clone()),
+            ReaderOptions {
+                buf_size: 4096,
+                // room for every chunk, so drop-on-lag can't interfere with what we test here
+                capacity: 128,
+                ..ReaderOptions::default()
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(drain_result(&sb).await.unwrap(), data);
+    }
+
+    /// Nobody subscribing is not a reason to keep the reader open forever: the idle timeout
+    /// applies to the wait too, and a subscriber that turns up afterwards gets the error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_reader_gives_up_when_nobody_subscribes() {
+        let sb = SharedBody::from_reader(
+            std::io::Cursor::new(b"never read".to_vec()),
+            ReaderOptions {
+                idle_timeout: Some(Duration::from_millis(50)),
+                ..ReaderOptions::default()
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let err = drain_result(&sb).await.unwrap_err();
+        assert!(err.to_string().contains("no subscriber"), "got: {err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_subscriber_gets_the_terminal_error() {
+        let sb = SharedBody::new(8);
+        sb.error(NetError::Cancelled("gone".into()));
+        let mut s = sb.subscribe_stream();
+        assert!(matches!(s.next().await, Some(Err(NetError::Cancelled(_)))));
+        assert!(s.next().await.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
