@@ -338,6 +338,9 @@ fn kind_of(err: &rustls::Error) -> TlsErrorKind {
             C::UnknownIssuer => TlsErrorKind::UnknownIssuer,
             C::NotValidForName | C::NotValidForNameContext { .. } => TlsErrorKind::HostnameMismatch,
             C::Revoked => TlsErrorKind::Revoked,
+            C::Other(other) => {
+                apple_kind(&other.to_string()).unwrap_or(TlsErrorKind::InvalidCertificate)
+            }
             _ => TlsErrorKind::InvalidCertificate,
         },
         E::InvalidCertRevocationList(_) => TlsErrorKind::InvalidCertificate,
@@ -351,6 +354,26 @@ fn kind_of(err: &rustls::Error) -> TlsErrorKind {
         | E::DecryptError
         | E::EncryptError => TlsErrorKind::Handshake,
         _ => TlsErrorKind::Other,
+    }
+}
+
+/// On macOS the platform verifier only maps a few Security.framework codes to rustls variants
+/// and passes the rest through as `CertificateError::Other("<description>: <OSStatus>")`. Pick
+/// out the ones we care about by their code.
+#[cfg(not(target_arch = "wasm32"))]
+fn apple_kind(msg: &str) -> Option<TlsErrorKind> {
+    let code: i32 = msg
+        .rsplit(": ")
+        .next()?
+        .trim_end_matches('"')
+        .parse()
+        .ok()?;
+    match code {
+        -67843 => Some(TlsErrorKind::UnknownIssuer), // errSecNotTrusted
+        -67818 => Some(TlsErrorKind::Expired),       // errSecCertificateExpired
+        -67819 => Some(TlsErrorKind::NotYetValid),   // errSecCertificateNotValidYet
+        -67820 => Some(TlsErrorKind::Revoked),       // errSecCertificateRevoked
+        _ => None,
     }
 }
 
@@ -399,6 +422,31 @@ mod tests {
             assert_eq!(e.host, "example.test");
             assert!(e.certificate.is_none());
         }
+    }
+
+    #[test]
+    fn classifies_unmapped_macos_codes() {
+        // What rustls-platform-verifier produces on macOS for a self-signed certificate.
+        let e = classify_wrapped(rustls::Error::InvalidCertificate(CertificateError::Other(
+            rustls::OtherError(Arc::from(Box::<dyn std::error::Error + Send + Sync>::from(
+                "“rcgen self signed cert” certificate is not trusted: -67843",
+            ))),
+        )));
+        assert_eq!(e.kind, TlsErrorKind::UnknownIssuer);
+
+        let e = classify_wrapped(rustls::Error::InvalidCertificate(CertificateError::Other(
+            rustls::OtherError(Arc::from(Box::<dyn std::error::Error + Send + Sync>::from(
+                "“x” certificate is expired: -67818",
+            ))),
+        )));
+        assert_eq!(e.kind, TlsErrorKind::Expired);
+
+        let e = classify_wrapped(rustls::Error::InvalidCertificate(CertificateError::Other(
+            rustls::OtherError(Arc::from(Box::<dyn std::error::Error + Send + Sync>::from(
+                "something else entirely",
+            ))),
+        )));
+        assert_eq!(e.kind, TlsErrorKind::InvalidCertificate);
     }
 
     #[test]
