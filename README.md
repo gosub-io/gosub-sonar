@@ -110,6 +110,37 @@ private-browsing session wants.
 There is no preload list. On wasm32 the browser's `fetch()` applies its own HSTS, so the field does
 not exist there.
 
+### TLS errors and certificate overrides
+
+A failed handshake comes back as `NetError::Tls(TlsError)` with a `kind` (`Expired`,
+`UnknownIssuer`, `HostnameMismatch`, ...) so you can show the right warning. To let the user
+proceed anyway, give the fetcher a `TlsOverrideStore`; the error then also carries the
+certificate and its fingerprint:
+
+```rust
+use gosub_sonar::{FetcherConfig, InMemoryTlsOverrideStore, NetError, FetchResult};
+
+let overrides = Arc::new(InMemoryTlsOverrideStore::new());
+let cfg = FetcherConfig {
+    tls_overrides: Some(overrides.clone()),
+    ..Default::default()
+};
+
+// ...
+if let FetchResult::Error(NetError::Tls(err)) = fetcher.fetch(req).await {
+    if err.kind.is_certificate_error() && user_clicked_proceed(&err) {
+        overrides.accept(&err.host, err.fingerprint.unwrap());
+        // retry the request; the next connection is let through
+    }
+}
+```
+
+Overrides are per (host, certificate): a different bad certificate for the same host is a new
+error. Known HSTS hosts can't be overridden, nor can handshake failures that aren't about the
+certificate. For a policy rather than a dialog (say, trust self-signed certificates on your dev
+hosts) implement `FetcherContext::tls_override`; it is asked synchronously during the handshake,
+after the store. See `examples/tls_override.rs`. Native only.
+
 ### Proxies
 
 By default the fetcher reads `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` from the
@@ -140,6 +171,7 @@ uses the user's own proxy settings, so the field does not exist there.
 cargo run --example simple_fetch -- https://example.org
 cargo run --example fetcher -- https://example.org
 cargo run --example fetcher_harness --features test-support
+cargo run --example tls_override -- https://self-signed.badssl.com/
 ```
 
 ## Documentation
