@@ -14,9 +14,10 @@
 //! degrade across a chain, and `Origin` becomes the literal `null` once the chain redirects
 //! away from an origin the request had already left.
 //!
-//! There is no public suffix list, so sibling subdomains (`a.example.com` → `b.example.com`)
-//! report `cross-site` instead of `same-site`. Same host on another port reports `same-site`,
-//! since a site has no port.
+//! `Sec-Fetch-Site: same-site` means same scheme and same registrable domain (eTLD+1, per the
+//! public suffix list), so `a.example.com` → `b.example.com` is same-site while
+//! `a.github.io` → `b.github.io` is not. Same host on another port is same-site too, since a
+//! site has no port.
 //!
 //! Inert on `wasm32`: these are forbidden header names there, so the browser strips ours and
 //! applies its own.
@@ -33,7 +34,7 @@
 use crate::net::mixed_content::is_potentially_trustworthy;
 use crate::net::referrer::ReferrerPolicy;
 use http::{header, HeaderMap, HeaderValue, Method};
-use url::{Origin, Url};
+use url::{Host, Origin, Url};
 
 static SEC_FETCH_DEST: header::HeaderName = header::HeaderName::from_static("sec-fetch-dest");
 static SEC_FETCH_MODE: header::HeaderName = header::HeaderName::from_static("sec-fetch-mode");
@@ -193,19 +194,49 @@ impl SecFetchSite {
 /// Classify one hop's target against the initiating origin.
 ///
 /// Never returns [`SecFetchSite::None`]; that value means there is no initiating origin at
-/// all. Sibling subdomains classify as [`CrossSite`](SecFetchSite::CrossSite) for lack of a
-/// public suffix list; same host on another port is [`SameSite`](SecFetchSite::SameSite).
+/// all. Same site is schemeful: same scheme and [`same_site_host`] hosts.
 pub(crate) fn classify_site(initiator: &Origin, target: &Url) -> SecFetchSite {
     let target_origin = target.origin();
     if *initiator == target_origin {
         return SecFetchSite::SameOrigin;
     }
     match (initiator, &target_origin) {
-        (Origin::Tuple(s1, h1, _), Origin::Tuple(s2, h2, _)) if s1 == s2 && h1 == h2 => {
+        (Origin::Tuple(s1, h1, _), Origin::Tuple(s2, h2, _))
+            if s1 == s2 && same_site_host(h1, h2) =>
+        {
             SecFetchSite::SameSite
         }
         _ => SecFetchSite::CrossSite,
     }
+}
+
+/// Two hosts are same site when they are equal, or both are domains with the same registrable
+/// domain (HTML "same site"). IP addresses and hosts without a registrable domain (`localhost`,
+/// a bare public suffix) only match themselves.
+fn same_site_host(a: &Host, b: &Host) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a, b) {
+        (Host::Domain(a), Host::Domain(b)) => {
+            match (registrable_domain(a), registrable_domain(b)) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn registrable_domain(host: &str) -> Option<&str> {
+    psl::domain_str(host)
+}
+
+// No public suffix list on wasm32; the browser sets Sec-Fetch-Site itself there anyway.
+#[cfg(target_arch = "wasm32")]
+fn registrable_domain(_host: &str) -> Option<&str> {
+    None
 }
 
 /// Set (or clear) the four `Sec-Fetch-*` headers for one hop.
@@ -322,9 +353,66 @@ mod tests {
             classify_site(&init, &u("https://other.com/a")),
             SecFetchSite::CrossSite
         );
-        // Without a public suffix list a sibling subdomain degrades to cross-site.
+    }
+
+    #[test]
+    fn site_classification_uses_registrable_domain() {
+        let init = o("https://a.example.com");
+        // same eTLD+1
         assert_eq!(
-            classify_site(&init, &u("https://sub.example.com/a")),
+            classify_site(&init, &u("https://b.example.com/")),
+            SecFetchSite::SameSite
+        );
+        assert_eq!(
+            classify_site(&init, &u("https://example.com/")),
+            SecFetchSite::SameSite
+        );
+        assert_eq!(
+            classify_site(&init, &u("https://deep.b.example.com:8443/")),
+            SecFetchSite::SameSite
+        );
+        assert_eq!(
+            classify_site(&init, &u("https://example.org/")),
+            SecFetchSite::CrossSite
+        );
+        assert_eq!(
+            classify_site(&init, &u("https://notexample.com/")),
+            SecFetchSite::CrossSite
+        );
+
+        // multi-label public suffixes
+        assert_eq!(
+            classify_site(
+                &o("https://x.example.co.uk"),
+                &u("https://y.example.co.uk/")
+            ),
+            SecFetchSite::SameSite
+        );
+        assert_eq!(
+            classify_site(&o("https://a.co.uk"), &u("https://b.co.uk/")),
+            SecFetchSite::CrossSite
+        );
+        // private-section suffixes: every github.io user is its own site
+        assert_eq!(
+            classify_site(&o("https://a.github.io"), &u("https://b.github.io/")),
+            SecFetchSite::CrossSite
+        );
+
+        // hosts without a registrable domain only match themselves
+        assert_eq!(
+            classify_site(&o("http://localhost:3000"), &u("http://localhost:4000/")),
+            SecFetchSite::SameSite
+        );
+        assert_eq!(
+            classify_site(&o("http://a.localhost"), &u("http://b.localhost/")),
+            SecFetchSite::CrossSite
+        );
+        assert_eq!(
+            classify_site(&o("http://127.0.0.1"), &u("http://127.0.0.1:8080/")),
+            SecFetchSite::SameSite
+        );
+        assert_eq!(
+            classify_site(&o("http://127.0.0.1"), &u("http://127.0.0.2/")),
             SecFetchSite::CrossSite
         );
     }
