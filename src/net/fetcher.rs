@@ -45,8 +45,12 @@ pub struct FetcherConfig {
     pub global_slots: usize,
     /// Maximum concurrent connections **per origin** for HTTP/1.x.
     /// HTTP/1 pipelines poorly, so browsers cap this at 6.
+    ///
+    /// Every origin starts at this limit, whatever the scheme, since the protocol is only known
+    /// after the first response. Once an HTTP/2 or HTTP/3 response arrives from an origin,
+    /// `h2_per_origin` applies to it.
     pub h1_per_origin: usize,
-    /// Maximum concurrent streams **per origin** for HTTP/2 (multiplexed).
+    /// Maximum concurrent streams **per origin** for HTTP/2 and HTTP/3 (multiplexed).
     pub h2_per_origin: usize,
     /// Timeout for the TCP + TLS handshake.  Applies before any bytes are sent.
     pub connect_timeout: Duration,
@@ -234,7 +238,7 @@ pub struct Fetcher {
 
     global_slots: Arc<Semaphore>,
     // Wrapped in Arc so spawned tasks share the same map rather than each getting a clone.
-    per_origin: Arc<DashMap<String, Arc<Semaphore>>>,
+    per_origin: Arc<OriginTable>,
 
     q_high: tokio::sync::Mutex<VecDeque<QueueItem>>,
     q_norm: tokio::sync::Mutex<VecDeque<QueueItem>>,
@@ -275,7 +279,7 @@ impl Fetcher {
             client_raw,
             cfg: config.clone(),
             global_slots: Arc::new(Semaphore::new(config.global_slots)),
-            per_origin: Arc::new(DashMap::new()),
+            per_origin: Arc::new(OriginTable::new(&config)),
             q_high: tokio::sync::Mutex::new(VecDeque::new()),
             q_norm: tokio::sync::Mutex::new(VecDeque::new()),
             q_low: tokio::sync::Mutex::new(VecDeque::new()),
@@ -550,20 +554,14 @@ impl Fetcher {
 
             let title = format!("Fetcher: {}", short_url(&req.url, 80));
             spawn_named(&title, async move {
-                let origin = Fetcher::origin_key(&req.url);
-                let slots = per_origin
-                    .entry(origin.clone())
-                    .or_insert_with(|| {
-                        Arc::new(Semaphore::new(per_origin_limit_for(&cfg, &req.url)))
-                    })
-                    .clone();
+                let slots = per_origin.slots_for(&req.url);
 
                 let g = tokio::select! { p = global.acquire_owned() => Some(p), _ = shutdown_child.cancelled() => None };
                 if g.is_none() {
                     return;
                 }
 
-                let h = tokio::select! { p = slots.acquire_owned() => Some(p), _ = shutdown_child.cancelled() => None };
+                let h = tokio::select! { p = slots.sem.acquire() => Some(p), _ = shutdown_child.cancelled() => None };
                 if h.is_none() {
                     return;
                 }
@@ -579,6 +577,7 @@ impl Fetcher {
                         &cfg,
                         cancel_parent.clone(),
                         ctx_clone.clone(),
+                        per_origin.clone(),
                     )
                     .await
                 } else {
@@ -589,6 +588,7 @@ impl Fetcher {
                         &cfg,
                         cancel_parent.clone(),
                         ctx_clone.clone(),
+                        per_origin.clone(),
                     )
                     .await
                 };
@@ -698,12 +698,90 @@ fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Cl
     }
 }
 
-fn per_origin_limit_for(cfg: &FetcherConfig, url: &Url) -> usize {
-    match url.scheme() {
-        // Only HTTPS can negotiate HTTP/2 via ALPN; plain HTTP uses HTTP/1.x
-        "https" => cfg.h2_per_origin,
-        _ => cfg.h1_per_origin,
+/// Connection semaphore for one origin.
+///
+/// Starts at the h1 limit, since we only know whether an origin speaks HTTP/2 after ALPN.
+/// Once an HTTP/2 (or HTTP/3) response comes in from the origin, the semaphore is grown to the
+/// h2 limit. It is never shrunk again.
+struct OriginSlots {
+    sem: Semaphore,
+    h2: AtomicBool,
+}
+
+/// Per-origin connection semaphores, keyed by serialized origin.
+struct OriginTable {
+    cfg: FetcherConfig,
+    slots: DashMap<String, Arc<OriginSlots>>,
+}
+
+impl OriginTable {
+    fn new(cfg: &FetcherConfig) -> Self {
+        Self {
+            cfg: cfg.clone(),
+            slots: DashMap::new(),
+        }
     }
+
+    fn slots_for(&self, url: &Url) -> Arc<OriginSlots> {
+        self.slots
+            .entry(Fetcher::origin_key(url))
+            .or_insert_with(|| {
+                Arc::new(OriginSlots {
+                    sem: Semaphore::new(self.cfg.h1_per_origin),
+                    h2: AtomicBool::new(false),
+                })
+            })
+            .clone()
+    }
+
+    /// Called with the HTTP version of every response; grows the origin's semaphore the first
+    /// time it turns out to speak h2.
+    fn observe(&self, url: &Url, version: http::Version) {
+        if !matches!(version, http::Version::HTTP_2 | http::Version::HTTP_3) {
+            return;
+        }
+        let slots = self.slots_for(url);
+        if !slots.h2.swap(true, Ordering::AcqRel) {
+            let extra = self
+                .cfg
+                .h2_per_origin
+                .saturating_sub(self.cfg.h1_per_origin);
+            slots.sem.add_permits(extra);
+        }
+    }
+
+    #[cfg(test)]
+    fn limit_for(&self, url: &Url) -> usize {
+        if self.slots_for(url).h2.load(Ordering::Acquire) {
+            self.cfg.h2_per_origin
+        } else {
+            self.cfg.h1_per_origin
+        }
+    }
+}
+
+/// Build the `NetPolicy` for a fetcher request: context hooks, HSTS, CORS preflight cache and
+/// the protocol sink that updates the per-origin limits. On wasm32 the sink is never called
+/// (reqwest's wasm Response has no version), so origins stay at the h1 limit there; the browser
+/// does the actual connection management anyway.
+fn build_policy(
+    cfg: &FetcherConfig,
+    ctx: &Arc<dyn FetcherContext>,
+    origins: Arc<OriginTable>,
+) -> NetPolicy {
+    let policy = NetPolicy::from_context(ctx)
+        .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)));
+    #[cfg(not(target_arch = "wasm32"))]
+    let policy = {
+        let policy = policy.with_hsts(cfg.hsts.clone());
+        match cfg.cors_preflight_cache.clone() {
+            Some(cache) => policy.with_cors_preflight_cache(cache),
+            None => policy,
+        }
+    };
+    #[cfg(target_arch = "wasm32")]
+    let _ = cfg;
+    policy
 }
 
 async fn perform_streaming(
@@ -713,17 +791,9 @@ async fn perform_streaming(
     cfg: &FetcherConfig,
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
+    origins: Arc<OriginTable>,
 ) -> Result<FetchResult, NetError> {
-    #[cfg(not(target_arch = "wasm32"))]
-    let policy = {
-        let policy = NetPolicy::from_context(&ctx).with_hsts(cfg.hsts.clone());
-        match cfg.cors_preflight_cache.clone() {
-            Some(cache) => policy.with_cors_preflight_cache(cache),
-            None => policy,
-        }
-    };
-    #[cfg(target_arch = "wasm32")]
-    let policy = NetPolicy::from_context(&ctx);
+    let policy = build_policy(cfg, &ctx, origins);
 
     let ResponseTop {
         meta,
@@ -769,17 +839,9 @@ async fn perform_buffered(
     cfg: &FetcherConfig,
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
+    origins: Arc<OriginTable>,
 ) -> Result<FetchResult, NetError> {
-    #[cfg(not(target_arch = "wasm32"))]
-    let policy = {
-        let policy = NetPolicy::from_context(&ctx).with_hsts(cfg.hsts.clone());
-        match cfg.cors_preflight_cache.clone() {
-            Some(cache) => policy.with_cors_preflight_cache(cache),
-            None => policy,
-        }
-    };
-    #[cfg(target_arch = "wasm32")]
-    let policy = NetPolicy::from_context(&ctx);
+    let policy = build_policy(cfg, &ctx, origins);
 
     let (meta, body) = fetch_response_complete(
         Arc::new(client.clone()),
@@ -1210,26 +1272,65 @@ mod tests {
         shutdown.cancel();
     }
 
-    #[test]
-    fn per_origin_limit_for_uses_h2_for_https_only() {
-        let cfg = FetcherConfig {
+    fn origin_table() -> OriginTable {
+        OriginTable::new(&FetcherConfig {
             h1_per_origin: 3,
             h2_per_origin: 8,
             ..FetcherConfig::default()
-        };
-        // Plain http uses HTTP/1.x; only https can negotiate HTTP/2 via ALPN
-        assert_eq!(
-            per_origin_limit_for(&cfg, &Url::parse("http://example.com/").unwrap()),
-            3
+        })
+    }
+
+    #[test]
+    fn origin_table_starts_at_h1_limit_for_all_schemes() {
+        let t = origin_table();
+        for u in [
+            "http://example.com/",
+            "https://example.com/",
+            "ftp://example.com/",
+        ] {
+            let url = Url::parse(u).unwrap();
+            assert_eq!(t.limit_for(&url), 3, "{u}");
+            assert_eq!(t.slots_for(&url).sem.available_permits(), 3, "{u}");
+        }
+    }
+
+    #[test]
+    fn origin_table_grows_to_h2_limit_after_h2_response() {
+        let t = origin_table();
+        let a = Url::parse("https://a.example/x").unwrap();
+        let b = Url::parse("https://b.example/x").unwrap();
+        // different port = different origin
+        let a_alt = Url::parse("https://a.example:8443/x").unwrap();
+
+        t.observe(&a, http::Version::HTTP_2);
+        assert_eq!(t.limit_for(&a), 8);
+        assert_eq!(t.slots_for(&a).sem.available_permits(), 8);
+        assert_eq!(t.limit_for(&b), 3);
+        assert_eq!(t.limit_for(&a_alt), 3);
+
+        // more h2 responses (or an h1 one) don't change anything
+        t.observe(&a, http::Version::HTTP_2);
+        t.observe(
+            &Url::parse("https://a.example/other").unwrap(),
+            http::Version::HTTP_3,
         );
-        assert_eq!(
-            per_origin_limit_for(&cfg, &Url::parse("https://example.com/").unwrap()),
-            8
-        );
-        assert_eq!(
-            per_origin_limit_for(&cfg, &Url::parse("ftp://example.com/").unwrap()),
-            3
-        );
+        t.observe(&a, http::Version::HTTP_11);
+        assert_eq!(t.slots_for(&a).sem.available_permits(), 8);
+    }
+
+    /// The extra permits must land on the semaphore that requests are already waiting on.
+    #[test]
+    fn origin_table_growth_reaches_blocked_acquirers() {
+        let t = origin_table();
+        let url = Url::parse("https://a.example/x").unwrap();
+        let slots = t.slots_for(&url);
+
+        let held: Vec<_> = (0..3).map(|_| slots.sem.try_acquire().unwrap()).collect();
+        assert!(slots.sem.try_acquire().is_err());
+
+        t.observe(&url, http::Version::HTTP_2);
+        assert!(slots.sem.try_acquire().is_ok());
+        drop(held);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1422,7 +1523,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
-        // With h2_per_origin=1 and 3x60ms requests the minimum wall-clock time is ~120ms
+        // With h1_per_origin=1 and 3x60ms requests the minimum wall-clock time is ~120ms
         // (two serial batches). Allow generous headroom for slow CI.
         assert!(
             start.elapsed() >= Duration::from_millis(100),
