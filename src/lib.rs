@@ -42,6 +42,7 @@
 //! - `simple_fetch` — one-shot GET using [`simple_get`]
 //! - `fetcher` — minimal [`Fetcher`] setup with a no-op context
 //! - `fetcher_harness` — self-contained harness covering concurrency, coalescing, priority, cancellation, and errors
+//! - `tls_override` — certificate errors and letting the user proceed anyway ([`TlsOverrideStore`], [`FetcherContext::tls_override`])
 
 #![forbid(unsafe_code)]
 #![deny(clippy::todo)]
@@ -78,7 +79,9 @@ pub use net::shared_body::SharedBody;
 pub use net::simple::simple_get;
 #[cfg(not(target_arch = "wasm32"))]
 pub use net::simple::{sync_fetch, sync_get};
-pub use net::tls::{InMemoryTlsOverrideStore, TlsError, TlsErrorKind, TlsOverrideStore};
+pub use net::tls::{
+    Fingerprint, InMemoryTlsOverrideStore, TlsError, TlsErrorKind, TlsOverrideStore,
+};
 pub use net::types::{
     BlockReason, BoxedAsyncRead, FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta,
     Initiator, NetError, Priority, RequestBody, RequestCredentials, ResourceKind,

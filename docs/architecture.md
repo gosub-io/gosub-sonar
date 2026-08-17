@@ -493,7 +493,7 @@ error can fan out to many listeners:
 | Variant | Meaning |
 |---------|---------|
 | `Reqwest` | Underlying `reqwest` client error. |
-| `Tls` | TLS handshake failed. Carries a `TlsError` (kind, host, port, message); also emitted as `NetEvent::TlsFailed`. Native-only. |
+| `Tls` | TLS handshake failed. Carries a `TlsError` (kind, host, message, and with overrides enabled the certificate and fingerprint); also emitted as `NetEvent::TlsFailed`. Native-only. |
 | `Redirect` | Redirect resolution failed (missing `Location`, bad scheme, too many hops, blocked). |
 | `Io` | I/O error reading the body. |
 | `Cancelled` | Request cancelled. |
