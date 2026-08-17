@@ -1323,6 +1323,56 @@ mod tests {
         }
     }
 
+    // Fetch from a TLS server with a certificate that is valid between the given dates. The
+    // cert is trusted, so validity is the only thing that can fail.
+    async fn tls_error_for_validity(
+        not_before: crate::net::test_support::Ymd,
+        not_after: crate::net::test_support::Ymd,
+    ) -> crate::net::tls::TlsError {
+        let srv = TestServer::new()
+            .tls("tls.test")
+            .tls_validity(not_before, not_after)
+            .route("/", RouteConfig::ok(b"x".to_vec()))
+            .start()
+            .await;
+        let cert = reqwest::Certificate::from_pem(srv.cert_pem().unwrap()).unwrap();
+        let client = reqwest::Client::builder()
+            .tls_certs_only([cert])
+            .resolve(srv.tls_domain().unwrap(), srv.socket_addr())
+            .build()
+            .unwrap();
+        match fetch_response_top(
+            Arc::new(client),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default(),
+        )
+        .await
+        {
+            Err(NetError::Tls(tls)) => tls,
+            Err(other) => panic!("expected NetError::Tls, got {other:?}"),
+            Ok(_) => panic!("expected an error"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_certificate_is_a_tls_error() {
+        let tls = tls_error_for_validity((2000, 1, 1), (2001, 1, 1)).await;
+        assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::Expired, "{tls}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn not_yet_valid_certificate_is_a_tls_error() {
+        let tls = tls_error_for_validity((3000, 1, 1), (3001, 1, 1)).await;
+        assert_eq!(
+            tls.kind,
+            crate::net::tls::TlsErrorKind::NotYetValid,
+            "{tls}"
+        );
+    }
+
     /// The plain mock server cannot cover this: HSTS ignores plaintext responses and IP-literal
     /// hosts, so only a TLS server with a domain name can arm a store.
     #[tokio::test(flavor = "current_thread")]

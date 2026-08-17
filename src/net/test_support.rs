@@ -609,11 +609,15 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+/// `(year, month, day)`, see [`TestServer::tls_validity`].
+pub type Ymd = (i32, u8, u8);
+
 /// Fluent builder for an in-process mock HTTP server.
 pub struct TestServer {
     routes: HashMap<String, RouteConfig>,
     default: RouteConfig,
     tls_domain: Option<String>,
+    tls_validity: Option<(Ymd, Ymd)>,
 }
 
 impl Default for TestServer {
@@ -629,6 +633,7 @@ impl TestServer {
             routes: HashMap::new(),
             default: RouteConfig::Ok(b"hello".to_vec()),
             tls_domain: None,
+            tls_validity: None,
         }
     }
 
@@ -639,6 +644,13 @@ impl TestServer {
     /// [`TestServerHandle::cert_pem`].
     pub fn tls(mut self, domain: &str) -> Self {
         self.tls_domain = Some(domain.to_string());
+        self
+    }
+
+    /// Set the validity period of the [`tls`](Self::tls) certificate, to test expired or
+    /// not-yet-valid certificates. Defaults to rcgen's 1975..4096.
+    pub fn tls_validity(mut self, not_before: Ymd, not_after: Ymd) -> Self {
+        self.tls_validity = Some((not_before, not_after));
         self
     }
 
@@ -662,16 +674,22 @@ impl TestServer {
         let shutdown = CancellationToken::new();
 
         let tls = self.tls_domain.as_ref().map(|domain| {
-            let ck = rcgen::generate_simple_self_signed(vec![domain.clone()]).unwrap();
-            let cert_pem = ck.cert.pem().into_bytes();
-            let cert_der = ck.cert.der().to_vec();
+            let signing_key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![domain.clone()]).unwrap();
+            if let Some(((y1, m1, d1), (y2, m2, d2))) = self.tls_validity {
+                params.not_before = rcgen::date_time_ymd(y1, m1, d1);
+                params.not_after = rcgen::date_time_ymd(y2, m2, d2);
+            }
+            let cert = params.self_signed(&signing_key).unwrap();
+            let cert_pem = cert.pem().into_bytes();
+            let cert_der = cert.der().to_vec();
             let key = tokio_rustls::rustls::pki_types::PrivateKeyDer::try_from(
-                rcgen::KeyPair::serialize_der(&ck.signing_key),
+                rcgen::KeyPair::serialize_der(&signing_key),
             )
             .unwrap();
             let server_config = tokio_rustls::rustls::ServerConfig::builder()
                 .with_no_client_auth()
-                .with_single_cert(vec![ck.cert.der().clone()], key)
+                .with_single_cert(vec![cert.der().clone()], key)
                 .unwrap();
             (
                 domain.clone(),
