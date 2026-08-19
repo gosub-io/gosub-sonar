@@ -915,9 +915,7 @@ mod tests {
             .route("/hang", RouteConfig::hang_after_connect())
             .route("/fast", RouteConfig::ok(b"x"))
             // 12 KiB dribbled in 1 KiB chunks: headers arrive immediately, the body takes
-            // ~360 ms, so tests can subscribe to a stream before it completes (no replay).
-            // Chunk size divides PEEK_MAX exactly, so the peek phase leaves no excess bytes
-            // that would be pushed to subscribers before a test can attach.
+            // ~360 ms, so tests can watch a stream while it is still in progress.
             .route(
                 "/dribble-big",
                 RouteConfig::chunked_with_delay(
@@ -1393,10 +1391,56 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// A streamed body must arrive complete even when the subscriber attaches a while after
+    /// `fetch()` returned. The first server chunk is larger than the peek buffer, so the reader
+    /// already holds bytes when the result is delivered; before the pump waited for a
+    /// subscriber those were pushed to nobody and lost.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_streaming_keeps_bytes_read_before_subscribe() {
+        let chunk = vec![b'x'; 8 * 1024];
+        let srv = TestServer::new()
+            .route(
+                "/big",
+                RouteConfig::chunked(vec![&chunk, &chunk, &chunk, &chunk]),
+            )
+            .start()
+            .await;
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let req = FetchRequest::builder(Method::GET, srv.url("/big"))
+            .with_streaming(true)
+            .build();
+        let result = tokio::time::timeout(Duration::from_secs(5), fetcher.fetch(req))
+            .await
+            .unwrap();
+        let (peek_buf, shared) = match result {
+            FetchResult::Stream {
+                peek_buf, shared, ..
+            } => (peek_buf, shared),
+            other => panic!("expected Stream, got {other:?}"),
+        };
+        assert!(
+            peek_buf.len() < 8 * 1024,
+            "peek should be smaller than a chunk"
+        );
+
+        // late subscriber
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut reader = crate::net::shared_body::SharedBody::combined_reader(peek_buf, shared);
+        let mut body = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut body)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 4 * 8 * 1024);
+        shutdown.cancel();
+    }
+
     /// Streaming fetches must honor `max_bytes`: a subscriber sees an error when the body
     /// exceeds the cap, and a body of exactly `max_bytes` streams in full (boundary case).
-    /// Uses a dribbling route so the subscriber attaches before the body completes —
-    /// `SharedBody` has no replay.
     #[tokio::test(flavor = "current_thread")]
     async fn fetcher_streaming_respects_max_bytes() {
         use futures_util::StreamExt;

@@ -53,6 +53,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#38). The value is available as `DEFAULT_USER_AGENT`; set `FetcherConfig::user_agent` to
   override it, or to `None` to send no `User-Agent` header.
 
+### Fixed
+
+- Streamed bodies lost data when the subscriber attached after bytes had already been read:
+  the first chunk beyond the peek buffer, and everything the server sent before the caller got
+  around to `subscribe_stream()`, was pushed to nobody. `SharedBody::from_reader` now waits for
+  the first subscriber before it starts reading (bounded by the idle/total timeouts and
+  cancellation), and subscribing after the body ended with an error yields that error instead
+  of an empty stream.
+
 ## [0.2.0] - 2026-08-01
 
 ### Added

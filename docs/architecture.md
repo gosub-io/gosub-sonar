@@ -235,7 +235,8 @@ The heart of the "one fetch, many consumers" behaviour lives in three pieces:
   `finish(result)` delivers to all of them.
 - **`SharedBody`** (`shared_body.rs`) — a bounded fan-out stream. Each subscriber has its own queue
   (capacity 32); a subscriber that can't keep up is **dropped** rather than stalling the producer.
-  Subscribers see only *future* chunks (no replay).
+  Subscribers see only *future* chunks (no replay), but the pump doesn't start reading until the
+  first subscriber attaches, so that one always gets the whole body.
 
 **Streaming and buffered requests coalesce in both directions.** The coalescing key does not
 distinguish them, so which mode runs is decided by the subscribers: if any asked for streaming, the
