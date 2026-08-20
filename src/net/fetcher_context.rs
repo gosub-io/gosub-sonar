@@ -3,6 +3,7 @@
 use crate::net::null_emitter::NullEmitter;
 use crate::net::observer::NetObserver;
 use crate::net::request_ref::RequestReference;
+use crate::net::tls::TlsError;
 use crate::net::types::{Initiator, ResourceKind};
 use crate::types::RequestId;
 use std::sync::Arc;
@@ -53,6 +54,22 @@ pub trait FetcherContext: Send + Sync {
     ///
     /// The default implementation does nothing.
     fn on_cookies_received(&self, _url: &Url, _values: &[&str]) {}
+
+    /// Whether to accept a certificate that failed verification.
+    ///
+    /// Only called when [`FetcherConfig::tls_overrides`] is set and the store doesn't already
+    /// accept the certificate. Returning `true` accepts it for `error.host` and adds it to the
+    /// store. This is called synchronously during the handshake, so don't block on a dialog
+    /// here; for the interactive case return `false`, show the error, and when the user clicks
+    /// through call [`TlsOverrideStore::accept`] with `error.fingerprint` and retry.
+    ///
+    /// Default: `false`.
+    ///
+    /// [`FetcherConfig::tls_overrides`]: crate::net::fetcher::FetcherConfig::tls_overrides
+    /// [`TlsOverrideStore::accept`]: crate::net::tls::TlsOverrideStore::accept
+    fn tls_override(&self, _error: &TlsError) -> bool {
+        false
+    }
 }
 
 /// A no-op [`FetcherContext`] for consumers that don't need lifecycle hooks.

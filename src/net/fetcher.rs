@@ -16,6 +16,8 @@ use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::proxy::ProxyConfig;
 use crate::net::shared_body::{ReaderOptions, SharedBody};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::tls::TlsOverrideStore;
 use crate::net::types::{FetchRequest, FetchResult, Initiator, NetError, Priority};
 use crate::net::utils::{short_url, spawn_named, Waiter};
 use dashmap::{DashMap, Entry};
@@ -88,6 +90,14 @@ pub struct FetcherConfig {
     #[cfg(not(target_arch = "wasm32"))]
     pub hsts: Option<Arc<dyn HstsStore>>,
 
+    /// Store of certificates the user accepted despite a verification error. Setting this
+    /// enables "proceed anyway": failures consult the store and [`FetcherContext::tls_override`],
+    /// and `NetError::Tls` includes the certificate. See [`tls`](mod@crate::net::tls).
+    ///
+    /// `None` (the default) means no overrides and reqwest's stock verifier.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub tls_overrides: Option<Arc<dyn TlsOverrideStore>>,
+
     /// What to do when a request carrying a secure [`FetchRequest::origin`] targets an insecure
     /// URL. Defaults to [`MixedContentPolicy::Block`], and is overridable per request via
     /// [`FetchRequest::mixed_content`]. See [`mixed_content`](mod@crate::net::mixed_content).
@@ -145,6 +155,8 @@ impl Default for FetcherConfig {
             user_agent: Some(DEFAULT_USER_AGENT.to_string()),
             #[cfg(not(target_arch = "wasm32"))]
             hsts: Some(Arc::new(InMemoryHstsStore::new())),
+            #[cfg(not(target_arch = "wasm32"))]
+            tls_overrides: None,
             mixed_content: MixedContentPolicy::default(),
             #[cfg(not(target_arch = "wasm32"))]
             cors_preflight_cache: Some(Arc::new(InMemoryPreflightCache::new())),
@@ -271,8 +283,8 @@ impl Fetcher {
             "FetcherConfig.h2_per_origin must be >= 1"
         );
 
-        let client = build_client(&config, true)?;
-        let client_raw = build_client(&config, false)?;
+        let client = build_client(&config, true, &ctx)?;
+        let client_raw = build_client(&config, false, &ctx)?;
 
         Ok(Self {
             client,
@@ -650,7 +662,11 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
 /// When `decode` is `true` the client automatically decompresses `gzip`, `brotli`, and `deflate`
 /// response bodies and sends the corresponding `Accept-Encoding` request header.
 /// When `false` neither header is added nor is any decompression performed.
-fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Client> {
+fn build_client(
+    cfg: &FetcherConfig,
+    decode: bool,
+    ctx: &Arc<dyn FetcherContext>,
+) -> anyhow::Result<reqwest::Client> {
     // The browser's fetch() owns TLS, connection management, timeouts, proxying, and transparent
     // decompression; none of the tuning knobs below exist in reqwest's wasm backend.
     //
@@ -660,7 +676,7 @@ fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Cl
     // cannot see, so this is a loss of reporting rather than of enforcement.
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = decode;
+        let _ = (decode, ctx);
         let mut b = reqwest::Client::builder();
         if let Some(ref ua) = cfg.user_agent {
             b = b.user_agent(ua);
@@ -683,10 +699,18 @@ fn build_client(cfg: &FetcherConfig, decode: bool) -> anyhow::Result<reqwest::Cl
             .pool_max_idle_per_host(cfg.pool_max_idle_per_host)
             .pool_idle_timeout(cfg.pool_idle_timeout)
             .tcp_keepalive(cfg.tcp_keepalive)
-            .use_rustls_tls()
             .gzip(decode)
             .brotli(decode)
             .deflate(decode);
+        // overrides need our own verifier, so we build the rustls config ourselves
+        b = match &cfg.tls_overrides {
+            Some(store) => b.tls_backend_preconfigured(crate::net::tls::client_config(
+                store.clone(),
+                ctx.clone(),
+                cfg.hsts.clone(),
+            )?),
+            None => b.use_rustls_tls(),
+        };
         if let Some(ref ua) = cfg.user_agent {
             b = b.user_agent(ua);
         }
@@ -1574,6 +1598,171 @@ mod tests {
             "requests should be serialized, elapsed: {:?}",
             start.elapsed()
         );
+        shutdown.cancel();
+    }
+
+    struct Loopback(std::net::SocketAddr);
+    impl DnsResolver for Loopback {
+        fn resolve(&self, _host: &str) -> crate::net::dns::Resolving {
+            let addr = self.0;
+            Box::pin(async move { Ok(vec![addr]) })
+        }
+    }
+
+    /// TLS test server (self-signed, so verification fails) plus a fetcher pointed at it.
+    async fn tls_server_and_fetcher(
+        cfg: FetcherConfig,
+        ctx: Arc<dyn FetcherContext>,
+    ) -> (
+        crate::net::test_support::TestServerHandle,
+        Arc<Fetcher>,
+        CancellationToken,
+    ) {
+        let srv = TestServer::new()
+            .tls("tls.test")
+            .route("/", RouteConfig::ok(b"x".to_vec()))
+            .start()
+            .await;
+        let cfg = FetcherConfig {
+            dns_resolver: Some(Arc::new(Loopback(srv.socket_addr()))),
+            ..cfg
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, ctx).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+        (srv, fetcher, shutdown)
+    }
+
+    async fn fetch_root(
+        fetcher: &Fetcher,
+        srv: &crate::net::test_support::TestServerHandle,
+    ) -> FetchResult {
+        let (req, _) = make_req(srv.url("/"), Priority::Normal);
+        tokio::time::timeout(Duration::from_secs(5), fetcher.fetch(req))
+            .await
+            .unwrap()
+    }
+
+    fn expect_tls_error(result: FetchResult) -> crate::net::tls::TlsError {
+        match result {
+            FetchResult::Error(NetError::Tls(tls)) => tls,
+            other => panic!("expected NetError::Tls, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_reports_untrusted_certificate_as_tls_error() {
+        let (srv, fetcher, shutdown) =
+            tls_server_and_fetcher(test_config(), Arc::new(NullContext)).await;
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::UnknownIssuer);
+        assert_eq!(tls.host, "tls.test");
+        // no override store, so reqwest verifies and we don't get the cert
+        assert!(tls.certificate.is_none());
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_tls_override_via_store() {
+        let store = Arc::new(crate::net::tls::InMemoryTlsOverrideStore::new());
+        let cfg = FetcherConfig {
+            tls_overrides: Some(store.clone()),
+            ..test_config()
+        };
+        let (srv, fetcher, shutdown) = tls_server_and_fetcher(cfg, Arc::new(NullContext)).await;
+
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::UnknownIssuer);
+        assert_eq!(tls.host, "tls.test");
+        assert_eq!(tls.certificate.as_deref(), srv.cert_der());
+        let fp = tls.fingerprint.unwrap();
+        assert_eq!(fp, crate::net::tls::fingerprint(srv.cert_der().unwrap()));
+
+        // wrong host / wrong cert: still refused
+        store.accept("other.test", fp);
+        store.accept("tls.test", crate::net::tls::fingerprint(b"not this one"));
+        expect_tls_error(fetch_root(&fetcher, &srv).await);
+
+        store.accept("tls.test", fp);
+        match fetch_root(&fetcher, &srv).await {
+            FetchResult::Buffered { meta, body } => {
+                assert_eq!(meta.status, 200);
+                assert_eq!(&body[..], b"x");
+            }
+            other => panic!("expected success after override, got {other:?}"),
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_tls_override_via_context_hook() {
+        struct AcceptSelfSigned {
+            seen: parking_lot::Mutex<Vec<crate::net::tls::TlsError>>,
+        }
+        impl FetcherContext for AcceptSelfSigned {
+            fn observer_for(
+                &self,
+                _: RequestReference,
+                _: RequestId,
+                _: ResourceKind,
+                _: Initiator,
+            ) -> Arc<dyn NetObserver + Send + Sync> {
+                Arc::new(crate::net::null_emitter::NullEmitter)
+            }
+            fn on_ref_active(&self, _: RequestReference) {}
+            fn on_ref_done(&self, _: RequestReference) {}
+            fn tls_override(&self, error: &crate::net::tls::TlsError) -> bool {
+                self.seen.lock().push(error.clone());
+                error.kind == crate::net::tls::TlsErrorKind::UnknownIssuer
+            }
+        }
+
+        let store = Arc::new(crate::net::tls::InMemoryTlsOverrideStore::new());
+        let ctx = Arc::new(AcceptSelfSigned {
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let cfg = FetcherConfig {
+            tls_overrides: Some(store.clone()),
+            ..test_config()
+        };
+        let (srv, fetcher, shutdown) = tls_server_and_fetcher(cfg, ctx.clone()).await;
+
+        match fetch_root(&fetcher, &srv).await {
+            FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 200),
+            other => panic!("expected success, got {other:?}"),
+        }
+        let seen = ctx.seen.lock();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].host, "tls.test");
+        assert_eq!(seen[0].certificate.as_deref(), srv.cert_der());
+        assert!(store.is_accepted("tls.test", &seen[0].fingerprint.unwrap()));
+        shutdown.cancel();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_tls_override_is_refused_for_hsts_hosts() {
+        let store = Arc::new(crate::net::tls::InMemoryTlsOverrideStore::new());
+        let hsts = Arc::new(InMemoryHstsStore::new());
+        hsts.store(
+            "tls.test",
+            crate::net::hsts::HstsEntry {
+                expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+                include_subdomains: false,
+            },
+        );
+        let cfg = FetcherConfig {
+            tls_overrides: Some(store.clone()),
+            hsts: Some(hsts),
+            ..test_config()
+        };
+        let (srv, fetcher, shutdown) = tls_server_and_fetcher(cfg, Arc::new(NullContext)).await;
+
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        store.accept("tls.test", tls.fingerprint.unwrap());
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::UnknownIssuer);
         shutdown.cancel();
     }
 

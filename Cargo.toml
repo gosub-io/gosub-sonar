@@ -45,6 +45,13 @@ tokio-rustls = { version = "0.26", optional = true }
 # Public suffix list, for the registrable-domain comparison behind `Sec-Fetch-Site: same-site`.
 # Compiled in; not needed on wasm32 where the browser sets these headers itself.
 psl = "2"
+# rustls: to downcast the error behind a failed handshake into `TlsError`, and to build the
+# client config that carries the certificate-override verifier. Must stay on the same major as
+# reqwest's rustls or the downcast silently never matches. rustls-platform-verifier is what
+# reqwest verifies with by default; we wrap it. sha2 for certificate fingerprints.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
+rustls-platform-verifier = "0.7"
+sha2 = "0.10"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # tokio's wasm32-supported feature subset — "net" needs mio, which cannot build for
@@ -76,6 +83,18 @@ tokio-rustls = "0.26"
 
 [[example]]
 name = "fetcher_harness"
+required-features = ["test-support"]
+
+[[example]]
+name = "fetcher_context"
+required-features = ["test-support"]
+
+[[example]]
+name = "streaming"
+required-features = ["test-support"]
+
+[[example]]
+name = "document_fetch"
 required-features = ["test-support"]
 
 [[test]]

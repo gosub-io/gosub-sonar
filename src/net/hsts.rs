@@ -221,11 +221,16 @@ pub(crate) fn should_upgrade(store: &dyn HstsStore, url: &Url, now: DateTime<Utc
     if url.scheme() != "http" {
         return false;
     }
-    let Some(host) = domain_of(url) else {
-        return false;
-    };
+    match domain_of(url) {
+        Some(host) => is_known_host(store, host, now),
+        None => false,
+    }
+}
 
-    let mut candidate = host;
+/// Whether `host` is a Known HSTS Host (§8.2): an exact entry, or an `includeSubDomains` entry
+/// on a superdomain, either one unexpired.
+pub(crate) fn is_known_host(store: &dyn HstsStore, host: &str, now: DateTime<Utc>) -> bool {
+    let mut candidate = normalize_host(host);
     let mut is_exact = true;
 
     loop {

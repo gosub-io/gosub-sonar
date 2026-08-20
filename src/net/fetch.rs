@@ -13,7 +13,7 @@ use crate::net::observer::NetObserver;
 use crate::net::referrer::{self, ReferrerPolicy};
 use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody, RequestCredentials};
 use crate::types::PeekBuf;
-use anyhow::{anyhow, Context};
+use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
 use futures_util::{stream, StreamExt, TryStreamExt};
 use http::{header, HeaderMap, Method};
@@ -711,6 +711,27 @@ pub async fn fetch_response_complete(
     Ok((meta, body_buf.freeze()))
 }
 
+/// Map a failed `send()` to a `NetError`: TLS handshake failures become `NetError::Tls` (plus a
+/// `NetEvent::TlsFailed`), everything else is wrapped in `Read` as before.
+fn send_error(
+    e: reqwest::Error,
+    url: &Url,
+    what: &str,
+    observer: &Arc<dyn NetObserver + Send + Sync>,
+) -> NetError {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(tls) = crate::net::tls::classify(&e, url) {
+        observer.on_event(NetEvent::TlsFailed {
+            url: url.clone(),
+            error: tls.clone(),
+        });
+        return NetError::Tls(tls);
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = (url, observer);
+    NetError::Read(Arc::new(anyhow::Error::from(e).context(what.to_string())))
+}
+
 /// Perform a GET request, following redirects up to MAX_REDIRECTS times, while sending out net events.
 ///
 /// Follow a chain of HTTP redirects, returning the first non-redirect response.
@@ -947,7 +968,7 @@ async fn get_with_redirects(
                                 observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled during CORS preflight" });
                                 return Err(NetError::Cancelled("cancelled during CORS preflight".into()));
                             }
-                            r = &mut fut => r.context("CORS preflight request failed").map_err(|e| NetError::Read(Arc::new(e)))?
+                            r = &mut fut => r.map_err(|e| send_error(e, &url, "CORS preflight request failed", &observer))?
                         };
                         let allows = cors::validate_preflight_response(
                             pf_resp.status().as_u16(),
@@ -1012,7 +1033,7 @@ async fn get_with_redirects(
                 observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled net.get_with_redirects" });
                 return Err(NetError::Cancelled("cancelled net.get_with_redirects".into()));
             }
-            r = &mut fut => r.context("net.get_with_redirects request failed").map_err(|e| NetError::Read(Arc::new(e)))?
+            r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer))?
         };
 
         // Report the HTTP version of every hop, not just the final response, so the fetcher's
@@ -1228,6 +1249,128 @@ mod tests {
             .build()
             .unwrap();
         (srv, Arc::new(client))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn untrusted_certificate_is_a_tls_error() {
+        let srv = TestServer::new()
+            .tls("tls.test")
+            .route("/", RouteConfig::ok(b"x".to_vec()))
+            .start()
+            .await;
+        // client that doesn't trust the self-signed cert
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .resolve(srv.tls_domain().unwrap(), srv.socket_addr())
+            .build()
+            .unwrap();
+        let rec = Arc::new(RecordingObserver::new());
+
+        let err = fetch_response_top(
+            Arc::new(client),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await;
+
+        let tls = match err {
+            Ok(_) => panic!("expected an error"),
+            Err(NetError::Tls(tls)) => tls,
+            Err(other) => panic!("expected NetError::Tls, got {other:?}"),
+        };
+        assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::UnknownIssuer);
+        assert_eq!(tls.host, "tls.test");
+        assert!(tls.certificate.is_none());
+        assert_eq!(rec.tls_errors(), vec![tls]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn certificate_for_another_host_is_a_tls_error() {
+        let srv = TestServer::new()
+            .tls("tls.test")
+            .route("/", RouteConfig::ok(b"x".to_vec()))
+            .start()
+            .await;
+        // trust the cert, but connect with a name it wasn't issued for
+        let cert = reqwest::Certificate::from_pem(srv.cert_pem().unwrap()).unwrap();
+        let client = reqwest::Client::builder()
+            .tls_certs_only([cert])
+            .resolve("other.test", srv.socket_addr())
+            .build()
+            .unwrap();
+        let url = Url::parse(&format!("https://other.test:{}/", srv.socket_addr().port())).unwrap();
+
+        let err = fetch_response_top(
+            Arc::new(client),
+            url,
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default(),
+        )
+        .await;
+
+        match err {
+            Err(NetError::Tls(tls)) => {
+                assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::HostnameMismatch);
+                assert_eq!(tls.host, "other.test");
+            }
+            Err(other) => panic!("expected NetError::Tls, got {other:?}"),
+            Ok(_) => panic!("expected an error"),
+        }
+    }
+
+    // Fetch from a TLS server with a certificate that is valid between the given dates. The
+    // cert is trusted, so validity is the only thing that can fail.
+    async fn tls_error_for_validity(
+        not_before: crate::net::test_support::Ymd,
+        not_after: crate::net::test_support::Ymd,
+    ) -> crate::net::tls::TlsError {
+        let srv = TestServer::new()
+            .tls("tls.test")
+            .tls_validity(not_before, not_after)
+            .route("/", RouteConfig::ok(b"x".to_vec()))
+            .start()
+            .await;
+        let cert = reqwest::Certificate::from_pem(srv.cert_pem().unwrap()).unwrap();
+        let client = reqwest::Client::builder()
+            .tls_certs_only([cert])
+            .resolve(srv.tls_domain().unwrap(), srv.socket_addr())
+            .build()
+            .unwrap();
+        match fetch_response_top(
+            Arc::new(client),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default(),
+        )
+        .await
+        {
+            Err(NetError::Tls(tls)) => tls,
+            Err(other) => panic!("expected NetError::Tls, got {other:?}"),
+            Ok(_) => panic!("expected an error"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn expired_certificate_is_a_tls_error() {
+        let tls = tls_error_for_validity((2000, 1, 1), (2001, 1, 1)).await;
+        assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::Expired, "{tls}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn not_yet_valid_certificate_is_a_tls_error() {
+        let tls = tls_error_for_validity((3000, 1, 1), (3001, 1, 1)).await;
+        assert_eq!(
+            tls.kind,
+            crate::net::tls::TlsErrorKind::NotYetValid,
+            "{tls}"
+        );
     }
 
     /// The plain mock server cannot cover this: HSTS ignores plaintext responses and IP-literal
