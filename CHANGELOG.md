@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-20
+
 ### Added
 
 - TLS errors and certificate overrides (#4):
@@ -19,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     carries the certificate and its fingerprint, `store.accept(host, fingerprint)` lets the
     next connection through, and `FetcherContext::tls_override` can accept on the spot.
     Per (host, certificate); refused for HSTS hosts and for non-certificate failures.
+  - `test-support`: `TestServer::tls_validity` sets the certificate's validity window, to
+    test expired and not-yet-valid certificates
   - native-only; on wasm32 the browser does TLS
 - CORS per WHATWG Fetch (#2), enforced per redirect hop whenever a request carries
   `FetchRequest::origin`; without one CORS is entirely inert, like mixed content:
@@ -51,8 +55,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `same-site` compares registrable domains using the public suffix list (`psl` crate,
     native only) (#60); same host on another port reports `same-site`
   - inert on wasm32, where the browser owns these headers
+- Runnable examples: `document_fetch`, `fetcher_context`, `streaming`, and `tls_override`
 
 ### Changed
+
+- Per-origin concurrency limits now follow the negotiated protocol (#49): every origin
+  starts at the HTTP/1.1 limit (`h1_per_origin`, default 6) and is raised to the HTTP/2
+  limit (`h2_per_origin`, default 16) once an HTTP/2 or HTTP/3 response has been seen from
+  it, redirect hops included. Previously every `https` origin was assumed to speak HTTP/2,
+  giving HTTP/1.1-only servers 16 connections instead of 6.
 
 - **Breaking:** `FetchRequest` gains the `credentials` field, `FetchResultMeta` gains
   `tainting`, `BlockReason` gains `Cors(CorsError)`, `NetEvent` gains `CorsPreflight` and
@@ -226,6 +237,7 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/gosub-io/gosub-sonar/releases/tag/v0.1.0
