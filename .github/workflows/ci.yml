@@ -30,7 +30,7 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: cargo fmt
         run: cargo fmt --check
@@ -60,7 +60,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       # Separate cache key so wasm artefacts don't pollute the native build cache.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: wasm32
 
@@ -82,7 +82,7 @@ jobs:
         with:
           toolchain: stable
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       # Both configurations are needed: `test_support` compiles under `cfg(test)` whether or
       # not the feature is on, and each build activates dependencies the other does not.
@@ -105,7 +105,7 @@ jobs:
 
       # Separate cache key so the MSRV build artefacts don't pollute the
       # stable build cache and vice-versa.
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: msrv-1.88
 
