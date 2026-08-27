@@ -51,7 +51,7 @@ psl = "2"
 # reqwest verifies with by default; we wrap it. sha2 for certificate fingerprints.
 rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
 rustls-platform-verifier = "0.7"
-sha2 = "0.10"
+sha2 = "0.11"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # tokio's wasm32-supported feature subset — "net" needs mio, which cannot build for
