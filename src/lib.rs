@@ -12,6 +12,10 @@ pub mod http;
 pub mod net;
 pub mod types;
 
+pub use net::auth::{
+    AuthChallenge, AuthScheme, AuthTarget, CredentialStore, Credentials, InMemoryCredentialStore,
+    ProtectionSpace, MAX_AUTH_ATTEMPTS,
+};
 pub use net::cors::{CorsError, ResponseTainting};
 #[cfg(not(target_arch = "wasm32"))]
 pub use net::cors::{CorsPreflightCache, InMemoryPreflightCache, PreflightAllows};

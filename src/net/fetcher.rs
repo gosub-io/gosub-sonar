@@ -1,5 +1,6 @@
 //! Priority-scheduled fetcher with request coalescing and per-origin concurrency limits.
 
+use crate::net::auth::{CredentialStore, InMemoryCredentialStore};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::cors::{CorsPreflightCache, InMemoryPreflightCache};
 #[cfg(not(target_arch = "wasm32"))]
@@ -114,6 +115,19 @@ pub struct FetcherConfig {
     #[cfg(not(target_arch = "wasm32"))]
     pub cors_preflight_cache: Option<Arc<dyn CorsPreflightCache>>,
 
+    /// Credentials remembered per authentication protection space (target + origin + realm),
+    /// consulted before [`FetcherContext::on_auth_challenge`] and updated with whatever it
+    /// returns once the server accepts it.
+    ///
+    /// Defaults to an [`InMemoryCredentialStore`], so a realm is only asked about once per
+    /// fetcher; supply your own [`CredentialStore`] to back it with a keychain. `None` keeps
+    /// authentication working but asks the hook for every challenge; use it for a
+    /// private-browsing session. See [`auth`](mod@crate::net::auth).
+    ///
+    /// Nothing is stored unless a hook supplies credentials, so the default is inert for a
+    /// fetcher that does not authenticate.
+    pub credentials: Option<Arc<dyn CredentialStore>>,
+
     /// Which proxy outgoing requests go through.
     ///
     /// Defaults to [`ProxyConfig::System`], which reads `HTTP_PROXY` and friends from the
@@ -160,6 +174,7 @@ impl Default for FetcherConfig {
             mixed_content: MixedContentPolicy::default(),
             #[cfg(not(target_arch = "wasm32"))]
             cors_preflight_cache: Some(Arc::new(InMemoryPreflightCache::new())),
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
             #[cfg(not(target_arch = "wasm32"))]
             proxy: ProxyConfig::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -794,7 +809,8 @@ fn build_policy(
     origins: Arc<OriginTable>,
 ) -> NetPolicy {
     let policy = NetPolicy::from_context(ctx)
-        .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)));
+        .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)))
+        .with_credential_store(cfg.credentials.clone());
     #[cfg(not(target_arch = "wasm32"))]
     let policy = {
         let policy = policy.with_hsts(cfg.hsts.clone());
@@ -803,8 +819,6 @@ fn build_policy(
             None => policy,
         }
     };
-    #[cfg(target_arch = "wasm32")]
-    let _ = cfg;
     policy
 }
 

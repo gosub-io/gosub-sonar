@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Authentication challenges (#7): a `401`/`407` hop is now re-sent with credentials instead of
+  being handed to the caller as a finished non-2xx response.
+  - new `net::auth` module: `AuthChallenge` (scheme, realm, every auth-param, token68) parsed
+    from `WWW-Authenticate`/`Proxy-Authenticate`, `AuthScheme`, `AuthTarget`, `Credentials`
+    (`Basic`, computed per RFC 7617, or `Raw` for a verbatim header value), and
+    `ProtectionSpace` — target + scheme + origin + realm, without the origin for a proxy
+  - `FetcherContext::on_auth_challenge(&challenge) -> Option<Credentials>` is asked for each
+    challenge in turn, so an unanswerable scheme falls through to the next one. Synchronous, like
+    `tls_override`: for a password dialog return `None` and re-submit, or seed the store
+  - `FetcherConfig::credentials` takes a `CredentialStore` (in-memory default:
+    `InMemoryCredentialStore`) so a realm is only asked about once. Accepted passwords are
+    stored, refused ones forgotten, and `challenge.attempt` counts the rejections. A `Raw` answer
+    is not stored, since it was computed for one challenge, but the store can be pre-seeded with
+    one. `None` keeps authentication working without remembering anything
+  - retries are capped at `MAX_AUTH_ATTEMPTS` (3) per hop; the credentials header is added to the
+    send only, so it never leaks into a redirect
+  - server credentials follow `FetchRequest::credentials` and are only attached to a
+    CORS-untainted chain (`Authorization` is not CORS-safelisted); proxy challenges are
+    native-only
+  - observers get `NetEvent::AuthRequired` for every challenged response, answered or not
+  - `test-support`: `RouteConfig::RequireAuth` demands a credentials header before answering,
+    and `RecordingObserver::auth_required` collects the events
+  - `examples/auth.rs` shows answering, declining, and falling through to a second challenge
+
 ## [0.3.0] - 2026-08-20
 
 ### Added

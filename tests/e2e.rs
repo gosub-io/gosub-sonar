@@ -4,10 +4,11 @@
 
 use gosub_sonar::net::test_support::{CorsRouteOptions, RouteConfig, TestServer, TestServerHandle};
 use gosub_sonar::{
-    simple_get, BlockReason, CorsError, FetchRequest, FetchResult, Fetcher, FetcherConfig,
-    FetcherContext, Initiator, NetError, NetObserver, NullContext, NullEmitter, RequestBody,
-    RequestCredentials, RequestDestination, RequestId, RequestMode, RequestReference, ResourceKind,
-    ResponseTainting, SharedBody, DEFAULT_USER_AGENT,
+    simple_get, AuthChallenge, AuthScheme, AuthTarget, BlockReason, CorsError, CredentialStore,
+    Credentials, FetchRequest, FetchResult, Fetcher, FetcherConfig, FetcherContext,
+    InMemoryCredentialStore, Initiator, NetError, NetObserver, NullContext, NullEmitter,
+    ProtectionSpace, RequestBody, RequestCredentials, RequestDestination, RequestId, RequestMode,
+    RequestReference, ResourceKind, ResponseTainting, SharedBody, DEFAULT_USER_AGENT,
 };
 use http::Method;
 use std::sync::Arc;
@@ -619,5 +620,226 @@ async fn identical_concurrent_requests_coalesce() {
         1,
         "identical in-flight GETs must share one fetch"
     );
+    shutdown.cancel();
+}
+
+/// base64("e2e:hunter2") — what the `/protected` routes below accept.
+const E2E_AUTH: &str = "Basic ZTJlOmh1bnRlcjI=";
+
+/// Answers `Basic` challenges with one fixed password and records what it was asked.
+struct AuthContext {
+    seen: std::sync::Mutex<Vec<AuthChallenge>>,
+    password: String,
+}
+
+impl AuthContext {
+    fn new(password: &str) -> Self {
+        Self {
+            seen: std::sync::Mutex::new(Vec::new()),
+            password: password.to_string(),
+        }
+    }
+}
+
+impl FetcherContext for AuthContext {
+    fn observer_for(
+        &self,
+        _reference: RequestReference,
+        _req_id: RequestId,
+        _kind: ResourceKind,
+        _initiator: Initiator,
+    ) -> Arc<dyn NetObserver + Send + Sync> {
+        Arc::new(NullEmitter)
+    }
+    fn on_ref_active(&self, _: RequestReference) {}
+    fn on_ref_done(&self, _: RequestReference) {}
+    fn on_auth_challenge(&self, challenge: &AuthChallenge) -> Option<Credentials> {
+        self.seen.lock().unwrap().push(challenge.clone());
+        match challenge.scheme {
+            AuthScheme::Basic => Some(Credentials::basic("e2e", self.password.clone())),
+            // Nothing here can compute a Digest response.
+            _ => None,
+        }
+    }
+}
+
+fn protected_server(challenge: &str) -> TestServer {
+    TestServer::new().route(
+        "/protected",
+        RouteConfig::require_auth(challenge, E2E_AUTH, b"top secret".to_vec()),
+    )
+}
+
+/// Issue #7: a 401 is answered and retried instead of being the result of the fetch.
+#[tokio::test]
+async fn a_401_is_answered_from_the_context_hook() {
+    let srv = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let ctx = Arc::new(AuthContext::new("hunter2"));
+    let (fetcher, shutdown) = spawn_fetcher(ctx.clone());
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, body } => {
+            assert_eq!(meta.status, 200);
+            assert_eq!(&body[..], b"top secret");
+        }
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+    assert_eq!(srv.hit_count("/protected"), 2);
+
+    let seen = ctx.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].target, AuthTarget::Server);
+    assert_eq!(seen[0].realm.as_deref(), Some("Members Only"));
+    assert_eq!(seen[0].url, srv.url("/protected"));
+    shutdown.cancel();
+}
+
+/// A context that answers no challenge gets the 401 back, `WWW-Authenticate` intact.
+#[tokio::test]
+async fn a_401_without_an_answer_is_still_delivered() {
+    let srv = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, .. } => {
+            assert_eq!(meta.status, 401);
+            assert_eq!(
+                meta.headers
+                    .get(http::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(r#"Basic realm="Members Only""#)
+            );
+        }
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+    assert_eq!(srv.hit_count("/protected"), 1);
+    shutdown.cancel();
+}
+
+/// A challenge the embedder cannot answer falls through to the next one the server offered.
+#[tokio::test]
+async fn the_first_answerable_challenge_wins() {
+    let srv = protected_server(r#"Digest realm="d", nonce="n", Basic realm="Members Only""#)
+        .start()
+        .await;
+    let ctx = Arc::new(AuthContext::new("hunter2"));
+    let (fetcher, shutdown) = spawn_fetcher(ctx.clone());
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 200),
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+
+    let seen = ctx.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].scheme, AuthScheme::Digest);
+    assert_eq!(seen[0].param("nonce"), Some("n"));
+    assert_eq!(seen[1].scheme, AuthScheme::Basic);
+    shutdown.cancel();
+}
+
+/// A wrong password is retried a bounded number of times and then handed back as the 401.
+#[tokio::test]
+async fn a_refused_password_is_not_retried_forever() {
+    let srv = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let ctx = Arc::new(AuthContext::new("wrong"));
+    let (fetcher, shutdown) = spawn_fetcher(ctx.clone());
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 401),
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+    assert_eq!(
+        srv.hit_count("/protected"),
+        1 + gosub_sonar::MAX_AUTH_ATTEMPTS as usize
+    );
+    assert_eq!(
+        ctx.seen.lock().unwrap().len(),
+        gosub_sonar::MAX_AUTH_ATTEMPTS as usize
+    );
+    shutdown.cancel();
+}
+
+/// The credential store can be pre-seeded. An asynchronous password dialog uses that: return
+/// `None` from the hook, ask the user, put the answer in the store, fetch again.
+#[tokio::test]
+async fn a_pre_seeded_credential_store_answers_without_the_hook() {
+    let srv = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let store = Arc::new(InMemoryCredentialStore::new());
+    store.store(
+        ProtectionSpace {
+            target: AuthTarget::Server,
+            scheme: AuthScheme::Basic,
+            origin: Some(srv.url("/protected").origin().ascii_serialization()),
+            realm: "Members Only".into(),
+        },
+        Credentials::basic("e2e", "hunter2"),
+    );
+
+    let cfg = FetcherConfig {
+        credentials: Some(store.clone()),
+        ..FetcherConfig::default()
+    };
+    // This context refuses every challenge; the store answers before it is consulted.
+    let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+    let shutdown = CancellationToken::new();
+    let (f, c) = (fetcher.clone(), shutdown.clone());
+    tokio::spawn(async move { f.run(c).await });
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, body } => {
+            assert_eq!(meta.status, 200);
+            assert_eq!(&body[..], b"top secret");
+        }
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+    shutdown.cancel();
+}
+
+/// Credentials for one origin's realm are not offered to another origin's, even when the realm
+/// name matches.
+#[tokio::test]
+async fn credentials_do_not_cross_origins() {
+    let one = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let two = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let store = Arc::new(InMemoryCredentialStore::new());
+    let cfg = FetcherConfig {
+        credentials: Some(store.clone()),
+        ..FetcherConfig::default()
+    };
+    let ctx = Arc::new(AuthContext::new("hunter2"));
+    let fetcher = Arc::new(Fetcher::new(cfg, ctx.clone()).unwrap());
+    let shutdown = CancellationToken::new();
+    let (f, c) = (fetcher.clone(), shutdown.clone());
+    tokio::spawn(async move { f.run(c).await });
+
+    for srv in [&one, &two] {
+        let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+        match fetcher.fetch(req).await {
+            FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 200),
+            other => panic!("expected Buffered, got {other:?}"),
+        }
+    }
+
+    // One entry per origin, and the hook was asked once for each.
+    assert_eq!(store.len(), 2);
+    assert_eq!(ctx.seen.lock().unwrap().len(), 2);
     shutdown.cancel();
 }

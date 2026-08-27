@@ -46,6 +46,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::fetch` | `src/net/fetch.rs` | Low-level fetch primitives: `fetch_response_top`, `fetch_response_complete`, redirect handling, `ProgressReader`, `NetPolicy`. |
 | `net::fetcher_context` | `src/net/fetcher_context.rs` | `FetcherContext` trait — the host's hook into the fetch lifecycle (observers, ref tracking, URL policy, cookies). |
 | `net::cors` | `src/net/cors.rs` | CORS (WHATWG Fetch): safelist predicates, the CORS check, preflight validation, response tainting/filtering. `CorsPreflightCache` / `InMemoryPreflightCache`. Enforcement is native-only. |
+| `net::auth` | `src/net/auth.rs` | HTTP authentication (RFC 9110 §11): `WWW-Authenticate`/`Proxy-Authenticate` parsing into `AuthChallenge`, `Credentials` (Basic computed here, anything else verbatim), `CredentialStore` / `InMemoryCredentialStore`. |
 | `net::referrer` | `src/net/referrer.rs` | `Referer` header from a `ReferrerPolicy` (W3C Referrer Policy), recomputed per redirect hop. |
 | `net::mixed_content` | `src/net/mixed_content.rs` | Blocking/upgrading insecure sub-resources of a secure document (W3C Mixed Content), checked per hop. `MixedContentPolicy`. |
 | `net::fetch_metadata` | `src/net/fetch_metadata.rs` | `Origin` and `Sec-Fetch-Dest/Mode/Site/User` headers (W3C Fetch Metadata). `RequestDestination`, `RequestMode`, `SecFetchSite`. |
@@ -495,6 +496,49 @@ Native-only. Testing: `TestServer::tls` is self-signed, so the platform verifier
 
 ---
 
+## Authentication challenges
+
+A `401` (origin server) or `407` (proxy) is retried as long as credentials for it can be found.
+`get_with_redirects` re-sends the hop, at most `MAX_AUTH_ATTEMPTS` times, and only a response that
+is not a challenge continues through the redirect chain. Every challenged response is reported as
+`NetEvent::AuthRequired`, answered or not.
+
+Per challenged hop, for each challenge in the order the server listed them:
+
+1. `FetcherConfig::credentials` (a `CredentialStore`, in-memory by default) is asked for the
+   challenge's `ProtectionSpace` — target + scheme + origin + realm, and for a proxy without the
+   origin, since a fetcher has one proxy configuration;
+2. otherwise `FetcherContext::on_auth_challenge(&challenge)` is asked, so an embedder can answer
+   from its own password manager or refuse a scheme it cannot compute;
+3. the answer becomes an `Authorization` / `Proxy-Authorization` header (marked sensitive) and the
+   hop is re-sent. A password the server then accepts is written to the store; credentials it
+   refuses are removed from it, and `challenge.attempt` tells the hook it is being asked again. A
+   `Credentials::Raw` answer is used but not stored, since it was computed for the challenge it
+   answered.
+
+`Credentials::Basic` is encoded here (RFC 7617). `Credentials::Raw` carries a verbatim header
+value for `Digest`, `Bearer` and `Negotiate`; the challenge's `params` (`nonce`, `qop`,
+`algorithm`, …) are parsed and handed over to build one from.
+
+The hook is synchronous, like `tls_override`, so a password dialog works the same way as a
+certificate warning: return `None`, prompt, then either seed the store or re-submit the fetch.
+
+Two limits:
+
+- Server credentials follow `FetchRequest::credentials` and are only attached to a chain the CORS
+  regime left untainted (`ResponseTainting::Basic`). `Authorization` is not a CORS-safelisted
+  header, so adding it to a cors request would need its own preflight and adding it to a no-cors
+  one would forge a header markup cannot produce. Navigations and requests without a document
+  origin are unaffected, and those are the ones a browser shows its password dialog for.
+- Proxy challenges are native-only: on wasm32 the browser owns the proxy connection and forbids
+  the header.
+
+Credentials do not survive a hop: the header is added to the send, not to the request, so a
+redirect starts from the caller's headers again (and `Authorization` is in
+`SENSITIVE_REDIRECT_HEADERS` for a hand-set one).
+
+---
+
 ## Observability
 
 Two traits decouple the net stack from the host's event system:
@@ -503,7 +547,8 @@ Two traits decouple the net stack from the host's event system:
 
 `NetObserver::on_event(&self, ev: NetEvent)` receives lifecycle events. `NetEvent` variants:
 `Started`, `Redirected`, `ResponseHeaders`, `Progress`, `Finished`, `Failed`, `Cancelled`,
-`Warning`, `Io`. `NullEmitter` is a no-op implementation for callers that don't care.
+`Warning`, `Io`, `Blocked`, `TlsFailed`, `CorsPreflight`, `AuthRequired`. `NullEmitter` is a no-op
+implementation for callers that don't care.
 
 ### FetcherContext
 
@@ -521,10 +566,12 @@ Implemented by the host and passed to `Fetcher::new`. The bridge between schedul
 - `tls_override(error)` — whether to accept a certificate that failed verification (default:
   no). Only used with `FetcherConfig::tls_overrides`; see
   [TLS errors & overrides](#tls-errors--overrides).
+- `on_auth_challenge(challenge)` — credentials for a `401`/`407` challenge (default: none); see
+  [Authentication challenges](#authentication-challenges).
 
-All of `is_url_allowed`, `cookies_for`, `on_cookies_received`, and `tls_override` have default
-implementations, so a minimal context only has to provide `observer_for`, `on_ref_active`, and
-`on_ref_done`.
+All of `is_url_allowed`, `cookies_for`, `on_cookies_received`, `tls_override`, and
+`on_auth_challenge` have default implementations, so a minimal context only has to provide
+`observer_for`, `on_ref_active`, and `on_ref_done`.
 
 ---
 

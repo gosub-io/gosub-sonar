@@ -28,14 +28,16 @@ The library has no dependency on any browser engine and can be used standalone.
   `Authorization`/`Cookie` stripped on cross-origin redirects.
 - Transport: TLS errors with user overrides, pluggable DNS (for SSRF policies), proxy
   configuration, default `User-Agent` of `gosub-sonar/<version>` (`FetcherConfig::user_agent`).
+- Authentication: `401`/`407` challenges answered from a credential store or a context hook and
+  the request retried; `Basic` is computed for you.
 - `NetEvent`s per request (started, redirected, headers, progress, blocked, preflight, TLS
-  failure, finished) via `NetObserver`; typed `NetError` / `BlockReason`.
+  failure, auth challenge, finished) via `NetObserver`; typed `NetError` / `BlockReason`.
 - Compiles for `wasm32-unknown-unknown` on top of the browser's `fetch()`. HSTS, DNS, proxies,
   TLS, the blocking helpers and `file://` are native only.
 
 The policies are documented in their modules on [docs.rs](https://docs.rs/gosub-sonar)
 (`net::cors`, `net::referrer`, `net::mixed_content`, `net::fetch_metadata`, `net::hsts`,
-`net::tls`, `net::dns`, `net::proxy`);
+`net::tls`, `net::auth`, `net::dns`, `net::proxy`);
 [docs/architecture.md](https://github.com/gosub-io/gosub-sonar/blob/main/docs/architecture.md)
 has the overall picture.
 
@@ -206,6 +208,45 @@ certificate. For a policy rather than a dialog (say, trust self-signed certifica
 hosts) implement `FetcherContext::tls_override`; it is asked synchronously during the handshake,
 after the store. See `examples/tls_override.rs`. Native only.
 
+### Authentication challenges
+
+A `401` (or a proxy's `407`) is answered rather than returned: the challenges are parsed, the
+credentials are looked up, and the hop is re-sent with an `Authorization` header. After
+`MAX_AUTH_ATTEMPTS` tries the challenge is handed to the caller as before.
+
+Credentials come from `FetcherConfig::credentials` (a `CredentialStore` keyed by protection
+space — target, scheme, origin, realm — with an in-memory default) and otherwise from your
+context:
+
+```rust,ignore
+use gosub_sonar::{AuthChallenge, AuthScheme, Credentials, FetcherContext};
+
+impl FetcherContext for MyApp {
+    // ... observer_for / on_ref_active / on_ref_done ...
+
+    fn on_auth_challenge(&self, challenge: &AuthChallenge) -> Option<Credentials> {
+        match challenge.scheme {
+            // Basic is encoded for you; `challenge.realm` is what to show the user.
+            AuthScheme::Basic => self.passwords.lookup(&challenge.url, challenge.realm.as_deref()),
+            // Any other scheme: build the header value yourself from `challenge.params`.
+            AuthScheme::Bearer => Some(Credentials::Raw(format!("Bearer {}", self.token))),
+            _ => None,
+        }
+    }
+}
+```
+
+The hook is called once per challenge, in the order the server listed them, so returning `None`
+for a scheme you cannot compute lets the next one through. It runs on the request path and must
+not block on a password dialog: return `None`, prompt, and then either put the answer in the store
+or re-submit the fetch. A password that works is remembered; credentials the server refuses are
+dropped, and `challenge.attempt` tells you it is being asked again. A `Raw` value is used but not
+remembered, since it was computed for that one challenge, so pre-seed the store yourself for a
+stable one such as a bearer token.
+
+Server credentials follow `FetchRequest::credentials` and are not attached to CORS-tainted
+requests (`Authorization` is not a CORS-safelisted header). Proxy challenges are native only.
+
 ### DNS and SSRF
 
 `FetcherConfig::dns_resolver` replaces the system resolver. It is used for every connection,
@@ -290,6 +331,7 @@ cargo run --example tls_override -- https://self-signed.badssl.com/
 cargo run --example fetcher_context --features test-support
 cargo run --example streaming --features test-support
 cargo run --example document_fetch --features test-support
+cargo run --example auth --features test-support
 cargo run --example fetcher_harness --features test-support
 ```
 
@@ -300,9 +342,10 @@ cargo run --example fetcher_harness --features test-support
 - `streaming` — a streamed body, and two subscribers sharing one fetch
 - `document_fetch` — requests as a page makes them: `Referer`, `Sec-Fetch-*`, `Origin`, CORS with
   preflight, mixed content
+- `auth` — answering `401` challenges: from the context, from the credential store, and not at all
 - `fetcher_harness` — concurrency, coalescing, priority, cancellation and error scenarios
 
-The last four run against the mock server, no network needed.
+The last five run against the mock server, no network needed.
 
 ## Documentation
 
