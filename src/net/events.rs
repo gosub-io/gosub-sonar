@@ -1,6 +1,7 @@
 //! Events emitted by the fetch stack to observers during a request lifecycle.
 
 use crate::net::auth::{AuthChallenge, AuthTarget};
+use crate::net::cache::CacheOutcome;
 use crate::net::tls::TlsError;
 use crate::net::types::BlockReason;
 use http::HeaderMap;
@@ -107,6 +108,15 @@ pub enum NetEvent {
         /// Whether credentials were found and the hop re-sent with them. `false` means the
         /// `401`/`407` is the response the caller gets.
         retried: bool,
+    },
+    /// The HTTP cache was used for this hop: a stored response was served, one was confirmed by
+    /// a `304`, a response was written, or an unsafe method dropped what was stored.
+    /// See [`cache`](crate::net::cache).
+    Cache {
+        /// The hop the cache acted on
+        url: Url,
+        /// What it did
+        outcome: CacheOutcome,
     },
     /// Resource fetching was cancelled
     Cancelled {

@@ -58,6 +58,7 @@ impl NetObserver for Logger {
             NetEvent::Cancelled { reason, .. } => println!("[{t}] cancelled {reason}"),
             NetEvent::TlsFailed { error, .. } => println!("[{t}] tls       {error}"),
             NetEvent::CorsPreflight { url } => println!("[{t}] preflight {url}"),
+            NetEvent::Cache { url, outcome } => println!("[{t}] cache     {outcome} {url}"),
             NetEvent::AuthRequired {
                 challenges,
                 retried,

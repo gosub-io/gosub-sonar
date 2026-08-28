@@ -90,6 +90,10 @@ name = "auth"
 required-features = ["test-support"]
 
 [[example]]
+name = "caching"
+required-features = ["test-support"]
+
+[[example]]
 name = "fetcher_context"
 required-features = ["test-support"]
 

@@ -46,6 +46,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::fetch` | `src/net/fetch.rs` | Low-level fetch primitives: `fetch_response_top`, `fetch_response_complete`, redirect handling, `ProgressReader`, `NetPolicy`. |
 | `net::fetcher_context` | `src/net/fetcher_context.rs` | `FetcherContext` trait — the host's hook into the fetch lifecycle (observers, ref tracking, URL policy, cookies). |
 | `net::cors` | `src/net/cors.rs` | CORS (WHATWG Fetch): safelist predicates, the CORS check, preflight validation, response tainting/filtering. `CorsPreflightCache` / `InMemoryPreflightCache`. Enforcement is native-only. |
+| `net::cache` | `src/net/cache.rs` | HTTP caching (RFC 9111): freshness and age, request/response `Cache-Control`, conditional revalidation, `Vary`, invalidation. `HttpCache` / `InMemoryHttpCache`, `CacheMode`. Native-only. |
 | `net::auth` | `src/net/auth.rs` | HTTP authentication (RFC 9110 §11): `WWW-Authenticate`/`Proxy-Authenticate` parsing into `AuthChallenge`, `Credentials` (Basic computed here, anything else verbatim), `CredentialStore` / `InMemoryCredentialStore`. |
 | `net::referrer` | `src/net/referrer.rs` | `Referer` header from a `ReferrerPolicy` (W3C Referrer Policy), recomputed per redirect hop. |
 | `net::mixed_content` | `src/net/mixed_content.rs` | Blocking/upgrading insecure sub-resources of a secure document (W3C Mixed Content), checked per hop. `MixedContentPolicy`. |
@@ -496,6 +497,46 @@ Native-only. Testing: `TestServer::tls` is self-signed, so the platform verifier
 
 ---
 
+## HTTP caching
+
+A private cache, consulted and updated at every hop of `get_with_redirects` rather than once per
+fetch, so a cacheable redirect is an entry of its own and a stored `301` is followed without a
+request. The store is `FetcherConfig::cache` (an `HttpCache`, in-memory by default);
+`FetchRequest::cache_mode` picks how one request uses it.
+
+Because a hop can be answered without a response from the server, the loop and its consumers read
+the hop through `HopResponse`, which is either a `reqwest::Response` or a stored `CacheEntry`.
+
+Per hop, after the headers for it are computed (so `Vary` selects on the cookies and negotiation
+headers as sent):
+
+1. `cache::decide` looks at the stored variants and the request's directives and cache mode, and
+   returns `Use` (serve it, send nothing), `Revalidate` (send with `If-None-Match` /
+   `If-Modified-Since`), `Send`, or `NotCached` (`only-if-cached` with nothing stored, which
+   fails the request with `BlockReason::NotCached`).
+2. A `304` to a revalidation produces the stored entry with the response's headers merged in and
+   the age clock restarted (§4.3.4). The caller sees the stored 200, not the 304.
+3. `cache::is_storable` decides whether the response may be written (§3). A redirect is written
+   immediately; the final response's write waits for its body.
+
+The body only exists once someone reads it, so a storable response leaves `get_with_redirects` as
+a `PendingStore` that the reader completes. `ProgressReader` carries a `CacheCollector` that
+copies bytes as they are delivered and writes the entry when the stream ends, which covers the
+buffered and the streaming path in one place: a fetch that is cancelled, fails, or grows past
+`HttpCache::max_entry_bytes` never commits.
+
+`Set-Cookie` is removed before a response is stored, so a cache hit cannot re-apply a cookie, and
+so are the hop-by-hop headers. A body the HTTP client decompressed is stored
+without its `Content-Encoding`, and only answers requests that also decode, since the raw caller
+asked for different bytes.
+
+Known limits: shared-cache rules (`s-maxage`, the `Authorization` restriction of §3.5) do not
+apply to a private cache; range requests and `206` are not stored; there is no
+`stale-while-revalidate`; and a cors-mode request that needs a preflight still sends it before a
+cache hit is considered.
+
+---
+
 ## Authentication challenges
 
 A `401` (origin server) or `407` (proxy) is retried as long as credentials for it can be found.
@@ -547,8 +588,8 @@ Two traits decouple the net stack from the host's event system:
 
 `NetObserver::on_event(&self, ev: NetEvent)` receives lifecycle events. `NetEvent` variants:
 `Started`, `Redirected`, `ResponseHeaders`, `Progress`, `Finished`, `Failed`, `Cancelled`,
-`Warning`, `Io`, `Blocked`, `TlsFailed`, `CorsPreflight`, `AuthRequired`. `NullEmitter` is a no-op
-implementation for callers that don't care.
+`Warning`, `Io`, `Blocked`, `TlsFailed`, `CorsPreflight`, `AuthRequired`, `Cache`. `NullEmitter`
+is a no-op implementation for callers that don't care.
 
 ### FetcherContext
 
