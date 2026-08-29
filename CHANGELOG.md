@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `SharedBody`: a subscriber dropped for falling behind the producer now receives
+  `Err(NetError::Read(..))` before its stream ends, instead of the same clean end a
+  finished body gives. A consumer that missed chunks could not tell the difference
+  before and would deliver a truncated body as complete.
+
 ## [0.3.0] - 2026-08-20
 
 ### Added
