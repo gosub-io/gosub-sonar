@@ -45,7 +45,7 @@ Add to your `Cargo.toml` (the scheduler API also uses these companion crates dir
 
 ```toml
 [dependencies]
-gosub-sonar = "0.3"
+gosub-sonar = "0.4"
 http = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
 tokio-util = "0.7"
