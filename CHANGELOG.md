@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-29
+
 ### Changed
 
 - `SharedBody`: a subscriber dropped for falling behind the producer now receives
@@ -244,7 +246,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/gosub-io/gosub-sonar/releases/tag/v0.1.0
