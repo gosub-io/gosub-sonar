@@ -6,7 +6,9 @@
 //! than stalling the producer (and other subscribers).
 //!
 //! Semantics:
-//! - `push(Bytes)`: best-effort, non-blocking; slow subscribers are removed.
+//! - `push(Bytes)`: best-effort, non-blocking; a slow subscriber is removed and
+//!   sees an error (`NetError::Read`) before its stream ends, never a clean EOF -
+//!   a consumer must not mistake a body it fell behind on for a complete one.
 //! - `finish()`: closes all subscribers → they observe EOF (`None`) cleanly.
 //! - `error(NetError)`: broadcasts an error to all, then closes.
 //! - `subscribe_stream()`: returns a `Stream<Item = Result<Bytes, NetError>>`
@@ -80,7 +82,7 @@ pub struct SharedBody {
 // Internal state of a shared body
 struct State {
     /// Active subscribers
-    subs: HashMap<u64, mpsc::Sender<Result<Bytes, NetError>>>,
+    subs: HashMap<u64, Subscriber>,
     /// Monotic id for subscribers
     next_id: AtomicU64,
     /// Limit on how many subscribers per queue are allowed
@@ -93,6 +95,13 @@ struct State {
     has_subscriber: bool,
     /// The error the body ended with, if any; handed to subscribers that attach after the end.
     error: Option<NetError>,
+}
+
+/// One subscriber's queue, plus the flag that tells its stream why the queue
+/// closed: dropped for lagging (an error is due) or finished (a clean end).
+struct Subscriber {
+    tx: mpsc::Sender<Result<Bytes, NetError>>,
+    lagged: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SharedBody {
@@ -118,7 +127,9 @@ impl SharedBody {
 
     /// Pushes a chunk to all current subscribers (best-effort, non-blocking).
     ///
-    /// - If a subscriber's queue is **full** or **closed**, that subscriber is removed.
+    /// - If a subscriber's queue is **full**, that subscriber is removed and its
+    ///   stream yields an error, then ends: it missed this chunk.
+    /// - If a subscriber's queue is **closed** (the stream was dropped), it is removed.
     /// - If [`finish`](Self::finish) or [`error`](Self::error) has been called,
     ///   additional pushes are ignored.
     pub fn push(&self, chunk: Bytes) {
@@ -127,20 +138,21 @@ impl SharedBody {
             if st.closed {
                 return;
             }
-            let subs: Vec<(u64, mpsc::Sender<_>)> =
-                st.subs.iter().map(|(id, tx)| (*id, tx.clone())).collect();
-
-            // It might be possible that we can detect closed channels here and thus add them
-            // already to the remove list. For now, we just return an empty list as a starting point.
+            let subs: Vec<(u64, mpsc::Sender<_>, Arc<std::sync::atomic::AtomicBool>)> = st
+                .subs
+                .iter()
+                .map(|(id, sub)| (*id, sub.tx.clone(), Arc::clone(&sub.lagged)))
+                .collect();
             (subs, Vec::new())
         };
 
         // Try to send to each subscriber without blocking
-        for (id, tx) in subs {
+        for (id, tx, lagged) in subs {
             match tx.try_send(Ok(chunk.clone())) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    // This subscriber is too slow; drop it
+                    // Too slow: it missed this chunk, and must know it did.
+                    lagged.store(true, std::sync::atomic::Ordering::Release);
                     to_remove.push(id);
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -174,7 +186,7 @@ impl SharedBody {
             }
             st.closed = true;
             st.error = Some(e.clone());
-            st.subs.drain().map(|(_, tx)| tx).collect()
+            st.subs.drain().map(|(_, sub)| sub.tx).collect()
         };
 
         for tx in senders {
@@ -194,7 +206,7 @@ impl SharedBody {
                 return;
             }
             st.closed = true;
-            st.subs.drain().map(|(_, tx)| tx).collect()
+            st.subs.drain().map(|(_, sub)| sub.tx).collect()
         };
 
         // dropping senders is enough; receivers yield None (EOF)
@@ -213,7 +225,7 @@ impl SharedBody {
         &self,
         max_queue: usize,
     ) -> BoxStream<'static, Result<Bytes, NetError>> {
-        let (rx, id) = {
+        let (rx, id, lagged) = {
             let mut st = self.inner.lock();
             if st.closed {
                 return match st.error.clone() {
@@ -226,19 +238,28 @@ impl SharedBody {
             let id = st
                 .next_id
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            st.subs.insert(id, tx);
+            let lagged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            st.subs.insert(
+                id,
+                Subscriber {
+                    tx,
+                    lagged: Arc::clone(&lagged),
+                },
+            );
             if !st.has_subscriber {
                 st.has_subscriber = true;
                 // notify_one stores a permit if the pump isn't waiting yet
                 st.first_subscriber.notify_one();
             }
-            (rx, id)
+            (rx, id, lagged)
         };
 
         SubStream {
             id,
             parent: self.inner.clone(),
             inner: ReceiverStream::new(rx),
+            lagged,
+            lag_reported: false,
         }
         .boxed()
     }
@@ -534,6 +555,9 @@ struct SubStream {
     id: u64,
     parent: Arc<Mutex<State>>,
     inner: ReceiverStream<Result<Bytes, NetError>>,
+    /// Set by the producer when it dropped this subscriber for lagging.
+    lagged: Arc<std::sync::atomic::AtomicBool>,
+    lag_reported: bool,
 }
 
 impl Stream for SubStream {
@@ -541,7 +565,19 @@ impl Stream for SubStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        Pin::new(&mut this.inner).poll_next(cx)
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            // The queue closed. Dropped for lagging, that is an error the
+            // consumer gets once before the end; finished, a clean end.
+            Poll::Ready(None)
+                if !this.lag_reported && this.lagged.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                this.lag_reported = true;
+                Poll::Ready(Some(Err(NetError::Read(Arc::new(anyhow::anyhow!(
+                    "body subscriber fell behind the producer and was dropped; the body is incomplete"
+                ))))))
+            }
+            other => other,
+        }
     }
 }
 
@@ -606,11 +642,15 @@ mod tests {
         // Consume 'B' from fast
         let fb = fast.next().await.unwrap().unwrap();
 
-        // Slow should get 'A' but not 'B' (it was dropped)
+        // Slow should get 'A', then an error for the 'B' it missed, then the end.
         let first = slow.next().await.unwrap();
         assert!(first.is_ok());
-        let tail = slow.next().await; // None or Err
-        assert!(tail.is_none() || tail.unwrap().is_err());
+        let tail = slow.next().await;
+        assert!(
+            matches!(tail, Some(Err(NetError::Read(_)))),
+            "a dropped subscriber must see an error, got {tail:?}"
+        );
+        assert!(slow.next().await.is_none());
 
         // Push third chunk; There is no more slow subscriber, only fast.
         sb.push(Bytes::from_static(b"C"));
