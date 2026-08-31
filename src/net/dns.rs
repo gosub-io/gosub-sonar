@@ -50,6 +50,7 @@
 //! [`Fetcher`]: crate::net::fetcher::Fetcher
 //! [`FetcherConfig::dns_resolver`]: crate::net::fetcher::FetcherConfig::dns_resolver
 
+use crate::net::events::NetEvent;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -91,8 +92,41 @@ impl reqwest::dns::Resolve for ReqwestResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let resolver = self.0.clone();
         Box::pin(async move {
+            let started = std::time::Instant::now();
             let addrs = resolver.resolve(name.as_str()).await?;
+
+            // Report to whichever request caused this lookup. A pooled connection resolves
+            // nothing, so no event is emitted for it and the absence is the answer: that
+            // request spent no time in DNS.
+            crate::net::observer::emit_to_current(NetEvent::DnsResolved {
+                host: name.as_str().to_string(),
+                elapsed: started.elapsed(),
+                addr_count: addrs.len(),
+            });
+
             Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Resolves through the system resolver, refusing nothing.
+///
+/// Behaviourally the same as reqwest's built-in resolution, so installing it changes no
+/// policy - but because it goes through [`DnsResolver`], lookups become visible as
+/// [`NetEvent::DnsResolved`]. For embedders that want DNS timing without writing a
+/// resolver of their own.
+///
+/// It applies no SSRF or rebinding protection whatsoever. Anything facing untrusted URLs
+/// wants a resolver that classifies addresses - see the module docs.
+pub struct SystemResolver;
+
+impl DnsResolver for SystemResolver {
+    fn resolve(&self, host: &str) -> Resolving {
+        // Port 0: the fetcher substitutes the scheme default when the URL names none.
+        let host = format!("{host}:0");
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host(host).await?.collect();
+            Ok(addrs)
         })
     }
 }
@@ -187,6 +221,63 @@ mod tests {
             other => panic!("expected Buffered, got {other:?}"),
         }
         assert_eq!(resolver.seen(), vec!["sonar-dns.test"]);
+        shutdown.cancel();
+    }
+
+    /// A context that hands the same recording observer to every request, so a test can
+    /// assert on events the fetch stack emitted.
+    struct RecordingCtx(Arc<crate::net::test_support::RecordingObserver>);
+
+    impl crate::net::fetcher_context::FetcherContext for RecordingCtx {
+        fn observer_for(
+            &self,
+            _: crate::net::request_ref::RequestReference,
+            _: crate::types::RequestId,
+            _: crate::net::types::ResourceKind,
+            _: crate::net::types::Initiator,
+        ) -> Arc<dyn crate::net::observer::NetObserver + Send + Sync> {
+            self.0.clone()
+        }
+        fn on_ref_active(&self, _: crate::net::request_ref::RequestReference) {}
+        fn on_ref_done(&self, _: crate::net::request_ref::RequestReference) {}
+    }
+
+    /// The resolver runs inside reqwest's connection pool, well below the request layer, so
+    /// the event it emits can only reach the right observer through the task-local. This is
+    /// the test that the plumbing actually holds end to end.
+    #[tokio::test(flavor = "current_thread")]
+    async fn resolution_is_reported_to_the_requests_observer() {
+        let srv = TestServer::new()
+            .route("/x", RouteConfig::ok(b"x"))
+            .start()
+            .await;
+        let addr = srv.socket_addr();
+
+        let resolver = MapResolver::new(&[("sonar-timed.test", addr)]);
+        let recorder = Arc::new(crate::net::test_support::RecordingObserver::new());
+        let ctx = Arc::new(RecordingCtx(recorder.clone()));
+
+        let fetcher = Arc::new(Fetcher::new(config_with(resolver), ctx).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let url = Url::parse(&format!("http://sonar-timed.test:{}/x", addr.port())).unwrap();
+        let _ = fetch(&fetcher, url.clone()).await;
+
+        let lookups = recorder.dns_lookups();
+        assert_eq!(
+            lookups,
+            vec![("sonar-timed.test".to_string(), 1)],
+            "the lookup should have reached this request's observer"
+        );
+
+        // Deliberately not asserting that a second request reuses the connection and so
+        // reports no lookup: the test server does not keep connections alive, so a second
+        // fetch resolves again here. The per-connection behaviour is reqwest's, documented
+        // on `DnsResolver`, and is not this test's to pin down.
+
         shutdown.cancel();
     }
 

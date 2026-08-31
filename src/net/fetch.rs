@@ -359,15 +359,22 @@ pub async fn fetch_response_top(
     let started = Instant::now();
     observer.on_event(NetEvent::Started { url: url.clone() });
 
-    let (resp, tainting) = get_with_redirects(
-        client.clone(),
-        url.clone(),
-        init,
-        cancel.clone(),
-        observer.clone(),
-        policy,
-    )
-    .await?;
+    // Bind this request's observer for the duration of the HTTP exchange. Work that
+    // happens below the request layer - DNS resolution inside the connection pool - has no
+    // other way to reach it.
+    let (resp, tainting) = crate::net::observer::CURRENT_OBSERVER
+        .scope(
+            observer.clone(),
+            get_with_redirects(
+                client.clone(),
+                url.clone(),
+                init,
+                cancel.clone(),
+                observer.clone(),
+                policy,
+            ),
+        )
+        .await?;
 
     // Response is received, setup our meta structure
     let mut meta = FetchResultMeta {

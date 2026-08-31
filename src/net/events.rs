@@ -21,6 +21,24 @@ pub enum NetEvent {
         /// Description of the warning
         message: String,
     },
+    /// A hostname was resolved to addresses.
+    ///
+    /// Only emitted when a connection actually had to be opened - a request served from
+    /// the connection pool resolves nothing and reports nothing, which is the honest
+    /// answer rather than a zero.
+    ///
+    /// Requires a [`DnsResolver`](crate::net::dns::DnsResolver) to be configured on the
+    /// fetcher; reqwest's built-in resolution happens below our level and cannot be timed.
+    /// [`SystemResolver`](crate::net::dns::SystemResolver) is the drop-in for embedders
+    /// with no resolution policy of their own.
+    DnsResolved {
+        /// Hostname that was looked up
+        host: String,
+        /// How long resolution took
+        elapsed: Duration,
+        /// Number of addresses returned
+        addr_count: usize,
+    },
     /// Resource started loading
     Started {
         /// URL being fetched

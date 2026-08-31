@@ -856,6 +856,21 @@ impl RecordingObserver {
         })
     }
 
+    /// Every [`NetEvent::DnsResolved`] recorded, as `(host, addr_count)`.
+    pub fn dns_lookups(&self) -> Vec<(String, usize)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::DnsResolved {
+                    host, addr_count, ..
+                } => Some((host.clone(), *addr_count)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every [`NetEvent::Warning`] message recorded, in order.
     pub fn warnings(&self) -> Vec<String> {
         self.events
