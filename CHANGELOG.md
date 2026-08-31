@@ -27,8 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `test-support`: `RecordingObserver::connects()` and `RecordingObserver::dns_lookups()`
   - native-only; on wasm32 the browser owns both resolution and connection setup
 
-  `NetEvent` is not `#[non_exhaustive]`, so an exhaustive `match` over it needs arms for
-  the two new variants.
+### Changed
+
+- **Breaking:** `NetEvent` is now `#[non_exhaustive]`. A `match` over it needs a catch-all
+  arm — but from here on, a new event is no longer a breaking change. Done in the same
+  release as three new variants, when it costs one adjustment rather than two.
 
 ## [0.4.0] - 2026-08-29
 

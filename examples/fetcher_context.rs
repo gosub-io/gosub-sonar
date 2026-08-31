@@ -66,6 +66,8 @@ impl NetObserver for Logger {
             NetEvent::Connected { elapsed } => println!("[{t}] connect   {elapsed:?}"),
             NetEvent::Warning { message, .. } => println!("[{t}] warning   {message}"),
             NetEvent::Io { message } => println!("[{t}] io        {message}"),
+            // `NetEvent` is non-exhaustive; a new event should not break this example.
+            _ => {}
         }
     }
 }

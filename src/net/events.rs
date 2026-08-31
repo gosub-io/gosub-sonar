@@ -7,7 +7,11 @@ use std::time::Duration;
 use url::Url;
 
 /// Events that are emitted by the net::fetch() functions
+///
+/// Non-exhaustive: new events are added as the stack learns to report more, so a `match`
+/// over this needs a catch-all arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum NetEvent {
     /// Io error happened
     Io {

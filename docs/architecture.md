@@ -506,6 +506,9 @@ Two traits decouple the net stack from the host's event system:
 `Blocked`, `TlsFailed`, `CorsPreflight`, `DnsResolved`, `Connected`,
 `Warning`, `Io`. `NullEmitter` is a no-op implementation for callers that don't care.
 
+`NetEvent` is `#[non_exhaustive]`: a `match` over it needs a catch-all arm, and new events can
+be added without a breaking release.
+
 **Timing events.** `DnsResolved` and `Connected` each carry an `elapsed`, so the embedder can
 break the time before the first byte into resolution and connection setup instead of seeing one
 opaque gap. They report only work that actually happened: a request served from the connection
