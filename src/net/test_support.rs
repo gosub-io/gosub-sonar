@@ -856,6 +856,19 @@ impl RecordingObserver {
         })
     }
 
+    /// Every [`NetEvent::Connected`] duration recorded, in order.
+    pub fn connects(&self) -> Vec<std::time::Duration> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Connected { elapsed } => Some(*elapsed),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every [`NetEvent::DnsResolved`] recorded, as `(host, addr_count)`.
     pub fn dns_lookups(&self) -> Vec<(String, usize)> {
         self.events

@@ -242,6 +242,68 @@ mod tests {
         fn on_ref_done(&self, _: crate::net::request_ref::RequestReference) {}
     }
 
+    /// Establishing a connection is reported to the request that caused it. The layer sits
+    /// inside reqwest's connector, so like DNS this can only arrive through the task-local.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_is_reported_to_the_requests_observer() {
+        let srv = TestServer::new()
+            .route("/x", RouteConfig::ok(b"x"))
+            .start()
+            .await;
+        let addr = srv.socket_addr();
+
+        let resolver = MapResolver::new(&[("sonar-connect.test", addr)]);
+        let recorder = Arc::new(crate::net::test_support::RecordingObserver::new());
+        let ctx = Arc::new(RecordingCtx(recorder.clone()));
+
+        let fetcher = Arc::new(Fetcher::new(config_with(resolver), ctx).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let url = Url::parse(&format!("http://sonar-connect.test:{}/x", addr.port())).unwrap();
+        let _ = fetch(&fetcher, url).await;
+
+        let connects = recorder.connects();
+        assert_eq!(connects.len(), 1, "one connection established, one report");
+
+        shutdown.cancel();
+    }
+
+    /// A refused connection reports nothing: `net.connect` means "how long connecting
+    /// takes", and a failure has no meaningful duration to contribute to that.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_connect_is_not_reported() {
+        // Resolves fine, but nothing is listening on the port.
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let resolver = MapResolver::new(&[("sonar-dead.test", dead)]);
+        let recorder = Arc::new(crate::net::test_support::RecordingObserver::new());
+        let ctx = Arc::new(RecordingCtx(recorder.clone()));
+
+        let fetcher = Arc::new(Fetcher::new(config_with(resolver), ctx).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let url = Url::parse("http://sonar-dead.test:1/x").unwrap();
+        let result = fetch(&fetcher, url).await;
+        assert!(
+            result.is_error(),
+            "expected a connect failure, got {result:?}"
+        );
+
+        assert!(
+            recorder.connects().is_empty(),
+            "a failed connect must not be reported as a connection time"
+        );
+        // The lookup did happen, though, and is still reported.
+        assert_eq!(recorder.dns_lookups().len(), 1);
+
+        shutdown.cancel();
+    }
+
     /// The resolver runs inside reqwest's connection pool, well below the request layer, so
     /// the event it emits can only reach the right observer through the task-local. This is
     /// the test that the plumbing actually holds end to end.

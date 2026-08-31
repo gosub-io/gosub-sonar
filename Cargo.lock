@@ -615,6 +615,8 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tokio-util",
+ "tower-layer",
+ "tower-service",
  "tracing",
  "url",
  "uuid",

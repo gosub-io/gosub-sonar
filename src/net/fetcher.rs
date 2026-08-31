@@ -717,6 +717,9 @@ fn build_client(
         if let Some(ref resolver) = cfg.dns_resolver {
             b = b.dns_resolver(Arc::new(crate::net::dns::ReqwestResolver(resolver.clone())));
         }
+        // Observation only - forwards the request and returns the connector's own result
+        // unchanged - so it is installed for every client rather than gated on config.
+        b = b.connector_layer(crate::net::connect_timing::ConnectTimingLayer);
         b = cfg.proxy.apply(b)?;
         Ok(b.build()?)
     }

@@ -39,6 +39,20 @@ pub enum NetEvent {
         /// Number of addresses returned
         addr_count: usize,
     },
+    /// A new connection was established: TCP handshake plus, for https, the TLS
+    /// handshake.
+    ///
+    /// Like [`NetEvent::DnsResolved`], only emitted when a connection actually had to be
+    /// opened. A request served from the pool reports nothing, because it spent no time
+    /// connecting.
+    ///
+    /// Carries no host: reqwest's connector request type is opaque, so the layer cannot
+    /// read it. The observer receiving this belongs to the request that caused the
+    /// connect, which is the attribution that matters.
+    Connected {
+        /// How long the connection took to establish
+        elapsed: Duration,
+    },
     /// Resource started loading
     Started {
         /// URL being fetched
