@@ -377,8 +377,10 @@ on every one of them. The embedder owns the *policy* through request fields:
   embedder's job.
 
 Failures surface as `NetError::Blocked { reason: BlockReason::Cors(CorsError), .. }` with a
-typed `CorsError` naming the violated rule, and a `NetEvent::CorsPreflight` event announces each
-preflight for devtools-style observability.
+typed `CorsError` naming the violated rule, and a `NetEvent::CorsPreflight` /
+`NetEvent::CorsPreflightDone` pair brackets each preflight for devtools-style observability —
+the second carries how long the `OPTIONS` round-trip took, and is emitted for any response that
+came back, including one that then fails validation.
 
 Enforcement is native-only: on wasm32 the browser's `fetch()` enforces CORS itself and hides the
 `Access-Control-*` response headers the checks would need.
@@ -503,20 +505,22 @@ Two traits decouple the net stack from the host's event system:
 
 `NetObserver::on_event(&self, ev: NetEvent)` receives lifecycle events. `NetEvent` variants:
 `Started`, `Redirected`, `ResponseHeaders`, `Progress`, `Finished`, `Failed`, `Cancelled`,
-`Blocked`, `TlsFailed`, `CorsPreflight`, `DnsResolved`, `Connected`,
+`Blocked`, `TlsFailed`, `CorsPreflight`, `CorsPreflightDone`, `DnsResolved`, `Connected`,
 `Warning`, `Io`. `NullEmitter` is a no-op implementation for callers that don't care.
 
 `NetEvent` is `#[non_exhaustive]`: a `match` over it needs a catch-all arm, and new events can
 be added without a breaking release.
 
-**Timing events.** `DnsResolved` and `Connected` each carry an `elapsed`, so the embedder can
-break the time before the first byte into resolution and connection setup instead of seeing one
-opaque gap. They report only work that actually happened: a request served from the connection
-pool emits neither — the absence is the answer, rather than a zero that would read as
-"instant". `DnsResolved` further requires a `FetcherConfig::dns_resolver`, because reqwest's
-built-in resolution sits below this crate and cannot be timed; `dns::SystemResolver` is the
-policy-free resolver for embedders that only want the timing. Both are native-only: on wasm32
-the browser owns resolution and connection setup alike.
+**Timing events.** `DnsResolved`, `Connected`, and the `CorsPreflight`/`CorsPreflightDone` pair
+each carry an `elapsed`, so the embedder can break the time before the first byte into
+resolution, connection setup, and preflight instead of seeing one opaque gap. They report only
+work that actually happened: a request served from the connection pool emits no `DnsResolved`
+and no `Connected`, and a hop covered by a cached CORS grant emits no preflight events — the
+absence is the answer, rather than a zero that would read as "instant". `DnsResolved` further
+requires a `FetcherConfig::dns_resolver`, because reqwest's built-in resolution sits below this
+crate and cannot be timed; `dns::SystemResolver` is the policy-free resolver for embedders that
+only want the timing. All three are native-only: on wasm32 the browser owns resolution,
+connection setup, and preflighting alike.
 
 `Connected` is produced by a tower `connector_layer` (`net::connect_timing`) wrapped around
 reqwest's connector, and `DnsResolved` from inside the resolver. Both sit below the request

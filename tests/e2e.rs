@@ -2,7 +2,9 @@
 //! would: `use gosub_sonar::…`, an externally implemented [`FetcherContext`], and the
 //! `test-support` mock server. Requires `--features test-support`.
 
-use gosub_sonar::net::test_support::{CorsRouteOptions, RouteConfig, TestServer, TestServerHandle};
+use gosub_sonar::net::test_support::{
+    CorsRouteOptions, RecordingObserver, RouteConfig, TestServer, TestServerHandle,
+};
 use gosub_sonar::{
     simple_get, BlockReason, CorsError, FetchRequest, FetchResult, Fetcher, FetcherConfig,
     FetcherContext, Initiator, NetError, NetObserver, NullContext, NullEmitter, RequestBody,
@@ -387,6 +389,97 @@ async fn preflight_runs_once_then_is_cached() {
         "second request must be served from the preflight cache"
     );
     assert_eq!(away.hit_count("/data"), 2);
+    shutdown.cancel();
+}
+
+/// Hands the same recording observer to every request, so a test can assert on the events
+/// the fetch stack emitted.
+struct RecordingCtx(Arc<RecordingObserver>);
+
+impl FetcherContext for RecordingCtx {
+    fn observer_for(
+        &self,
+        _reference: RequestReference,
+        _req_id: RequestId,
+        _kind: ResourceKind,
+        _initiator: Initiator,
+    ) -> Arc<dyn NetObserver + Send + Sync> {
+        self.0.clone()
+    }
+    fn on_ref_active(&self, _: RequestReference) {}
+    fn on_ref_done(&self, _: RequestReference) {}
+}
+
+/// The `OPTIONS` round-trip is reported as a completed pair, so its cost is attributable
+/// rather than hiding in the gap before the response. A hop served from the grant cache
+/// sends no `OPTIONS` and so reports nothing at all.
+#[tokio::test]
+async fn preflight_reports_its_round_trip() {
+    let home = TestServer::new().start().await;
+    let away = TestServer::new()
+        .route(
+            "/data",
+            RouteConfig::cors(CorsRouteOptions {
+                allow_methods: Some("PUT".into()),
+                max_age: Some(600),
+                ..Default::default()
+            }),
+        )
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    for _ in 0..2 {
+        let req = FetchRequest::builder(Method::PUT, away.url("/data"))
+            .with_origin(home.base_url().origin())
+            .with_mode(RequestMode::Cors)
+            .with_credentials(RequestCredentials::Omit)
+            .with_body(RequestBody::text("payload"))
+            .build();
+        match fetcher.fetch(req).await {
+            FetchResult::Buffered { .. } => {}
+            other => panic!("expected Buffered, got {other:?}"),
+        }
+    }
+
+    let preflights = obs.cors_preflights();
+    assert_eq!(
+        preflights.len(),
+        1,
+        "the cached second request must report no preflight, got {preflights:?}"
+    );
+    assert_eq!(preflights[0].0, away.url("/data").to_string());
+    assert!(preflights[0].1, "the preflight got a response");
+    shutdown.cancel();
+}
+
+/// A rejected preflight still cost a round-trip, so it is reported as completed - the
+/// refusal is carried separately by `Blocked`.
+#[tokio::test]
+async fn rejected_preflight_still_reports_its_cost() {
+    let home = TestServer::new().start().await;
+    let away = TestServer::new()
+        .route("/data", RouteConfig::cors(CorsRouteOptions::default()))
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    let req = FetchRequest::builder(Method::DELETE, away.url("/data"))
+        .with_origin(home.base_url().origin())
+        .with_mode(RequestMode::Cors)
+        .with_credentials(RequestCredentials::Omit)
+        .build();
+    assert_eq!(
+        cors_block_reason(fetcher.fetch(req).await),
+        CorsError::PreflightMethodRejected
+    );
+
+    assert_eq!(
+        obs.cors_preflights(),
+        vec![(away.url("/data").to_string(), true)]
+    );
     shutdown.cancel();
 }
 

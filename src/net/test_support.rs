@@ -884,6 +884,29 @@ impl RecordingObserver {
             .collect()
     }
 
+    /// Every CORS preflight recorded, as `(url, completed)` in order - `completed` is
+    /// whether a matching [`NetEvent::CorsPreflightDone`] followed the announcement, so a
+    /// preflight that never got a response is visible as `false`.
+    pub fn cors_preflights(&self) -> Vec<(String, bool)> {
+        let events = self.events.lock().unwrap();
+        let mut out: Vec<(String, bool)> = Vec::new();
+        for e in events.iter() {
+            match e {
+                NetEvent::CorsPreflight { url } => out.push((url.to_string(), false)),
+                NetEvent::CorsPreflightDone { url, .. } => {
+                    // Pair with the most recent unfinished announcement of the same URL;
+                    // a redirect chain can preflight the same hop more than once.
+                    let u = url.to_string();
+                    if let Some(slot) = out.iter_mut().rev().find(|(h, done)| *h == u && !done) {
+                        slot.1 = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     /// Every [`NetEvent::Warning`] message recorded, in order.
     pub fn warnings(&self) -> Vec<String> {
         self.events

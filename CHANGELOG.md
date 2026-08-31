@@ -26,6 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     addresses.
   - `test-support`: `RecordingObserver::connects()` and `RecordingObserver::dns_lookups()`
   - native-only; on wasm32 the browser owns both resolution and connection setup
+- `NetEvent::CorsPreflightDone { url, elapsed }` closes the pair that `NetEvent::CorsPreflight`
+  opened. A preflight is a blocking extra round-trip whose cost was invisible before — it
+  looked like server think-time in the gap before the response. Emitted whenever the
+  `OPTIONS` got a response, including one that fails validation: the round-trip was paid for
+  either way, and the refusal is separately reported as `Blocked`. A preflight that never got
+  a response reports nothing here; the resulting `Failed` or `Cancelled` covers it, and a hop
+  served from the grant cache sends no `OPTIONS` and reports neither event.
+  `test-support` gains `RecordingObserver::cors_preflights()`.
 
 ### Changed
 

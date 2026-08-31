@@ -965,6 +965,7 @@ async fn get_with_redirects(
                             false,
                         );
                         observer.on_event(NetEvent::CorsPreflight { url: url.clone() });
+                        let pf_started = Instant::now();
                         let fut = client
                             .request(Method::OPTIONS, url.clone())
                             .headers(pf_headers)
@@ -977,6 +978,13 @@ async fn get_with_redirects(
                             }
                             r = &mut fut => r.map_err(|e| send_error(e, &url, "CORS preflight request failed", &observer))?
                         };
+                        // Reported before validation: a preflight the server answered cost
+                        // this round-trip whether or not the answer turns out to permit the
+                        // request. A rejection is separately reported as `Blocked`.
+                        observer.on_event(NetEvent::CorsPreflightDone {
+                            url: url.clone(),
+                            elapsed: pf_started.elapsed(),
+                        });
                         let allows = cors::validate_preflight_response(
                             pf_resp.status().as_u16(),
                             pf_resp.headers(),

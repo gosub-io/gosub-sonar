@@ -127,6 +127,26 @@ pub enum NetEvent {
         /// The hop being preflighted
         url: Url,
     },
+    /// A CORS preflight `OPTIONS` round-trip completed and a response came back. Paired
+    /// with the [`NetEvent::CorsPreflight`] that announced it.
+    ///
+    /// A preflight blocks the request that needs it, so this is real latency the embedder
+    /// would otherwise see as unexplained time before the response.
+    ///
+    /// Emitted for a response that arrived, whatever it said: if validation then rejects
+    /// it the request fails with [`BlockReason::Cors`](crate::net::types::BlockReason),
+    /// but the round-trip was still paid for. A preflight that never got a response - the
+    /// send failed, or the fetch was cancelled - reports nothing here and is covered by
+    /// the resulting [`NetEvent::Failed`] or [`NetEvent::Cancelled`].
+    ///
+    /// A hop covered by a cached grant emits neither this nor
+    /// [`NetEvent::CorsPreflight`]: no `OPTIONS` was sent.
+    CorsPreflightDone {
+        /// The hop that was preflighted
+        url: Url,
+        /// How long the `OPTIONS` round-trip took
+        elapsed: Duration,
+    },
     /// Resource fetching was cancelled
     Cancelled {
         /// URL whose fetch was cancelled
