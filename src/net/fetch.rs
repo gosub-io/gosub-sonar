@@ -356,6 +356,37 @@ pub async fn fetch_response_top(
     observer: Arc<dyn NetObserver + Send + Sync>,
     policy: NetPolicy,
 ) -> Result<ResponseTop, NetError> {
+    let result =
+        fetch_response_top_inner(client, url.clone(), init, cancel, observer.clone(), policy).await;
+
+    // One terminal event per failed request, whatever went wrong and wherever it went
+    // wrong. The events that name a specific cause - `Blocked`, `TlsFailed` - are emitted
+    // on the way here and stay; without this an observer would see `Started` and then
+    // silence, unable to tell a dead request from a slow one.
+    //
+    // Cancellation is not a failure and already reported itself as `Cancelled`.
+    if let Err(ref e) = result {
+        if !matches!(e, NetError::Cancelled(_)) {
+            observer.on_event(NetEvent::Failed {
+                url,
+                error: anyhow::Error::new(e.clone()),
+            });
+        }
+    }
+
+    result
+}
+
+/// The body of [`fetch_response_top`], split out so every error exit funnels through the
+/// one place that reports the failure.
+async fn fetch_response_top_inner(
+    client: Arc<reqwest::Client>,
+    url: Url,
+    init: RequestInit,
+    cancel: CancellationToken,
+    observer: Arc<dyn NetObserver + Send + Sync>,
+    policy: NetPolicy,
+) -> Result<ResponseTop, NetError> {
     let started = Instant::now();
     observer.on_event(NetEvent::Started { url: url.clone() });
 
@@ -440,12 +471,10 @@ pub async fn fetch_response_top(
                 }
             }
             Some(Err(e)) => {
-                // Something failed
-                observer.on_event(NetEvent::Failed {
-                    url: url.clone(),
-                    error: e.into(),
-                });
-                return Err(NetError::Read(Arc::new(anyhow!("peek read failed"))));
+                // Reported by the caller, along with every other failure path. The error
+                // is returned as it came rather than flattened into a generic one, so what
+                // reaches the observer still names the cause.
+                return Err(e);
             }
             None => {
                 // Stream ended successfully
@@ -533,6 +562,8 @@ struct ProgressReader<R> {
     cancel_emitted: bool,
     /// Whether we already emitted a finished event (guards against duplicate EOF polls)
     finished_emitted: bool,
+    /// Whether we already emitted a failed event (a reader may be polled again after an error)
+    failed_emitted: bool,
 }
 
 impl<R: AsyncRead + Unpin> ProgressReader<R> {
@@ -555,6 +586,7 @@ impl<R: AsyncRead + Unpin> ProgressReader<R> {
             received: already_received,
             cancel_emitted: false,
             finished_emitted: false,
+            failed_emitted: false,
         }
     }
 }
@@ -603,6 +635,19 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
                     received_bytes: self.received,
                     elapsed: self.started.elapsed(),
                     expected_length: self.expected_length,
+                });
+            }
+        }
+
+        // A body that dies mid-stream is past the point where `fetch_response_top` can
+        // report it - the caller already has this reader - so the terminal event is emitted
+        // here instead. Errors are reported once: a reader may be polled again afterwards.
+        if let std::task::Poll::Ready(Err(e)) = &poll {
+            if !self.failed_emitted && !self.cancel.is_cancelled() {
+                self.failed_emitted = true;
+                self.observer.on_event(NetEvent::Failed {
+                    url: self.url.clone(),
+                    error: anyhow!("body read failed: {e}"),
                 });
             }
         }

@@ -41,7 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `NetEvent::ResponseHeaders` was declared but never emitted by anything, so there was no
   time-to-first-byte signal. It is now emitted per hop, which also accounts for each hop of
-  a redirect chain. `test-support` gains `RecordingObserver::response_headers()`.
+  a redirect chain.
+- `NetEvent::Failed` was only emitted for a body-read error while filling the peek buffer.
+  Every other failure — a refused connection, a rejected policy check, a TLS handshake
+  failure, a body that died mid-stream — returned an error and reported nothing, leaving an
+  observer to see `Started` and then silence with no way to tell a dead request from a slow
+  one. It is now the terminal event for any failed request: the events naming a specific
+  cause (`Blocked`, `TlsFailed`) still come first and carry the detail. Cancellation is not
+  a failure and still reports only `Cancelled`, so every request now ends in exactly one of
+  `Finished`, `Failed`, or `Cancelled`.
+  `test-support` gains `RecordingObserver::response_headers()` and
+  `RecordingObserver::failures()`.
 
 ### Changed
 

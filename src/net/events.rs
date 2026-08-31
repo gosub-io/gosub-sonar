@@ -106,7 +106,18 @@ pub enum NetEvent {
         /// URL that finished loading
         url: Url,
     },
-    /// Resource failed to fetch
+    /// The request failed. Emitted once for any request that ends in an error, whatever
+    /// went wrong and wherever it went wrong - a refused connection, a rejected policy
+    /// check, a body that died mid-stream.
+    ///
+    /// The events that name a specific cause - [`NetEvent::Blocked`],
+    /// [`NetEvent::TlsFailed`] - are emitted first and carry the detail; this one is the
+    /// terminal event, so an observer can tell a dead request from a slow one without
+    /// matching every cause it might have.
+    ///
+    /// A cancelled request is not a failure: it reports [`NetEvent::Cancelled`] and
+    /// nothing else. Every request therefore ends in exactly one of [`NetEvent::Finished`],
+    /// `Failed`, or [`NetEvent::Cancelled`].
     Failed {
         /// URL that failed to load
         url: Url,
@@ -114,14 +125,16 @@ pub enum NetEvent {
         error: anyhow::Error,
     },
     /// TLS handshake failed for this hop. The request fails with the same error as
-    /// [`NetError::Tls`](crate::net::types::NetError::Tls).
+    /// [`NetError::Tls`](crate::net::types::NetError::Tls), and [`NetEvent::Failed`]
+    /// follows as the terminal event.
     TlsFailed {
         /// URL of the hop
         url: Url,
         /// The error
         error: TlsError,
     },
-    /// A request hop was refused by policy and never sent
+    /// A request hop was refused by policy and never sent. [`NetEvent::Failed`] follows as
+    /// the terminal event.
     Blocked {
         /// The refused hop (see [`NetError::Blocked`](crate::net::types::NetError::Blocked))
         url: Url,

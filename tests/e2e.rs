@@ -438,6 +438,62 @@ async fn response_headers_are_reported_per_hop() {
     shutdown.cancel();
 }
 
+/// A request refused by policy reports the reason *and* a terminal `Failed`, so an observer
+/// can tell a dead request from a slow one without matching every possible cause.
+#[tokio::test]
+async fn a_refused_request_reports_a_terminal_failure() {
+    let home = TestServer::new().start().await;
+    let away = TestServer::new()
+        .route("/data", RouteConfig::ok(b"nope"))
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    // cors mode against a route that sends no Access-Control-Allow-Origin.
+    let req = FetchRequest::builder(Method::GET, away.url("/data"))
+        .with_origin(home.base_url().origin())
+        .with_mode(RequestMode::Cors)
+        .with_credentials(RequestCredentials::Omit)
+        .build();
+    assert!(fetcher.fetch(req).await.is_error());
+
+    assert!(
+        obs.blocked_reason().is_some(),
+        "the cause is still reported"
+    );
+    assert_eq!(
+        obs.failures().len(),
+        1,
+        "exactly one terminal failure, got {:?}",
+        obs.failures()
+    );
+    shutdown.cancel();
+}
+
+/// A cancelled request is not a failure: it reports `Cancelled` and nothing else.
+#[tokio::test]
+async fn a_cancelled_request_is_not_reported_as_failed() {
+    let srv = TestServer::new()
+        .route("/slow", RouteConfig::ok(b"never read"))
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let req = FetchRequest::builder(Method::GET, srv.url("/slow")).build();
+    assert!(fetcher.fetch_with_cancel(req, cancel).await.is_error());
+
+    assert!(
+        obs.failures().is_empty(),
+        "cancellation must not report a failure, got {:?}",
+        obs.failures()
+    );
+    shutdown.cancel();
+}
+
 /// The `OPTIONS` round-trip is reported as a completed pair, so its cost is attributable
 /// rather than hiding in the gap before the response. A hop served from the grant cache
 /// sends no `OPTIONS` and so reports nothing at all.

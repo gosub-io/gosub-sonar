@@ -921,6 +921,19 @@ impl RecordingObserver {
             .collect()
     }
 
+    /// Every [`NetEvent::Failed`] recorded, as its error rendered to a string.
+    pub fn failures(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Failed { error, .. } => Some(error.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every [`NetEvent::Warning`] message recorded, in order.
     pub fn warnings(&self) -> Vec<String> {
         self.events

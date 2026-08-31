@@ -511,6 +511,12 @@ Two traits decouple the net stack from the host's event system:
 `NetEvent` is `#[non_exhaustive]`: a `match` over it needs a catch-all arm, and new events can
 be added without a breaking release.
 
+**Terminal events.** Every request ends in exactly one of `Finished`, `Failed`, or `Cancelled`.
+`Failed` is emitted for any failure wherever it happened; the events that name a specific cause
+— `Blocked`, `TlsFailed` — are emitted first and carry the detail, so an observer can treat
+`Failed` as "this request is over" without matching every cause it might have. A cancelled
+request is not a failure and reports only `Cancelled`.
+
 **Timing events.** `DnsResolved`, `Connected`, and the `CorsPreflight`/`CorsPreflightDone` pair
 each carry an `elapsed`, so the embedder can break the time before the first byte into
 resolution, connection setup, and preflight instead of seeing one opaque gap.
