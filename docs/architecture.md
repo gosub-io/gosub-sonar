@@ -503,7 +503,25 @@ Two traits decouple the net stack from the host's event system:
 
 `NetObserver::on_event(&self, ev: NetEvent)` receives lifecycle events. `NetEvent` variants:
 `Started`, `Redirected`, `ResponseHeaders`, `Progress`, `Finished`, `Failed`, `Cancelled`,
+`Blocked`, `TlsFailed`, `CorsPreflight`, `DnsResolved`, `Connected`,
 `Warning`, `Io`. `NullEmitter` is a no-op implementation for callers that don't care.
+
+**Timing events.** `DnsResolved` and `Connected` each carry an `elapsed`, so the embedder can
+break the time before the first byte into resolution and connection setup instead of seeing one
+opaque gap. They report only work that actually happened: a request served from the connection
+pool emits neither — the absence is the answer, rather than a zero that would read as
+"instant". `DnsResolved` further requires a `FetcherConfig::dns_resolver`, because reqwest's
+built-in resolution sits below this crate and cannot be timed; `dns::SystemResolver` is the
+policy-free resolver for embedders that only want the timing. Both are native-only: on wasm32
+the browser owns resolution and connection setup alike.
+
+`Connected` is produced by a tower `connector_layer` (`net::connect_timing`) wrapped around
+reqwest's connector, and `DnsResolved` from inside the resolver. Both sit below the request
+layer, where the request's observer is not in scope, so `net::observer::CURRENT_OBSERVER` — a
+`tokio::task_local` bound for the duration of the HTTP exchange — carries the right observer
+down. Task-local rather than thread-local because a fetch may resume on a different worker
+thread between polls. `Connected` carries no host: reqwest's connector request type is opaque,
+and the observer receiving it is the attribution that matters.
 
 ### FetcherContext
 
