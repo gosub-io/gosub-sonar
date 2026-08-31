@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Connection timing is reported to the request's observer, so an embedder can attribute
+  the time before the first byte instead of guessing at it:
+  - `NetEvent::DnsResolved { host, elapsed, addr_count }` times a hostname lookup. It
+    requires a `FetcherConfig::dns_resolver` to be set — reqwest's built-in resolution
+    happens below this crate's level and cannot be timed.
+  - `NetEvent::Connected { elapsed }` times connection establishment: the TCP handshake
+    plus, for https, the TLS handshake on top of it. Always reported; it carries no host
+    because reqwest's connector request type is opaque.
+  - Both are emitted only when a connection was actually opened. A request served from the
+    connection pool reports neither, which is the honest answer rather than a zero.
+  - `dns::SystemResolver` is a `DnsResolver` that goes through the system resolver and
+    refuses nothing — behaviourally what reqwest already does, for embedders who want the
+    timing without a resolution policy of their own. It applies no SSRF or DNS-rebinding
+    protection; anything facing untrusted URLs still wants a resolver that classifies
+    addresses.
+  - `test-support`: `RecordingObserver::connects()` and `RecordingObserver::dns_lookups()`
+  - native-only; on wasm32 the browser owns both resolution and connection setup
+
+  `NetEvent` is not `#[non_exhaustive]`, so an exhaustive `match` over it needs arms for
+  the two new variants.
+
 ## [0.4.0] - 2026-08-29
 
 ### Changed
