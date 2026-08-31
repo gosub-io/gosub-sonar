@@ -521,7 +521,7 @@ request is not a failure and reports only `Cancelled`.
 each carry an `elapsed`, so the embedder can break the time before the first byte into
 resolution, connection setup, and preflight instead of seeing one opaque gap.
 `ResponseHeaders` marks time-to-first-byte and `Finished` carries the total, so the whole
-waterfall is reconstructable.
+waterfall is reconstructable; `examples/timings.rs` prints exactly that.
 
 They **nest rather than tile**: resolution happens inside reqwest's connector and the connect
 timing wraps that connector, so `Connected` encloses `DnsResolved`, and the durations

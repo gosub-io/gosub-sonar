@@ -36,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a response reports nothing here; the resulting `Failed` or `Cancelled` covers it, and a hop
   served from the grant cache sends no `OPTIONS` and reports neither event.
   `test-support` gains `RecordingObserver::cors_preflights()`.
+- `examples/timings.rs` fetches URLs and prints where the time went as a waterfall
+  (`cargo run --example timings -- <url>...`). Pass the same URL twice to see the second
+  request served from the connection pool, reporting no dns and no connect at all.
 
 ### Fixed
 
