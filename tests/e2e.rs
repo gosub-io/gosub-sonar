@@ -410,6 +410,34 @@ impl FetcherContext for RecordingCtx {
     fn on_ref_done(&self, _: RequestReference) {}
 }
 
+/// Every hop reports its response headers, so a redirect chain accounts for each round-trip
+/// it waited on rather than only the one that produced the body.
+#[tokio::test]
+async fn response_headers_are_reported_per_hop() {
+    let srv = TestServer::new()
+        .route("/start", RouteConfig::RedirectTo("/end".into()))
+        .route("/end", RouteConfig::ok(b"arrived"))
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/start")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { body, .. } => assert_eq!(&body[..], b"arrived"),
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+
+    assert_eq!(
+        obs.response_headers(),
+        vec![
+            (srv.url("/start").to_string(), 302),
+            (srv.url("/end").to_string(), 200),
+        ]
+    );
+    shutdown.cancel();
+}
+
 /// The `OPTIONS` round-trip is reported as a completed pair, so its cost is attributable
 /// rather than hiding in the gap before the response. A hop served from the grant cache
 /// sends no `OPTIONS` and so reports nothing at all.

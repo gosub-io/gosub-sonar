@@ -907,6 +907,20 @@ impl RecordingObserver {
         out
     }
 
+    /// Every [`NetEvent::ResponseHeaders`] recorded, as `(url, status)` in order - one per
+    /// hop, so a redirect chain lists every hop it waited on.
+    pub fn response_headers(&self) -> Vec<(String, u16)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::ResponseHeaders { url, status, .. } => Some((url.to_string(), *status)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every [`NetEvent::Warning`] message recorded, in order.
     pub fn warnings(&self) -> Vec<String> {
         self.events

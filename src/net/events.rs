@@ -75,7 +75,11 @@ pub enum NetEvent {
         /// HTTP status code of the redirect response (e.g. 301, 302)
         status: u16,
     },
-    /// Response headers were received
+    /// Response headers were received for a hop.
+    ///
+    /// Emitted per hop, like the other per-connection events: the first one marks
+    /// time-to-first-byte, and a redirect chain reports one for every hop it waited on
+    /// (each paired with the [`NetEvent::Redirected`] that followed it).
     ResponseHeaders {
         /// URL the response was received from
         url: Url,

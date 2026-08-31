@@ -1057,6 +1057,14 @@ async fn get_with_redirects(
         #[cfg(not(target_arch = "wasm32"))]
         (policy.on_protocol)(resp.url(), resp.version());
 
+        // Per hop, like the other events in this loop: the first one marks time-to-first-byte
+        // for the request, and a redirect chain reports each hop it waited on.
+        observer.on_event(NetEvent::ResponseHeaders {
+            url: resp.url().clone(),
+            status: resp.status().as_u16(),
+            headers: resp.headers().clone(),
+        });
+
         // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
         // a site first arms it, and that response is consumed below.
         #[cfg(not(target_arch = "wasm32"))]

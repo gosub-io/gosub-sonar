@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   served from the grant cache sends no `OPTIONS` and reports neither event.
   `test-support` gains `RecordingObserver::cors_preflights()`.
 
+### Fixed
+
+- `NetEvent::ResponseHeaders` was declared but never emitted by anything, so there was no
+  time-to-first-byte signal. It is now emitted per hop, which also accounts for each hop of
+  a redirect chain. `test-support` gains `RecordingObserver::response_headers()`.
+
 ### Changed
 
 - **Breaking:** `NetEvent` is now `#[non_exhaustive]`. A `match` over it needs a catch-all
