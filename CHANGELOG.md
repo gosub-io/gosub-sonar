@@ -14,9 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `NetEvent::DnsResolved { host, elapsed, addr_count }` times a hostname lookup. It
     requires a `FetcherConfig::dns_resolver` to be set — reqwest's built-in resolution
     happens below this crate's level and cannot be timed.
-  - `NetEvent::Connected { elapsed }` times connection establishment: the TCP handshake
-    plus, for https, the TLS handshake on top of it. Always reported; it carries no host
-    because reqwest's connector request type is opaque.
+  - `NetEvent::Connected { elapsed }` times connection establishment. Note that it *encloses*
+    the resolution above: name resolution happens inside reqwest's connector, and the timing
+    wraps that connector, so `Connected` covers dns + TCP + (for https) TLS. The phases nest
+    rather than tile, and their durations deliberately do not add up to the elapsed total.
+    Always reported; it carries no host because reqwest's connector request type is opaque.
   - Both are emitted only when a connection was actually opened. A request served from the
     connection pool reports neither, which is the honest answer rather than a zero.
   - `dns::SystemResolver` is a `DnsResolver` that goes through the system resolver and

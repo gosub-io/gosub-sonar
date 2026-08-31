@@ -1,7 +1,8 @@
 //! Tower layer that reports how long connection establishment took.
 //!
-//! Connecting - the TCP handshake, and for https the TLS handshake on top of it - happens
-//! inside reqwest's connector, below the request layer. `ClientBuilder::connector_layer`
+//! Connecting - name resolution, the TCP handshake, and for https the TLS handshake on top
+//! of it - happens inside reqwest's connector, below the request layer. Resolution being
+//! inside means this span encloses the one `net::dns` reports, rather than following it. `ClientBuilder::connector_layer`
 //! is the one seam that wraps it, so this times the connector's own future and reports the
 //! result to the request that triggered it via the task-local observer.
 //!

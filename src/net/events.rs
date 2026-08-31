@@ -43,8 +43,12 @@ pub enum NetEvent {
         /// Number of addresses returned
         addr_count: usize,
     },
-    /// A new connection was established: TCP handshake plus, for https, the TLS
-    /// handshake.
+    /// A new connection was established.
+    ///
+    /// This *encloses* [`NetEvent::DnsResolved`] rather than following it: resolution
+    /// happens inside reqwest's connector and this times the connector, so the span covers
+    /// name resolution, the TCP handshake, and for https the TLS handshake on top. The
+    /// timing phases nest rather than tile; their durations do not add up to elapsed time.
     ///
     /// Like [`NetEvent::DnsResolved`], only emitted when a connection actually had to be
     /// opened. A request served from the pool reports nothing, because it spent no time

@@ -513,13 +513,18 @@ be added without a breaking release.
 
 **Timing events.** `DnsResolved`, `Connected`, and the `CorsPreflight`/`CorsPreflightDone` pair
 each carry an `elapsed`, so the embedder can break the time before the first byte into
-resolution, connection setup, and preflight instead of seeing one opaque gap. They report only
-work that actually happened: a request served from the connection pool emits no `DnsResolved`
-and no `Connected`, and a hop covered by a cached CORS grant emits no preflight events — the
-absence is the answer, rather than a zero that would read as "instant". `DnsResolved` further
-requires a `FetcherConfig::dns_resolver`, because reqwest's built-in resolution sits below this
-crate and cannot be timed; `dns::SystemResolver` is the policy-free resolver for embedders that
-only want the timing. All three are native-only: on wasm32 the browser owns resolution,
+resolution, connection setup, and preflight instead of seeing one opaque gap.
+
+They **nest rather than tile**: resolution happens inside reqwest's connector and the connect
+timing wraps that connector, so `Connected` encloses `DnsResolved`, and the durations
+deliberately do not add up to the elapsed total.
+
+They also report only work that actually happened: a request served from the connection pool
+emits no `DnsResolved` and no `Connected`, and a hop covered by a cached CORS grant emits no
+preflight events — the absence is the answer, rather than a zero that would read as "instant".
+`DnsResolved` further requires a `FetcherConfig::dns_resolver`, because reqwest's built-in
+resolution sits below this crate and cannot be timed; `dns::SystemResolver` is the policy-free
+resolver for embedders that only want the timing. All three are native-only: on wasm32 the browser owns resolution,
 connection setup, and preflighting alike.
 
 `Connected` is produced by a tower `connector_layer` (`net::connect_timing`) wrapped around
