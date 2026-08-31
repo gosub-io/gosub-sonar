@@ -27,6 +27,10 @@ tokio::task_local! {
 ///
 /// Silently drops the event outside a request (a connection warmed by something other
 /// than a fetch, say) - there is nobody to report it to.
+///
+/// Native-only: every producer of these below-the-request events - DNS resolution and the
+/// connect-timing layer - is itself native-only.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn emit_to_current(ev: NetEvent) {
     let _ = CURRENT_OBSERVER.try_with(|o| o.on_event(ev));
 }
