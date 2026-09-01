@@ -65,6 +65,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `test-support`: `RouteConfig::RequireAuth` demands a credentials header before answering,
     and `RecordingObserver::auth_required` collects the events
   - `examples/auth.rs` shows answering, declining, and falling through to a second challenge
+- Connection timing is reported to the request's observer, so an embedder can attribute
+  the time before the first byte instead of guessing at it:
+  - `NetEvent::DnsResolved { host, elapsed, addr_count }` times a hostname lookup. It
+    requires a `FetcherConfig::dns_resolver` to be set — reqwest's built-in resolution
+    happens below this crate's level and cannot be timed.
+  - `NetEvent::Connected { elapsed }` times connection establishment. Note that it *encloses*
+    the resolution above: name resolution happens inside reqwest's connector, and the timing
+    wraps that connector, so `Connected` covers dns + TCP + (for https) TLS. The phases nest
+    rather than tile, and their durations deliberately do not add up to the elapsed total.
+    Always reported; it carries no host because reqwest's connector request type is opaque.
+  - Both are emitted only when a connection was actually opened. A request served from the
+    connection pool reports neither, which is the honest answer rather than a zero.
+  - `dns::SystemResolver` is a `DnsResolver` that goes through the system resolver and
+    refuses nothing — behaviourally what reqwest already does, for embedders who want the
+    timing without a resolution policy of their own. It applies no SSRF or DNS-rebinding
+    protection; anything facing untrusted URLs still wants a resolver that classifies
+    addresses.
+  - `test-support`: `RecordingObserver::connects()` and `RecordingObserver::dns_lookups()`
+  - native-only; on wasm32 the browser owns both resolution and connection setup
+- `NetEvent::CorsPreflightDone { url, elapsed }` closes the pair that `NetEvent::CorsPreflight`
+  opened. A preflight is a blocking extra round-trip whose cost was invisible before — it
+  looked like server think-time in the gap before the response. Emitted whenever the
+  `OPTIONS` got a response, including one that fails validation: the round-trip was paid for
+  either way, and the refusal is separately reported as `Blocked`. A preflight that never got
+  a response reports nothing here; the resulting `Failed` or `Cancelled` covers it, and a hop
+  served from the grant cache sends no `OPTIONS` and reports neither event.
+  `test-support` gains `RecordingObserver::cors_preflights()`.
+- `examples/timings.rs` fetches URLs and prints where the time went as a waterfall
+  (`cargo run --example timings -- <url>...`). Pass the same URL twice to see the second
+  request served from the connection pool, reporting no dns and no connect at all.
+
+### Fixed
+
+- `NetEvent::ResponseHeaders` was declared but never emitted by anything, so there was no
+  time-to-first-byte signal. It is now emitted per hop, which also accounts for each hop of
+  a redirect chain.
+- `NetEvent::Failed` was only emitted for a body-read error while filling the peek buffer.
+  Every other failure — a refused connection, a rejected policy check, a TLS handshake
+  failure, a body that died mid-stream — returned an error and reported nothing, leaving an
+  observer to see `Started` and then silence with no way to tell a dead request from a slow
+  one. It is now the terminal event for any failed request: the events naming a specific
+  cause (`Blocked`, `TlsFailed`) still come first and carry the detail. Cancellation is not
+  a failure and still reports only `Cancelled`, so every request now ends in exactly one of
+  `Finished`, `Failed`, or `Cancelled`.
+  `test-support` gains `RecordingObserver::response_headers()` and
+  `RecordingObserver::failures()`.
+
+### Changed
+
+- **Breaking:** `NetEvent` is now `#[non_exhaustive]`. A `match` over it needs a catch-all
+  arm — but from here on, a new event is no longer a breaking change. Done in the same
+  release as three new variants, when it costs one adjustment rather than two.
 
 ## [0.4.0] - 2026-08-29
 

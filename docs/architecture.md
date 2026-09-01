@@ -379,8 +379,10 @@ on every one of them. The embedder owns the *policy* through request fields:
   embedder's job.
 
 Failures surface as `NetError::Blocked { reason: BlockReason::Cors(CorsError), .. }` with a
-typed `CorsError` naming the violated rule, and a `NetEvent::CorsPreflight` event announces each
-preflight for devtools-style observability.
+typed `CorsError` naming the violated rule, and a `NetEvent::CorsPreflight` /
+`NetEvent::CorsPreflightDone` pair brackets each preflight for devtools-style observability —
+the second carries how long the `OPTIONS` round-trip took, and is emitted for any response that
+came back, including one that then fails validation.
 
 Enforcement is native-only: on wasm32 the browser's `fetch()` enforces CORS itself and hides the
 `Access-Control-*` response headers the checks would need.
@@ -588,8 +590,44 @@ Two traits decouple the net stack from the host's event system:
 
 `NetObserver::on_event(&self, ev: NetEvent)` receives lifecycle events. `NetEvent` variants:
 `Started`, `Redirected`, `ResponseHeaders`, `Progress`, `Finished`, `Failed`, `Cancelled`,
-`Warning`, `Io`, `Blocked`, `TlsFailed`, `CorsPreflight`, `AuthRequired`, `Cache`. `NullEmitter`
-is a no-op implementation for callers that don't care.
+`Blocked`, `TlsFailed`, `CorsPreflight`, `CorsPreflightDone`, `AuthRequired`, `Cache`,
+`DnsResolved`, `Connected`, `Warning`, `Io`. `NullEmitter` is a no-op implementation for callers
+that don't care.
+
+`NetEvent` is `#[non_exhaustive]`: a `match` over it needs a catch-all arm, and new events can
+be added without a breaking release.
+
+**Terminal events.** Every request ends in exactly one of `Finished`, `Failed`, or `Cancelled`.
+`Failed` is emitted for any failure wherever it happened; the events that name a specific cause
+— `Blocked`, `TlsFailed` — are emitted first and carry the detail, so an observer can treat
+`Failed` as "this request is over" without matching every cause it might have. A cancelled
+request is not a failure and reports only `Cancelled`.
+
+**Timing events.** `DnsResolved`, `Connected`, and the `CorsPreflight`/`CorsPreflightDone` pair
+each carry an `elapsed`, so the embedder can break the time before the first byte into
+resolution, connection setup, and preflight instead of seeing one opaque gap.
+`ResponseHeaders` marks time-to-first-byte and `Finished` carries the total, so the whole
+waterfall is reconstructable; `examples/timings.rs` prints exactly that.
+
+They **nest rather than tile**: resolution happens inside reqwest's connector and the connect
+timing wraps that connector, so `Connected` encloses `DnsResolved`, and the durations
+deliberately do not add up to the elapsed total.
+
+They also report only work that actually happened: a request served from the connection pool
+emits no `DnsResolved` and no `Connected`, and a hop covered by a cached CORS grant emits no
+preflight events — the absence is the answer, rather than a zero that would read as "instant".
+`DnsResolved` further requires a `FetcherConfig::dns_resolver`, because reqwest's built-in
+resolution sits below this crate and cannot be timed; `dns::SystemResolver` is the policy-free
+resolver for embedders that only want the timing. All three are native-only: on wasm32 the browser owns resolution,
+connection setup, and preflighting alike.
+
+`Connected` is produced by a tower `connector_layer` (`net::connect_timing`) wrapped around
+reqwest's connector, and `DnsResolved` from inside the resolver. Both sit below the request
+layer, where the request's observer is not in scope, so `net::observer::CURRENT_OBSERVER` — a
+`tokio::task_local` bound for the duration of the HTTP exchange — carries the right observer
+down. Task-local rather than thread-local because a fetch may resume on a different worker
+thread between polls. `Connected` carries no host: reqwest's connector request type is opaque,
+and the observer receiving it is the attribution that matters.
 
 ### FetcherContext
 

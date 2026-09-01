@@ -58,6 +58,15 @@ impl NetObserver for Logger {
             NetEvent::Cancelled { reason, .. } => println!("[{t}] cancelled {reason}"),
             NetEvent::TlsFailed { error, .. } => println!("[{t}] tls       {error}"),
             NetEvent::CorsPreflight { url } => println!("[{t}] preflight {url}"),
+            NetEvent::CorsPreflightDone { elapsed, .. } => {
+                println!("[{t}] preflight done in {elapsed:?}")
+            }
+            NetEvent::DnsResolved {
+                host,
+                elapsed,
+                addr_count,
+            } => println!("[{t}] dns       {host} -> {addr_count} addr(s) in {elapsed:?}"),
+            NetEvent::Connected { elapsed } => println!("[{t}] connect   {elapsed:?}"),
             NetEvent::Cache { url, outcome } => println!("[{t}] cache     {outcome} {url}"),
             NetEvent::AuthRequired {
                 challenges,
@@ -69,6 +78,8 @@ impl NetObserver for Logger {
             ),
             NetEvent::Warning { message, .. } => println!("[{t}] warning   {message}"),
             NetEvent::Io { message } => println!("[{t}] io        {message}"),
+            // `NetEvent` is non-exhaustive; a new event should not break this example.
+            _ => {}
         }
     }
 }
