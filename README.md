@@ -33,7 +33,10 @@ The library has no dependency on any browser engine and can be used standalone.
 - HTTP caching (RFC 9111) per redirect hop: freshness, revalidation with `ETag`/`Last-Modified`,
   `Vary`, invalidation, and a per-request cache mode.
 - `NetEvent`s per request (started, redirected, headers, progress, blocked, preflight, TLS
-  failure, auth challenge, finished) via `NetObserver`; typed `NetError` / `BlockReason`.
+  failure, auth challenge, cache, finished) via `NetObserver`; typed `NetError` / `BlockReason`.
+- Timing: `DnsResolved`, `Connected` and the CORS preflight pair each carry an `elapsed`, and
+  `ResponseHeaders` marks time-to-first-byte, so the wait before the body breaks down into
+  resolution, connection setup, preflight and server time.
 - Compiles for `wasm32-unknown-unknown` on top of the browser's `fetch()`. HSTS, DNS, proxies,
   TLS, the blocking helpers and `file://` are native only.
 
@@ -49,7 +52,7 @@ Add to your `Cargo.toml` (the scheduler API also uses these companion crates dir
 
 ```toml
 [dependencies]
-gosub-sonar = "0.4"
+gosub-sonar = "0.5"
 http = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
 tokio-util = "0.7"
@@ -366,6 +369,7 @@ Minimum supported Rust version: 1.88.
 cargo run --example simple_fetch -- https://example.org
 cargo run --example fetcher -- https://example.org
 cargo run --example tls_override -- https://self-signed.badssl.com/
+cargo run --example timings -- https://example.org
 cargo run --example fetcher_context --features test-support
 cargo run --example streaming --features test-support
 cargo run --example document_fetch --features test-support
@@ -377,6 +381,7 @@ cargo run --example fetcher_harness --features test-support
 - `simple_fetch` — one-shot GET
 - `fetcher` — minimal `Fetcher` setup with a no-op context
 - `tls_override` — certificate errors and "proceed anyway" (needs network)
+- `timings` — where a fetch's time went, as a waterfall (needs network)
 - `fetcher_context` — a `FetcherContext` with an event log, a cookie jar and a URL blocklist
 - `streaming` — a streamed body, and two subscribers sharing one fetch
 - `document_fetch` — requests as a page makes them: `Referer`, `Sec-Fetch-*`, `Origin`, CORS with
