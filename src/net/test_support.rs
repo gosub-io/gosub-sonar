@@ -1066,6 +1066,84 @@ impl RecordingObserver {
         })
     }
 
+    /// Every [`NetEvent::Connected`] duration recorded, in order.
+    pub fn connects(&self) -> Vec<std::time::Duration> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Connected { elapsed } => Some(*elapsed),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every [`NetEvent::DnsResolved`] recorded, as `(host, addr_count)`.
+    pub fn dns_lookups(&self) -> Vec<(String, usize)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::DnsResolved {
+                    host, addr_count, ..
+                } => Some((host.clone(), *addr_count)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every CORS preflight recorded, as `(url, completed)` in order - `completed` is
+    /// whether a matching [`NetEvent::CorsPreflightDone`] followed the announcement, so a
+    /// preflight that never got a response is visible as `false`.
+    pub fn cors_preflights(&self) -> Vec<(String, bool)> {
+        let events = self.events.lock().unwrap();
+        let mut out: Vec<(String, bool)> = Vec::new();
+        for e in events.iter() {
+            match e {
+                NetEvent::CorsPreflight { url } => out.push((url.to_string(), false)),
+                NetEvent::CorsPreflightDone { url, .. } => {
+                    // Pair with the most recent unfinished announcement of the same URL;
+                    // a redirect chain can preflight the same hop more than once.
+                    let u = url.to_string();
+                    if let Some(slot) = out.iter_mut().rev().find(|(h, done)| *h == u && !done) {
+                        slot.1 = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Every [`NetEvent::ResponseHeaders`] recorded, as `(url, status)` in order - one per
+    /// hop, so a redirect chain lists every hop it waited on.
+    pub fn response_headers(&self) -> Vec<(String, u16)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::ResponseHeaders { url, status, .. } => Some((url.to_string(), *status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every [`NetEvent::Failed`] recorded, as its error rendered to a string.
+    pub fn failures(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Failed { error, .. } => Some(error.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every [`NetEvent::Warning`] message recorded, in order.
     pub fn warnings(&self) -> Vec<String> {
         self.events

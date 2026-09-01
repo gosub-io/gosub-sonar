@@ -3,7 +3,8 @@
 //! `test-support` mock server. Requires `--features test-support`.
 
 use gosub_sonar::net::test_support::{
-    CacheRouteOptions, CorsRouteOptions, RouteConfig, TestServer, TestServerHandle,
+    CacheRouteOptions, CorsRouteOptions, RecordingObserver, RouteConfig, TestServer,
+    TestServerHandle,
 };
 use gosub_sonar::{
     simple_get, AuthChallenge, AuthScheme, AuthTarget, BlockReason, CacheMode, CorsError,
@@ -391,6 +392,181 @@ async fn preflight_runs_once_then_is_cached() {
         "second request must be served from the preflight cache"
     );
     assert_eq!(away.hit_count("/data"), 2);
+    shutdown.cancel();
+}
+
+/// Hands the same recording observer to every request, so a test can assert on the events
+/// the fetch stack emitted.
+struct RecordingCtx(Arc<RecordingObserver>);
+
+impl FetcherContext for RecordingCtx {
+    fn observer_for(
+        &self,
+        _reference: RequestReference,
+        _req_id: RequestId,
+        _kind: ResourceKind,
+        _initiator: Initiator,
+    ) -> Arc<dyn NetObserver + Send + Sync> {
+        self.0.clone()
+    }
+    fn on_ref_active(&self, _: RequestReference) {}
+    fn on_ref_done(&self, _: RequestReference) {}
+}
+
+/// Every hop reports its response headers, so a redirect chain accounts for each round-trip
+/// it waited on rather than only the one that produced the body.
+#[tokio::test]
+async fn response_headers_are_reported_per_hop() {
+    let srv = TestServer::new()
+        .route("/start", RouteConfig::RedirectTo("/end".into()))
+        .route("/end", RouteConfig::ok(b"arrived"))
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/start")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { body, .. } => assert_eq!(&body[..], b"arrived"),
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+
+    assert_eq!(
+        obs.response_headers(),
+        vec![
+            (srv.url("/start").to_string(), 302),
+            (srv.url("/end").to_string(), 200),
+        ]
+    );
+    shutdown.cancel();
+}
+
+/// A request refused by policy reports the reason *and* a terminal `Failed`, so an observer
+/// can tell a dead request from a slow one without matching every possible cause.
+#[tokio::test]
+async fn a_refused_request_reports_a_terminal_failure() {
+    let home = TestServer::new().start().await;
+    let away = TestServer::new()
+        .route("/data", RouteConfig::ok(b"nope"))
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    // cors mode against a route that sends no Access-Control-Allow-Origin.
+    let req = FetchRequest::builder(Method::GET, away.url("/data"))
+        .with_origin(home.base_url().origin())
+        .with_mode(RequestMode::Cors)
+        .with_credentials(RequestCredentials::Omit)
+        .build();
+    assert!(fetcher.fetch(req).await.is_error());
+
+    assert!(
+        obs.blocked_reason().is_some(),
+        "the cause is still reported"
+    );
+    assert_eq!(
+        obs.failures().len(),
+        1,
+        "exactly one terminal failure, got {:?}",
+        obs.failures()
+    );
+    shutdown.cancel();
+}
+
+/// A cancelled request is not a failure: it reports `Cancelled` and nothing else.
+#[tokio::test]
+async fn a_cancelled_request_is_not_reported_as_failed() {
+    let srv = TestServer::new()
+        .route("/slow", RouteConfig::ok(b"never read"))
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let req = FetchRequest::builder(Method::GET, srv.url("/slow")).build();
+    assert!(fetcher.fetch_with_cancel(req, cancel).await.is_error());
+
+    assert!(
+        obs.failures().is_empty(),
+        "cancellation must not report a failure, got {:?}",
+        obs.failures()
+    );
+    shutdown.cancel();
+}
+
+/// The `OPTIONS` round-trip is reported as a completed pair, so its cost is attributable
+/// rather than hiding in the gap before the response. A hop served from the grant cache
+/// sends no `OPTIONS` and so reports nothing at all.
+#[tokio::test]
+async fn preflight_reports_its_round_trip() {
+    let home = TestServer::new().start().await;
+    let away = TestServer::new()
+        .route(
+            "/data",
+            RouteConfig::cors(CorsRouteOptions {
+                allow_methods: Some("PUT".into()),
+                max_age: Some(600),
+                ..Default::default()
+            }),
+        )
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    for _ in 0..2 {
+        let req = FetchRequest::builder(Method::PUT, away.url("/data"))
+            .with_origin(home.base_url().origin())
+            .with_mode(RequestMode::Cors)
+            .with_credentials(RequestCredentials::Omit)
+            .with_body(RequestBody::text("payload"))
+            .build();
+        match fetcher.fetch(req).await {
+            FetchResult::Buffered { .. } => {}
+            other => panic!("expected Buffered, got {other:?}"),
+        }
+    }
+
+    let preflights = obs.cors_preflights();
+    assert_eq!(
+        preflights.len(),
+        1,
+        "the cached second request must report no preflight, got {preflights:?}"
+    );
+    assert_eq!(preflights[0].0, away.url("/data").to_string());
+    assert!(preflights[0].1, "the preflight got a response");
+    shutdown.cancel();
+}
+
+/// A rejected preflight still cost a round-trip, so it is reported as completed - the
+/// refusal is carried separately by `Blocked`.
+#[tokio::test]
+async fn rejected_preflight_still_reports_its_cost() {
+    let home = TestServer::new().start().await;
+    let away = TestServer::new()
+        .route("/data", RouteConfig::cors(CorsRouteOptions::default()))
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    let req = FetchRequest::builder(Method::DELETE, away.url("/data"))
+        .with_origin(home.base_url().origin())
+        .with_mode(RequestMode::Cors)
+        .with_credentials(RequestCredentials::Omit)
+        .build();
+    assert_eq!(
+        cors_block_reason(fetcher.fetch(req).await),
+        CorsError::PreflightMethodRejected
+    );
+
+    assert_eq!(
+        obs.cors_preflights(),
+        vec![(away.url("/data").to_string(), true)]
+    );
     shutdown.cancel();
 }
 
