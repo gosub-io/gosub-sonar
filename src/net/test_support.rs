@@ -42,6 +42,7 @@ fn reason(code: u16) -> &'static str {
         302 => "Found",
         400 => "Bad Request",
         401 => "Unauthorized",
+        407 => "Proxy Authentication Required",
         403 => "Forbidden",
         404 => "Not Found",
         500 => "Internal Server Error",
@@ -149,6 +150,94 @@ pub enum RouteConfig {
     /// Read `Content-Length` bytes from the request body and echo them back as a 200 response.
     /// Use to verify that POST/PUT bodies are transmitted correctly.
     EchoBody,
+    /// Cacheable route: answers 200 with the configured validators and cache directives, and
+    /// `304` when the request's `If-None-Match` or `If-Modified-Since` matches them. Every
+    /// request counts as a hit on the path, so a test can tell a stored response from a fresh
+    /// one by the hit count alone.
+    Cacheable(CacheRouteOptions),
+    /// Demand credentials: answer with `401` (or `407` when `proxy` is set) plus the configured
+    /// challenge header until a request arrives whose `Authorization` (`Proxy-Authorization`)
+    /// value is exactly `expect`, then answer 200 with `body`. An `expect` no client sends keeps
+    /// challenging, for testing the retry cap. Every attempt counts as a hit on the path.
+    RequireAuth {
+        /// Challenge the origin server (`401`/`WWW-Authenticate`) or a proxy
+        /// (`407`/`Proxy-Authenticate`)
+        proxy: bool,
+        /// Value of the challenge header, e.g. `Basic realm="Secure Area"`
+        challenge: String,
+        /// Credentials header value that unlocks the route, e.g. `Basic dTpw`
+        expect: String,
+        /// Body of the successful response
+        body: Vec<u8>,
+    },
+}
+
+/// What a [`RouteConfig::Cacheable`] route sends. The defaults describe a response no cache may
+/// keep: no directives, no validators, and a fixed body.
+#[derive(Clone, Debug, Default)]
+pub struct CacheRouteOptions {
+    /// `Cache-Control` on the response, when set.
+    pub cache_control: Option<String>,
+    /// `ETag` on the response, and the value `If-None-Match` is compared against.
+    pub etag: Option<String>,
+    /// `Last-Modified` on the response, and the value `If-Modified-Since` is compared against.
+    pub last_modified: Option<String>,
+    /// `Vary` on the response, when set.
+    pub vary: Option<String>,
+    /// Extra `(name, value)` response headers.
+    pub extra_headers: Vec<(String, String)>,
+    /// Body of the 200 response.
+    pub body: Vec<u8>,
+    /// Replace `body` with `hit-<n>`, `n` counting this route's requests from 1. Use to tell
+    /// which response a caller ended up with.
+    pub counting_body: bool,
+}
+
+impl CacheRouteOptions {
+    /// Response with `Cache-Control: max-age=<seconds>` and nothing else.
+    pub fn max_age(seconds: u64, body: impl Into<Vec<u8>>) -> Self {
+        Self {
+            cache_control: Some(format!("max-age={seconds}")),
+            body: body.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Add an `ETag`, which also makes the route answer a matching `If-None-Match` with `304`.
+    #[must_use]
+    pub fn with_etag(mut self, etag: impl Into<String>) -> Self {
+        self.etag = Some(etag.into());
+        self
+    }
+
+    /// Add a `Last-Modified`, which also makes the route answer a matching `If-Modified-Since`
+    /// with `304`.
+    #[must_use]
+    pub fn with_last_modified(mut self, value: impl Into<String>) -> Self {
+        self.last_modified = Some(value.into());
+        self
+    }
+
+    /// Add a `Vary`.
+    #[must_use]
+    pub fn with_vary(mut self, value: impl Into<String>) -> Self {
+        self.vary = Some(value.into());
+        self
+    }
+
+    /// Replace `Cache-Control` with another directive set.
+    #[must_use]
+    pub fn with_cache_control(mut self, value: impl Into<String>) -> Self {
+        self.cache_control = Some(value.into());
+        self
+    }
+
+    /// Number the body per request: `hit-1`, `hit-2`, ...
+    #[must_use]
+    pub fn counting(mut self) -> Self {
+        self.counting_body = true;
+        self
+    }
 }
 
 /// What a [`RouteConfig::Cors`] route sends. The defaults describe the most permissive
@@ -252,9 +341,39 @@ impl RouteConfig {
     pub fn gzip_ok(body: impl Into<Vec<u8>>) -> Self {
         Self::GzipOk(body.into())
     }
+    /// Shorthand for a [`RouteConfig::Cacheable`] with `Cache-Control: max-age=<seconds>`.
+    pub fn cacheable(seconds: u64, body: impl Into<Vec<u8>>) -> Self {
+        Self::Cacheable(CacheRouteOptions::max_age(seconds, body))
+    }
     /// Shorthand for [`RouteConfig::EchoBody`]
     pub fn echo_body() -> Self {
         Self::EchoBody
+    }
+    /// Shorthand for a [`RouteConfig::RequireAuth`] challenging as the origin server.
+    pub fn require_auth(
+        challenge: impl Into<String>,
+        expect: impl Into<String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self::RequireAuth {
+            proxy: false,
+            challenge: challenge.into(),
+            expect: expect.into(),
+            body: body.into(),
+        }
+    }
+    /// Shorthand for a [`RouteConfig::RequireAuth`] challenging as a proxy.
+    pub fn require_proxy_auth(
+        challenge: impl Into<String>,
+        expect: impl Into<String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self::RequireAuth {
+            proxy: true,
+            challenge: challenge.into(),
+            expect: expect.into(),
+            body: body.into(),
+        }
     }
     /// Shorthand for [`RouteConfig::RedirectSelf`]
     pub fn redirect_self() -> Self {
@@ -348,9 +467,12 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
     } else {
         path.clone()
     };
-    hits.entry(hit_key)
+    // 1 for the first request to this path, so a counting route's body says which request it is.
+    let hit_no = hits
+        .entry(hit_key)
         .or_insert_with(|| AtomicUsize::new(0))
-        .fetch_add(1, Ordering::Relaxed);
+        .fetch_add(1, Ordering::Relaxed)
+        + 1;
 
     let cfg = routes
         .get(&path)
@@ -493,6 +615,94 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 base, target, cookie
             );
             let _ = stream.write_all(hdr.as_bytes()).await;
+        }
+        RouteConfig::Cacheable(options) => {
+            let header_value = |name: &str| {
+                let needle = format!("{name}:");
+                req.lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with(&needle))
+                    .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
+            };
+            let mut response_headers: Vec<(String, String)> = Vec::new();
+            for (name, value) in [
+                ("Cache-Control", options.cache_control.clone()),
+                ("ETag", options.etag.clone()),
+                ("Last-Modified", options.last_modified.clone()),
+                ("Vary", options.vary.clone()),
+            ] {
+                if let Some(value) = value {
+                    response_headers.push((name.to_string(), value));
+                }
+            }
+            response_headers.extend(options.extra_headers.clone());
+
+            let matches_etag = matches!(
+                (header_value("if-none-match"), options.etag.as_ref()),
+                (Some(ref sent), Some(etag)) if sent == etag
+            );
+            let matches_date = matches!(
+                (header_value("if-modified-since"), options.last_modified.as_ref()),
+                (Some(ref sent), Some(modified)) if sent == modified
+            );
+
+            if matches_etag || matches_date {
+                let extra: String = response_headers
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {v}\r\n"))
+                    .collect();
+                let hdr = format!("HTTP/1.1 304 Not Modified\r\n{extra}Connection: close\r\n\r\n");
+                let _ = stream.write_all(hdr.as_bytes()).await;
+            } else {
+                let body = if options.counting_body {
+                    format!("hit-{hit_no}").into_bytes()
+                } else {
+                    options.body.clone()
+                };
+                let extra: String = response_headers
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {v}\r\n"))
+                    .collect();
+                let hdr = format!(
+                    "HTTP/1.1 200 OK\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    extra,
+                    body.len()
+                );
+                let _ = stream.write_all(hdr.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            }
+        }
+        RouteConfig::RequireAuth {
+            proxy,
+            challenge,
+            expect,
+            body,
+        } => {
+            let header = if proxy {
+                "proxy-authorization:"
+            } else {
+                "authorization:"
+            };
+            let sent = req
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with(header))
+                .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()));
+            if sent.as_deref() == Some(expect.as_str()) {
+                send_response(&mut stream, 200, &body).await;
+            } else {
+                let (code, name) = if proxy {
+                    (407, "Proxy-Authenticate")
+                } else {
+                    (401, "WWW-Authenticate")
+                };
+                let hdr = format!(
+                    "HTTP/1.1 {} {}\r\n{}: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    code,
+                    reason(code),
+                    name,
+                    challenge
+                );
+                let _ = stream.write_all(hdr.as_bytes()).await;
+            }
         }
         RouteConfig::EchoCookieHeader => {
             let cookie = req
@@ -955,6 +1165,36 @@ impl RecordingObserver {
             .iter()
             .filter_map(|e| match e {
                 NetEvent::TlsFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every [`NetEvent::AuthRequired`] recorded, as `(challenges, retried)` pairs, in order.
+    pub fn auth_required(&self) -> Vec<(Vec<crate::net::auth::AuthChallenge>, bool)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::AuthRequired {
+                    challenges,
+                    retried,
+                    ..
+                } => Some((challenges.clone(), *retried)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every [`NetEvent::Cache`] outcome recorded, in order.
+    pub fn cache_outcomes(&self) -> Vec<crate::net::cache::CacheOutcome> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Cache { outcome, .. } => Some(*outcome),
                 _ => None,
             })
             .collect()

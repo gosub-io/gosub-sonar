@@ -1,5 +1,6 @@
 //! Core types for fetch requests, responses, errors, and priorities.
 
+use crate::net::cache::CacheMode;
 use crate::net::cors::{self, CorsError, ResponseTainting};
 use crate::net::fetch_metadata::{RequestDestination, RequestMode};
 use crate::net::mixed_content::{is_origin_potentially_trustworthy, MixedContentPolicy};
@@ -95,6 +96,10 @@ pub struct FetchResultMeta {
     pub content_type: Option<String>,
     /// True if the response has a body (e.g. HEAD requests do not)
     pub has_body: bool,
+    /// Whether this response came out of the HTTP cache instead of the network. True both for a
+    /// stored response used as is and for one a `304` confirmed. See
+    /// [`cache`](mod@crate::net::cache).
+    pub from_cache: bool,
     /// How much of this response the initiating document's scripts may read. The fetcher
     /// annotates; enforcing the visibility boundary is the embedder's job — see
     /// [`readable_headers`](Self::readable_headers) and [`cors`].
@@ -135,6 +140,9 @@ pub enum BlockReason {
     /// Refused by CORS — the carried [`CorsError`] says which rule.
     /// See [`cors`].
     Cors(CorsError),
+    /// The request required a stored response ([`CacheMode::OnlyIfCached`], or
+    /// `Cache-Control: only-if-cached`) and the cache had none.
+    NotCached,
 }
 
 impl Display for BlockReason {
@@ -143,6 +151,7 @@ impl Display for BlockReason {
             BlockReason::MixedContent => "mixed content",
             BlockReason::UrlPolicy => "blocked by URL policy",
             BlockReason::UnsupportedScheme => "unsupported URL scheme",
+            BlockReason::NotCached => "not in the cache",
             BlockReason::Cors(err) => return write!(f, "CORS: {err}"),
         };
         f.write_str(s)
@@ -528,6 +537,10 @@ pub struct FetchRequest {
     /// Whether cookies from the context's jar ride along, and how strict the CORS
     /// credentialed rules are. See [`RequestCredentials`].
     pub credentials: RequestCredentials,
+    /// How this request uses the HTTP cache: normal caching, a reload, a forced revalidation,
+    /// or no cache at all. Inert when the fetcher has no
+    /// [`cache`](crate::net::fetcher::FetcherConfig::cache). See [`cache`](mod@crate::net::cache).
+    pub cache_mode: CacheMode,
     /// HTTP Headers (unified).
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
@@ -685,8 +698,20 @@ impl FetchRequest {
             RequestCredentials::Include => "include",
         };
 
+        // A reload and a normal fetch of the same URL are not interchangeable: one must reach
+        // the server, and the other may be answered from the cache. Two requests can only share
+        // a response when they would use the cache the same way.
+        let cache_mode = match self.cache_mode {
+            CacheMode::Default => "default",
+            CacheMode::NoStore => "no-store",
+            CacheMode::Reload => "reload",
+            CacheMode::NoCache => "no-cache",
+            CacheMode::ForceCache => "force-cache",
+            CacheMode::OnlyIfCached => "only-if-cached",
+        };
+
         Some(format!(
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={}",
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={};Cache={}",
             self.method,
             url,
             range,
@@ -698,7 +723,8 @@ impl FetchRequest {
             mixed_content,
             referrer,
             fetch_meta,
-            credentials
+            credentials,
+            cache_mode
         ))
     }
 }
@@ -726,6 +752,7 @@ pub struct FetchRequestBuilder {
     destination: RequestDestination,
     mode: RequestMode,
     credentials: RequestCredentials,
+    cache_mode: CacheMode,
     body: Option<RequestBody>,
 }
 
@@ -751,6 +778,7 @@ impl FetchRequestBuilder {
             destination: RequestDestination::default(),
             mode: RequestMode::default(),
             credentials: RequestCredentials::default(),
+            cache_mode: CacheMode::default(),
             body: None,
         }
     }
@@ -868,6 +896,13 @@ impl FetchRequestBuilder {
         self
     }
 
+    /// Sets how this request uses the HTTP cache (default: [`CacheMode::Default`], i.e. normal
+    /// HTTP caching). See [`cache`](mod@crate::net::cache).
+    pub fn with_cache_mode(mut self, mode: CacheMode) -> Self {
+        self.cache_mode = mode;
+        self
+    }
+
     /// Sets the HTTP method of the request
     pub fn with_method(mut self, method: Method) -> Self {
         self.method = method;
@@ -901,6 +936,7 @@ impl FetchRequestBuilder {
             destination: self.destination,
             mode: self.mode,
             credentials: self.credentials,
+            cache_mode: self.cache_mode,
             body: self.body,
         }
     }
@@ -1035,14 +1071,35 @@ mod tests {
         let expected = format!(
             // MC=n: no secure initiating origin. Ref=n: no referrer set, so none is ever sent.
             // FM: default destination and mode, no initiating origin, no user navigation.
-            // Cred: the default credentials mode.
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include",
+            // Cred and Cache: the default credentials mode and normal HTTP caching.
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include;Cache=default",
             fr.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash
         );
 
         assert_eq!(key, expected);
         assert!(key.starts_with("M=GET;U=https://example.org/a/b"));
         assert!(!key.contains("#frag"));
+    }
+
+    /// A reload has to reach the server, so it cannot be answered by joining a fetch that is
+    /// allowed to come from the cache.
+    #[test]
+    fn cache_mode_splits_the_coalescing_key() {
+        let url = Url::parse("https://example.org/a").unwrap();
+        let key_for = |mode: CacheMode| {
+            FetchRequest::builder(Method::GET, url.clone())
+                .with_cache_mode(mode)
+                .build()
+                .generate_request_key()
+                .unwrap()
+        };
+
+        let default = key_for(CacheMode::Default);
+        assert!(default.ends_with(";Cache=default"), "{default}");
+        assert_ne!(default, key_for(CacheMode::Reload));
+        assert_ne!(default, key_for(CacheMode::NoStore));
+        assert_ne!(key_for(CacheMode::NoCache), key_for(CacheMode::ForceCache));
+        assert_eq!(default, key_for(CacheMode::Default));
     }
 
     /// Two documents fetching the same insecure URL must not coalesce when only one of them is
@@ -1352,6 +1409,7 @@ mod tests {
             content_length: None,
             content_type: None,
             has_body: false,
+            from_cache: false,
             tainting: ResponseTainting::Basic,
         };
 

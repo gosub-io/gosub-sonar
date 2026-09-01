@@ -67,6 +67,15 @@ impl NetObserver for Logger {
                 addr_count,
             } => println!("[{t}] dns       {host} -> {addr_count} addr(s) in {elapsed:?}"),
             NetEvent::Connected { elapsed } => println!("[{t}] connect   {elapsed:?}"),
+            NetEvent::Cache { url, outcome } => println!("[{t}] cache     {outcome} {url}"),
+            NetEvent::AuthRequired {
+                challenges,
+                retried,
+                ..
+            } => println!(
+                "[{t}] auth      {} challenge(s), retried: {retried}",
+                challenges.len()
+            ),
             NetEvent::Warning { message, .. } => println!("[{t}] warning   {message}"),
             NetEvent::Io { message } => println!("[{t}] io        {message}"),
             // `NetEvent` is non-exhaustive; a new event should not break this example.

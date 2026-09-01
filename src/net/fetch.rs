@@ -1,5 +1,12 @@
 //! Low-level fetch functions used by the [`super::fetcher::Fetcher`].
 
+use crate::net::auth::{
+    self, AuthChallenge, AuthTarget, CredentialStore, Credentials, ProtectionSpace,
+    MAX_AUTH_ATTEMPTS,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::cache::{self, CacheDecision, CacheKey, HttpCache};
+use crate::net::cache::{CacheEntry, CacheMode, CacheOutcome};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::cors::CorsPreflightCache;
 use crate::net::cors::{self, CorsError, ResponseTainting};
@@ -12,6 +19,7 @@ use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
 use crate::net::observer::NetObserver;
 use crate::net::referrer::{self, ReferrerPolicy};
 use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody, RequestCredentials};
+use crate::net::utils::BytesAsyncReader;
 use crate::types::PeekBuf;
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
@@ -105,6 +113,9 @@ pub type CookieSinkFn = Box<dyn Fn(&Url, &[&str]) + Send + Sync>;
 /// Callback type for reporting the HTTP version of a response.
 pub type ProtocolSinkFn = Box<dyn Fn(&Url, http::Version) + Send + Sync>;
 
+/// Callback type for answering an authentication challenge.
+pub type AuthChallengeFn = Box<dyn Fn(&AuthChallenge) -> Option<Credentials> + Send + Sync>;
+
 /// Network-level request policies threaded through the fetch stack.
 ///
 /// Bundles the URL allowlist check and the cookie-jar query so both can be applied at
@@ -136,6 +147,19 @@ pub struct NetPolicy {
     /// asking the server every time. Set via [`NetPolicy::with_cors_preflight_cache`].
     #[cfg(not(target_arch = "wasm32"))]
     pub cors_preflight: Option<Arc<dyn CorsPreflightCache>>,
+    /// Called for each challenge of a `401`/`407` response until one yields credentials to retry
+    /// the hop with. The default answers no challenge, leaving the response for the caller.
+    /// See [`auth`](mod@crate::net::auth).
+    pub on_auth_challenge: AuthChallengeFn,
+    /// Credentials remembered per protection space, consulted before `on_auth_challenge` and
+    /// updated from its answers. `None` still authenticates, asking the hook every time.
+    /// Set via [`NetPolicy::with_credential_store`].
+    pub credentials: Option<Arc<dyn CredentialStore>>,
+    /// Store of cached responses, consulted before every hop and written to after it.
+    /// `None` disables caching. Set via [`NetPolicy::with_cache`].
+    /// See [`cache`](mod@crate::net::cache).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub cache: Option<Arc<dyn HttpCache>>,
 }
 
 impl Default for NetPolicy {
@@ -149,6 +173,10 @@ impl Default for NetPolicy {
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
             cors_preflight: None,
+            on_auth_challenge: Box::new(|_| None),
+            credentials: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            cache: None,
         }
     }
 }
@@ -159,6 +187,7 @@ impl NetPolicy {
         let ctx_url = ctx.clone();
         let ctx_cookies = ctx.clone();
         let ctx_sink = ctx.clone();
+        let ctx_auth = ctx.clone();
         Self {
             url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
             cookies_for: Box::new(move |url| ctx_cookies.cookies_for(url)),
@@ -168,6 +197,10 @@ impl NetPolicy {
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
             cors_preflight: None,
+            on_auth_challenge: Box::new(move |challenge| ctx_auth.on_auth_challenge(challenge)),
+            credentials: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            cache: None,
         }
     }
 
@@ -197,6 +230,27 @@ impl NetPolicy {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn clear_preflight_cache(mut self) -> Self {
         self.cors_preflight = None;
+        self
+    }
+
+    /// Attaches the credential store consulted for authentication challenges, and updated when
+    /// credentials from [`NetPolicy::on_auth_challenge`] turn out to work. `None` asks the hook
+    /// for every challenge.
+    pub fn with_credential_store(mut self, store: Option<Arc<dyn CredentialStore>>) -> Self {
+        self.credentials = store;
+        self
+    }
+
+    /// Replaces the callback answering authentication challenges.
+    pub fn with_auth_challenge_fn(mut self, hook: AuthChallengeFn) -> Self {
+        self.on_auth_challenge = hook;
+        self
+    }
+
+    /// Attaches the store of cached responses. `None` disables caching.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_cache(mut self, cache: Option<Arc<dyn HttpCache>>) -> Self {
+        self.cache = cache;
         self
     }
 }
@@ -236,6 +290,12 @@ pub struct RequestInit {
     /// Whether cookies from the policy's jar ride along, and how strict the credentialed CORS
     /// rules are. See [`RequestCredentials`].
     pub credentials: RequestCredentials,
+    /// How this request uses the HTTP cache. Inert without [`NetPolicy::cache`].
+    /// See [`cache`](mod@crate::net::cache).
+    pub cache_mode: CacheMode,
+    /// Whether the HTTP client decompresses the body. A cache entry records it, since a decoded
+    /// body is not the bytes a raw caller asked for.
+    pub auto_decode: bool,
 }
 
 impl Default for RequestInit {
@@ -272,6 +332,8 @@ impl RequestInit {
             mode: RequestMode::default(),
             user_activated: false,
             credentials: RequestCredentials::default(),
+            cache_mode: CacheMode::default(),
+            auto_decode: true,
         }
     }
 
@@ -315,6 +377,15 @@ impl RequestInit {
     /// Attach the request's credentials mode (default: [`RequestCredentials::Include`]).
     pub fn with_credentials(mut self, credentials: RequestCredentials) -> Self {
         self.credentials = credentials;
+        self
+    }
+
+    /// Attach how this request uses the cache, and whether the client decodes the body. The two
+    /// together decide which stored responses may answer it.
+    /// See [`cache`](mod@crate::net::cache).
+    pub fn with_cache(mut self, mode: CacheMode, auto_decode: bool) -> Self {
+        self.cache_mode = mode;
+        self.auto_decode = auto_decode;
         self
     }
 }
@@ -393,7 +464,7 @@ async fn fetch_response_top_inner(
     // Bind this request's observer for the duration of the HTTP exchange. Work that
     // happens below the request layer - DNS resolution inside the connection pool - has no
     // other way to reach it.
-    let (resp, tainting) = crate::net::observer::CURRENT_OBSERVER
+    let outcome = crate::net::observer::CURRENT_OBSERVER
         .scope(
             observer.clone(),
             get_with_redirects(
@@ -406,11 +477,65 @@ async fn fetch_response_top_inner(
             ),
         )
         .await?;
+    let ChainOutcome {
+        response,
+        url: final_url,
+        tainting,
+        #[cfg(not(target_arch = "wasm32"))]
+        store,
+    } = outcome;
+
+    // A stored response has no stream to read: the body is already here, so it is split into the
+    // peek window and a reader over the remainder, and handed back in the same shape as a
+    // response off the wire.
+    let resp = match response {
+        HopResponse::Cached(entry) => {
+            let peek_len = entry.body.len().min(PEEK_MAX);
+            let meta = FetchResultMeta {
+                tainting,
+                final_url: final_url.clone(),
+                status: entry.status,
+                status_text: http::StatusCode::from_u16(entry.status)
+                    .ok()
+                    .and_then(|s| s.canonical_reason())
+                    .unwrap_or("")
+                    .to_string(),
+                headers: entry.headers.clone(),
+                content_length: Some(entry.body.len() as u64),
+                content_type: entry
+                    .headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string()),
+                has_body: !entry.body.is_empty(),
+                from_cache: true,
+            };
+            let rest = BytesAsyncReader {
+                data: entry.body.slice(peek_len..),
+                pos: 0,
+            };
+            let reader = ProgressReader::new(
+                rest,
+                cancel.clone(),
+                observer.clone(),
+                final_url,
+                started,
+                meta.content_length,
+                peek_len as u64,
+            );
+            return Ok(ResponseTop {
+                meta,
+                peek_buf: PeekBuf::from_vec(entry.body[..peek_len].to_vec()),
+                reader: Box::new(reader),
+            });
+        }
+        HopResponse::Network(resp) => resp,
+    };
 
     // Response is received, setup our meta structure
     let mut meta = FetchResultMeta {
         tainting,
-        final_url: resp.url().clone(),
+        final_url,
         status: resp.status().as_u16(),
         status_text: resp.status().canonical_reason().unwrap_or("").to_string(),
         headers: resp.headers().clone(),
@@ -421,6 +546,7 @@ async fn fetch_response_top_inner(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string()),
         has_body: true, // Don't know yet
+        from_cache: false,
     };
 
     // Peek the stream up to PEEK_MAX bytes
@@ -533,12 +659,77 @@ async fn fetch_response_top_inner(
         meta.content_length,
         already_delivered,
     );
+    // A response the cache accepted is copied as the caller reads it, and written when the body
+    // is complete. A body already known to be too large is not collected at all.
+    #[cfg(not(target_arch = "wasm32"))]
+    let progress_reader = progress_reader.with_cache(store.and_then(|store| {
+        let too_large = meta
+            .content_length
+            .is_some_and(|len| len as usize > store.max_bytes());
+        (!too_large).then(|| CacheCollector::new(store, peek_buf.as_slice()))
+    }));
 
     Ok(ResponseTop {
         meta,
         peek_buf,
         reader: Box::new(progress_reader),
     })
+}
+
+/// Copies a body on its way to the caller so it can be written to the cache when the stream ends.
+///
+/// Only a complete body is stored. A fetch that is cancelled, fails, or is dropped mid-stream
+/// drops the collector instead, and one that grows past the cache's ceiling drops the pending
+/// write and stops copying.
+#[cfg(not(target_arch = "wasm32"))]
+struct CacheCollector {
+    /// The write to perform on EOF. Taken away when the body turns out to be too large.
+    store: Option<PendingStore>,
+    /// Body bytes so far, starting with the peek window the caller already read.
+    body: BytesMut,
+    /// Ceiling from [`HttpCache::max_entry_bytes`].
+    limit: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CacheCollector {
+    /// Collector for `store`, seeded with the bytes read before the reader was built.
+    fn new(store: PendingStore, prefix: &[u8]) -> Self {
+        let limit = store.max_bytes();
+        let mut body = BytesMut::with_capacity(prefix.len());
+        body.extend_from_slice(prefix);
+        let mut collector = Self {
+            store: Some(store),
+            body,
+            limit,
+        };
+        collector.enforce_limit();
+        collector
+    }
+
+    /// Record bytes handed to the caller.
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.store.is_none() {
+            return;
+        }
+        self.body.extend_from_slice(chunk);
+        self.enforce_limit();
+    }
+
+    /// Give up on a body the cache would refuse anyway, and stop holding it in memory.
+    fn enforce_limit(&mut self) {
+        if self.body.len() > self.limit {
+            self.store = None;
+            self.body = BytesMut::new();
+        }
+    }
+
+    /// Write the complete body to the cache.
+    fn commit(&mut self, observer: &Arc<dyn NetObserver + Send + Sync>) {
+        if let Some(store) = self.store.take() {
+            store.commit(std::mem::take(&mut self.body).freeze(), observer);
+        }
+    }
 }
 
 /// Progres reader is a simple stream that will wrap another AsyncRead stream, and emit progress
@@ -564,6 +755,9 @@ struct ProgressReader<R> {
     finished_emitted: bool,
     /// Whether we already emitted a failed event (a reader may be polled again after an error)
     failed_emitted: bool,
+    /// Copies the body for the HTTP cache, when this response is one that may be stored.
+    #[cfg(not(target_arch = "wasm32"))]
+    cache: Option<CacheCollector>,
 }
 
 impl<R: AsyncRead + Unpin> ProgressReader<R> {
@@ -587,7 +781,16 @@ impl<R: AsyncRead + Unpin> ProgressReader<R> {
             cancel_emitted: false,
             finished_emitted: false,
             failed_emitted: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            cache: None,
         }
+    }
+
+    /// Collect the body for the HTTP cache as it is read.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn with_cache(mut self, collector: Option<CacheCollector>) -> Self {
+        self.cache = collector;
+        self
     }
 }
 
@@ -623,6 +826,14 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
             // nothing read, then we have reached the end of the stream
             if read_bytes == 0 && !self.finished_emitted {
                 self.finished_emitted = true;
+                // The body is complete, so a response waiting to be cached can be written.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let observer = self.observer.clone();
+                    if let Some(collector) = self.cache.as_mut() {
+                        collector.commit(&observer);
+                    }
+                }
                 self.observer.on_event(NetEvent::Finished {
                     received_bytes: self.received,
                     elapsed: self.started.elapsed(),
@@ -630,6 +841,11 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
                 });
             }
             if read_bytes > 0 {
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(collector) = self.cache.as_mut() {
+                    let filled = buf.filled();
+                    collector.feed(&filled[pre_len..new_len]);
+                }
                 self.received += read_bytes;
                 self.observer.on_event(NetEvent::Progress {
                     received_bytes: self.received,
@@ -784,6 +1000,126 @@ fn send_error(
     NetError::Read(Arc::new(anyhow::Error::from(e).context(what.to_string())))
 }
 
+/// A hop's response: what the server sent, or what the cache had.
+///
+/// A stored response is not a `reqwest::Response` and cannot be made into one, so the redirect
+/// loop and its consumers read both through this.
+pub(crate) enum HopResponse {
+    /// A response from the network.
+    Network(reqwest::Response),
+    /// A stored response, used as it was or confirmed by a `304`.
+    Cached(Arc<CacheEntry>),
+}
+
+impl HopResponse {
+    /// Status code of the response.
+    pub(crate) fn status(&self) -> u16 {
+        match self {
+            Self::Network(resp) => resp.status().as_u16(),
+            Self::Cached(entry) => entry.status,
+        }
+    }
+
+    /// Response headers. A stored response carries the headers as they were stored: without
+    /// `Set-Cookie`, and with the `304`'s updates already merged in.
+    pub(crate) fn headers(&self) -> &HeaderMap {
+        match self {
+            Self::Network(resp) => resp.headers(),
+            Self::Cached(entry) => &entry.headers,
+        }
+    }
+
+    /// Whether this is a redirect the chain should follow.
+    pub(crate) fn is_redirection(&self) -> bool {
+        (300..400).contains(&self.status())
+    }
+}
+
+/// A storable response whose body has not been read yet.
+///
+/// `get_with_redirects` decides whether a response may be cached from its headers, but the body
+/// only arrives later, in whichever consumer reads it. This carries that decision until then;
+/// dropping it (a cancelled fetch, a body over the cache's ceiling) stores nothing.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct PendingStore {
+    cache: Arc<dyn HttpCache>,
+    key: CacheKey,
+    url: Url,
+    status: u16,
+    response_headers: HeaderMap,
+    request_headers: HeaderMap,
+    decoded: bool,
+    requested_at: chrono::DateTime<chrono::Utc>,
+    received_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PendingStore {
+    /// Largest body the cache behind this will accept.
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.cache.max_entry_bytes()
+    }
+
+    /// Write the response to the cache now that its body is complete.
+    pub(crate) fn commit(self, body: Bytes, observer: &Arc<dyn NetObserver + Send + Sync>) {
+        let entry = cache::entry_from_response(
+            self.status,
+            &self.response_headers,
+            &self.request_headers,
+            body,
+            self.decoded,
+            self.requested_at,
+            self.received_at,
+        );
+        self.cache.put(self.key, Arc::new(entry));
+        observer.on_event(NetEvent::Cache {
+            url: self.url,
+            outcome: CacheOutcome::Stored,
+        });
+    }
+}
+
+/// What a whole redirect chain came to.
+pub(crate) struct ChainOutcome {
+    /// The first response that was not a redirect.
+    pub(crate) response: HopResponse,
+    /// URL of the hop that produced it, i.e. the final URL of the chain.
+    pub(crate) url: Url,
+    /// Response tainting of the chain — see [`cors`](mod@crate::net::cors).
+    pub(crate) tainting: ResponseTainting,
+    /// Set when that response may be cached once its body has been read.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) store: Option<PendingStore>,
+}
+
+/// Find credentials for the first challenge that has any: the credential store first, then the
+/// embedder's hook, walking the challenges in the order the server listed them.
+///
+/// Returns the protection space they belong to, so they can be stored or dropped depending on
+/// what the server makes of them, the credentials, and the value for the credentials header.
+fn credentials_for_challenges(
+    policy: &NetPolicy,
+    challenges: &[AuthChallenge],
+) -> Option<(ProtectionSpace, Credentials, header::HeaderValue)> {
+    for challenge in challenges {
+        let space = challenge.protection_space();
+        let known = policy
+            .credentials
+            .as_ref()
+            .and_then(|store| store.credentials_for(&space));
+        let credentials = match known.or_else(|| (policy.on_auth_challenge)(challenge)) {
+            Some(credentials) => credentials,
+            None => continue,
+        };
+        // Credentials that cannot be expressed as a header value are not an answer; try the next
+        // challenge instead of re-sending the request unchanged.
+        if let Some(value) = credentials.header_value() {
+            return Some((space, credentials, value));
+        }
+    }
+    None
+}
+
 /// Perform a GET request, following redirects up to MAX_REDIRECTS times, while sending out net events.
 ///
 /// Follow a chain of HTTP redirects, returning the first non-redirect response.
@@ -803,6 +1139,9 @@ fn send_error(
 ///   the chain, and `Origin` collapses to `null` once the chain redirects away from an origin
 ///   the request had already left — see [`fetch_metadata`](mod@crate::net::fetch_metadata).
 /// - `policy.url_allowed` and `policy.cookies_for` are called at every hop.
+/// - A `401`/`407` hop is re-sent with credentials from the credential store or
+///   `policy.on_auth_challenge` (see [`auth`](mod@crate::net::auth)); only a response that is
+///   not a challenge continues through the chain.
 /// - `Set-Cookie` values on 3xx responses are reported via `policy.on_cookies` and the jar is
 ///   re-queried for the next hop; the final response's cookies are the caller's responsibility.
 /// - CORS is enforced per hop when `init.origin` is set — the same-origin/no-cors mode rules
@@ -817,7 +1156,7 @@ async fn get_with_redirects(
     cancel: CancellationToken,
     observer: Arc<dyn NetObserver + Send + Sync>,
     policy: NetPolicy,
-) -> Result<(reqwest::Response, ResponseTainting), NetError> {
+) -> Result<ChainOutcome, NetError> {
     let mut url = url;
     let mut current_method = init.method;
     let mut current_headers = init.headers;
@@ -1051,11 +1390,12 @@ async fn get_with_redirects(
             }
         }
 
-        // Inject cookies from the jar for this hop's origin — but only when the request's
-        // credentials mode says this hop gets credentials at all.
-        // Only applied when no Cookie header is already set; this naturally handles cross-origin
-        // redirects: the cookie was stripped above, so the jar is re-queried for the new origin.
-        let attach_cookies = match init.credentials {
+        // Cookies from the jar and an answer to an authentication challenge are both
+        // credentials, so the request's credentials mode gates them together.
+        // Cookies are only injected when no Cookie header is already set; this naturally handles
+        // cross-origin redirects: the cookie was stripped above, so the jar is re-queried for the
+        // new origin.
+        let attach_credentials = match init.credentials {
             RequestCredentials::Include => true,
             RequestCredentials::Omit => false,
             // Without a document origin to compare against, "same-origin" has no meaning and
@@ -1064,7 +1404,7 @@ async fn get_with_redirects(
                 .as_ref()
                 .is_none_or(|o| !origin_tainted && *o == url.origin()),
         };
-        if attach_cookies && !current_headers.contains_key(header::COOKIE) {
+        if attach_credentials && !current_headers.contains_key(header::COOKIE) {
             if let Some(cookie_str) = (policy.cookies_for)(&url) {
                 if let Ok(val) = cookie_str.parse() {
                     current_headers.insert(header::COOKIE, val);
@@ -1072,77 +1412,316 @@ async fn get_with_redirects(
             }
         }
 
-        let mut req_builder = client
-            .request(current_method.clone(), url.clone())
-            .headers(current_headers.clone());
-        if let Some(ref body) = current_body {
-            // Built fresh per hop so a streamed body can be replayed on 307/308.
-            let (hop_body, explicit_len) = body.to_reqwest_body()?;
-            if let Some(len) = explicit_len {
-                if !current_headers.contains_key(header::CONTENT_LENGTH) {
-                    req_builder = req_builder.header(header::CONTENT_LENGTH, len);
+        // The HTTP cache (RFC 9111), consulted per hop with the headers this hop will actually
+        // send, so `Vary` selects on the cookies and the negotiation headers as sent. A fresh
+        // stored response ends the hop without a request; a stale one that can be revalidated
+        // adds its conditional headers to the send below. See [`cache`](mod@crate::net::cache).
+        #[cfg(not(target_arch = "wasm32"))]
+        let (cache_hit, revalidating, conditional) = match policy.cache {
+            Some(ref cache) => {
+                let key = CacheKey::new(&current_method, &url);
+                let stored = cache.get(&key);
+                match cache::decide(
+                    &stored,
+                    &current_headers,
+                    init.auto_decode,
+                    init.cache_mode,
+                    chrono::Utc::now(),
+                ) {
+                    CacheDecision::Use(entry) => (Some(entry), None, HeaderMap::new()),
+                    CacheDecision::Revalidate(entry, conditional) => {
+                        (None, Some(entry), conditional)
+                    }
+                    CacheDecision::Send => (None, None, HeaderMap::new()),
+                    // `only-if-cached`, with nothing stored to answer it.
+                    CacheDecision::NotCached => {
+                        return Err(blocked(&observer, url, BlockReason::NotCached))
+                    }
                 }
             }
-            req_builder = req_builder.body(hop_body);
-        }
-        let fut = req_builder.send();
-        tokio::pin!(fut);
+            None => (None, None, HeaderMap::new()),
+        };
+        // No cache on wasm32, so every hop goes out as it is.
+        #[cfg(target_arch = "wasm32")]
+        let (cache_hit, conditional): (Option<Arc<CacheEntry>>, HeaderMap) =
+            (None, HeaderMap::new());
 
-        let resp = tokio::select! {
-            _ = cancel.cancelled() => {
-                observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled net.get_with_redirects" });
-                return Err(NetError::Cancelled("cancelled net.get_with_redirects".into()));
+        // Authentication (RFC 9110 §11): a 401 or 407 is re-sent with credentials whenever they
+        // can be found for one of its challenges, at most `MAX_AUTH_ATTEMPTS` times. Only a
+        // response that is not a challenge leaves this loop. See
+        // [`auth`](mod@crate::net::auth).
+        let mut auth_header: Option<(header::HeaderName, header::HeaderValue)> = None;
+        let mut auth_attempt = 0u32;
+        // Credentials the server has not accepted yet. Stored once a response arrives that is
+        // not another challenge, dropped when it is.
+        let mut unproven: Option<(ProtectionSpace, Credentials)> = None;
+
+        // Timestamps of the exchange that produced the response below, for the age of a cache
+        // entry made from it (RFC 9111 §4.2.3). A retried hop overwrites them, so they always
+        // describe the send that was kept.
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut requested_at = chrono::Utc::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut received_at = requested_at;
+
+        let hop = match cache_hit {
+            Some(entry) => {
+                observer.on_event(NetEvent::Cache {
+                    url: url.clone(),
+                    outcome: CacheOutcome::Hit,
+                });
+                HopResponse::Cached(entry)
             }
-            r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer))?
+            None => loop {
+                // The credentials and conditional headers are added for the send only, so a redirect
+                // from this hop starts from the caller's headers again.
+                let mut hop_headers = current_headers.clone();
+                if let Some((ref name, ref value)) = auth_header {
+                    hop_headers.insert(name.clone(), value.clone());
+                }
+                for (name, value) in conditional.iter() {
+                    hop_headers.insert(name.clone(), value.clone());
+                }
+                let mut req_builder = client
+                    .request(current_method.clone(), url.clone())
+                    .headers(hop_headers);
+                if let Some(ref body) = current_body {
+                    // Built fresh per send so a streamed body can be replayed on 307/308 and for an
+                    // authenticated retry of this hop.
+                    let (hop_body, explicit_len) = body.to_reqwest_body()?;
+                    if let Some(len) = explicit_len {
+                        if !current_headers.contains_key(header::CONTENT_LENGTH) {
+                            req_builder = req_builder.header(header::CONTENT_LENGTH, len);
+                        }
+                    }
+                    req_builder = req_builder.body(hop_body);
+                }
+                let fut = req_builder.send();
+                tokio::pin!(fut);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    requested_at = chrono::Utc::now();
+                }
+
+                let resp = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled net.get_with_redirects" });
+                        return Err(NetError::Cancelled("cancelled net.get_with_redirects".into()));
+                    }
+                    r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer))?
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    received_at = chrono::Utc::now();
+                }
+
+                // Report the HTTP version of every hop, not just the final response, so the fetcher's
+                // per-origin limits also learn about intermediate origins. reqwest's wasm Response has
+                // no version().
+                #[cfg(not(target_arch = "wasm32"))]
+                (policy.on_protocol)(resp.url(), resp.version());
+
+                // Per hop, like the other events in this loop: the first one marks
+                // time-to-first-byte for the request, and a redirect chain reports each hop
+                // it waited on. A hop served from the cache received no headers over the
+                // wire and reports `Cache` instead.
+                observer.on_event(NetEvent::ResponseHeaders {
+                    url: resp.url().clone(),
+                    status: resp.status().as_u16(),
+                    headers: resp.headers().clone(),
+                });
+
+                // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
+                // a site first arms it, and that response is consumed below.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(ref store) = policy.hsts {
+                    hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
+                }
+
+                // The CORS check (Fetch §4.10.3) runs on *every* response of a cors-tainted chain —
+                // redirects included, and also a final same-origin hop reached through a cross-origin
+                // detour. Native-only: on wasm32 the browser has already enforced this.
+                #[cfg(not(target_arch = "wasm32"))]
+                if tainting == ResponseTainting::Cors {
+                    if let Some(ref o) = origin {
+                        if let Err(e) =
+                            cors::cors_check(o, origin_tainted, credentials_include, resp.headers())
+                        {
+                            return Err(blocked(&observer, url, BlockReason::Cors(e)));
+                        }
+                    }
+                }
+
+                // A `304` answers a revalidation: the stored body stands, with the headers the
+                // response carried written over the stored ones (RFC 9111 §4.3.4).
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(ref entry) = revalidating {
+                    if resp.status().as_u16() == 304 {
+                        let updated = Arc::new(entry.updated_by_304(
+                            resp.headers(),
+                            requested_at,
+                            received_at,
+                        ));
+                        if let Some(ref cache) = policy.cache {
+                            cache.put(CacheKey::new(&current_method, &url), updated.clone());
+                        }
+                        observer.on_event(NetEvent::Cache {
+                            url: url.clone(),
+                            outcome: CacheOutcome::Validated,
+                        });
+                        break HopResponse::Cached(updated);
+                    }
+                }
+
+                // After the checks above: a response CORS refuses is blocked even when it asks for
+                // credentials.
+                let Some(target) = AuthTarget::for_status(resp.status().as_u16()) else {
+                    // Only a password is remembered. A `Raw` answer was computed for the challenge
+                    // it answered (a Digest nonce, a Negotiate token), and replaying it would only
+                    // draw another challenge.
+                    if let (Some(store), Some((space, credentials))) =
+                        (policy.credentials.as_ref(), unproven.take())
+                    {
+                        if matches!(credentials, Credentials::Basic { .. }) {
+                            store.store(space, credentials);
+                        }
+                    }
+                    break HopResponse::Network(resp);
+                };
+
+                let may_answer = match target {
+                    // Server credentials follow the request's credentials mode, and are only
+                    // attached to a chain the CORS regime left untainted. `Authorization` is not a
+                    // CORS-safelisted header, so adding it to a cors request would need a preflight
+                    // of its own, and adding it to a no-cors one would be a header markup cannot
+                    // produce. Navigations and requests without a document origin stay basic, and
+                    // those are the ones a browser shows its password dialog for.
+                    AuthTarget::Server => attach_credentials && tainting == ResponseTainting::Basic,
+                    // A proxy challenge is about the hop to the proxy. `Proxy-Authorization` never
+                    // reaches the origin server, so neither CORS nor the credentials mode has a say.
+                    // On wasm32 the browser owns the proxy connection and forbids the header.
+                    AuthTarget::Proxy => cfg!(not(target_arch = "wasm32")),
+                };
+                let challenges = auth::parse_challenges(resp.headers(), target, &url, auth_attempt);
+                let answer = if may_answer && auth_attempt < MAX_AUTH_ATTEMPTS {
+                    // What was sent last time has just been rejected: drop it so the store stops
+                    // handing back a password the server no longer takes.
+                    if let (Some(store), Some((space, _))) =
+                        (policy.credentials.as_ref(), unproven.take())
+                    {
+                        store.forget(&space);
+                    }
+                    credentials_for_challenges(&policy, &challenges)
+                } else {
+                    None
+                };
+
+                observer.on_event(NetEvent::AuthRequired {
+                    url: url.clone(),
+                    target,
+                    challenges,
+                    retried: answer.is_some(),
+                });
+
+                let Some((space, credentials, value)) = answer else {
+                    break HopResponse::Network(resp);
+                };
+                auth_header = Some((target.credentials_header(), value));
+                unproven = Some((space, credentials));
+                auth_attempt += 1;
+            },
         };
 
-        // Report the HTTP version of every hop, not just the final response, so the fetcher's
-        // per-origin limits also learn about intermediate origins. reqwest's wasm Response has
-        // no version().
+        // A method that changed the resource makes what is stored for it wrong, including for
+        // the `Location` it points at (RFC 9111 §4.4). Only a successful one: a rejected POST
+        // changed nothing.
         #[cfg(not(target_arch = "wasm32"))]
-        (policy.on_protocol)(resp.url(), resp.version());
-
-        // Per hop, like the other events in this loop: the first one marks time-to-first-byte
-        // for the request, and a redirect chain reports each hop it waited on.
-        observer.on_event(NetEvent::ResponseHeaders {
-            url: resp.url().clone(),
-            status: resp.status().as_u16(),
-            headers: resp.headers().clone(),
-        });
-
-        // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
-        // a site first arms it, and that response is consumed below.
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ref store) = policy.hsts {
-            hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
-        }
-
-        // The CORS check (Fetch §4.10.3) runs on *every* response of a cors-tainted chain —
-        // redirects included, and also a final same-origin hop reached through a cross-origin
-        // detour. Native-only: on wasm32 the browser has already enforced this.
-        #[cfg(not(target_arch = "wasm32"))]
-        if tainting == ResponseTainting::Cors {
-            if let Some(ref o) = origin {
-                if let Err(e) =
-                    cors::cors_check(o, origin_tainted, credentials_include, resp.headers())
-                {
-                    return Err(blocked(&observer, url, BlockReason::Cors(e)));
+        if let Some(ref cache) = policy.cache {
+            if cache::invalidates(&current_method) && hop.status() < 400 {
+                let mut targets = vec![url.clone()];
+                for name in [header::LOCATION, header::CONTENT_LOCATION] {
+                    let target = hop
+                        .headers()
+                        .get(&name)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| url.join(v).ok());
+                    // Only same-origin: a response cannot invalidate another site's entries.
+                    if let Some(target) = target.filter(|t| t.origin() == url.origin()) {
+                        targets.push(target);
+                    }
                 }
+                for target in targets {
+                    // Entries are keyed by method, so both of the cacheable ones go.
+                    for method in [Method::GET, Method::HEAD] {
+                        cache.invalidate(&CacheKey::new(&method, &target));
+                    }
+                }
+                observer.on_event(NetEvent::Cache {
+                    url: url.clone(),
+                    outcome: CacheOutcome::Invalidated,
+                });
             }
         }
 
-        if !resp.status().is_redirection() {
-            return Ok((resp, tainting));
+        // Whether this response may be stored. The body is not here yet: a redirect has none
+        // worth keeping and is stored right away, while the final response's write waits for the
+        // reader of its body.
+        #[cfg(not(target_arch = "wasm32"))]
+        let pending_store = match (&hop, policy.cache.as_ref()) {
+            // `no-store` is both directions: the lookup above skipped the cache, and nothing
+            // about this exchange is written to it either.
+            (HopResponse::Network(resp), Some(cache))
+                if init.cache_mode != CacheMode::NoStore
+                    && cache::is_storable(
+                        &current_method,
+                        &current_headers,
+                        resp.status().as_u16(),
+                        resp.headers(),
+                    ) =>
+            {
+                Some(PendingStore {
+                    cache: cache.clone(),
+                    key: CacheKey::new(&current_method, &url),
+                    url: url.clone(),
+                    status: resp.status().as_u16(),
+                    response_headers: resp.headers().clone(),
+                    request_headers: current_headers.clone(),
+                    decoded: init.auto_decode,
+                    requested_at,
+                    received_at,
+                })
+            }
+            _ => None,
+        };
+
+        if !hop.is_redirection() {
+            return Ok(ChainOutcome {
+                response: hop,
+                url: url.clone(),
+                tainting,
+                #[cfg(not(target_arch = "wasm32"))]
+                store: pending_store,
+            });
+        }
+
+        // A redirect is stored now: the caller never sees its body, and a stored `301` lets the
+        // next fetch skip the hop entirely.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(store) = pending_store {
+            store.commit(Bytes::new(), &observer);
         }
 
         // 3xx — resolve the Location header
-        let status = resp.status().as_u16();
-        let from = resp.url().clone();
+        let status = hop.status();
+        let from = match hop {
+            HopResponse::Network(ref resp) => resp.url().clone(),
+            HopResponse::Cached(_) => url.clone(),
+        };
 
         // A redirect may tighten (or loosen) the policy for the rest of the chain. Read every
         // field line, not just the first: a server may split the list across lines, and the
         // last token we understand wins across all of them.
-        if let Some(updated) = resp
+        if let Some(updated) = hop
             .headers()
             .get_all(&REFERRER_POLICY)
             .iter()
@@ -1156,7 +1735,7 @@ async fn get_with_redirects(
         // Report Set-Cookie values on this hop to the jar before following the redirect —
         // login flows commonly set the session cookie on a 302. Dropping our Cookie header
         // makes the next hop re-query the now-updated jar instead of resending a stale value.
-        let set_cookies: Vec<&str> = resp
+        let set_cookies: Vec<&str> = hop
             .headers()
             .get_all(header::SET_COOKIE)
             .iter()
@@ -1167,7 +1746,7 @@ async fn get_with_redirects(
             current_headers.remove(header::COOKIE);
         }
 
-        let loc = resp
+        let loc = hop
             .headers()
             .get(reqwest::header::LOCATION)
             .and_then(|v| v.to_str().ok())
@@ -1259,8 +1838,9 @@ async fn get_with_redirects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::auth::{AuthScheme, InMemoryCredentialStore};
     use crate::net::referrer::ReferrerPolicy;
-    use crate::net::test_support::{RecordingObserver, RouteConfig, TestServer};
+    use crate::net::test_support::{CacheRouteOptions, RecordingObserver, RouteConfig, TestServer};
     use cow_utils::CowUtils;
     use http::HeaderMap;
     use std::sync::Mutex;
@@ -2848,5 +3428,849 @@ mod tests {
 
         assert_eq!(meta.status, 200);
         assert_eq!(&body[..], b"");
+    }
+
+    /// base64("user:pass"), the credentials the auth routes below accept.
+    const GOOD_AUTH: &str = "Basic dXNlcjpwYXNz";
+
+    async fn auth_server() -> crate::net::test_support::TestServerHandle {
+        TestServer::new()
+            .route(
+                "/protected",
+                RouteConfig::require_auth(
+                    r#"Basic realm="Secure Area""#,
+                    GOOD_AUTH,
+                    b"secret".to_vec(),
+                ),
+            )
+            .route(
+                "/via-proxy",
+                RouteConfig::require_proxy_auth(r#"Basic realm="corp""#, GOOD_AUTH, b"ok".to_vec()),
+            )
+            .start()
+            .await
+    }
+
+    /// Run one fetch against the auth server with the given request and policy.
+    async fn auth_fetch(
+        srv: &crate::net::test_support::TestServerHandle,
+        path: &str,
+        init: RequestInit,
+        policy: NetPolicy,
+        observer: Arc<dyn NetObserver + Send + Sync>,
+    ) -> Result<(FetchResultMeta, Bytes), NetError> {
+        super::fetch_response_complete(
+            client(),
+            srv.url(path),
+            init,
+            CancellationToken::new(),
+            observer,
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            policy,
+        )
+        .await
+    }
+
+    /// A policy whose hook answers every challenge with the given credentials, counting calls.
+    fn answering_policy(credentials: Credentials) -> (NetPolicy, Arc<Mutex<Vec<AuthChallenge>>>) {
+        let seen: Arc<Mutex<Vec<AuthChallenge>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let policy = NetPolicy::default().with_auth_challenge_fn(Box::new(move |challenge| {
+            sink.lock().unwrap().push(challenge.clone());
+            Some(credentials.clone())
+        }));
+        (policy, seen)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_basic_challenge_is_answered_and_the_hop_retried() {
+        let srv = auth_server().await;
+        let rec = Arc::new(RecordingObserver::new());
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            rec.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"secret");
+        // The 401 and the authenticated retry.
+        assert_eq!(srv.hit_count("/protected"), 2);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].scheme, AuthScheme::Basic);
+        assert_eq!(seen[0].realm.as_deref(), Some("Secure Area"));
+        assert_eq!(seen[0].target, AuthTarget::Server);
+        assert_eq!(seen[0].attempt, 0);
+
+        let events = rec.auth_required();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].1, "the challenge was answered");
+        assert_eq!(events[0].0.len(), 1);
+    }
+
+    /// Without credentials the 401 itself is the response.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unanswered_challenge_is_returned_to_the_caller() {
+        let srv = auth_server().await;
+        let rec = Arc::new(RecordingObserver::new());
+
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            NetPolicy::default(),
+            rec.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 401);
+        assert_eq!(srv.hit_count("/protected"), 1);
+
+        // The challenge still reaches the observer, so an embedder that can only answer
+        // asynchronously can prompt and re-submit.
+        let events = rec.auth_required();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].1);
+        assert_eq!(events[0].0[0].realm.as_deref(), Some("Secure Area"));
+    }
+
+    /// Credentials the hook supplied are remembered once they work, so the second request answers
+    /// the challenge without asking again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_credentials_are_remembered_in_the_store() {
+        let srv = auth_server().await;
+        let store = Arc::new(InMemoryCredentialStore::new());
+
+        for expected_calls in [1, 1] {
+            let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+            let policy = policy.with_credential_store(Some(store.clone()));
+            let (meta, _) = auth_fetch(
+                &srv,
+                "/protected",
+                RequestInit::get(HeaderMap::new()),
+                policy,
+                observer(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(meta.status, 200);
+            // The hook answers the first request; the second is served from the store, which is
+            // why each fresh hook here sees at most one call.
+            assert!(seen.lock().unwrap().len() <= expected_calls);
+        }
+
+        assert_eq!(store.len(), 1);
+        let space = ProtectionSpace {
+            target: AuthTarget::Server,
+            scheme: AuthScheme::Basic,
+            origin: Some(srv.url("/protected").origin().ascii_serialization()),
+            realm: "Secure Area".into(),
+        };
+        assert_eq!(
+            store.credentials_for(&space),
+            Some(Credentials::basic("user", "pass"))
+        );
+    }
+
+    /// Stored credentials the server rejects are dropped, and the hook is asked for better ones.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_stored_credentials_are_forgotten_and_replaced() {
+        let srv = auth_server().await;
+        let space = ProtectionSpace {
+            target: AuthTarget::Server,
+            scheme: AuthScheme::Basic,
+            origin: Some(srv.url("/protected").origin().ascii_serialization()),
+            realm: "Secure Area".into(),
+        };
+        let store = Arc::new(InMemoryCredentialStore::new());
+        store.store(space.clone(), Credentials::basic("user", "stale"));
+
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+        let policy = policy.with_credential_store(Some(store.clone()));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"secret");
+        // Unauthenticated, stale password, good password.
+        assert_eq!(srv.hit_count("/protected"), 3);
+
+        // The hook was only consulted after the stored password had been rejected.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].attempt, 1);
+        assert_eq!(
+            store.credentials_for(&space),
+            Some(Credentials::basic("user", "pass"))
+        );
+    }
+
+    /// An embedder that keeps handing back credentials the server refuses must not loop forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_retry_gives_up_after_max_attempts() {
+        let srv = auth_server().await;
+        let rec = Arc::new(RecordingObserver::new());
+        let (policy, seen) = answering_policy(Credentials::basic("user", "wrong"));
+
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            rec.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 401);
+        // The unauthenticated request plus MAX_AUTH_ATTEMPTS answers to it.
+        assert_eq!(srv.hit_count("/protected"), 1 + MAX_AUTH_ATTEMPTS as usize);
+        assert_eq!(seen.lock().unwrap().len(), MAX_AUTH_ATTEMPTS as usize);
+
+        let events = rec.auth_required();
+        assert_eq!(events.len(), 1 + MAX_AUTH_ATTEMPTS as usize);
+        assert!(
+            !events.last().unwrap().1,
+            "the last challenge was given up on"
+        );
+    }
+
+    /// A `407` is answered with `Proxy-Authorization`, and its protection space is not tied to
+    /// the origin the request was going to.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_proxy_challenge_is_answered_with_proxy_authorization() {
+        let srv = auth_server().await;
+        let store = Arc::new(InMemoryCredentialStore::new());
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+        let policy = policy.with_credential_store(Some(store.clone()));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/via-proxy",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"ok");
+        assert_eq!(srv.hit_count("/via-proxy"), 2);
+        assert_eq!(seen.lock().unwrap()[0].target, AuthTarget::Proxy);
+        assert_eq!(
+            store.credentials_for(&ProtectionSpace {
+                target: AuthTarget::Proxy,
+                scheme: AuthScheme::Basic,
+                origin: None,
+                realm: "corp".into(),
+            }),
+            Some(Credentials::basic("user", "pass"))
+        );
+    }
+
+    /// `RequestCredentials::Omit` means no credentials of any kind, so the challenge is not even
+    /// offered to the embedder.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_credential_less_request_is_never_authenticated() {
+        let srv = auth_server().await;
+        let rec = Arc::new(RecordingObserver::new());
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()).with_credentials(RequestCredentials::Omit),
+            policy,
+            rec.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 401);
+        assert_eq!(srv.hit_count("/protected"), 1);
+        assert!(seen.lock().unwrap().is_empty());
+        // Still reported, so the caller can see why the request came back a 401.
+        assert_eq!(rec.auth_required().len(), 1);
+    }
+
+    /// `Authorization` is not CORS-safelisted, so a cors-tainted chain is left alone instead of
+    /// getting credentials added behind the preflight's back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cors_request_is_not_authenticated() {
+        let srv = auth_server().await;
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+
+        let init = RequestInit::get(HeaderMap::new())
+            .with_mixed_content(
+                Some(Url::parse("http://other.test/").unwrap().origin()),
+                MixedContentPolicy::Allow,
+            )
+            .with_fetch_metadata(RequestDestination::Empty, RequestMode::NoCors, false);
+
+        let (meta, _) = auth_fetch(&srv, "/protected", init, policy, observer())
+            .await
+            .unwrap();
+
+        assert_eq!(meta.status, 401);
+        assert_eq!(srv.hit_count("/protected"), 1);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// The retry rebuilds the request, body included.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_challenged_post_is_replayed_with_its_body() {
+        let srv = auth_server().await;
+        let (policy, _) = answering_policy(Credentials::basic("user", "pass"));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::post(HeaderMap::new(), Bytes::from_static(b"payload")),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"secret");
+        assert_eq!(srv.hit_count("/protected"), 2);
+    }
+
+    /// A `Raw` answer is used but not remembered; the hook recomputes it for the next challenge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_computed_answer_is_used_but_not_stored() {
+        let srv = auth_server().await;
+        let store = Arc::new(InMemoryCredentialStore::new());
+        let (policy, seen) = answering_policy(Credentials::Raw(GOOD_AUTH.into()));
+        let policy = policy.with_credential_store(Some(store.clone()));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"secret");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(store.is_empty(), "a computed answer is not replayable");
+    }
+
+    /// Credentials that cannot become a header value are not an answer, so the next challenge
+    /// gets a turn: here the `Basic` one the server also offered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unusable_answer_falls_through_to_the_next_challenge() {
+        let srv = TestServer::new()
+            .route(
+                "/protected",
+                RouteConfig::require_auth(
+                    r#"Digest realm="d", nonce="n", Basic realm="Secure Area""#,
+                    GOOD_AUTH,
+                    b"secret".to_vec(),
+                ),
+            )
+            .start()
+            .await;
+
+        let seen: Arc<Mutex<Vec<AuthChallenge>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let policy = NetPolicy::default().with_auth_challenge_fn(Box::new(move |challenge| {
+            sink.lock().unwrap().push(challenge.clone());
+            match challenge.scheme {
+                // A colon in the user-id makes these unrepresentable.
+                AuthScheme::Digest => Some(Credentials::basic("bad:name", "x")),
+                _ => Some(Credentials::basic("user", "pass")),
+            }
+        }));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"secret");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "both challenges were offered");
+        assert_eq!(seen[0].scheme, AuthScheme::Digest);
+        assert_eq!(seen[1].scheme, AuthScheme::Basic);
+    }
+
+    /// A policy with a fresh in-memory cache, plus the cache itself.
+    fn caching_policy() -> (NetPolicy, Arc<crate::net::cache::InMemoryHttpCache>) {
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        (NetPolicy::default().with_cache(Some(cache.clone())), cache)
+    }
+
+    /// Fetch `path` through the policy, returning the metadata and body.
+    async fn cache_fetch(
+        srv: &crate::net::test_support::TestServerHandle,
+        path: &str,
+        init: RequestInit,
+        policy: NetPolicy,
+        observer: Arc<dyn NetObserver + Send + Sync>,
+    ) -> (FetchResultMeta, Bytes) {
+        super::fetch_response_complete(
+            client(),
+            srv.url(path),
+            init,
+            CancellationToken::new(),
+            observer,
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            policy,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A fresh stored response answers the next fetch without a request going out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fresh_response_is_served_from_the_cache() {
+        let srv = TestServer::new()
+            .route(
+                "/fresh",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(60, b"v1".to_vec()).counting()),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+
+        let (meta, body) =
+            cache_fetch(&srv, "/fresh", RequestInit::default(), policy, observer()).await;
+        assert_eq!(meta.status, 200);
+        assert!(!meta.from_cache);
+        assert_eq!(&body[..], b"hit-1");
+        assert_eq!(cache.len(), 1);
+
+        let (policy, _) = (NetPolicy::default().with_cache(Some(cache.clone())), ());
+        let rec = Arc::new(RecordingObserver::new());
+        let (meta, body) =
+            cache_fetch(&srv, "/fresh", RequestInit::default(), policy, rec.clone()).await;
+        assert!(meta.from_cache);
+        assert_eq!(&body[..], b"hit-1", "the stored body, not a second request");
+        assert_eq!(srv.hit_count("/fresh"), 1, "the server was not asked again");
+        assert_eq!(rec.cache_outcomes(), vec![CacheOutcome::Hit]);
+    }
+
+    /// A stale entry is revalidated, and a `304` reuses the stored body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_response_is_revalidated_and_a_304_reuses_the_body() {
+        let srv = TestServer::new()
+            .route(
+                "/stale",
+                RouteConfig::Cacheable(
+                    CacheRouteOptions::max_age(0, b"original".to_vec()).with_etag("\"v1\""),
+                ),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+
+        let (_, body) =
+            cache_fetch(&srv, "/stale", RequestInit::default(), policy, observer()).await;
+        assert_eq!(&body[..], b"original");
+        assert_eq!(cache.len(), 1);
+
+        let rec = Arc::new(RecordingObserver::new());
+        let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+        let (meta, body) =
+            cache_fetch(&srv, "/stale", RequestInit::default(), policy, rec.clone()).await;
+
+        // The server was asked, answered 304, and the stored body came back.
+        assert_eq!(srv.hit_count("/stale"), 2);
+        assert_eq!(meta.status, 200, "the 304 is not what the caller sees");
+        assert!(meta.from_cache);
+        assert_eq!(&body[..], b"original");
+        assert_eq!(rec.cache_outcomes(), vec![CacheOutcome::Validated]);
+    }
+
+    /// A stale entry the server cannot confirm is refetched, and the fresh response takes its
+    /// place instead of piling up beside it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_entry_without_a_validator_is_refetched_and_replaced() {
+        let srv = TestServer::new()
+            .route(
+                "/changing",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(0, Vec::new()).counting()),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+        let (_, body) = cache_fetch(
+            &srv,
+            "/changing",
+            RequestInit::default(),
+            policy,
+            observer(),
+        )
+        .await;
+        assert_eq!(&body[..], b"hit-1");
+        assert_eq!(cache.len(), 1);
+
+        let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+        let (meta, body) = cache_fetch(
+            &srv,
+            "/changing",
+            RequestInit::default(),
+            policy,
+            observer(),
+        )
+        .await;
+        assert!(!meta.from_cache);
+        assert_eq!(&body[..], b"hit-2");
+        assert_eq!(srv.hit_count("/changing"), 2);
+        assert_eq!(cache.len(), 1, "replaced, not piled up");
+    }
+
+    /// `no-store` keeps a response out of the cache; `Cache-Control` with nothing to go on keeps
+    /// it out too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn responses_that_may_not_be_stored_are_not_stored() {
+        let srv = TestServer::new()
+            .route(
+                "/no-store",
+                RouteConfig::Cacheable(
+                    CacheRouteOptions::max_age(60, b"x".to_vec()).with_cache_control("no-store"),
+                ),
+            )
+            .route("/plain", RouteConfig::ok(b"x"))
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+        cache_fetch(
+            &srv,
+            "/no-store",
+            RequestInit::default(),
+            policy,
+            observer(),
+        )
+        .await;
+        assert!(cache.is_empty());
+
+        let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+        cache_fetch(&srv, "/plain", RequestInit::default(), policy, observer()).await;
+        assert!(
+            cache.is_empty(),
+            "no directives and no validator: nothing to store"
+        );
+    }
+
+    /// A cacheable redirect is stored, so the next fetch skips the hop entirely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cacheable_redirect_is_stored_and_reused() {
+        let target = TestServer::new()
+            .route("/target", RouteConfig::ok(b"arrived"))
+            .start()
+            .await;
+        let srv = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::RedirectAbsoluteWithHeaders {
+                    headers: vec![("Cache-Control".into(), "max-age=600".into())],
+                    target: target.url("/target").to_string(),
+                },
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+
+        let (_, body) = cache_fetch(&srv, "/hop", RequestInit::default(), policy, observer()).await;
+        assert_eq!(&body[..], b"arrived");
+        assert_eq!(srv.hit_count("/hop"), 1);
+        assert_eq!(cache.len(), 1, "the redirect itself is the entry");
+
+        let rec = Arc::new(RecordingObserver::new());
+        let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+        let (_, body) =
+            cache_fetch(&srv, "/hop", RequestInit::default(), policy, rec.clone()).await;
+
+        assert_eq!(&body[..], b"arrived");
+        assert_eq!(srv.hit_count("/hop"), 1, "the redirect came from the cache");
+        assert_eq!(
+            target.hit_count("/target"),
+            2,
+            "the target itself is not cacheable"
+        );
+        assert_eq!(rec.cache_outcomes(), vec![CacheOutcome::Hit]);
+    }
+
+    /// An unsafe method drops what is stored for the URL it changed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_post_invalidates_the_stored_response() {
+        let srv = TestServer::new()
+            .route(
+                "/resource",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(600, b"v1".to_vec())),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+        cache_fetch(
+            &srv,
+            "/resource",
+            RequestInit::default(),
+            policy,
+            observer(),
+        )
+        .await;
+        assert_eq!(cache.len(), 1);
+
+        let rec = Arc::new(RecordingObserver::new());
+        let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+        cache_fetch(
+            &srv,
+            "/resource",
+            RequestInit::post(HeaderMap::new(), Bytes::from_static(b"update")),
+            policy,
+            rec.clone(),
+        )
+        .await;
+
+        assert!(cache.is_empty(), "the stored response is now wrong");
+        assert_eq!(rec.cache_outcomes(), vec![CacheOutcome::Invalidated]);
+    }
+
+    /// The cache modes reach past the normal rules in both directions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cache_modes_bypass_and_force() {
+        let srv = TestServer::new()
+            .route(
+                "/mode",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(600, Vec::new()).counting()),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+        let (_, body) =
+            cache_fetch(&srv, "/mode", RequestInit::default(), policy, observer()).await;
+        assert_eq!(&body[..], b"hit-1");
+
+        // Reload ignores the fresh entry and stores what comes back.
+        let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+        let (meta, body) = cache_fetch(
+            &srv,
+            "/mode",
+            RequestInit::default().with_cache(CacheMode::Reload, true),
+            policy,
+            observer(),
+        )
+        .await;
+        assert!(!meta.from_cache);
+        assert_eq!(&body[..], b"hit-2");
+        assert_eq!(srv.hit_count("/mode"), 2);
+
+        // Force-cache uses the stored response even when the request would normally revalidate.
+        let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+        let (meta, body) = cache_fetch(
+            &srv,
+            "/mode",
+            RequestInit::default().with_cache(CacheMode::ForceCache, true),
+            policy,
+            observer(),
+        )
+        .await;
+        assert!(meta.from_cache);
+        assert_eq!(&body[..], b"hit-2");
+        assert_eq!(srv.hit_count("/mode"), 2);
+    }
+
+    /// `only-if-cached` fails rather than reaching the network.
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_if_cached_without_an_entry_is_refused() {
+        let srv = TestServer::new()
+            .route("/nothing", RouteConfig::ok(b"x"))
+            .start()
+            .await;
+        let (policy, _cache) = caching_policy();
+        let rec = Arc::new(RecordingObserver::new());
+
+        let err = super::fetch_response_complete(
+            client(),
+            srv.url("/nothing"),
+            RequestInit::default().with_cache(CacheMode::OnlyIfCached, true),
+            CancellationToken::new(),
+            rec.clone(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            policy,
+        )
+        .await;
+
+        match err {
+            Err(NetError::Blocked { reason, .. }) => assert_eq!(reason, BlockReason::NotCached),
+            other => panic!("expected a NotCached block, got {other:?}"),
+        }
+        assert_eq!(srv.hit_count("/nothing"), 0, "nothing went out");
+        assert_eq!(rec.blocked_reason(), Some(BlockReason::NotCached));
+    }
+
+    /// `Vary` keeps one entry per set of request headers the response depends on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn vary_stores_one_entry_per_variant() {
+        let srv = TestServer::new()
+            .route(
+                "/varies",
+                RouteConfig::Cacheable(
+                    CacheRouteOptions::max_age(600, Vec::new())
+                        .counting()
+                        .with_vary("accept-language"),
+                ),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+
+        let fetch = |policy: NetPolicy, language: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT_LANGUAGE, language.parse().unwrap());
+            (policy, RequestInit::get(headers))
+        };
+
+        let (policy, init) = fetch(policy, "nl");
+        let (_, body) = cache_fetch(&srv, "/varies", init, policy, observer()).await;
+        assert_eq!(&body[..], b"hit-1");
+
+        // A different language is a different variant, so it goes to the server.
+        let (policy, init) = fetch(NetPolicy::default().with_cache(Some(cache.clone())), "en");
+        let (_, body) = cache_fetch(&srv, "/varies", init, policy, observer()).await;
+        assert_eq!(&body[..], b"hit-2");
+        assert_eq!(cache.len(), 2);
+
+        // The first variant is still there.
+        let (policy, init) = fetch(NetPolicy::default().with_cache(Some(cache.clone())), "nl");
+        let (meta, body) = cache_fetch(&srv, "/varies", init, policy, observer()).await;
+        assert!(meta.from_cache);
+        assert_eq!(&body[..], b"hit-1");
+        assert_eq!(srv.hit_count("/varies"), 2);
+    }
+
+    /// A body past the cache's ceiling is delivered as usual, and not stored.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_over_the_ceiling_is_not_stored() {
+        let big = pattern(64 * 1024);
+        let srv = TestServer::new()
+            .route(
+                "/big",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(600, big.clone())),
+            )
+            .start()
+            .await;
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::with_limits(
+            1024 * 1024,
+            1024,
+        ));
+        let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+
+        let (_, body) = cache_fetch(&srv, "/big", RequestInit::default(), policy, observer()).await;
+        assert_eq!(&body[..], big.as_slice(), "the caller still gets it all");
+        assert!(cache.is_empty());
+    }
+
+    /// The streaming path fills the cache too: the body is collected as the caller reads it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_streamed_body_is_stored_once_it_is_read_to_the_end() {
+        let body = pattern(32 * 1024);
+        let srv = TestServer::new()
+            .route(
+                "/stream",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(600, body.clone())),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+
+        let ResponseTop {
+            peek_buf,
+            mut reader,
+            ..
+        } = super::fetch_response_top(
+            client(),
+            srv.url("/stream"),
+            RequestInit::default(),
+            CancellationToken::new(),
+            observer(),
+            policy,
+        )
+        .await
+        .unwrap();
+
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await.unwrap();
+        let mut received = peek_buf.as_slice().to_vec();
+        received.extend_from_slice(&rest);
+        assert_eq!(received, body);
+
+        // Stored complete, peek window included.
+        let stored = cache.get(&crate::net::cache::CacheKey::new(
+            &Method::GET,
+            &srv.url("/stream"),
+        ));
+        assert_eq!(stored.len(), 1);
+        assert_eq!(&stored[0].body[..], body.as_slice());
+    }
+
+    /// A stream the caller abandons mid-body leaves nothing behind.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unfinished_body_is_not_stored() {
+        let body = pattern(32 * 1024);
+        let srv = TestServer::new()
+            .route(
+                "/partial",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(600, body.clone())),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+
+        let ResponseTop { mut reader, .. } = super::fetch_response_top(
+            client(),
+            srv.url("/partial"),
+            RequestInit::default(),
+            CancellationToken::new(),
+            observer(),
+            policy,
+        )
+        .await
+        .unwrap();
+
+        // Read a little and drop the reader.
+        let mut scratch = vec![0u8; 128];
+        let _ = reader.read(&mut scratch).await.unwrap();
+        drop(reader);
+
+        assert!(cache.is_empty(), "an incomplete body is not a cache entry");
     }
 }

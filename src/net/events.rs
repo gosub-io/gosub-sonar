@@ -1,5 +1,7 @@
 //! Events emitted by the fetch stack to observers during a request lifecycle.
 
+use crate::net::auth::{AuthChallenge, AuthTarget};
+use crate::net::cache::CacheOutcome;
 use crate::net::tls::TlsError;
 use crate::net::types::BlockReason;
 use http::HeaderMap;
@@ -167,6 +169,31 @@ pub enum NetEvent {
         url: Url,
         /// How long the `OPTIONS` round-trip took
         elapsed: Duration,
+    },
+    /// The origin server (`401`) or a proxy (`407`) demanded credentials for this hop.
+    ///
+    /// See [`auth`](crate::net::auth). Emitted once per challenged response, answered or not, so
+    /// an embedder that cannot answer synchronously can prompt the user and re-submit the fetch.
+    AuthRequired {
+        /// The hop that was challenged
+        url: Url,
+        /// Whether the origin server or a proxy is asking
+        target: AuthTarget,
+        /// Every challenge the response offered, in the order the server listed them. Empty when
+        /// the challenge header was missing or unparsable.
+        challenges: Vec<AuthChallenge>,
+        /// Whether credentials were found and the hop re-sent with them. `false` means the
+        /// `401`/`407` is the response the caller gets.
+        retried: bool,
+    },
+    /// The HTTP cache was used for this hop: a stored response was served, one was confirmed by
+    /// a `304`, a response was written, or an unsafe method dropped what was stored.
+    /// See [`cache`](crate::net::cache).
+    Cache {
+        /// The hop the cache acted on
+        url: Url,
+        /// What it did
+        outcome: CacheOutcome,
     },
     /// Resource fetching was cancelled
     Cancelled {

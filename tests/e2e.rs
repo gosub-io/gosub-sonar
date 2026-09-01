@@ -3,13 +3,16 @@
 //! `test-support` mock server. Requires `--features test-support`.
 
 use gosub_sonar::net::test_support::{
-    CorsRouteOptions, RecordingObserver, RouteConfig, TestServer, TestServerHandle,
+    CacheRouteOptions, CorsRouteOptions, RecordingObserver, RouteConfig, TestServer,
+    TestServerHandle,
 };
 use gosub_sonar::{
-    simple_get, BlockReason, CorsError, FetchRequest, FetchResult, Fetcher, FetcherConfig,
-    FetcherContext, Initiator, NetError, NetObserver, NullContext, NullEmitter, RequestBody,
-    RequestCredentials, RequestDestination, RequestId, RequestMode, RequestReference, ResourceKind,
-    ResponseTainting, SharedBody, DEFAULT_USER_AGENT,
+    simple_get, AuthChallenge, AuthScheme, AuthTarget, BlockReason, CacheMode, CorsError,
+    CredentialStore, Credentials, FetchRequest, FetchResult, Fetcher, FetcherConfig,
+    FetcherContext, HttpCache, InMemoryCredentialStore, InMemoryHttpCache, Initiator, NetError,
+    NetObserver, NullContext, NullEmitter, ProtectionSpace, RequestBody, RequestCredentials,
+    RequestDestination, RequestId, RequestMode, RequestReference, ResourceKind, ResponseTainting,
+    SharedBody, DEFAULT_USER_AGENT,
 };
 use http::Method;
 use std::sync::Arc;
@@ -796,5 +799,430 @@ async fn identical_concurrent_requests_coalesce() {
         1,
         "identical in-flight GETs must share one fetch"
     );
+    shutdown.cancel();
+}
+
+/// base64("e2e:hunter2") — what the `/protected` routes below accept.
+const E2E_AUTH: &str = "Basic ZTJlOmh1bnRlcjI=";
+
+/// Answers `Basic` challenges with one fixed password and records what it was asked.
+struct AuthContext {
+    seen: std::sync::Mutex<Vec<AuthChallenge>>,
+    password: String,
+}
+
+impl AuthContext {
+    fn new(password: &str) -> Self {
+        Self {
+            seen: std::sync::Mutex::new(Vec::new()),
+            password: password.to_string(),
+        }
+    }
+}
+
+impl FetcherContext for AuthContext {
+    fn observer_for(
+        &self,
+        _reference: RequestReference,
+        _req_id: RequestId,
+        _kind: ResourceKind,
+        _initiator: Initiator,
+    ) -> Arc<dyn NetObserver + Send + Sync> {
+        Arc::new(NullEmitter)
+    }
+    fn on_ref_active(&self, _: RequestReference) {}
+    fn on_ref_done(&self, _: RequestReference) {}
+    fn on_auth_challenge(&self, challenge: &AuthChallenge) -> Option<Credentials> {
+        self.seen.lock().unwrap().push(challenge.clone());
+        match challenge.scheme {
+            AuthScheme::Basic => Some(Credentials::basic("e2e", self.password.clone())),
+            // Nothing here can compute a Digest response.
+            _ => None,
+        }
+    }
+}
+
+fn protected_server(challenge: &str) -> TestServer {
+    TestServer::new().route(
+        "/protected",
+        RouteConfig::require_auth(challenge, E2E_AUTH, b"top secret".to_vec()),
+    )
+}
+
+/// Issue #7: a 401 is answered and retried instead of being the result of the fetch.
+#[tokio::test]
+async fn a_401_is_answered_from_the_context_hook() {
+    let srv = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let ctx = Arc::new(AuthContext::new("hunter2"));
+    let (fetcher, shutdown) = spawn_fetcher(ctx.clone());
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, body } => {
+            assert_eq!(meta.status, 200);
+            assert_eq!(&body[..], b"top secret");
+        }
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+    assert_eq!(srv.hit_count("/protected"), 2);
+
+    let seen = ctx.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].target, AuthTarget::Server);
+    assert_eq!(seen[0].realm.as_deref(), Some("Members Only"));
+    assert_eq!(seen[0].url, srv.url("/protected"));
+    shutdown.cancel();
+}
+
+/// A context that answers no challenge gets the 401 back, `WWW-Authenticate` intact.
+#[tokio::test]
+async fn a_401_without_an_answer_is_still_delivered() {
+    let srv = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, .. } => {
+            assert_eq!(meta.status, 401);
+            assert_eq!(
+                meta.headers
+                    .get(http::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok()),
+                Some(r#"Basic realm="Members Only""#)
+            );
+        }
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+    assert_eq!(srv.hit_count("/protected"), 1);
+    shutdown.cancel();
+}
+
+/// A challenge the embedder cannot answer falls through to the next one the server offered.
+#[tokio::test]
+async fn the_first_answerable_challenge_wins() {
+    let srv = protected_server(r#"Digest realm="d", nonce="n", Basic realm="Members Only""#)
+        .start()
+        .await;
+    let ctx = Arc::new(AuthContext::new("hunter2"));
+    let (fetcher, shutdown) = spawn_fetcher(ctx.clone());
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 200),
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+
+    let seen = ctx.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].scheme, AuthScheme::Digest);
+    assert_eq!(seen[0].param("nonce"), Some("n"));
+    assert_eq!(seen[1].scheme, AuthScheme::Basic);
+    shutdown.cancel();
+}
+
+/// A wrong password is retried a bounded number of times and then handed back as the 401.
+#[tokio::test]
+async fn a_refused_password_is_not_retried_forever() {
+    let srv = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let ctx = Arc::new(AuthContext::new("wrong"));
+    let (fetcher, shutdown) = spawn_fetcher(ctx.clone());
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 401),
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+    assert_eq!(
+        srv.hit_count("/protected"),
+        1 + gosub_sonar::MAX_AUTH_ATTEMPTS as usize
+    );
+    assert_eq!(
+        ctx.seen.lock().unwrap().len(),
+        gosub_sonar::MAX_AUTH_ATTEMPTS as usize
+    );
+    shutdown.cancel();
+}
+
+/// The credential store can be pre-seeded. An asynchronous password dialog uses that: return
+/// `None` from the hook, ask the user, put the answer in the store, fetch again.
+#[tokio::test]
+async fn a_pre_seeded_credential_store_answers_without_the_hook() {
+    let srv = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let store = Arc::new(InMemoryCredentialStore::new());
+    store.store(
+        ProtectionSpace {
+            target: AuthTarget::Server,
+            scheme: AuthScheme::Basic,
+            origin: Some(srv.url("/protected").origin().ascii_serialization()),
+            realm: "Members Only".into(),
+        },
+        Credentials::basic("e2e", "hunter2"),
+    );
+
+    let cfg = FetcherConfig {
+        credentials: Some(store.clone()),
+        ..FetcherConfig::default()
+    };
+    // This context refuses every challenge; the store answers before it is consulted.
+    let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+    let shutdown = CancellationToken::new();
+    let (f, c) = (fetcher.clone(), shutdown.clone());
+    tokio::spawn(async move { f.run(c).await });
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, body } => {
+            assert_eq!(meta.status, 200);
+            assert_eq!(&body[..], b"top secret");
+        }
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+    shutdown.cancel();
+}
+
+/// Credentials for one origin's realm are not offered to another origin's, even when the realm
+/// name matches.
+#[tokio::test]
+async fn credentials_do_not_cross_origins() {
+    let one = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let two = protected_server(r#"Basic realm="Members Only""#)
+        .start()
+        .await;
+    let store = Arc::new(InMemoryCredentialStore::new());
+    let cfg = FetcherConfig {
+        credentials: Some(store.clone()),
+        ..FetcherConfig::default()
+    };
+    let ctx = Arc::new(AuthContext::new("hunter2"));
+    let fetcher = Arc::new(Fetcher::new(cfg, ctx.clone()).unwrap());
+    let shutdown = CancellationToken::new();
+    let (f, c) = (fetcher.clone(), shutdown.clone());
+    tokio::spawn(async move { f.run(c).await });
+
+    for srv in [&one, &two] {
+        let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
+        match fetcher.fetch(req).await {
+            FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 200),
+            other => panic!("expected Buffered, got {other:?}"),
+        }
+    }
+
+    // One entry per origin, and the hook was asked once for each.
+    assert_eq!(store.len(), 2);
+    assert_eq!(ctx.seen.lock().unwrap().len(), 2);
+    shutdown.cancel();
+}
+
+/// A fetcher with an explicit cache (or none), plus the cache itself.
+fn spawn_with_cache(cache: Option<Arc<InMemoryHttpCache>>) -> (Arc<Fetcher>, CancellationToken) {
+    let cfg = FetcherConfig {
+        cache: cache.map(|c| c as Arc<dyn HttpCache>),
+        ..FetcherConfig::default()
+    };
+    let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+    let shutdown = CancellationToken::new();
+    let (f, c) = (fetcher.clone(), shutdown.clone());
+    tokio::spawn(async move { f.run(c).await });
+    (fetcher, shutdown)
+}
+
+fn buffered(result: FetchResult) -> (gosub_sonar::FetchResultMeta, bytes::Bytes) {
+    match result {
+        FetchResult::Buffered { meta, body } => (meta, body),
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+}
+
+/// Issue #1: a second fetch of a fresh resource does not reach the server.
+#[tokio::test]
+async fn a_fresh_response_is_served_from_the_cache() {
+    let srv = TestServer::new()
+        .route(
+            "/cached",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, Vec::new()).counting()),
+        )
+        .start()
+        .await;
+    let cache = Arc::new(InMemoryHttpCache::new());
+    let (fetcher, shutdown) = spawn_with_cache(Some(cache.clone()));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/cached")).build();
+    let (meta, body) = buffered(fetcher.fetch(req).await);
+    assert_eq!(meta.status, 200);
+    assert!(!meta.from_cache);
+    assert_eq!(&body[..], b"hit-1");
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/cached")).build();
+    let (meta, body) = buffered(fetcher.fetch(req).await);
+    assert!(meta.from_cache);
+    assert_eq!(&body[..], b"hit-1");
+    assert_eq!(srv.hit_count("/cached"), 1);
+    assert_eq!(cache.len(), 1);
+    shutdown.cancel();
+}
+
+/// A `304` is invisible to the caller: the stored body comes back as a 200.
+#[tokio::test]
+async fn a_revalidated_response_comes_back_as_a_200() {
+    let srv = TestServer::new()
+        .route(
+            "/etag",
+            RouteConfig::Cacheable(
+                CacheRouteOptions::max_age(0, b"stored body".to_vec()).with_etag("\"v1\""),
+            ),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_with_cache(Some(Arc::new(InMemoryHttpCache::new())));
+
+    for expected_from_cache in [false, true] {
+        let req = FetchRequest::builder(Method::GET, srv.url("/etag")).build();
+        let (meta, body) = buffered(fetcher.fetch(req).await);
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"stored body");
+        assert_eq!(meta.from_cache, expected_from_cache);
+    }
+    // Asked twice, transferred once.
+    assert_eq!(srv.hit_count("/etag"), 2);
+    shutdown.cancel();
+}
+
+/// `CacheMode::Reload` is what a refresh button does: back to the server, and the answer
+/// replaces what was stored.
+#[tokio::test]
+async fn a_reload_ignores_a_fresh_entry() {
+    let srv = TestServer::new()
+        .route(
+            "/reload",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, Vec::new()).counting()),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_with_cache(Some(Arc::new(InMemoryHttpCache::new())));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/reload")).build();
+    assert_eq!(&buffered(fetcher.fetch(req).await).1[..], b"hit-1");
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/reload"))
+        .with_cache_mode(CacheMode::Reload)
+        .build();
+    let (meta, body) = buffered(fetcher.fetch(req).await);
+    assert!(!meta.from_cache);
+    assert_eq!(&body[..], b"hit-2");
+
+    // And the reloaded response is what the next normal fetch gets.
+    let req = FetchRequest::builder(Method::GET, srv.url("/reload")).build();
+    let (meta, body) = buffered(fetcher.fetch(req).await);
+    assert!(meta.from_cache);
+    assert_eq!(&body[..], b"hit-2");
+    assert_eq!(srv.hit_count("/reload"), 2);
+    shutdown.cancel();
+}
+
+/// `CacheMode::NoStore` neither reads nor writes, for a private session.
+#[tokio::test]
+async fn no_store_leaves_no_trace() {
+    let srv = TestServer::new()
+        .route(
+            "/private",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, b"secret".to_vec())),
+        )
+        .start()
+        .await;
+    let cache = Arc::new(InMemoryHttpCache::new());
+    let (fetcher, shutdown) = spawn_with_cache(Some(cache.clone()));
+
+    for _ in 0..2 {
+        let req = FetchRequest::builder(Method::GET, srv.url("/private"))
+            .with_cache_mode(CacheMode::NoStore)
+            .build();
+        let (meta, _) = buffered(fetcher.fetch(req).await);
+        assert!(!meta.from_cache);
+    }
+    assert_eq!(srv.hit_count("/private"), 2);
+    assert!(cache.is_empty());
+    shutdown.cancel();
+}
+
+/// `only-if-cached` refuses rather than reaching the network.
+#[tokio::test]
+async fn only_if_cached_without_an_entry_fails() {
+    let srv = TestServer::new()
+        .route(
+            "/absent",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, b"x".to_vec())),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_with_cache(Some(Arc::new(InMemoryHttpCache::new())));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/absent"))
+        .with_cache_mode(CacheMode::OnlyIfCached)
+        .build();
+    match fetcher.fetch(req).await {
+        FetchResult::Error(NetError::Blocked { reason, .. }) => {
+            assert_eq!(reason, BlockReason::NotCached)
+        }
+        other => panic!("expected a NotCached block, got {other:?}"),
+    }
+    assert_eq!(srv.hit_count("/absent"), 0);
+    shutdown.cancel();
+}
+
+/// A fetcher configured without a cache behaves exactly as it did before caching existed.
+#[tokio::test]
+async fn a_fetcher_without_a_cache_always_goes_to_the_server() {
+    let srv = TestServer::new()
+        .route(
+            "/uncached",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, Vec::new()).counting()),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_with_cache(None);
+
+    for expected in [&b"hit-1"[..], &b"hit-2"[..]] {
+        let req = FetchRequest::builder(Method::GET, srv.url("/uncached")).build();
+        let (meta, body) = buffered(fetcher.fetch(req).await);
+        assert!(!meta.from_cache);
+        assert_eq!(&body[..], expected);
+    }
+    assert_eq!(srv.hit_count("/uncached"), 2);
+    shutdown.cancel();
+}
+
+/// Clearing the store empties the fetcher's cache: what a "clear browsing data" button does.
+#[tokio::test]
+async fn clearing_the_store_drops_what_was_cached() {
+    let srv = TestServer::new()
+        .route(
+            "/clearable",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, Vec::new()).counting()),
+        )
+        .start()
+        .await;
+    let cache = Arc::new(InMemoryHttpCache::new());
+    let (fetcher, shutdown) = spawn_with_cache(Some(cache.clone()));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/clearable")).build();
+    assert_eq!(&buffered(fetcher.fetch(req).await).1[..], b"hit-1");
+    assert_eq!(cache.len(), 1);
+
+    cache.clear();
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/clearable")).build();
+    let (meta, body) = buffered(fetcher.fetch(req).await);
+    assert!(!meta.from_cache);
+    assert_eq!(&body[..], b"hit-2");
     shutdown.cancel();
 }

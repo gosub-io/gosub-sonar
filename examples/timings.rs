@@ -7,9 +7,9 @@
 //!
 //! Two things it makes visible that are easy to misread as bugs:
 //!
-//! - a phase that did not happen reports nothing rather than zero. Fetch the same host
-//!   twice and the second request shows no dns and no connect: it reused a pooled
-//!   connection, so it spent no time on either.
+//! - a phase that did not happen reports nothing rather than zero. Fetch the same URL twice
+//!   and the second request shows no dns and no connect - and, if the response was
+//!   cacheable, no request at all. It spent no time on what it did not do.
 //! - `DnsResolved` needs a [`DnsResolver`] to be configured. reqwest's built-in resolution
 //!   happens below this crate and cannot be timed, so this example installs
 //!   [`SystemResolver`], which resolves exactly like reqwest would but through a seam that
@@ -54,6 +54,9 @@ enum Mark {
     },
     Headers {
         status: u16,
+    },
+    Cache {
+        outcome: String,
     },
     Redirected {
         status: u16,
@@ -110,6 +113,9 @@ impl NetObserver for Timeline {
                 self.push(Mark::PreflightDone { elapsed })
             }
             NetEvent::ResponseHeaders { status, .. } => self.push(Mark::Headers { status }),
+            NetEvent::Cache { outcome, .. } => self.push(Mark::Cache {
+                outcome: outcome.to_string(),
+            }),
             NetEvent::Redirected { status, to, .. } => self.push(Mark::Redirected { status, to }),
             NetEvent::Finished {
                 received_bytes,
@@ -190,6 +196,7 @@ fn report(url: &Url, tl: &Timeline, error: Option<String>) {
     let mut pf_start: Option<Duration> = None;
     let mut headers: Vec<(Duration, u16)> = Vec::new();
     let mut saw_failure = false;
+    let mut cache: Vec<String> = Vec::new();
 
     for (at, mark) in marks.iter() {
         match mark {
@@ -232,6 +239,7 @@ fn report(url: &Url, tl: &Timeline, error: Option<String>) {
                 note: "CORS OPTIONS round-trip".into(),
             }),
             Mark::Headers { status } => headers.push((*at, *status)),
+            Mark::Cache { outcome } => cache.push(outcome.clone()),
             Mark::Redirected { status, to } => {
                 notes.push(format!("{} redirect {status} -> {to}", ms(*at)))
             }
@@ -300,7 +308,14 @@ fn report(url: &Url, tl: &Timeline, error: Option<String>) {
                 note: format!("{bytes} bytes of body"),
             });
         }
-        // No headers event: fall back to one bar for everything after the connection.
+        // No headers event. Either the response came from the HTTP cache, in which case no
+        // request was sent at all, or nothing reported them.
+        _ if cache.iter().any(|o| o == "hit") => phases.push(Phase {
+            label: "cache",
+            start: last_end,
+            dur: total.saturating_sub(last_end),
+            note: format!("served from the HTTP cache, {bytes} bytes, no request sent"),
+        }),
         _ => phases.push(Phase {
             label: "req+resp",
             start: last_end,
@@ -325,12 +340,31 @@ fn report(url: &Url, tl: &Timeline, error: Option<String>) {
     for n in &notes {
         println!("  {n}");
     }
-    // An absent phase is a real answer, not a gap in the instrumentation.
+    // An absent phase is a real answer, not a gap in the instrumentation - but say which
+    // answer, since a cache hit and a pooled connection are different kinds of nothing.
+    let hit = cache.iter().any(|o| o == "hit");
+    if !cache.is_empty() {
+        println!("  (cache: {})", cache.join(", "));
+    }
     if !phases.iter().any(|p| p.label == "dns") {
-        println!("  (no dns: served from the connection pool, nothing was resolved)");
+        println!(
+            "  (no dns: {}, nothing was resolved)",
+            if hit {
+                "served from the HTTP cache"
+            } else {
+                "served from the connection pool"
+            }
+        );
     }
     if !phases.iter().any(|p| p.label == "connect") {
-        println!("  (no connect: served from the connection pool, nothing was opened)");
+        println!(
+            "  (no connect: {}, nothing was opened)",
+            if hit {
+                "served from the HTTP cache"
+            } else {
+                "served from the connection pool"
+            }
+        );
     }
 }
 

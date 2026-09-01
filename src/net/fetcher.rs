@@ -1,5 +1,8 @@
 //! Priority-scheduled fetcher with request coalescing and per-origin concurrency limits.
 
+use crate::net::auth::{CredentialStore, InMemoryCredentialStore};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::cache::{HttpCache, InMemoryHttpCache};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::cors::{CorsPreflightCache, InMemoryPreflightCache};
 #[cfg(not(target_arch = "wasm32"))]
@@ -114,6 +117,31 @@ pub struct FetcherConfig {
     #[cfg(not(target_arch = "wasm32"))]
     pub cors_preflight_cache: Option<Arc<dyn CorsPreflightCache>>,
 
+    /// Credentials remembered per authentication protection space (target + origin + realm),
+    /// consulted before [`FetcherContext::on_auth_challenge`] and updated with whatever it
+    /// returns once the server accepts it.
+    ///
+    /// Defaults to an [`InMemoryCredentialStore`], so a realm is only asked about once per
+    /// fetcher; supply your own [`CredentialStore`] to back it with a keychain. `None` keeps
+    /// authentication working but asks the hook for every challenge; use it for a
+    /// private-browsing session. See [`auth`](mod@crate::net::auth).
+    ///
+    /// Nothing is stored unless a hook supplies credentials, so the default is inert for a
+    /// fetcher that does not authenticate.
+    pub credentials: Option<Arc<dyn CredentialStore>>,
+
+    /// Store of cached responses, consulted before every hop and written to after it.
+    ///
+    /// Defaults to an [`InMemoryHttpCache`] with a 16 MiB budget, so a fetcher caches like a
+    /// browser does; supply your own [`HttpCache`] to persist entries or bound them differently.
+    /// `None` disables caching entirely, which is also what
+    /// [`CacheMode::NoStore`](crate::net::cache::CacheMode::NoStore) does per request.
+    /// See [`cache`](mod@crate::net::cache).
+    ///
+    /// Native-only: on wasm32 the browser's `fetch()` has its own HTTP cache.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub cache: Option<Arc<dyn HttpCache>>,
+
     /// Which proxy outgoing requests go through.
     ///
     /// Defaults to [`ProxyConfig::System`], which reads `HTTP_PROXY` and friends from the
@@ -160,6 +188,9 @@ impl Default for FetcherConfig {
             mixed_content: MixedContentPolicy::default(),
             #[cfg(not(target_arch = "wasm32"))]
             cors_preflight_cache: Some(Arc::new(InMemoryPreflightCache::new())),
+            credentials: Some(Arc::new(InMemoryCredentialStore::new())),
+            #[cfg(not(target_arch = "wasm32"))]
+            cache: Some(Arc::new(InMemoryHttpCache::new())),
             #[cfg(not(target_arch = "wasm32"))]
             proxy: ProxyConfig::default(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -655,6 +686,7 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
         .with_referrer(req.referrer.clone(), req.referrer_policy)
         .with_fetch_metadata(req.destination, req.mode, req.initiator == Initiator::User)
         .with_credentials(req.credentials)
+        .with_cache(req.cache_mode, req.auto_decode)
 }
 
 /// Build a reqwest client from `FetcherConfig`.
@@ -797,17 +829,18 @@ fn build_policy(
     origins: Arc<OriginTable>,
 ) -> NetPolicy {
     let policy = NetPolicy::from_context(ctx)
-        .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)));
+        .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)))
+        .with_credential_store(cfg.credentials.clone());
     #[cfg(not(target_arch = "wasm32"))]
     let policy = {
-        let policy = policy.with_hsts(cfg.hsts.clone());
+        let policy = policy
+            .with_hsts(cfg.hsts.clone())
+            .with_cache(cfg.cache.clone());
         match cfg.cors_preflight_cache.clone() {
             Some(cache) => policy.with_cors_preflight_cache(cache),
             None => policy,
         }
     };
-    #[cfg(target_arch = "wasm32")]
-    let _ = cfg;
     policy
 }
 
@@ -978,6 +1011,7 @@ mod tests {
             destination: Default::default(),
             mode: Default::default(),
             credentials: Default::default(),
+            cache_mode: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1008,6 +1042,7 @@ mod tests {
                 destination: Default::default(),
                 mode: Default::default(),
                 credentials: Default::default(),
+                cache_mode: Default::default(),
                 streaming: false,
                 auto_decode: true,
                 max_bytes: None,
@@ -1230,6 +1265,7 @@ mod tests {
             destination: Default::default(),
             mode: Default::default(),
             credentials: Default::default(),
+            cache_mode: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1385,6 +1421,7 @@ mod tests {
             destination: Default::default(),
             mode: Default::default(),
             credentials: Default::default(),
+            cache_mode: Default::default(),
             streaming: true,
             auto_decode: true,
             max_bytes: None,
@@ -2040,6 +2077,7 @@ mod tests {
             destination: Default::default(),
             mode: Default::default(),
             credentials: Default::default(),
+            cache_mode: Default::default(),
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -2403,6 +2441,7 @@ mod tests {
             destination: Default::default(),
             mode: Default::default(),
             credentials: Default::default(),
+            cache_mode: Default::default(),
             streaming: false,
             auto_decode,
             max_bytes: None,

@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- HTTP caching (#1), applied per redirect hop, so a cacheable `301` is followed without a
+  request of its own:
+  - new `net::cache` module: freshness from `Cache-Control: max-age`, `Expires`/`Date` or the
+    `Last-Modified` heuristic, with the stored response's age corrected for `Age` and request
+    latency (RFC 9111 §4.2); revalidation of a stale entry with `If-None-Match` /
+    `If-Modified-Since`, and a `304` that updates the stored headers and reuses the stored body;
+    `Vary`, as one entry per combination of the request headers a response varies on;
+    invalidation of the target URI and a same-origin `Location`/`Content-Location` by an unsafe
+    method; and the request directives `no-store`, `no-cache`, `max-age`, `max-stale`,
+    `min-fresh` and `only-if-cached`
+  - `FetcherConfig::cache` takes an `HttpCache` and defaults to `InMemoryHttpCache` with a
+    16 MiB budget and a 2 MiB per-entry ceiling, evicting least-recently-used entries. `None`
+    disables caching
+  - `FetchRequest::cache_mode` (`CacheMode`, mirroring the Fetch standard's request cache mode):
+    `Default`, `NoStore`, `Reload`, `NoCache`, `ForceCache`, `OnlyIfCached`. It is part of the
+    coalescing key, so a reload never joins a fetch that may be answered from the cache
+  - `FetchResultMeta::from_cache` says whether a response came from the cache, including one a
+    `304` confirmed; observers get `NetEvent::Cache` with a `CacheOutcome` of `Hit`,
+    `Validated`, `Stored` or `Invalidated`
+  - `Set-Cookie` and the hop-by-hop headers are stripped before a response is stored, and a body
+    the client decompressed is stored without its `Content-Encoding` and only answers requests
+    that also want decoding
+  - streamed responses are cached too: the body is copied as the caller reads it and written
+    when the stream ends, so a cancelled or oversized one stores nothing
+  - `BlockReason::NotCached` for a request that demanded a stored response and got none
+  - not included: shared-cache rules (`s-maxage`, the `Authorization` restriction), range
+    requests and `206`, and `stale-while-revalidate`
+  - `test-support`: `RouteConfig::Cacheable` with `CacheRouteOptions` (directives, validators,
+    `Vary`, a per-request body) answers `304` to a matching conditional request;
+    `RecordingObserver::cache_outcomes`
+  - native-only; on wasm32 the browser's `fetch()` has its own HTTP cache
+  - `examples/caching.rs` walks through a hit, a revalidation, a reload, and `only-if-cached`
+
+- Authentication challenges (#7): a `401`/`407` hop is now re-sent with credentials instead of
+  being handed to the caller as a finished non-2xx response.
+  - new `net::auth` module: `AuthChallenge` (scheme, realm, every auth-param, token68) parsed
+    from `WWW-Authenticate`/`Proxy-Authenticate`, `AuthScheme`, `AuthTarget`, `Credentials`
+    (`Basic`, computed per RFC 7617, or `Raw` for a verbatim header value), and
+    `ProtectionSpace` — target + scheme + origin + realm, without the origin for a proxy
+  - `FetcherContext::on_auth_challenge(&challenge) -> Option<Credentials>` is asked for each
+    challenge in turn, so an unanswerable scheme falls through to the next one. Synchronous, like
+    `tls_override`: for a password dialog return `None` and re-submit, or seed the store
+  - `FetcherConfig::credentials` takes a `CredentialStore` (in-memory default:
+    `InMemoryCredentialStore`) so a realm is only asked about once. Accepted passwords are
+    stored, refused ones forgotten, and `challenge.attempt` counts the rejections. A `Raw` answer
+    is not stored, since it was computed for one challenge, but the store can be pre-seeded with
+    one. `None` keeps authentication working without remembering anything
+  - retries are capped at `MAX_AUTH_ATTEMPTS` (3) per hop; the credentials header is added to the
+    send only, so it never leaks into a redirect
+  - server credentials follow `FetchRequest::credentials` and are only attached to a
+    CORS-untainted chain (`Authorization` is not CORS-safelisted); proxy challenges are
+    native-only
+  - observers get `NetEvent::AuthRequired` for every challenged response, answered or not
+  - `test-support`: `RouteConfig::RequireAuth` demands a credentials header before answering,
+    and `RecordingObserver::auth_required` collects the events
+  - `examples/auth.rs` shows answering, declining, and falling through to a second challenge
 - Connection timing is reported to the request's observer, so an embedder can attribute
   the time before the first byte instead of guessing at it:
   - `NetEvent::DnsResolved { host, elapsed, addr_count }` times a hostname lookup. It
