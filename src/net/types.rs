@@ -114,6 +114,39 @@ pub struct FetchResultMeta {
 }
 
 impl FetchResultMeta {
+    /// Metadata for a result the fetcher did not produce.
+    ///
+    /// Not everything a browser loads comes off the network: `file://` reads, engine
+    /// internal pages and inline documents all need a [`FetchResult`] to hand onward, and
+    /// this struct is `#[non_exhaustive]` so an embedder cannot build one with a struct
+    /// literal. Start from here and assign the fields that apply - they are all public:
+    ///
+    /// ```
+    /// # use gosub_sonar::FetchResultMeta;
+    /// # use url::Url;
+    /// let url = Url::parse("file:///tmp/page.html").unwrap();
+    /// let mut meta = FetchResultMeta::synthetic(url);
+    /// meta.content_type = Some("text/html".into());
+    /// meta.has_body = true;
+    /// ```
+    ///
+    /// Defaults describe a successful, same-origin, non-cached response with no body and
+    /// no headers: status 200 `OK`, [`ResponseTainting::Basic`], `from_cache` false.
+    #[must_use]
+    pub fn synthetic(final_url: Url) -> Self {
+        Self {
+            final_url,
+            status: 200,
+            status_text: "OK".to_string(),
+            headers: HeaderMap::new(),
+            content_length: None,
+            content_type: None,
+            has_body: false,
+            from_cache: false,
+            tainting: ResponseTainting::default(),
+        }
+    }
+
     /// The header view scripts may read, per this response's [`tainting`](Self::tainting):
     /// everything but `Set-Cookie` for a basic response, the CORS-safelisted set plus
     /// `Access-Control-Expose-Headers` for a CORS response, nothing for an opaque one.

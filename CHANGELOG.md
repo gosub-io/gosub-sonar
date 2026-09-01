@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-01
+
+### Added
+
+- `FetchResultMeta::synthetic(final_url)`, a constructor for metadata the fetcher did not
+  produce - a `file://` read, an engine internal page, an inline document. The struct is
+  `#[non_exhaustive]`, so an embedder outside the crate cannot build one with a struct literal;
+  this starts from a successful, same-origin, non-cached response (status 200 `OK`,
+  `ResponseTainting::Basic`, no body, no headers) whose public fields can then be assigned.
+
 ## [0.5.0] - 2026-09-01
 
 ### Added
@@ -369,7 +379,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.2.0...v0.3.0
