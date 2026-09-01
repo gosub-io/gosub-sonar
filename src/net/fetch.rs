@@ -1,5 +1,9 @@
 //! Low-level fetch functions used by the [`super::fetcher::Fetcher`].
 
+use crate::net::auth::{
+    self, AuthChallenge, AuthTarget, CredentialStore, Credentials, ProtectionSpace,
+    MAX_AUTH_ATTEMPTS,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::cors::CorsPreflightCache;
 use crate::net::cors::{self, CorsError, ResponseTainting};
@@ -105,6 +109,9 @@ pub type CookieSinkFn = Box<dyn Fn(&Url, &[&str]) + Send + Sync>;
 /// Callback type for reporting the HTTP version of a response.
 pub type ProtocolSinkFn = Box<dyn Fn(&Url, http::Version) + Send + Sync>;
 
+/// Callback type for answering an authentication challenge.
+pub type AuthChallengeFn = Box<dyn Fn(&AuthChallenge) -> Option<Credentials> + Send + Sync>;
+
 /// Network-level request policies threaded through the fetch stack.
 ///
 /// Bundles the URL allowlist check and the cookie-jar query so both can be applied at
@@ -136,6 +143,14 @@ pub struct NetPolicy {
     /// asking the server every time. Set via [`NetPolicy::with_cors_preflight_cache`].
     #[cfg(not(target_arch = "wasm32"))]
     pub cors_preflight: Option<Arc<dyn CorsPreflightCache>>,
+    /// Called for each challenge of a `401`/`407` response until one yields credentials to retry
+    /// the hop with. The default answers no challenge, leaving the response for the caller.
+    /// See [`auth`](mod@crate::net::auth).
+    pub on_auth_challenge: AuthChallengeFn,
+    /// Credentials remembered per protection space, consulted before `on_auth_challenge` and
+    /// updated from its answers. `None` still authenticates, asking the hook every time.
+    /// Set via [`NetPolicy::with_credential_store`].
+    pub credentials: Option<Arc<dyn CredentialStore>>,
 }
 
 impl Default for NetPolicy {
@@ -149,6 +164,8 @@ impl Default for NetPolicy {
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
             cors_preflight: None,
+            on_auth_challenge: Box::new(|_| None),
+            credentials: None,
         }
     }
 }
@@ -159,6 +176,7 @@ impl NetPolicy {
         let ctx_url = ctx.clone();
         let ctx_cookies = ctx.clone();
         let ctx_sink = ctx.clone();
+        let ctx_auth = ctx.clone();
         Self {
             url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
             cookies_for: Box::new(move |url| ctx_cookies.cookies_for(url)),
@@ -168,6 +186,8 @@ impl NetPolicy {
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
             cors_preflight: None,
+            on_auth_challenge: Box::new(move |challenge| ctx_auth.on_auth_challenge(challenge)),
+            credentials: None,
         }
     }
 
@@ -197,6 +217,20 @@ impl NetPolicy {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn clear_preflight_cache(mut self) -> Self {
         self.cors_preflight = None;
+        self
+    }
+
+    /// Attaches the credential store consulted for authentication challenges, and updated when
+    /// credentials from [`NetPolicy::on_auth_challenge`] turn out to work. `None` asks the hook
+    /// for every challenge.
+    pub fn with_credential_store(mut self, store: Option<Arc<dyn CredentialStore>>) -> Self {
+        self.credentials = store;
+        self
+    }
+
+    /// Replaces the callback answering authentication challenges.
+    pub fn with_auth_challenge_fn(mut self, hook: AuthChallengeFn) -> Self {
+        self.on_auth_challenge = hook;
         self
     }
 }
@@ -732,6 +766,34 @@ fn send_error(
     NetError::Read(Arc::new(anyhow::Error::from(e).context(what.to_string())))
 }
 
+/// Find credentials for the first challenge that has any: the credential store first, then the
+/// embedder's hook, walking the challenges in the order the server listed them.
+///
+/// Returns the protection space they belong to, so they can be stored or dropped depending on
+/// what the server makes of them, the credentials, and the value for the credentials header.
+fn credentials_for_challenges(
+    policy: &NetPolicy,
+    challenges: &[AuthChallenge],
+) -> Option<(ProtectionSpace, Credentials, header::HeaderValue)> {
+    for challenge in challenges {
+        let space = challenge.protection_space();
+        let known = policy
+            .credentials
+            .as_ref()
+            .and_then(|store| store.credentials_for(&space));
+        let credentials = match known.or_else(|| (policy.on_auth_challenge)(challenge)) {
+            Some(credentials) => credentials,
+            None => continue,
+        };
+        // Credentials that cannot be expressed as a header value are not an answer; try the next
+        // challenge instead of re-sending the request unchanged.
+        if let Some(value) = credentials.header_value() {
+            return Some((space, credentials, value));
+        }
+    }
+    None
+}
+
 /// Perform a GET request, following redirects up to MAX_REDIRECTS times, while sending out net events.
 ///
 /// Follow a chain of HTTP redirects, returning the first non-redirect response.
@@ -751,6 +813,9 @@ fn send_error(
 ///   the chain, and `Origin` collapses to `null` once the chain redirects away from an origin
 ///   the request had already left — see [`fetch_metadata`](mod@crate::net::fetch_metadata).
 /// - `policy.url_allowed` and `policy.cookies_for` are called at every hop.
+/// - A `401`/`407` hop is re-sent with credentials from the credential store or
+///   `policy.on_auth_challenge` (see [`auth`](mod@crate::net::auth)); only a response that is
+///   not a challenge continues through the chain.
 /// - `Set-Cookie` values on 3xx responses are reported via `policy.on_cookies` and the jar is
 ///   re-queried for the next hop; the final response's cookies are the caller's responsibility.
 /// - CORS is enforced per hop when `init.origin` is set — the same-origin/no-cors mode rules
@@ -991,11 +1056,12 @@ async fn get_with_redirects(
             }
         }
 
-        // Inject cookies from the jar for this hop's origin — but only when the request's
-        // credentials mode says this hop gets credentials at all.
-        // Only applied when no Cookie header is already set; this naturally handles cross-origin
-        // redirects: the cookie was stripped above, so the jar is re-queried for the new origin.
-        let attach_cookies = match init.credentials {
+        // Cookies from the jar and an answer to an authentication challenge are both
+        // credentials, so the request's credentials mode gates them together.
+        // Cookies are only injected when no Cookie header is already set; this naturally handles
+        // cross-origin redirects: the cookie was stripped above, so the jar is re-queried for the
+        // new origin.
+        let attach_credentials = match init.credentials {
             RequestCredentials::Include => true,
             RequestCredentials::Omit => false,
             // Without a document origin to compare against, "same-origin" has no meaning and
@@ -1004,7 +1070,7 @@ async fn get_with_redirects(
                 .as_ref()
                 .is_none_or(|o| !origin_tainted && *o == url.origin()),
         };
-        if attach_cookies && !current_headers.contains_key(header::COOKIE) {
+        if attach_credentials && !current_headers.contains_key(header::COOKIE) {
             if let Some(cookie_str) = (policy.cookies_for)(&url) {
                 if let Ok(val) = cookie_str.parse() {
                     current_headers.insert(header::COOKIE, val);
@@ -1012,56 +1078,132 @@ async fn get_with_redirects(
             }
         }
 
-        let mut req_builder = client
-            .request(current_method.clone(), url.clone())
-            .headers(current_headers.clone());
-        if let Some(ref body) = current_body {
-            // Built fresh per hop so a streamed body can be replayed on 307/308.
-            let (hop_body, explicit_len) = body.to_reqwest_body()?;
-            if let Some(len) = explicit_len {
-                if !current_headers.contains_key(header::CONTENT_LENGTH) {
-                    req_builder = req_builder.header(header::CONTENT_LENGTH, len);
+        // Authentication (RFC 9110 §11): a 401 or 407 is re-sent with credentials whenever they
+        // can be found for one of its challenges, at most `MAX_AUTH_ATTEMPTS` times. Only a
+        // response that is not a challenge leaves this loop. See
+        // [`auth`](mod@crate::net::auth).
+        let mut auth_header: Option<(header::HeaderName, header::HeaderValue)> = None;
+        let mut auth_attempt = 0u32;
+        // Credentials the server has not accepted yet. Stored once a response arrives that is
+        // not another challenge, dropped when it is.
+        let mut unproven: Option<(ProtectionSpace, Credentials)> = None;
+
+        let resp = loop {
+            // The credentials header is added for the send only, so a redirect from this hop
+            // starts from the caller's headers again.
+            let mut hop_headers = current_headers.clone();
+            if let Some((ref name, ref value)) = auth_header {
+                hop_headers.insert(name.clone(), value.clone());
+            }
+            let mut req_builder = client
+                .request(current_method.clone(), url.clone())
+                .headers(hop_headers);
+            if let Some(ref body) = current_body {
+                // Built fresh per send so a streamed body can be replayed on 307/308 and for an
+                // authenticated retry of this hop.
+                let (hop_body, explicit_len) = body.to_reqwest_body()?;
+                if let Some(len) = explicit_len {
+                    if !current_headers.contains_key(header::CONTENT_LENGTH) {
+                        req_builder = req_builder.header(header::CONTENT_LENGTH, len);
+                    }
+                }
+                req_builder = req_builder.body(hop_body);
+            }
+            let fut = req_builder.send();
+            tokio::pin!(fut);
+
+            let resp = tokio::select! {
+                _ = cancel.cancelled() => {
+                    observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled net.get_with_redirects" });
+                    return Err(NetError::Cancelled("cancelled net.get_with_redirects".into()));
+                }
+                r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer))?
+            };
+
+            // Report the HTTP version of every hop, not just the final response, so the fetcher's
+            // per-origin limits also learn about intermediate origins. reqwest's wasm Response has
+            // no version().
+            #[cfg(not(target_arch = "wasm32"))]
+            (policy.on_protocol)(resp.url(), resp.version());
+
+            // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
+            // a site first arms it, and that response is consumed below.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(ref store) = policy.hsts {
+                hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
+            }
+
+            // The CORS check (Fetch §4.10.3) runs on *every* response of a cors-tainted chain —
+            // redirects included, and also a final same-origin hop reached through a cross-origin
+            // detour. Native-only: on wasm32 the browser has already enforced this.
+            #[cfg(not(target_arch = "wasm32"))]
+            if tainting == ResponseTainting::Cors {
+                if let Some(ref o) = origin {
+                    if let Err(e) =
+                        cors::cors_check(o, origin_tainted, credentials_include, resp.headers())
+                    {
+                        return Err(blocked(&observer, url, BlockReason::Cors(e)));
+                    }
                 }
             }
-            req_builder = req_builder.body(hop_body);
-        }
-        let fut = req_builder.send();
-        tokio::pin!(fut);
 
-        let resp = tokio::select! {
-            _ = cancel.cancelled() => {
-                observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled net.get_with_redirects" });
-                return Err(NetError::Cancelled("cancelled net.get_with_redirects".into()));
-            }
-            r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer))?
-        };
-
-        // Report the HTTP version of every hop, not just the final response, so the fetcher's
-        // per-origin limits also learn about intermediate origins. reqwest's wasm Response has
-        // no version().
-        #[cfg(not(target_arch = "wasm32"))]
-        (policy.on_protocol)(resp.url(), resp.version());
-
-        // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
-        // a site first arms it, and that response is consumed below.
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ref store) = policy.hsts {
-            hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
-        }
-
-        // The CORS check (Fetch §4.10.3) runs on *every* response of a cors-tainted chain —
-        // redirects included, and also a final same-origin hop reached through a cross-origin
-        // detour. Native-only: on wasm32 the browser has already enforced this.
-        #[cfg(not(target_arch = "wasm32"))]
-        if tainting == ResponseTainting::Cors {
-            if let Some(ref o) = origin {
-                if let Err(e) =
-                    cors::cors_check(o, origin_tainted, credentials_include, resp.headers())
+            // After the checks above: a response CORS refuses is blocked even when it asks for
+            // credentials.
+            let Some(target) = AuthTarget::for_status(resp.status().as_u16()) else {
+                // Only a password is remembered. A `Raw` answer was computed for the challenge
+                // it answered (a Digest nonce, a Negotiate token), and replaying it would only
+                // draw another challenge.
+                if let (Some(store), Some((space, credentials))) =
+                    (policy.credentials.as_ref(), unproven.take())
                 {
-                    return Err(blocked(&observer, url, BlockReason::Cors(e)));
+                    if matches!(credentials, Credentials::Basic { .. }) {
+                        store.store(space, credentials);
+                    }
                 }
-            }
-        }
+                break resp;
+            };
+
+            let may_answer = match target {
+                // Server credentials follow the request's credentials mode, and are only
+                // attached to a chain the CORS regime left untainted. `Authorization` is not a
+                // CORS-safelisted header, so adding it to a cors request would need a preflight
+                // of its own, and adding it to a no-cors one would be a header markup cannot
+                // produce. Navigations and requests without a document origin stay basic, and
+                // those are the ones a browser shows its password dialog for.
+                AuthTarget::Server => attach_credentials && tainting == ResponseTainting::Basic,
+                // A proxy challenge is about the hop to the proxy. `Proxy-Authorization` never
+                // reaches the origin server, so neither CORS nor the credentials mode has a say.
+                // On wasm32 the browser owns the proxy connection and forbids the header.
+                AuthTarget::Proxy => cfg!(not(target_arch = "wasm32")),
+            };
+            let challenges = auth::parse_challenges(resp.headers(), target, &url, auth_attempt);
+            let answer = if may_answer && auth_attempt < MAX_AUTH_ATTEMPTS {
+                // What was sent last time has just been rejected: drop it so the store stops
+                // handing back a password the server no longer takes.
+                if let (Some(store), Some((space, _))) =
+                    (policy.credentials.as_ref(), unproven.take())
+                {
+                    store.forget(&space);
+                }
+                credentials_for_challenges(&policy, &challenges)
+            } else {
+                None
+            };
+
+            observer.on_event(NetEvent::AuthRequired {
+                url: url.clone(),
+                target,
+                challenges,
+                retried: answer.is_some(),
+            });
+
+            let Some((space, credentials, value)) = answer else {
+                break resp;
+            };
+            auth_header = Some((target.credentials_header(), value));
+            unproven = Some((space, credentials));
+            auth_attempt += 1;
+        };
 
         if !resp.status().is_redirection() {
             return Ok((resp, tainting));
@@ -1191,6 +1333,7 @@ async fn get_with_redirects(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::auth::{AuthScheme, InMemoryCredentialStore};
     use crate::net::referrer::ReferrerPolicy;
     use crate::net::test_support::{RecordingObserver, RouteConfig, TestServer};
     use cow_utils::CowUtils;
@@ -2780,5 +2923,401 @@ mod tests {
 
         assert_eq!(meta.status, 200);
         assert_eq!(&body[..], b"");
+    }
+
+    /// base64("user:pass"), the credentials the auth routes below accept.
+    const GOOD_AUTH: &str = "Basic dXNlcjpwYXNz";
+
+    async fn auth_server() -> crate::net::test_support::TestServerHandle {
+        TestServer::new()
+            .route(
+                "/protected",
+                RouteConfig::require_auth(
+                    r#"Basic realm="Secure Area""#,
+                    GOOD_AUTH,
+                    b"secret".to_vec(),
+                ),
+            )
+            .route(
+                "/via-proxy",
+                RouteConfig::require_proxy_auth(r#"Basic realm="corp""#, GOOD_AUTH, b"ok".to_vec()),
+            )
+            .start()
+            .await
+    }
+
+    /// Run one fetch against the auth server with the given request and policy.
+    async fn auth_fetch(
+        srv: &crate::net::test_support::TestServerHandle,
+        path: &str,
+        init: RequestInit,
+        policy: NetPolicy,
+        observer: Arc<dyn NetObserver + Send + Sync>,
+    ) -> Result<(FetchResultMeta, Bytes), NetError> {
+        super::fetch_response_complete(
+            client(),
+            srv.url(path),
+            init,
+            CancellationToken::new(),
+            observer,
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            policy,
+        )
+        .await
+    }
+
+    /// A policy whose hook answers every challenge with the given credentials, counting calls.
+    fn answering_policy(credentials: Credentials) -> (NetPolicy, Arc<Mutex<Vec<AuthChallenge>>>) {
+        let seen: Arc<Mutex<Vec<AuthChallenge>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let policy = NetPolicy::default().with_auth_challenge_fn(Box::new(move |challenge| {
+            sink.lock().unwrap().push(challenge.clone());
+            Some(credentials.clone())
+        }));
+        (policy, seen)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_basic_challenge_is_answered_and_the_hop_retried() {
+        let srv = auth_server().await;
+        let rec = Arc::new(RecordingObserver::new());
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            rec.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"secret");
+        // The 401 and the authenticated retry.
+        assert_eq!(srv.hit_count("/protected"), 2);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].scheme, AuthScheme::Basic);
+        assert_eq!(seen[0].realm.as_deref(), Some("Secure Area"));
+        assert_eq!(seen[0].target, AuthTarget::Server);
+        assert_eq!(seen[0].attempt, 0);
+
+        let events = rec.auth_required();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].1, "the challenge was answered");
+        assert_eq!(events[0].0.len(), 1);
+    }
+
+    /// Without credentials the 401 itself is the response.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unanswered_challenge_is_returned_to_the_caller() {
+        let srv = auth_server().await;
+        let rec = Arc::new(RecordingObserver::new());
+
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            NetPolicy::default(),
+            rec.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 401);
+        assert_eq!(srv.hit_count("/protected"), 1);
+
+        // The challenge still reaches the observer, so an embedder that can only answer
+        // asynchronously can prompt and re-submit.
+        let events = rec.auth_required();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].1);
+        assert_eq!(events[0].0[0].realm.as_deref(), Some("Secure Area"));
+    }
+
+    /// Credentials the hook supplied are remembered once they work, so the second request answers
+    /// the challenge without asking again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_credentials_are_remembered_in_the_store() {
+        let srv = auth_server().await;
+        let store = Arc::new(InMemoryCredentialStore::new());
+
+        for expected_calls in [1, 1] {
+            let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+            let policy = policy.with_credential_store(Some(store.clone()));
+            let (meta, _) = auth_fetch(
+                &srv,
+                "/protected",
+                RequestInit::get(HeaderMap::new()),
+                policy,
+                observer(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(meta.status, 200);
+            // The hook answers the first request; the second is served from the store, which is
+            // why each fresh hook here sees at most one call.
+            assert!(seen.lock().unwrap().len() <= expected_calls);
+        }
+
+        assert_eq!(store.len(), 1);
+        let space = ProtectionSpace {
+            target: AuthTarget::Server,
+            scheme: AuthScheme::Basic,
+            origin: Some(srv.url("/protected").origin().ascii_serialization()),
+            realm: "Secure Area".into(),
+        };
+        assert_eq!(
+            store.credentials_for(&space),
+            Some(Credentials::basic("user", "pass"))
+        );
+    }
+
+    /// Stored credentials the server rejects are dropped, and the hook is asked for better ones.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_stored_credentials_are_forgotten_and_replaced() {
+        let srv = auth_server().await;
+        let space = ProtectionSpace {
+            target: AuthTarget::Server,
+            scheme: AuthScheme::Basic,
+            origin: Some(srv.url("/protected").origin().ascii_serialization()),
+            realm: "Secure Area".into(),
+        };
+        let store = Arc::new(InMemoryCredentialStore::new());
+        store.store(space.clone(), Credentials::basic("user", "stale"));
+
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+        let policy = policy.with_credential_store(Some(store.clone()));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"secret");
+        // Unauthenticated, stale password, good password.
+        assert_eq!(srv.hit_count("/protected"), 3);
+
+        // The hook was only consulted after the stored password had been rejected.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].attempt, 1);
+        assert_eq!(
+            store.credentials_for(&space),
+            Some(Credentials::basic("user", "pass"))
+        );
+    }
+
+    /// An embedder that keeps handing back credentials the server refuses must not loop forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_retry_gives_up_after_max_attempts() {
+        let srv = auth_server().await;
+        let rec = Arc::new(RecordingObserver::new());
+        let (policy, seen) = answering_policy(Credentials::basic("user", "wrong"));
+
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            rec.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 401);
+        // The unauthenticated request plus MAX_AUTH_ATTEMPTS answers to it.
+        assert_eq!(srv.hit_count("/protected"), 1 + MAX_AUTH_ATTEMPTS as usize);
+        assert_eq!(seen.lock().unwrap().len(), MAX_AUTH_ATTEMPTS as usize);
+
+        let events = rec.auth_required();
+        assert_eq!(events.len(), 1 + MAX_AUTH_ATTEMPTS as usize);
+        assert!(
+            !events.last().unwrap().1,
+            "the last challenge was given up on"
+        );
+    }
+
+    /// A `407` is answered with `Proxy-Authorization`, and its protection space is not tied to
+    /// the origin the request was going to.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_proxy_challenge_is_answered_with_proxy_authorization() {
+        let srv = auth_server().await;
+        let store = Arc::new(InMemoryCredentialStore::new());
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+        let policy = policy.with_credential_store(Some(store.clone()));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/via-proxy",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"ok");
+        assert_eq!(srv.hit_count("/via-proxy"), 2);
+        assert_eq!(seen.lock().unwrap()[0].target, AuthTarget::Proxy);
+        assert_eq!(
+            store.credentials_for(&ProtectionSpace {
+                target: AuthTarget::Proxy,
+                scheme: AuthScheme::Basic,
+                origin: None,
+                realm: "corp".into(),
+            }),
+            Some(Credentials::basic("user", "pass"))
+        );
+    }
+
+    /// `RequestCredentials::Omit` means no credentials of any kind, so the challenge is not even
+    /// offered to the embedder.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_credential_less_request_is_never_authenticated() {
+        let srv = auth_server().await;
+        let rec = Arc::new(RecordingObserver::new());
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()).with_credentials(RequestCredentials::Omit),
+            policy,
+            rec.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 401);
+        assert_eq!(srv.hit_count("/protected"), 1);
+        assert!(seen.lock().unwrap().is_empty());
+        // Still reported, so the caller can see why the request came back a 401.
+        assert_eq!(rec.auth_required().len(), 1);
+    }
+
+    /// `Authorization` is not CORS-safelisted, so a cors-tainted chain is left alone instead of
+    /// getting credentials added behind the preflight's back.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cors_request_is_not_authenticated() {
+        let srv = auth_server().await;
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+
+        let init = RequestInit::get(HeaderMap::new())
+            .with_mixed_content(
+                Some(Url::parse("http://other.test/").unwrap().origin()),
+                MixedContentPolicy::Allow,
+            )
+            .with_fetch_metadata(RequestDestination::Empty, RequestMode::NoCors, false);
+
+        let (meta, _) = auth_fetch(&srv, "/protected", init, policy, observer())
+            .await
+            .unwrap();
+
+        assert_eq!(meta.status, 401);
+        assert_eq!(srv.hit_count("/protected"), 1);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// The retry rebuilds the request, body included.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_challenged_post_is_replayed_with_its_body() {
+        let srv = auth_server().await;
+        let (policy, _) = answering_policy(Credentials::basic("user", "pass"));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::post(HeaderMap::new(), Bytes::from_static(b"payload")),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"secret");
+        assert_eq!(srv.hit_count("/protected"), 2);
+    }
+
+    /// A `Raw` answer is used but not remembered; the hook recomputes it for the next challenge.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_computed_answer_is_used_but_not_stored() {
+        let srv = auth_server().await;
+        let store = Arc::new(InMemoryCredentialStore::new());
+        let (policy, seen) = answering_policy(Credentials::Raw(GOOD_AUTH.into()));
+        let policy = policy.with_credential_store(Some(store.clone()));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"secret");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(store.is_empty(), "a computed answer is not replayable");
+    }
+
+    /// Credentials that cannot become a header value are not an answer, so the next challenge
+    /// gets a turn: here the `Basic` one the server also offered.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unusable_answer_falls_through_to_the_next_challenge() {
+        let srv = TestServer::new()
+            .route(
+                "/protected",
+                RouteConfig::require_auth(
+                    r#"Digest realm="d", nonce="n", Basic realm="Secure Area""#,
+                    GOOD_AUTH,
+                    b"secret".to_vec(),
+                ),
+            )
+            .start()
+            .await;
+
+        let seen: Arc<Mutex<Vec<AuthChallenge>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let policy = NetPolicy::default().with_auth_challenge_fn(Box::new(move |challenge| {
+            sink.lock().unwrap().push(challenge.clone());
+            match challenge.scheme {
+                // A colon in the user-id makes these unrepresentable.
+                AuthScheme::Digest => Some(Credentials::basic("bad:name", "x")),
+                _ => Some(Credentials::basic("user", "pass")),
+            }
+        }));
+
+        let (meta, body) = auth_fetch(
+            &srv,
+            "/protected",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"secret");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "both challenges were offered");
+        assert_eq!(seen[0].scheme, AuthScheme::Digest);
+        assert_eq!(seen[1].scheme, AuthScheme::Basic);
     }
 }

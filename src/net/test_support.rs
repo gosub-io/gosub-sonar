@@ -42,6 +42,7 @@ fn reason(code: u16) -> &'static str {
         302 => "Found",
         400 => "Bad Request",
         401 => "Unauthorized",
+        407 => "Proxy Authentication Required",
         403 => "Forbidden",
         404 => "Not Found",
         500 => "Internal Server Error",
@@ -149,6 +150,21 @@ pub enum RouteConfig {
     /// Read `Content-Length` bytes from the request body and echo them back as a 200 response.
     /// Use to verify that POST/PUT bodies are transmitted correctly.
     EchoBody,
+    /// Demand credentials: answer with `401` (or `407` when `proxy` is set) plus the configured
+    /// challenge header until a request arrives whose `Authorization` (`Proxy-Authorization`)
+    /// value is exactly `expect`, then answer 200 with `body`. An `expect` no client sends keeps
+    /// challenging, for testing the retry cap. Every attempt counts as a hit on the path.
+    RequireAuth {
+        /// Challenge the origin server (`401`/`WWW-Authenticate`) or a proxy
+        /// (`407`/`Proxy-Authenticate`)
+        proxy: bool,
+        /// Value of the challenge header, e.g. `Basic realm="Secure Area"`
+        challenge: String,
+        /// Credentials header value that unlocks the route, e.g. `Basic dTpw`
+        expect: String,
+        /// Body of the successful response
+        body: Vec<u8>,
+    },
 }
 
 /// What a [`RouteConfig::Cors`] route sends. The defaults describe the most permissive
@@ -255,6 +271,32 @@ impl RouteConfig {
     /// Shorthand for [`RouteConfig::EchoBody`]
     pub fn echo_body() -> Self {
         Self::EchoBody
+    }
+    /// Shorthand for a [`RouteConfig::RequireAuth`] challenging as the origin server.
+    pub fn require_auth(
+        challenge: impl Into<String>,
+        expect: impl Into<String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self::RequireAuth {
+            proxy: false,
+            challenge: challenge.into(),
+            expect: expect.into(),
+            body: body.into(),
+        }
+    }
+    /// Shorthand for a [`RouteConfig::RequireAuth`] challenging as a proxy.
+    pub fn require_proxy_auth(
+        challenge: impl Into<String>,
+        expect: impl Into<String>,
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self::RequireAuth {
+            proxy: true,
+            challenge: challenge.into(),
+            expect: expect.into(),
+            body: body.into(),
+        }
     }
     /// Shorthand for [`RouteConfig::RedirectSelf`]
     pub fn redirect_self() -> Self {
@@ -493,6 +535,39 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 base, target, cookie
             );
             let _ = stream.write_all(hdr.as_bytes()).await;
+        }
+        RouteConfig::RequireAuth {
+            proxy,
+            challenge,
+            expect,
+            body,
+        } => {
+            let header = if proxy {
+                "proxy-authorization:"
+            } else {
+                "authorization:"
+            };
+            let sent = req
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with(header))
+                .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()));
+            if sent.as_deref() == Some(expect.as_str()) {
+                send_response(&mut stream, 200, &body).await;
+            } else {
+                let (code, name) = if proxy {
+                    (407, "Proxy-Authenticate")
+                } else {
+                    (401, "WWW-Authenticate")
+                };
+                let hdr = format!(
+                    "HTTP/1.1 {} {}\r\n{}: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    code,
+                    reason(code),
+                    name,
+                    challenge
+                );
+                let _ = stream.write_all(hdr.as_bytes()).await;
+            }
         }
         RouteConfig::EchoCookieHeader => {
             let cookie = req
@@ -877,6 +952,23 @@ impl RecordingObserver {
             .iter()
             .filter_map(|e| match e {
                 NetEvent::TlsFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every [`NetEvent::AuthRequired`] recorded, as `(challenges, retried)` pairs, in order.
+    pub fn auth_required(&self) -> Vec<(Vec<crate::net::auth::AuthChallenge>, bool)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::AuthRequired {
+                    challenges,
+                    retried,
+                    ..
+                } => Some((challenges.clone(), *retried)),
                 _ => None,
             })
             .collect()

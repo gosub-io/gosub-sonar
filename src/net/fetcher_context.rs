@@ -1,5 +1,6 @@
 //! Integration trait for wiring the fetcher into an application.
 
+use crate::net::auth::{AuthChallenge, Credentials};
 use crate::net::null_emitter::NullEmitter;
 use crate::net::observer::NetObserver;
 use crate::net::request_ref::RequestReference;
@@ -69,6 +70,27 @@ pub trait FetcherContext: Send + Sync {
     /// [`TlsOverrideStore::accept`]: crate::net::tls::TlsOverrideStore::accept
     fn tls_override(&self, _error: &TlsError) -> bool {
         false
+    }
+
+    /// Credentials to answer an authentication challenge with, or `None` to let the `401`/`407`
+    /// reach the caller.
+    ///
+    /// Called for each challenge of a challenged hop, in the order the server listed them, until
+    /// one returns credentials. Returning `None` for a scheme you cannot answer therefore offers
+    /// the next challenge. Only reached after [`FetcherConfig::credentials`] had no entry for the
+    /// challenge's [`ProtectionSpace`]; what is returned here is stored there once the retry
+    /// succeeds. `challenge.attempt` counts the credentials this hop already had rejected.
+    ///
+    /// Like [`tls_override`](Self::tls_override) this is called on the request path and must not
+    /// block on a password dialog. Return `None`, show the dialog, and then either put the answer
+    /// in the credential store or re-submit the fetch.
+    ///
+    /// Default: `None`, the behaviour of a fetcher without authentication support.
+    ///
+    /// [`FetcherConfig::credentials`]: crate::net::fetcher::FetcherConfig::credentials
+    /// [`ProtectionSpace`]: crate::net::auth::ProtectionSpace
+    fn on_auth_challenge(&self, _challenge: &AuthChallenge) -> Option<Credentials> {
+        None
     }
 }
 
