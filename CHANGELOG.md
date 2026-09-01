@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-01
+
 ### Added
 
 - HTTP caching (#1), applied per redirect hop, so a cacheable `301` is followed without a
@@ -93,8 +95,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   served from the grant cache sends no `OPTIONS` and reports neither event.
   `test-support` gains `RecordingObserver::cors_preflights()`.
 - `examples/timings.rs` fetches URLs and prints where the time went as a waterfall
-  (`cargo run --example timings -- <url>...`). Pass the same URL twice to see the second
-  request served from the connection pool, reporting no dns and no connect at all.
+  (`cargo run --example timings -- <url>...`). Pass the same URL twice to see what the second
+  request did not have to do: no dns, no connect, and — if the response was cacheable — no
+  request at all.
 
 ### Fixed
 
@@ -116,7 +119,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking:** `NetEvent` is now `#[non_exhaustive]`. A `match` over it needs a catch-all
   arm — but from here on, a new event is no longer a breaking change. Done in the same
-  release as three new variants, when it costs one adjustment rather than two.
+  release as five new variants (`DnsResolved`, `Connected`, `CorsPreflightDone`,
+  `AuthRequired`, `Cache`), when it costs one adjustment rather than five.
+- **Breaking:** new public fields — `FetcherConfig::cache`, `FetcherConfig::credentials`,
+  `FetchRequest::cache_mode`, `FetchResultMeta::from_cache`. Code that constructs these with
+  an exhaustive struct literal needs the new fields; `..FetcherConfig::default()` and the
+  `FetchRequest` builder are unaffected. `FetcherContext::on_auth_challenge` has a default
+  implementation, so existing contexts keep compiling.
+- **Breaking:** `FetchRequest` and `FetchResultMeta` are now `#[non_exhaustive]`, so future
+  fields on them are additive. Build a request with `FetchRequest::builder`; `FetchResultMeta`
+  is constructed by the fetcher, not by callers.
 
 ## [0.4.0] - 2026-08-29
 
@@ -357,7 +369,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.1.0...v0.2.0

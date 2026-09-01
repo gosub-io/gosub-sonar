@@ -80,7 +80,11 @@ pub enum Initiator {
 }
 
 /// Metadata returned by the FetchResult
+///
+/// Non-exhaustive: the fetcher constructs these, and gains fields to report as it learns
+/// to report more.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct FetchResultMeta {
     /// Final URL after redirects
     pub final_url: Url,
@@ -487,7 +491,11 @@ pub enum RequestCredentials {
 }
 
 /// A fetch request defines what needs to be fetched, how and where to send the result to
+///
+/// Non-exhaustive: fields are added as the stack grows. Build one with
+/// [`FetchRequest::builder`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct FetchRequest {
     /// Reference to what initiated this request (navigation, document, prefetch, background task)
     pub reference: RequestReference,
