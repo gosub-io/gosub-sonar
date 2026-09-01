@@ -11,6 +11,7 @@
 pub mod test_support;
 
 pub mod auth;
+pub mod cache;
 pub mod cors;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dns;

@@ -2,13 +2,16 @@
 //! would: `use gosub_sonar::…`, an externally implemented [`FetcherContext`], and the
 //! `test-support` mock server. Requires `--features test-support`.
 
-use gosub_sonar::net::test_support::{CorsRouteOptions, RouteConfig, TestServer, TestServerHandle};
+use gosub_sonar::net::test_support::{
+    CacheRouteOptions, CorsRouteOptions, RouteConfig, TestServer, TestServerHandle,
+};
 use gosub_sonar::{
-    simple_get, AuthChallenge, AuthScheme, AuthTarget, BlockReason, CorsError, CredentialStore,
-    Credentials, FetchRequest, FetchResult, Fetcher, FetcherConfig, FetcherContext,
-    InMemoryCredentialStore, Initiator, NetError, NetObserver, NullContext, NullEmitter,
-    ProtectionSpace, RequestBody, RequestCredentials, RequestDestination, RequestId, RequestMode,
-    RequestReference, ResourceKind, ResponseTainting, SharedBody, DEFAULT_USER_AGENT,
+    simple_get, AuthChallenge, AuthScheme, AuthTarget, BlockReason, CacheMode, CorsError,
+    CredentialStore, Credentials, FetchRequest, FetchResult, Fetcher, FetcherConfig,
+    FetcherContext, HttpCache, InMemoryCredentialStore, InMemoryHttpCache, Initiator, NetError,
+    NetObserver, NullContext, NullEmitter, ProtectionSpace, RequestBody, RequestCredentials,
+    RequestDestination, RequestId, RequestMode, RequestReference, ResourceKind, ResponseTainting,
+    SharedBody, DEFAULT_USER_AGENT,
 };
 use http::Method;
 use std::sync::Arc;
@@ -841,5 +844,209 @@ async fn credentials_do_not_cross_origins() {
     // One entry per origin, and the hook was asked once for each.
     assert_eq!(store.len(), 2);
     assert_eq!(ctx.seen.lock().unwrap().len(), 2);
+    shutdown.cancel();
+}
+
+/// A fetcher with an explicit cache (or none), plus the cache itself.
+fn spawn_with_cache(cache: Option<Arc<InMemoryHttpCache>>) -> (Arc<Fetcher>, CancellationToken) {
+    let cfg = FetcherConfig {
+        cache: cache.map(|c| c as Arc<dyn HttpCache>),
+        ..FetcherConfig::default()
+    };
+    let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+    let shutdown = CancellationToken::new();
+    let (f, c) = (fetcher.clone(), shutdown.clone());
+    tokio::spawn(async move { f.run(c).await });
+    (fetcher, shutdown)
+}
+
+fn buffered(result: FetchResult) -> (gosub_sonar::FetchResultMeta, bytes::Bytes) {
+    match result {
+        FetchResult::Buffered { meta, body } => (meta, body),
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+}
+
+/// Issue #1: a second fetch of a fresh resource does not reach the server.
+#[tokio::test]
+async fn a_fresh_response_is_served_from_the_cache() {
+    let srv = TestServer::new()
+        .route(
+            "/cached",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, Vec::new()).counting()),
+        )
+        .start()
+        .await;
+    let cache = Arc::new(InMemoryHttpCache::new());
+    let (fetcher, shutdown) = spawn_with_cache(Some(cache.clone()));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/cached")).build();
+    let (meta, body) = buffered(fetcher.fetch(req).await);
+    assert_eq!(meta.status, 200);
+    assert!(!meta.from_cache);
+    assert_eq!(&body[..], b"hit-1");
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/cached")).build();
+    let (meta, body) = buffered(fetcher.fetch(req).await);
+    assert!(meta.from_cache);
+    assert_eq!(&body[..], b"hit-1");
+    assert_eq!(srv.hit_count("/cached"), 1);
+    assert_eq!(cache.len(), 1);
+    shutdown.cancel();
+}
+
+/// A `304` is invisible to the caller: the stored body comes back as a 200.
+#[tokio::test]
+async fn a_revalidated_response_comes_back_as_a_200() {
+    let srv = TestServer::new()
+        .route(
+            "/etag",
+            RouteConfig::Cacheable(
+                CacheRouteOptions::max_age(0, b"stored body".to_vec()).with_etag("\"v1\""),
+            ),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_with_cache(Some(Arc::new(InMemoryHttpCache::new())));
+
+    for expected_from_cache in [false, true] {
+        let req = FetchRequest::builder(Method::GET, srv.url("/etag")).build();
+        let (meta, body) = buffered(fetcher.fetch(req).await);
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"stored body");
+        assert_eq!(meta.from_cache, expected_from_cache);
+    }
+    // Asked twice, transferred once.
+    assert_eq!(srv.hit_count("/etag"), 2);
+    shutdown.cancel();
+}
+
+/// `CacheMode::Reload` is what a refresh button does: back to the server, and the answer
+/// replaces what was stored.
+#[tokio::test]
+async fn a_reload_ignores_a_fresh_entry() {
+    let srv = TestServer::new()
+        .route(
+            "/reload",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, Vec::new()).counting()),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_with_cache(Some(Arc::new(InMemoryHttpCache::new())));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/reload")).build();
+    assert_eq!(&buffered(fetcher.fetch(req).await).1[..], b"hit-1");
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/reload"))
+        .with_cache_mode(CacheMode::Reload)
+        .build();
+    let (meta, body) = buffered(fetcher.fetch(req).await);
+    assert!(!meta.from_cache);
+    assert_eq!(&body[..], b"hit-2");
+
+    // And the reloaded response is what the next normal fetch gets.
+    let req = FetchRequest::builder(Method::GET, srv.url("/reload")).build();
+    let (meta, body) = buffered(fetcher.fetch(req).await);
+    assert!(meta.from_cache);
+    assert_eq!(&body[..], b"hit-2");
+    assert_eq!(srv.hit_count("/reload"), 2);
+    shutdown.cancel();
+}
+
+/// `CacheMode::NoStore` neither reads nor writes, for a private session.
+#[tokio::test]
+async fn no_store_leaves_no_trace() {
+    let srv = TestServer::new()
+        .route(
+            "/private",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, b"secret".to_vec())),
+        )
+        .start()
+        .await;
+    let cache = Arc::new(InMemoryHttpCache::new());
+    let (fetcher, shutdown) = spawn_with_cache(Some(cache.clone()));
+
+    for _ in 0..2 {
+        let req = FetchRequest::builder(Method::GET, srv.url("/private"))
+            .with_cache_mode(CacheMode::NoStore)
+            .build();
+        let (meta, _) = buffered(fetcher.fetch(req).await);
+        assert!(!meta.from_cache);
+    }
+    assert_eq!(srv.hit_count("/private"), 2);
+    assert!(cache.is_empty());
+    shutdown.cancel();
+}
+
+/// `only-if-cached` refuses rather than reaching the network.
+#[tokio::test]
+async fn only_if_cached_without_an_entry_fails() {
+    let srv = TestServer::new()
+        .route(
+            "/absent",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, b"x".to_vec())),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_with_cache(Some(Arc::new(InMemoryHttpCache::new())));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/absent"))
+        .with_cache_mode(CacheMode::OnlyIfCached)
+        .build();
+    match fetcher.fetch(req).await {
+        FetchResult::Error(NetError::Blocked { reason, .. }) => {
+            assert_eq!(reason, BlockReason::NotCached)
+        }
+        other => panic!("expected a NotCached block, got {other:?}"),
+    }
+    assert_eq!(srv.hit_count("/absent"), 0);
+    shutdown.cancel();
+}
+
+/// A fetcher configured without a cache behaves exactly as it did before caching existed.
+#[tokio::test]
+async fn a_fetcher_without_a_cache_always_goes_to_the_server() {
+    let srv = TestServer::new()
+        .route(
+            "/uncached",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, Vec::new()).counting()),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_with_cache(None);
+
+    for expected in [&b"hit-1"[..], &b"hit-2"[..]] {
+        let req = FetchRequest::builder(Method::GET, srv.url("/uncached")).build();
+        let (meta, body) = buffered(fetcher.fetch(req).await);
+        assert!(!meta.from_cache);
+        assert_eq!(&body[..], expected);
+    }
+    assert_eq!(srv.hit_count("/uncached"), 2);
+    shutdown.cancel();
+}
+
+/// Clearing the store empties the fetcher's cache: what a "clear browsing data" button does.
+#[tokio::test]
+async fn clearing_the_store_drops_what_was_cached() {
+    let srv = TestServer::new()
+        .route(
+            "/clearable",
+            RouteConfig::Cacheable(CacheRouteOptions::max_age(600, Vec::new()).counting()),
+        )
+        .start()
+        .await;
+    let cache = Arc::new(InMemoryHttpCache::new());
+    let (fetcher, shutdown) = spawn_with_cache(Some(cache.clone()));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/clearable")).build();
+    assert_eq!(&buffered(fetcher.fetch(req).await).1[..], b"hit-1");
+    assert_eq!(cache.len(), 1);
+
+    cache.clear();
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/clearable")).build();
+    let (meta, body) = buffered(fetcher.fetch(req).await);
+    assert!(!meta.from_cache);
+    assert_eq!(&body[..], b"hit-2");
     shutdown.cancel();
 }

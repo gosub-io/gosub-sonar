@@ -30,6 +30,8 @@ The library has no dependency on any browser engine and can be used standalone.
   configuration, default `User-Agent` of `gosub-sonar/<version>` (`FetcherConfig::user_agent`).
 - Authentication: `401`/`407` challenges answered from a credential store or a context hook and
   the request retried; `Basic` is computed for you.
+- HTTP caching (RFC 9111) per redirect hop: freshness, revalidation with `ETag`/`Last-Modified`,
+  `Vary`, invalidation, and a per-request cache mode.
 - `NetEvent`s per request (started, redirected, headers, progress, blocked, preflight, TLS
   failure, auth challenge, finished) via `NetObserver`; typed `NetError` / `BlockReason`.
 - Compiles for `wasm32-unknown-unknown` on top of the browser's `fetch()`. HSTS, DNS, proxies,
@@ -37,7 +39,7 @@ The library has no dependency on any browser engine and can be used standalone.
 
 The policies are documented in their modules on [docs.rs](https://docs.rs/gosub-sonar)
 (`net::cors`, `net::referrer`, `net::mixed_content`, `net::fetch_metadata`, `net::hsts`,
-`net::tls`, `net::auth`, `net::dns`, `net::proxy`);
+`net::tls`, `net::auth`, `net::cache`, `net::dns`, `net::proxy`);
 [docs/architecture.md](https://github.com/gosub-io/gosub-sonar/blob/main/docs/architecture.md)
 has the overall picture.
 
@@ -208,6 +210,42 @@ certificate. For a policy rather than a dialog (say, trust self-signed certifica
 hosts) implement `FetcherContext::tls_override`; it is asked synchronously during the handshake,
 after the store. See `examples/tls_override.rs`. Native only.
 
+### HTTP caching
+
+Responses are cached per redirect hop: a fresh one is served without a request, a stale one with
+an `ETag` or `Last-Modified` is revalidated and a `304` reuses the stored body, and a cacheable
+redirect is followed without asking for it again. `FetchResultMeta::from_cache` says which
+responses came from the cache.
+
+`FetcherConfig::cache` holds the store, an `InMemoryHttpCache` with a 16 MiB budget by default:
+
+```rust,ignore
+use gosub_sonar::{CacheMode, FetchRequest, FetcherConfig, HttpCache, InMemoryHttpCache};
+
+let cache = Arc::new(InMemoryHttpCache::new());
+let cfg = FetcherConfig {
+    cache: Some(cache.clone() as Arc<dyn HttpCache>),
+    ..Default::default()
+};
+
+// A refresh button: back to the server, and the answer replaces what was stored.
+let req = FetchRequest::builder(Method::GET, url)
+    .with_cache_mode(CacheMode::Reload)
+    .build();
+
+// "Clear browsing data".
+cache.clear();
+```
+
+The cache modes mirror the Fetch standard: `Default`, `Reload`, `NoCache` (always revalidate),
+`ForceCache` (use a stale entry), `OnlyIfCached` (fail rather than reach the network), and
+`NoStore` (neither read nor write, for a private session). Implement `HttpCache` yourself to
+persist entries or bound them differently; `FetcherConfig::cache: None` turns caching off.
+
+Not implemented: shared-cache rules (`s-maxage`, the `Authorization` restriction), range requests
+and `206` responses, and `stale-while-revalidate`. Native only: on wasm32 the browser's `fetch()`
+brings its own cache.
+
 ### Authentication challenges
 
 A `401` (or a proxy's `407`) is answered rather than returned: the challenges are parsed, the
@@ -332,6 +370,7 @@ cargo run --example fetcher_context --features test-support
 cargo run --example streaming --features test-support
 cargo run --example document_fetch --features test-support
 cargo run --example auth --features test-support
+cargo run --example caching --features test-support
 cargo run --example fetcher_harness --features test-support
 ```
 
@@ -343,9 +382,10 @@ cargo run --example fetcher_harness --features test-support
 - `document_fetch` — requests as a page makes them: `Referer`, `Sec-Fetch-*`, `Origin`, CORS with
   preflight, mixed content
 - `auth` — answering `401` challenges: from the context, from the credential store, and not at all
+- `caching` — a cache hit, a revalidation, a reload, and `only-if-cached`
 - `fetcher_harness` — concurrency, coalescing, priority, cancellation and error scenarios
 
-The last five run against the mock server, no network needed.
+The last six run against the mock server, no network needed.
 
 ## Documentation
 

@@ -26,6 +26,7 @@
 //! [`WWW-Authenticate`]: http::header::WWW_AUTHENTICATE
 //! [`Proxy-Authenticate`]: http::header::PROXY_AUTHENTICATE
 
+use crate::net::utils::split_outside_quotes;
 use http::{header, HeaderMap, HeaderValue};
 use std::fmt;
 use url::Url;
@@ -454,31 +455,6 @@ fn unquote(inner: &str) -> String {
 /// tchar (RFC 9110 §5.6.2).
 fn is_token_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
-}
-
-/// Split on commas that are not inside a quoted-string.
-fn split_outside_quotes(value: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut in_quotes = false;
-    let mut escaped = false;
-    for (i, c) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' if in_quotes => escaped = true,
-            '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => {
-                parts.push(&value[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&value[start..]);
-    parts
 }
 
 /// Standard base64 with padding (RFC 4648 §4). The only thing this crate encodes is a

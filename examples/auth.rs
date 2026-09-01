@@ -7,11 +7,11 @@
 //! 1. A context that knows the password. `FetcherContext::on_auth_challenge` answers on the spot
 //!    and the fetch returns 200. The credentials land in the store, so the second request for the
 //!    same realm does not ask again.
-//! 2. A context that does not. Without credentials the `401` is the result of the fetch,
+//! 2. A scheme we cannot compute. The server offers `Digest` first and `Basic` second; the hook
+//!    declines the `Digest` challenge and answers the `Basic` one.
+//! 3. A context that does not know the password. The `401` is then the result of the fetch,
 //!    `WWW-Authenticate` intact. That is how an asynchronous password dialog works: refuse,
 //!    prompt, then seed the store or re-submit.
-//! 3. A scheme we cannot compute. The server offers `Digest` first and `Basic` second; the hook
-//!    declines the `Digest` challenge and answers the `Basic` one.
 //!
 //! Run with:
 //! ```text
@@ -167,7 +167,7 @@ async fn main() {
     );
 
     show(
-        "3. Digest offered first, Basic second: the hook declines one and answers the other",
+        "2. Digest offered first, Basic second: the hook declines one and answers the other",
         &fetcher,
         FetchRequest::builder(Method::GET, srv.url("/digest-first")).build(),
     )
@@ -177,7 +177,7 @@ async fn main() {
 
     let (fetcher, shutdown) = fetcher_with(Arc::new(Passwords { password: None }));
     show(
-        "2. a context without credentials: the 401 is the result, ready for a dialog",
+        "3. a context without credentials: the 401 is the result, ready for a dialog",
         &fetcher,
         FetchRequest::builder(Method::GET, srv.url("/protected")).build(),
     )

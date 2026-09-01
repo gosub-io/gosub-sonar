@@ -240,6 +240,34 @@ pub async fn stream_to_bytes(
     Ok(Bytes::from(out))
 }
 
+/// Split a header value on commas that are not inside a quoted-string.
+///
+/// That is the shape of `Cache-Control`, `WWW-Authenticate` and most other multi-valued fields,
+/// where a quoted value (an auth realm, a `no-cache` field list) may contain a comma of its own.
+pub(crate) fn split_outside_quotes(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, c) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                parts.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +345,7 @@ mod tests {
             content_length: None,
             content_type: None,
             has_body: true,
+            from_cache: false,
             tainting: Default::default(),
         }
     }
