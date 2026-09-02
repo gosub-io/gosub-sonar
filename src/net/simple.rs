@@ -1,4 +1,10 @@
 //! One-shot GET helpers for callers that don't need the full scheduler.
+//!
+//! These send the same [`DEFAULT_USER_AGENT`] the [`Fetcher`](crate::Fetcher) does. reqwest sets
+//! no `User-Agent` of its own, so without it these requests would go out with the header absent
+//! entirely - which servers are entitled to refuse, and some do (Wikimedia answers a header-less
+//! request with 403). A caller reaching for the simple API is still the same client as one using
+//! the scheduler, and should look like it.
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -7,6 +13,8 @@ use url::Url;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::http::response::Response;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::fetcher::DEFAULT_USER_AGENT;
 #[cfg(not(target_arch = "wasm32"))]
 use cookie::Cookie;
 #[cfg(not(target_arch = "wasm32"))]
@@ -50,6 +58,7 @@ pub async fn simple_get(url: &Url) -> Result<Bytes> {
             #[cfg(not(target_arch = "wasm32"))]
             let client = reqwest::Client::builder()
                 .use_rustls_tls()
+                .user_agent(DEFAULT_USER_AGENT)
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(30))
                 .build()?;
@@ -149,6 +158,7 @@ fn do_sync_fetch(url: Url) -> Result<Response> {
     rt.block_on(async move {
         let client = reqwest::Client::builder()
             .use_rustls_tls()
+            .user_agent(DEFAULT_USER_AGENT)
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .build()?;
@@ -248,6 +258,41 @@ mod tests {
         let url = Url::parse(&format!("http://127.0.0.1:{}/", port)).unwrap();
         let bytes = sync_get(&url).unwrap();
         assert_eq!(&bytes[..], b"hello");
+    }
+
+    /// reqwest sets no `User-Agent` of its own, so a builder that does not ask for one sends the
+    /// header absent entirely - and servers are entitled to refuse that (Wikimedia answers a
+    /// header-less request with 403). Capture the raw request and assert the header is there.
+    #[test]
+    fn sync_fetch_sends_a_user_agent() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                );
+            }
+        });
+        let url = Url::parse(&format!("http://127.0.0.1:{}/", port)).unwrap();
+        let _ = sync_fetch(&url).unwrap();
+
+        let request = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("no request captured");
+        let sent = request
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("user-agent: ")
+                    .or_else(|| line.strip_prefix("User-Agent: "))
+            })
+            .map(str::trim);
+        assert_eq!(sent, Some(DEFAULT_USER_AGENT), "request was:\n{request}");
     }
 
     #[test]
