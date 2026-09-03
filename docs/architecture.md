@@ -589,10 +589,10 @@ Two traits decouple the net stack from the host's event system:
 ### NetObserver
 
 `NetObserver::on_event(&self, ev: NetEvent)` receives lifecycle events. `NetEvent` variants:
-`Started`, `Redirected`, `ResponseHeaders`, `Progress`, `Finished`, `Failed`, `Cancelled`,
-`Blocked`, `TlsFailed`, `CorsPreflight`, `CorsPreflightDone`, `AuthRequired`, `Cache`,
-`DnsResolved`, `Connected`, `Warning`, `Io`. `NullEmitter` is a no-op implementation for callers
-that don't care.
+`Started`, `RequestSent`, `Redirected`, `ResponseHeaders`, `Progress`, `BodyPreview`,
+`Finished`, `Failed`, `Cancelled`, `Blocked`, `TlsFailed`, `CorsPreflight`,
+`CorsPreflightDone`, `AuthRequired`, `Cache`, `DnsResolved`, `Connected`, `Warning`, `Io`.
+`NullEmitter` is a no-op implementation for callers that don't care.
 
 `NetEvent` is `#[non_exhaustive]`: a `match` over it needs a catch-all arm, and new events can
 be added without a breaking release.
@@ -602,6 +602,18 @@ be added without a breaking release.
 — `Blocked`, `TlsFailed` — are emitted first and carry the detail, so an observer can treat
 `Failed` as "this request is over" without matching every cause it might have. A cancelled
 request is not a failure and reports only `Cancelled`.
+
+**Request and body reporting.** `RequestSent` carries the method, URL and the headers this
+crate set for one hop, emitted once those headers are final — after credentials and conditional
+headers are added, and after a redirect has restarted from the caller's set. It is not a
+byte-exact wire capture: the HTTP client adds `host`, `accept-encoding` and its user agent
+below this layer. `BodyPreview` carries the leading bytes of a response body, and is emitted
+only when `NetObserver::body_capture_limit(headers, content_length)` returns a limit — asked
+once per response with the headers in hand, defaulting to `None`, so an oversized or unwanted
+body is refused before anything is copied. The body is teed as the consumer reads it rather
+than buffered ahead, so capturing does not move the timings; a consumer that stops early, or a
+body that fails part way through, still reports what arrived with `truncated` set. A cache hit
+reports a preview cut from the stored entry to the same budget.
 
 **Timing events.** `DnsResolved`, `Connected`, and the `CorsPreflight`/`CorsPreflightDone` pair
 each carry an `elapsed`, so the embedder can break the time before the first byte into
