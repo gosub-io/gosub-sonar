@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-03
+
 ### Added
 
 - Request and response body reporting, so an inspector can show what was sent and what came
@@ -29,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `test-support`: `RecordingObserver::requests_sent()` and `RecordingObserver::body_previews()`
 
   `NetEvent` is `#[non_exhaustive]`, so the new variants do not break an existing `match`.
+
+### Changed
+
+- `simple_get`, `sync_get` and `sync_fetch` now send the same `DEFAULT_USER_AGENT`
+  (`gosub-sonar/<version>`) the `Fetcher` does. reqwest sets no `User-Agent` of its own, so
+  these previously went out with the header absent entirely, which servers are entitled to
+  refuse - Wikimedia answers a header-less request with `403`.
 
 ## [0.5.1] - 2026-09-01
 
@@ -402,7 +411,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.3.0...v0.4.0

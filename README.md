@@ -32,8 +32,10 @@ The library has no dependency on any browser engine and can be used standalone.
   the request retried; `Basic` is computed for you.
 - HTTP caching (RFC 9111) per redirect hop: freshness, revalidation with `ETag`/`Last-Modified`,
   `Vary`, invalidation, and a per-request cache mode.
-- `NetEvent`s per request (started, redirected, headers, progress, blocked, preflight, TLS
-  failure, auth challenge, cache, finished) via `NetObserver`; typed `NetError` / `BlockReason`.
+- `NetEvent`s per request (started, request sent, redirected, headers, progress, blocked,
+  preflight, TLS failure, auth challenge, cache, finished) via `NetObserver`; typed
+  `NetError` / `BlockReason`. An observer that opts in with `body_capture_limit` also gets a
+  `BodyPreview` of the response body, teed as it is read.
 - Timing: `DnsResolved`, `Connected` and the CORS preflight pair each carry an `elapsed`, and
   `ResponseHeaders` marks time-to-first-byte, so the wait before the body breaks down into
   resolution, connection setup, preflight and server time.
@@ -52,7 +54,7 @@ Add to your `Cargo.toml` (the scheduler API also uses these companion crates dir
 
 ```toml
 [dependencies]
-gosub-sonar = "0.5"
+gosub-sonar = "0.6"
 http = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
 tokio-util = "0.7"
