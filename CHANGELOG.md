@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-09-03
+
+### Fixed
+
+- A request whose body reader is dropped before end-of-stream now reports a terminal event.
+  `Finished` was only emitted from a read that returned zero bytes, so a consumer that read
+  exactly `content-length` and stopped — or took what it needed and dropped the reader — ended
+  its request in silence, breaking the documented guarantee that every request reports exactly
+  one of `Finished`, `Failed` or `Cancelled`. An observer counting requests in flight never saw
+  those come back. Reported as `Finished` rather than `Cancelled`: a consumer stopping because
+  it has what it wanted is not a network failure, and `received_bytes` already says how much
+  arrived
+
+### Changed
+
+- `NetEvent::RequestSent` now reports the request the HTTP client assembled, rather than a copy
+  of the header map handed to it. The gap between what was asked for and what was assembled is
+  the thing a network inspector is opened to find
+- `RequestSent` also reports the client's user agent, via `NetPolicy::with_user_agent`. The
+  client will not say: a default header is merged when a request is *executed*, not when it is
+  built, and is never exposed for reading — so a policy is told what the client was configured
+  with. `Fetcher` fills this in from its own `FetcherConfig`. A policy told nothing reports no
+  user agent rather than guessing, and a per-request `user-agent` still wins, because that is
+  what gets sent
+
+  Two omissions remain, deliberately not guessed at: `accept-encoding`, which the client
+  composes from the codecs it was compiled with and inserts at execute time, and `host` (or
+  `:authority`) and transfer framing, which the connection adds below any layer where a typed
+  header map exists
+
+### Added
+
+- `test-support`: `RecordingObserver::len_finished()`
+
 ## [0.6.0] - 2026-09-03
 
 ### Added
@@ -411,7 +445,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.4.0...v0.5.0
