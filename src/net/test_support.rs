@@ -1233,6 +1233,17 @@ impl RecordingObserver {
             .collect()
     }
 
+    /// How many `Finished` events were recorded. A request reports exactly one terminal
+    /// event, so this doubles as "did this request end cleanly".
+    pub fn len_finished(&self) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, NetEvent::Finished { .. }))
+            .count()
+    }
+
     /// Number of events recorded so far.
     pub fn len(&self) -> usize {
         self.events.lock().unwrap().len()

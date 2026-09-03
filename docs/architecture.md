@@ -597,17 +597,25 @@ Two traits decouple the net stack from the host's event system:
 `NetEvent` is `#[non_exhaustive]`: a `match` over it needs a catch-all arm, and new events can
 be added without a breaking release.
 
-**Terminal events.** Every request ends in exactly one of `Finished`, `Failed`, or `Cancelled`.
+**Terminal events.** Every request ends in exactly one of `Finished`, `Failed`, or `Cancelled`,
+including one whose body reader is dropped before end-of-stream — that reports `Finished` with
+the bytes that arrived, since a consumer stopping early is not a network failure.
 `Failed` is emitted for any failure wherever it happened; the events that name a specific cause
 — `Blocked`, `TlsFailed` — are emitted first and carry the detail, so an observer can treat
 `Failed` as "this request is over" without matching every cause it might have. A cancelled
 request is not a failure and reports only `Cancelled`.
 
-**Request and body reporting.** `RequestSent` carries the method, URL and the headers this
-crate set for one hop, emitted once those headers are final — after credentials and conditional
-headers are added, and after a redirect has restarted from the caller's set. It is not a
-byte-exact wire capture: the HTTP client adds `host`, `accept-encoding` and its user agent
-below this layer. `BodyPreview` carries the leading bytes of a response body, and is emitted
+**Request and body reporting.** `RequestSent` carries the method, URL and headers of the
+request the HTTP client assembled for one hop, emitted once those headers are final — after
+credentials and conditional headers are added, and after a redirect has restarted from the
+caller's set. Everything this crate computes is included: cookies from the jar, `Referer`,
+`Origin`, the `Sec-Fetch-*` set. The client's user agent is included too, but only because
+`NetPolicy::with_user_agent` was told what it is — a client's default headers are merged when a
+request executes, not when it is built, and are never exposed for reading. It is still not a
+byte-exact wire capture: `accept-encoding` is composed by the client from the codecs it was
+compiled with and inserted at execute time, and `host` (or `:authority`) and transfer framing
+are added by the connection, below any layer where a typed header map exists. None of these is
+guessed at. `BodyPreview` carries the leading bytes of a response body, and is emitted
 only when `NetObserver::body_capture_limit(headers, content_length)` returns a limit — asked
 once per response with the headers in hand, defaulting to `None`, so an oversized or unwanted
 body is refused before anything is copied. The body is teed as the consumer reads it rather

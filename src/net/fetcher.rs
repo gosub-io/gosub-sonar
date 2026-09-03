@@ -830,7 +830,12 @@ fn build_policy(
 ) -> NetPolicy {
     let policy = NetPolicy::from_context(ctx)
         .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)))
-        .with_credential_store(cfg.credentials.clone());
+        .with_credential_store(cfg.credentials.clone())
+        // The same user agent `build_client` puts on the client. Passed along only so
+        // `NetEvent::RequestSent` can report it: reqwest merges a client default when the
+        // request is executed and never exposes it for reading, so without this an observer
+        // sees a request with no user agent on it at all.
+        .with_user_agent(cfg.user_agent.as_deref());
     #[cfg(not(target_arch = "wasm32"))]
     let policy = {
         let policy = policy
