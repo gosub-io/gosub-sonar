@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Request and response body reporting, so an inspector can show what was sent and what came
+  back:
+  - `NetEvent::RequestSent { url, method, headers }`, emitted once per redirect hop once the
+    headers for that hop are final: after credentials and conditional headers are added, and
+    after a redirect has restarted from the caller's set. These are the headers this crate set;
+    the HTTP client adds `host`, `accept-encoding` and its user agent below this layer, so it
+    is not a byte-exact capture of the wire
+  - `NetEvent::BodyPreview { url, body, truncated }`, the leading bytes of a response body as
+    received: not decoded, not necessarily valid UTF-8
+  - `NetObserver::body_capture_limit(headers, content_length)` decides whether a body is copied
+    and how much of it. Asked once per response, with the headers in hand, so an oversized or
+    unwanted response is refused before anything is copied. Defaults to `None`, which captures
+    nothing
+  - the body is teed as the consumer reads it, never buffered ahead, so capturing does not
+    change the timings being reported. A consumer that stops early, or a body that fails part
+    way through, still reports what arrived, marked `truncated`
+  - a cache hit reports a preview too, cut from the stored entry to the same budget
+  - `test-support`: `RecordingObserver::requests_sent()` and `RecordingObserver::body_previews()`
+
+  `NetEvent` is `#[non_exhaustive]`, so the new variants do not break an existing `match`.
+
 ## [0.5.1] - 2026-09-01
 
 ### Added

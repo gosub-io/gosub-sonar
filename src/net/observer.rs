@@ -8,6 +8,28 @@ use std::sync::Arc;
 pub trait NetObserver: Send + Sync {
     /// Called for every [`NetEvent`] emitted during a request's lifecycle
     fn on_event(&self, ev: NetEvent);
+
+    /// How many bytes of this response body, if any, the observer wants copied.
+    ///
+    /// `None` -- the default -- captures nothing and costs nothing. `Some(n)` tees the body
+    /// as it is consumed, stopping at `n`.
+    ///
+    /// Asked once per response, after the headers are in, so the answer can depend on them:
+    /// a large or unwanted response can be refused before anything is copied. The answer is
+    /// used as given.
+    ///
+    /// `content_length` is the declared length where the server gave one; it is absent for a
+    /// chunked response.
+    ///
+    /// The body is teed rather than buffered ahead, so the consumer never waits for the
+    /// capture and the reported timings are unchanged.
+    fn body_capture_limit(
+        &self,
+        _headers: &http::HeaderMap,
+        _content_length: Option<u64>,
+    ) -> Option<usize> {
+        None
+    }
 }
 
 tokio::task_local! {

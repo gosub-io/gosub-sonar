@@ -4,7 +4,7 @@ use crate::net::auth::{AuthChallenge, AuthTarget};
 use crate::net::cache::CacheOutcome;
 use crate::net::tls::TlsError;
 use crate::net::types::BlockReason;
-use http::HeaderMap;
+use http::{HeaderMap, Method};
 use std::time::Duration;
 use url::Url;
 
@@ -63,6 +63,42 @@ pub enum NetEvent {
         /// How long the connection took to establish
         elapsed: Duration,
     },
+    /// The request line and headers sent for one hop.
+    ///
+    /// Emitted per hop, so a redirect chain reports each leg separately; the headers differ
+    /// between legs, since credentials and conditional headers are added for a single send
+    /// and a method downgrade drops the body.
+    ///
+    /// These are the headers this crate set. The HTTP client adds `host`, `accept-encoding`
+    /// and its configured user agent below this layer, so this is not a byte-exact capture
+    /// of what left the socket.
+    RequestSent {
+        /// Target of this hop
+        url: Url,
+        /// HTTP method for this hop
+        method: Method,
+        /// Headers this stack set for this hop
+        headers: HeaderMap,
+    },
+
+    /// The leading bytes of the response body.
+    ///
+    /// Only emitted when an observer asks for a copy via
+    /// [`NetObserver::body_capture_limit`], which also sets the byte limit; nothing is copied
+    /// otherwise. The bytes are teed as the consumer reads the body, so the consumer never
+    /// waits for the capture, and the event lands when the body ends, fails, or is dropped.
+    ///
+    /// [`NetObserver::body_capture_limit`]: crate::net::observer::NetObserver::body_capture_limit
+    BodyPreview {
+        /// URL the body belongs to
+        url: Url,
+        /// Up to the observer's requested limit, as received: not decoded, not necessarily
+        /// valid UTF-8.
+        body: Vec<u8>,
+        /// Whether the body continued past what was captured
+        truncated: bool,
+    },
+
     /// Resource started loading
     Started {
         /// URL being fetched

@@ -523,6 +523,17 @@ async fn fetch_response_top_inner(
                 meta.content_length,
                 peek_len as u64,
             );
+            // A cache hit reports a preview too. No tee here: the entry is already whole in
+            // memory, so it is cut to the budget directly.
+            if let Some(limit) = observer.body_capture_limit(&meta.headers, meta.content_length) {
+                let take = entry.body.len().min(limit);
+                observer.on_event(NetEvent::BodyPreview {
+                    url: meta.final_url.clone(),
+                    body: entry.body[..take].to_vec(),
+                    truncated: take < entry.body.len(),
+                });
+            }
+
             return Ok(ResponseTop {
                 meta,
                 peek_buf: PeekBuf::from_vec(entry.body[..peek_len].to_vec()),
@@ -634,6 +645,38 @@ async fn fetch_response_top_inner(
             .boxed_local()
     } else {
         body_stream.boxed_local()
+    };
+
+    // Capture only when the observer asked for one, up to the limit it gave. It sees the
+    // headers first, so an oversized or unwanted response is refused before anything is
+    // copied.
+    //
+    // The peek window is handed over separately and read first, so it is seeded into the
+    // capture as the body's opening bytes; the wrapper copies the remainder as the consumer
+    // pulls it.
+    #[cfg(not(target_arch = "wasm32"))]
+    let body_stream = match observer.body_capture_limit(&meta.headers, meta.content_length) {
+        Some(limit) => crate::net::body_capture::CapturingBody::new(
+            body_stream,
+            observer.clone(),
+            meta.final_url.clone(),
+            limit,
+            &peek_buf_vec,
+        )
+        .boxed(),
+        None => body_stream,
+    };
+    #[cfg(target_arch = "wasm32")]
+    let body_stream = match observer.body_capture_limit(&meta.headers, meta.content_length) {
+        Some(limit) => crate::net::body_capture::CapturingBody::new(
+            body_stream,
+            observer.clone(),
+            meta.final_url.clone(),
+            limit,
+            &peek_buf_vec,
+        )
+        .boxed_local(),
+        None => body_stream,
     };
 
     // Update last remaining items in meta struct
@@ -1482,6 +1525,16 @@ async fn get_with_redirects(
                 for (name, value) in conditional.iter() {
                     hop_headers.insert(name.clone(), value.clone());
                 }
+                // Reported here rather than beside `Started`: the headers are only final
+                // for this hop at this point. Credentials and conditional headers are added
+                // just above, and a redirect starts over from the caller's set, so an
+                // earlier event would describe a request that was never sent.
+                observer.on_event(NetEvent::RequestSent {
+                    url: url.clone(),
+                    method: current_method.clone(),
+                    headers: hop_headers.clone(),
+                });
+
                 let mut req_builder = client
                     .request(current_method.clone(), url.clone())
                     .headers(hop_headers);
@@ -1855,6 +1908,188 @@ mod tests {
 
     fn observer() -> Arc<dyn NetObserver + Send + Sync> {
         Arc::new(TestObserver)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_request_line_is_reported_with_the_headers_that_were_sent() {
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(b"hi".to_vec()))
+            .start()
+            .await;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-marker", "present".parse().unwrap());
+        let rec = Arc::new(RecordingObserver::new());
+
+        fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(headers),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await
+        .expect("fetch");
+
+        let sent = rec.requests_sent();
+        assert_eq!(sent.len(), 1, "one hop, one request line");
+        let (method, url, headers) = &sent[0];
+        assert_eq!(method, http::Method::GET);
+        assert_eq!(url, &srv.url("/"));
+        // The caller's headers are included in the report.
+        assert_eq!(headers.get("x-marker").unwrap(), "present");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_shorter_than_the_budget_is_captured_whole() {
+        let body = pattern(64);
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(body.clone()))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+
+        let top = fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await
+        .expect("fetch");
+        drain(top).await;
+
+        let previews = rec.body_previews();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(
+            previews[0].0, body,
+            "the capture is the body, byte for byte"
+        );
+        assert!(!previews[0].1, "a body that fits is not truncated");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_larger_than_the_peek_window_is_captured_past_it() {
+        // Well past the peek window, so the capture cannot be just the buffered peek.
+        let body = pattern(PEEK_MAX * 4);
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(body.clone()))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+
+        let top = fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await
+        .expect("fetch");
+        // The tee fills as the consumer pulls, so the body has to be read.
+        drain(top).await;
+
+        let previews = rec.body_previews();
+        assert_eq!(previews.len(), 1);
+        assert!(
+            previews[0].0.len() > PEEK_MAX,
+            "the capture reaches past the peek window (got {})",
+            previews[0].0.len()
+        );
+        assert_eq!(
+            previews[0].0, body,
+            "and it is the whole body, byte for byte"
+        );
+        assert!(!previews[0].1, "and not truncated");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_over_the_budget_stops_at_it_and_says_so() {
+        let body = pattern(PEEK_MAX * 3);
+        let limit = PEEK_MAX + 512; // deliberately not a window multiple
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(body.clone()))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+
+        // The recorder has no limit of its own; this wrapper imposes the budget and passes
+        // the events through.
+        struct Capped(Arc<RecordingObserver>, usize);
+        impl NetObserver for Capped {
+            fn on_event(&self, ev: NetEvent) {
+                self.0.on_event(ev);
+            }
+            fn body_capture_limit(&self, _: &HeaderMap, _: Option<u64>) -> Option<usize> {
+                Some(self.1)
+            }
+        }
+
+        let top = fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            Arc::new(Capped(rec.clone(), limit)),
+            NetPolicy::default(),
+        )
+        .await
+        .expect("fetch");
+        drain(top).await;
+
+        let previews = rec.body_previews();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].0.len(), limit, "stops exactly at the budget");
+        assert_eq!(
+            previews[0].0,
+            body[..limit],
+            "and it is the start of the body"
+        );
+        assert!(
+            previews[0].1,
+            "a body that continued is reported as truncated"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn refusing_a_capture_leaves_the_body_intact() {
+        // The default `body_capture_limit` is None, which keeps the tee off the path.
+        let body = pattern(PEEK_MAX * 2);
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(body.clone()))
+            .start()
+            .await;
+
+        let top = fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            NetPolicy::default(),
+        )
+        .await
+        .expect("fetch");
+
+        assert_eq!(drain(top).await, body, "the body arrives whole");
+    }
+
+    /// Read a response to the end and return the whole body, peek window included. The
+    /// capture only fills as the consumer pulls.
+    async fn drain(top: ResponseTop) -> Vec<u8> {
+        let ResponseTop {
+            peek_buf,
+            mut reader,
+            ..
+        } = top;
+        let mut body = peek_buf.into_bytes().to_vec();
+        reader.read_to_end(&mut body).await.unwrap();
+        body
     }
 
     /// Deterministic, position-dependent byte pattern. Any truncation or mis-ordering during body
