@@ -11,6 +11,7 @@
 pub mod test_support;
 
 pub mod auth;
+mod body_capture;
 pub mod cache;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod connect_timing;

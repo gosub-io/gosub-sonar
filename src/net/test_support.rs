@@ -1200,6 +1200,39 @@ impl RecordingObserver {
             .collect()
     }
 
+    /// Every request line reported, as (method, url, headers), in order. A redirect chain
+    /// yields one per hop.
+    pub fn requests_sent(&self) -> Vec<(http::Method, url::Url, http::HeaderMap)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::RequestSent {
+                    url,
+                    method,
+                    headers,
+                } => Some((method.clone(), url.clone(), headers.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every body preview reported, as (bytes, truncated).
+    pub fn body_previews(&self) -> Vec<(Vec<u8>, bool)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::BodyPreview {
+                    body, truncated, ..
+                } => Some((body.clone(), *truncated)),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Number of events recorded so far.
     pub fn len(&self) -> usize {
         self.events.lock().unwrap().len()
@@ -1214,5 +1247,15 @@ impl RecordingObserver {
 impl NetObserver for RecordingObserver {
     fn on_event(&self, ev: NetEvent) {
         self.events.lock().unwrap().push(ev);
+    }
+
+    /// Effectively unlimited, so a test sees whatever the stack emits. Tests that exercise
+    /// the cap set their own limit.
+    fn body_capture_limit(
+        &self,
+        _headers: &http::HeaderMap,
+        _content_length: Option<u64>,
+    ) -> Option<usize> {
+        Some(usize::MAX / 2)
     }
 }
