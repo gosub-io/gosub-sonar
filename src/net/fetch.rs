@@ -160,6 +160,18 @@ pub struct NetPolicy {
     /// See [`cache`](mod@crate::net::cache).
     #[cfg(not(target_arch = "wasm32"))]
     pub cache: Option<Arc<dyn HttpCache>>,
+    /// The user agent configured on the HTTP client, purely so that
+    /// [`NetEvent::RequestSent`] can report it.
+    ///
+    /// It exists because the client will not say. A default header set on the client is
+    /// merged when a request is *executed*, not when it is built, and is never exposed for
+    /// reading -- so a request assembled here carries no user agent even though one is about
+    /// to be sent. Telling the policy what was configured is the only way an observer can be
+    /// shown the truth.
+    ///
+    /// `None` reports no user agent rather than inventing one, which is the honest answer
+    /// for a client this crate did not build. Set via [`NetPolicy::with_user_agent`].
+    pub user_agent: Option<http::HeaderValue>,
 }
 
 impl Default for NetPolicy {
@@ -169,6 +181,7 @@ impl Default for NetPolicy {
             cookies_for: Box::new(|_| None),
             on_cookies: Box::new(|_, _| {}),
             on_protocol: Box::new(|_, _| {}),
+            user_agent: None,
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -193,6 +206,8 @@ impl NetPolicy {
             cookies_for: Box::new(move |url| ctx_cookies.cookies_for(url)),
             on_cookies: Box::new(move |url, values| ctx_sink.on_cookies_received(url, values)),
             on_protocol: Box::new(|_, _| {}),
+            // Filled in by the fetcher, which is what knows how its client was built.
+            user_agent: None,
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -202,6 +217,14 @@ impl NetPolicy {
             #[cfg(not(target_arch = "wasm32"))]
             cache: None,
         }
+    }
+
+    /// Tell the policy which user agent the client was built with, so
+    /// [`NetEvent::RequestSent`] can report it. A value that is not a valid header is
+    /// dropped rather than reported wrongly.
+    pub fn with_user_agent(mut self, user_agent: Option<&str>) -> Self {
+        self.user_agent = user_agent.and_then(|ua| http::HeaderValue::from_str(ua).ok());
+        self
     }
 
     /// Attaches a callback that receives the URL and HTTP version of every response.
@@ -834,6 +857,31 @@ impl<R: AsyncRead + Unpin> ProgressReader<R> {
     fn with_cache(mut self, collector: Option<CacheCollector>) -> Self {
         self.cache = collector;
         self
+    }
+}
+
+impl<R> Drop for ProgressReader<R> {
+    /// Report the end of a request whose reader is dropped without being read to EOF.
+    ///
+    /// `Finished` is otherwise only emitted from a poll that returns zero bytes, so a
+    /// consumer that reads exactly `content-length` and stops -- or takes what it needs and
+    /// drops the reader -- ends the request with no terminal event at all. That silently
+    /// breaks this module's own contract: every request reports exactly one of `Finished`,
+    /// `Failed` or `Cancelled`, and an observer counting requests in flight would never see
+    /// these come back.
+    ///
+    /// Reported as finished rather than cancelled: the consumer stopping because it has what
+    /// it wanted is not a network failure, and `received_bytes` already says how much
+    /// actually arrived.
+    fn drop(&mut self) {
+        if self.finished_emitted || self.cancel_emitted || self.failed_emitted {
+            return;
+        }
+        self.observer.on_event(NetEvent::Finished {
+            received_bytes: self.received,
+            elapsed: self.started.elapsed(),
+            url: self.url.clone(),
+        });
     }
 }
 
@@ -1525,16 +1573,6 @@ async fn get_with_redirects(
                 for (name, value) in conditional.iter() {
                     hop_headers.insert(name.clone(), value.clone());
                 }
-                // Reported here rather than beside `Started`: the headers are only final
-                // for this hop at this point. Credentials and conditional headers are added
-                // just above, and a redirect starts over from the caller's set, so an
-                // earlier event would describe a request that was never sent.
-                observer.on_event(NetEvent::RequestSent {
-                    url: url.clone(),
-                    method: current_method.clone(),
-                    headers: hop_headers.clone(),
-                });
-
                 let mut req_builder = client
                     .request(current_method.clone(), url.clone())
                     .headers(hop_headers);
@@ -1549,7 +1587,45 @@ async fn get_with_redirects(
                     }
                     req_builder = req_builder.body(hop_body);
                 }
-                let fut = req_builder.send();
+                // Built rather than sent straight away, so the request line reported is the
+                // one the client actually assembled. `build()` has by then applied the
+                // client's own defaults -- its user agent, its configured default headers --
+                // on top of what this stack set. Reporting the headers we handed over would
+                // describe what was asked for, which is not the same thing, and the gap
+                // between the two is exactly what a developer opens a network panel to find.
+                //
+                // Reported here rather than beside `Started`: the headers are only final for
+                // this hop at this point. Credentials and conditional headers are added just
+                // above, and a redirect starts over from the caller's set, so an earlier
+                // event would describe a request that was never sent.
+                //
+                // A few headers are still added below this layer by the connection itself --
+                // `host` or `:authority`, and transfer framing. Those never reach a
+                // `reqwest::Request`, and are not guessed at here.
+                let request = req_builder.build().map_err(|e| {
+                    send_error(
+                        e,
+                        &url,
+                        "net.get_with_redirects request build failed",
+                        &observer,
+                    )
+                })?;
+                let mut reported = request.headers().clone();
+                // Only when the assembled request does not already carry one: a header set
+                // per-request wins over the client default, and reporting the default over
+                // the top of it would be a lie in the one direction that matters.
+                if let Some(ref ua) = policy.user_agent {
+                    reported
+                        .entry(http::header::USER_AGENT)
+                        .or_insert(ua.clone());
+                }
+                observer.on_event(NetEvent::RequestSent {
+                    url: url.clone(),
+                    method: request.method().clone(),
+                    headers: reported,
+                });
+
+                let fut = client.execute(request);
                 tokio::pin!(fut);
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -2077,6 +2153,188 @@ mod tests {
         .expect("fetch");
 
         assert_eq!(drain(top).await, body, "the body arrives whole");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_reported_headers_include_the_client_s_user_agent() {
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(b"hi".to_vec()))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+
+        // Set on the *client*, where reqwest merges it at execute time and never exposes it
+        // for reading. The policy is told separately, which is the only route to reporting it.
+        let client = Arc::new(
+            reqwest::Client::builder()
+                .user_agent("probe-agent/1.0")
+                .build()
+                .unwrap(),
+        );
+
+        fetch_response_top(
+            client,
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default().with_user_agent(Some("probe-agent/1.0")),
+        )
+        .await
+        .expect("fetch");
+
+        let sent = rec.requests_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]
+                .2
+                .get(http::header::USER_AGENT)
+                .map(|v| v.to_str().unwrap()),
+            Some("probe-agent/1.0")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn headers_this_crate_adds_are_reported_too() {
+        // The question a network panel exists to answer: not "what did the caller ask for"
+        // but "what went out". Cookies, Referer, Origin and the Sec-Fetch-* set are all
+        // computed here, after the caller's map is handed over, and must show up.
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(b"hi".to_vec()))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+        let target = srv.url("/");
+
+        let policy = NetPolicy {
+            cookies_for: Box::new(|_| Some("session=abc123".to_string())),
+            ..NetPolicy::default()
+        };
+
+        fetch_response_top(
+            client(),
+            target.clone(),
+            RequestInit::get(HeaderMap::new())
+                .with_referrer(Some(target.clone()), ReferrerPolicy::UnsafeUrl)
+                .with_fetch_metadata(RequestDestination::Image, RequestMode::NoCors, false),
+            CancellationToken::new(),
+            rec.clone(),
+            policy,
+        )
+        .await
+        .expect("fetch");
+
+        let sent = rec.requests_sent();
+        assert_eq!(sent.len(), 1);
+        let headers = &sent[0].2;
+
+        // The caller set none of these.
+        assert_eq!(
+            headers.get(header::COOKIE).map(|v| v.to_str().unwrap()),
+            Some("session=abc123"),
+            "a cookie from the jar is reported"
+        );
+        assert!(
+            headers.contains_key(header::REFERER),
+            "a computed Referer is reported"
+        );
+        assert!(
+            headers.contains_key("sec-fetch-dest") && headers.contains_key("sec-fetch-mode"),
+            "computed fetch metadata is reported"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_user_agent_is_invented_when_the_policy_was_not_told_one() {
+        // A client this crate did not build. Reporting a guess would be worse than reporting
+        // nothing, so the header is simply absent.
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(b"hi".to_vec()))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+
+        fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await
+        .expect("fetch");
+
+        assert!(!rec.requests_sent()[0]
+            .2
+            .contains_key(http::header::USER_AGENT));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_per_request_user_agent_wins_over_the_client_default() {
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(b"hi".to_vec()))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::USER_AGENT, "per-request/2.0".parse().unwrap());
+
+        fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(headers),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default().with_user_agent(Some("client-default/1.0")),
+        )
+        .await
+        .expect("fetch");
+
+        assert_eq!(
+            rec.requests_sent()[0]
+                .2
+                .get(http::header::USER_AGENT)
+                .map(|v| v.to_str().unwrap()),
+            Some("per-request/2.0"),
+            "the header on the request is what is sent, so it is what is reported"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reader_dropped_before_eof_still_reports_a_terminal_event() {
+        // A consumer that takes what it needs and stops. Without a terminal event on drop
+        // the request would simply never end as far as an observer is concerned.
+        let body = pattern(PEEK_MAX * 2);
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(body))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+
+        let top = fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await
+        .expect("fetch");
+
+        // Read one buffer's worth, then drop the reader without reaching EOF.
+        let ResponseTop { mut reader, .. } = top;
+        let mut sip = [0u8; 128];
+        let _ = reader.read(&mut sip).await.unwrap();
+        drop(reader);
+
+        assert_eq!(
+            rec.len_finished(),
+            1,
+            "every request ends in exactly one terminal event, dropped readers included"
+        );
     }
 
     /// Read a response to the end and return the whole body, peek window included. The

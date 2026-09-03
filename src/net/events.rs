@@ -69,9 +69,24 @@ pub enum NetEvent {
     /// between legs, since credentials and conditional headers are added for a single send
     /// and a method downgrade drops the body.
     ///
-    /// These are the headers this crate set. The HTTP client adds `host`, `accept-encoding`
-    /// and its configured user agent below this layer, so this is not a byte-exact capture
-    /// of what left the socket.
+    /// These are the headers of the request the client assembled, plus the user agent the
+    /// policy was told about -- which together is as close to the wire as the HTTP client
+    /// lets anyone see.
+    ///
+    /// The user agent needs that help because a client's default headers are merged when a
+    /// request is *executed*, not when it is built, and are never exposed for reading; see
+    /// [`NetPolicy::with_user_agent`](crate::net::fetch::NetPolicy::with_user_agent). A
+    /// policy that was told nothing reports no user agent rather than guessing.
+    ///
+    /// Everything this crate computes for the request is included -- cookies from the jar,
+    /// `Referer`, `Origin`, the `Sec-Fetch-*` set, credentials, conditional cache headers --
+    /// because all of it is written before the request is built.
+    ///
+    /// Two things are still missing, and are deliberately not guessed at. `accept-encoding`
+    /// is composed by the HTTP client from the codecs it was compiled with and inserted when
+    /// the request executes; writing what we *think* it will send would be a plausible
+    /// string that might not match. And the connection adds `host` (or `:authority`) and
+    /// transfer framing below this layer, where nothing typed is observable at all.
     RequestSent {
         /// Target of this hop
         url: Url,
