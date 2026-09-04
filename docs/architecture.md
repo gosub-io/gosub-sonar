@@ -598,8 +598,11 @@ Two traits decouple the net stack from the host's event system:
 be added without a breaking release.
 
 **Terminal events.** Every request ends in exactly one of `Finished`, `Failed`, or `Cancelled`,
-including one whose body reader is dropped before end-of-stream — that reports `Finished` with
-the bytes that arrived, since a consumer stopping early is not a network failure.
+including one whose body reader is dropped before end-of-stream. Which of the two that reports
+depends on whether the body arrived: one that fit in the peek window is `Finished`, and a
+partly-read body that was abandoned is `Cancelled`, because the transfer did not happen. The
+elapsed time on a drop is measured to the last read that moved bytes rather than to the drop,
+so a reader held idle by its owner does not report that wait as transfer time.
 `Failed` is emitted for any failure wherever it happened; the events that name a specific cause
 — `Blocked`, `TlsFailed` — are emitted first and carry the detail, so an observer can treat
 `Failed` as "this request is over" without matching every cause it might have. A cancelled
