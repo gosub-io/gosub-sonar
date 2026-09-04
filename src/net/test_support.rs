@@ -1244,6 +1244,36 @@ impl RecordingObserver {
             .count()
     }
 
+    /// Every `Finished` event, as `(received_bytes, elapsed)`.
+    pub fn finished(&self) -> Vec<(u64, std::time::Duration)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Finished {
+                    received_bytes,
+                    elapsed,
+                    ..
+                } => Some((*received_bytes, *elapsed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every `Cancelled` reason, in order.
+    pub fn cancellations(&self) -> Vec<&'static str> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Cancelled { reason, .. } => Some(*reason),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Number of events recorded so far.
     pub fn len(&self) -> usize {
         self.events.lock().unwrap().len()

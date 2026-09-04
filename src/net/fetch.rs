@@ -815,6 +815,10 @@ struct ProgressReader<R> {
     expected_length: Option<u64>,
     /// Number of bytes already received (from the peek buffer)
     received: u64,
+    /// When the body last actually moved. A reader can sit unread for a long time before it
+    /// is dropped, and reporting `started.elapsed()` then would describe the wait rather than
+    /// the transfer.
+    last_activity: Instant,
     /// Whether we already emitted a cancelled event
     cancel_emitted: bool,
     /// Whether we already emitted a finished event (guards against duplicate EOF polls)
@@ -844,6 +848,7 @@ impl<R: AsyncRead + Unpin> ProgressReader<R> {
             started,
             expected_length,
             received: already_received,
+            last_activity: Instant::now(),
             cancel_emitted: false,
             finished_emitted: false,
             failed_emitted: false,
@@ -861,27 +866,43 @@ impl<R: AsyncRead + Unpin> ProgressReader<R> {
 }
 
 impl<R> Drop for ProgressReader<R> {
-    /// Report the end of a request whose reader is dropped without being read to EOF.
+    /// Report the end of a request whose reader is dropped without reaching end-of-stream.
     ///
-    /// `Finished` is otherwise only emitted from a poll that returns zero bytes, so a
-    /// consumer that reads exactly `content-length` and stops -- or takes what it needs and
-    /// drops the reader -- ends the request with no terminal event at all. That silently
-    /// breaks this module's own contract: every request reports exactly one of `Finished`,
-    /// `Failed` or `Cancelled`, and an observer counting requests in flight would never see
-    /// these come back.
+    /// `Finished` is otherwise only emitted from a read that returns zero bytes, so a
+    /// consumer that takes what it needs and drops the reader would end the request with no
+    /// terminal event at all -- breaking this module's contract that every request reports
+    /// exactly one of `Finished`, `Failed` or `Cancelled`, and leaving an observer with a
+    /// request that never comes back.
     ///
-    /// Reported as finished rather than cancelled: the consumer stopping because it has what
-    /// it wanted is not a network failure, and `received_bytes` already says how much
-    /// actually arrived.
+    /// Which event depends on whether the body actually arrived. A consumer whose response
+    /// fit in the peek window has the whole thing and is genuinely finished; one that
+    /// abandoned a partly-read body is not, and saying `Finished` there would report a
+    /// transfer that did not happen. Without a declared length there is no way to tell, so
+    /// it is treated as abandoned rather than guessed complete.
+    ///
+    /// The elapsed time is measured to the last read that moved bytes, not to the drop. A
+    /// reader can sit untouched for a long time before its owner lets go -- fifteen seconds
+    /// is routine -- and `started.elapsed()` would report that wait as the transfer time,
+    /// which is a plausible number and a false one.
     fn drop(&mut self) {
         if self.finished_emitted || self.cancel_emitted || self.failed_emitted {
             return;
         }
-        self.observer.on_event(NetEvent::Finished {
-            received_bytes: self.received,
-            elapsed: self.started.elapsed(),
-            url: self.url.clone(),
-        });
+        let complete = self
+            .expected_length
+            .is_some_and(|expected| self.received >= expected);
+        if complete {
+            self.observer.on_event(NetEvent::Finished {
+                received_bytes: self.received,
+                elapsed: self.last_activity.saturating_duration_since(self.started),
+                url: self.url.clone(),
+            });
+        } else {
+            self.observer.on_event(NetEvent::Cancelled {
+                url: self.url.clone(),
+                reason: "body reader dropped before end of stream",
+            });
+        }
     }
 }
 
@@ -932,6 +953,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
                 });
             }
             if read_bytes > 0 {
+                self.last_activity = Instant::now();
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(collector) = self.cache.as_mut() {
                     let filled = buf.filled();
@@ -2303,9 +2325,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn a_reader_dropped_before_eof_still_reports_a_terminal_event() {
-        // A consumer that takes what it needs and stops. Without a terminal event on drop
-        // the request would simply never end as far as an observer is concerned.
+    async fn abandoning_a_partly_read_body_reports_a_cancellation() {
+        // Not "finished": the transfer did not happen, and reporting a completion with the
+        // handful of bytes that did arrive would describe a request nobody made.
         let body = pattern(PEEK_MAX * 2);
         let srv = TestServer::new()
             .route("/", RouteConfig::ok(body))
@@ -2324,17 +2346,64 @@ mod tests {
         .await
         .expect("fetch");
 
-        // Read one buffer's worth, then drop the reader without reaching EOF.
         let ResponseTop { mut reader, .. } = top;
         let mut sip = [0u8; 128];
         let _ = reader.read(&mut sip).await.unwrap();
         drop(reader);
 
         assert_eq!(
-            rec.len_finished(),
-            1,
-            "every request ends in exactly one terminal event, dropped readers included"
+            rec.finished().len(),
+            0,
+            "an abandoned body is not a completed one"
         );
+        assert_eq!(
+            rec.cancellations(),
+            vec!["body reader dropped before end of stream"]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_that_arrived_whole_reports_finished_when_dropped_unread() {
+        // The common case behind this: a response small enough to fit the peek window. Its
+        // consumer has the entire body without ever touching the reader, so dropping it is
+        // not an abandonment -- and the time reported must be the transfer, not however long
+        // the owner sat on the reader afterwards.
+        let body = pattern(64);
+        let srv = TestServer::new()
+            .route("/", RouteConfig::ok(body.clone()))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+
+        let top = fetch_response_top(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await
+        .expect("fetch");
+
+        let ResponseTop { reader, .. } = top;
+        let idle = Duration::from_millis(300);
+        tokio::time::sleep(idle).await;
+        drop(reader);
+
+        let finished = rec.finished();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(
+            finished[0].0,
+            body.len() as u64,
+            "the whole body is accounted for"
+        );
+        assert!(
+            finished[0].1 < idle,
+            "the idle wait before the drop is not reported as transfer time (got {:?})",
+            finished[0].1
+        );
+        assert!(rec.cancellations().is_empty());
     }
 
     /// Read a response to the end and return the whole body, peek window included. The

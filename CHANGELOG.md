@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-04
+
+### Fixed
+
+- A body reader dropped before end-of-stream is no longer always reported as `Finished`.
+  0.6.1 gave every such request a completion carrying whatever bytes had arrived and the time
+  until the drop, which for a reader its owner sat on for fifteen seconds read as a fifteen
+  second transfer of five kilobytes — a plausible number and a false one, which is worse than
+  the silence it replaced. Now:
+  - a body that arrived whole, which is the ordinary case for a response small enough to fit
+    the peek window, still reports `Finished`
+  - a partly-read body that was abandoned reports `Cancelled { reason: "body reader dropped
+    before end of stream" }`, because the transfer did not happen. Without a declared length
+    there is no way to tell the two apart, so it is treated as abandoned rather than guessed
+    complete
+  - the elapsed time on a drop is measured to the last read that moved bytes, not to the drop
+    itself, so a reader held idle does not report the wait as transfer time
+- `test-support`: `RecordingObserver::finished()` and `RecordingObserver::cancellations()`
+
 ## [0.6.1] - 2026-09-03
 
 ### Fixed
@@ -445,7 +464,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.0...v0.5.1
