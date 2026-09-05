@@ -614,11 +614,10 @@ credentials and conditional headers are added, and after a redirect has restarte
 caller's set. Everything this crate computes is included: cookies from the jar, `Referer`,
 `Origin`, the `Sec-Fetch-*` set. The client's user agent is included too, but only because
 `NetPolicy::with_user_agent` was told what it is — a client's default headers are merged when a
-request executes, not when it is built, and are never exposed for reading. It is still not a
-byte-exact wire capture: `accept-encoding` is composed by the client from the codecs it was
-compiled with and inserted at execute time, and `host` (or `:authority`) and transfer framing
-are added by the connection, below any layer where a typed header map exists. None of these is
-guessed at. `BodyPreview` carries the leading bytes of a response body, and is emitted
+request executes, not when it is built, and are never exposed for reading. `accept-encoding` is
+set by the fetcher rather than left to the client, precisely so that it can be reported. It is
+still not a byte-exact wire capture: `host` (or `:authority`) and transfer framing are added by
+the connection, below any layer where a typed header map exists, and neither is guessed at. `BodyPreview` carries the leading bytes of a response body, and is emitted
 only when `NetObserver::body_capture_limit(headers, content_length)` returns a limit — asked
 once per response with the headers in hand, defaulting to `None`, so an oversized or unwanted
 body is refused before anything is copied. The body is teed as the consumer reads it rather

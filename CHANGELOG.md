@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `accept-encoding` is set by the `Fetcher` instead of being left to the HTTP client, so
+  `NetEvent::RequestSent` can report it. The client would otherwise add it from the codecs it
+  was compiled with at the moment the request executes, after the point anything can read it —
+  leaving it as the one header this crate genuinely sent and could not report. Setting it makes
+  the reported value true by construction rather than a guess at what the client would send.
+  The advertised set matches what the decoding client can handle, so responses decode exactly
+  as before; a request with `auto_decode: false` advertises `identity`, and a caller that sets
+  its own `accept-encoding` keeps it
+
 ## [0.6.2] - 2026-09-04
 
 ### Fixed

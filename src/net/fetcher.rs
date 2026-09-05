@@ -671,6 +671,31 @@ fn effective_mixed_content(req: &FetchRequest, cfg: &FetcherConfig) -> MixedCont
 /// initiating origin plus the fetcher's mixed content policy down to the redirect loop.
 fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
     let mut headers = req.headers.clone();
+
+    // Set here rather than left to the HTTP client.
+    //
+    // The client would otherwise add this itself, from the codecs it was compiled with, at
+    // the moment the request executes -- after the point anything can read it. That left
+    // `accept-encoding` as the one header this stack genuinely sent and could not report,
+    // and an inspector that shows every header except one is worse than useless, because
+    // nothing tells you which one is missing.
+    //
+    // Writing it here makes it true by construction instead of by guesswork: this is the
+    // value that goes on the wire, and `NetEvent::RequestSent` carries it like any other.
+    // The set matches what `build_client` enables for a decoding client, so the response is
+    // still decoded exactly as before; a caller that asked for raw bytes advertises nothing
+    // and gets them.
+    if !headers.contains_key(header::ACCEPT_ENCODING) {
+        let advertised = if req.auto_decode {
+            "gzip, br, deflate"
+        } else {
+            "identity"
+        };
+        if let Ok(value) = advertised.parse() {
+            headers.insert(header::ACCEPT_ENCODING, value);
+        }
+    }
+
     let body = req.body.as_ref().map(|b| {
         if let Some(ref ct) = b.content_type {
             if !headers.contains_key(header::CONTENT_TYPE) {
@@ -2658,6 +2683,53 @@ mod tests {
             "bypassed host should be requested in origin-form, not as an absolute URI"
         );
         shutdown.cancel();
+    }
+
+    #[test]
+    fn accept_encoding_is_set_here_so_it_can_be_reported() {
+        let cfg = FetcherConfig::default();
+
+        // A decoding request advertises what build_client can actually decode.
+        let req = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
+            .with_auto_decode(true)
+            .build();
+        assert_eq!(
+            make_request_init(&req, &cfg)
+                .headers
+                .get(header::ACCEPT_ENCODING)
+                .map(|v| v.to_str().unwrap()),
+            Some("gzip, br, deflate")
+        );
+
+        // A caller that wants the bytes untouched advertises nothing.
+        let raw = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
+            .with_auto_decode(false)
+            .build();
+        assert_eq!(
+            make_request_init(&raw, &cfg)
+                .headers
+                .get(header::ACCEPT_ENCODING)
+                .map(|v| v.to_str().unwrap()),
+            Some("identity")
+        );
+    }
+
+    #[test]
+    fn a_caller_s_own_accept_encoding_is_left_alone() {
+        let cfg = FetcherConfig::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT_ENCODING, "zstd".parse().unwrap());
+        let req = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
+            .with_headers(headers)
+            .with_auto_decode(true)
+            .build();
+        assert_eq!(
+            make_request_init(&req, &cfg)
+                .headers
+                .get(header::ACCEPT_ENCODING)
+                .map(|v| v.to_str().unwrap()),
+            Some("zstd")
+        );
     }
 
     #[test]

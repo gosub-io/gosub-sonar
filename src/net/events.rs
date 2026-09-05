@@ -82,11 +82,13 @@ pub enum NetEvent {
     /// `Referer`, `Origin`, the `Sec-Fetch-*` set, credentials, conditional cache headers --
     /// because all of it is written before the request is built.
     ///
-    /// Two things are still missing, and are deliberately not guessed at. `accept-encoding`
-    /// is composed by the HTTP client from the codecs it was compiled with and inserted when
-    /// the request executes; writing what we *think* it will send would be a plausible
-    /// string that might not match. And the connection adds `host` (or `:authority`) and
-    /// transfer framing below this layer, where nothing typed is observable at all.
+    /// One thing is still missing, and is deliberately not guessed at: the connection adds
+    /// `host` (or, over HTTP/2, `:authority`) and transfer framing below this layer, where
+    /// nothing typed is observable at all.
+    ///
+    /// `accept-encoding` used to be missing too. It is now set by the fetcher rather than
+    /// left to the HTTP client, so it is reported like any other header -- true by
+    /// construction rather than by guessing what the client would have sent.
     RequestSent {
         /// Target of this hop
         url: Url,
