@@ -9,14 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- `accept-encoding` is set by the `Fetcher` instead of being left to the HTTP client, so
-  `NetEvent::RequestSent` can report it. The client would otherwise add it from the codecs it
-  was compiled with at the moment the request executes, after the point anything can read it —
-  leaving it as the one header this crate genuinely sent and could not report. Setting it makes
-  the reported value true by construction rather than a guess at what the client would send.
-  The advertised set matches what the decoding client can handle, so responses decode exactly
-  as before; a request with `auto_decode: false` advertises `identity`, and a caller that sets
-  its own `accept-encoding` keeps it
+- `NetEvent::RequestSent` now reports the headers a `Fetcher` request actually carries, rather
+  than an approximation of them. An HTTP client merges its own default headers when a request
+  executes, not when it is built, and never exposes them for reading — so any header left to the
+  client was sent unreported, and an inspector showing every header but those is worse than
+  useless, because nothing says which are missing. The fetcher therefore writes them itself:
+  - `accept` is composed from the request's destination (`text/html,…` for a document,
+    `image/…` for an image, `text/css,…` for a stylesheet, `*/*` otherwise) instead of the bare
+    `*/*` the client would have supplied. Every default value is CORS-safelisted, so no request
+    becomes preflighted that was not before. A caller that sets its own `accept` keeps it.
+  - `accept-encoding` is set from what the client can actually decode, so responses decode
+    exactly as before. A request with `auto_decode: false` advertises `identity`, and a caller
+    that sets its own `accept-encoding` keeps it.
+  - `content-length` is set from the body for buffered bodies too, not only for streamed ones.
+    hyper computes the same value while encoding the request and honours an existing one, so
+    this changes what can be observed, not what goes out.
+
+  What remains is created by the connection and determined by what is reported: `host` (or
+  `:authority`) is the authority of the reported URL, and `transfer-encoding: chunked` frames a
+  body of unknown length over HTTP/1.1 — exactly the case where no `content-length` is reported.
+  `Proxy-Authorization` for a configured proxy still comes from the client. See
+  `NetEvent::RequestSent` for the full account
+- The HTTP cache now matches `Vary: accept` correctly, as a consequence: the stored variant is
+  keyed on the `accept` the request really carried instead of on its absence
+
+### Added
+
+- `RouteConfig::echo_request_headers` in `test-support`, answering with every request header
+  line as it arrived — the only way to assert on the whole header set a request carried,
+  including anything the HTTP client added on its own
 
 ## [0.6.2] - 2026-09-04
 

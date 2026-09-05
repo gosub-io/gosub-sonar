@@ -413,6 +413,132 @@ impl FetcherContext for RecordingCtx {
     fn on_ref_done(&self, _: RequestReference) {}
 }
 
+/// The header set a request actually carried, as `name: value` lines read off the wire by the
+/// mock server, lowercased and sorted.
+async fn headers_on_the_wire(fetcher: &Arc<Fetcher>, req: FetchRequest) -> Vec<String> {
+    let body = match fetcher.fetch(req).await {
+        FetchResult::Buffered { body, .. } => body,
+        other => panic!("expected Buffered, got {other:?}"),
+    };
+    let mut lines: Vec<String> = String::from_utf8_lossy(&body)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let (name, value) = l.split_once(':').expect("header line");
+            format!("{}: {}", name.trim().to_ascii_lowercase(), value.trim())
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// The header set `NetEvent::RequestSent` reported for the last hop, in the same shape.
+fn headers_reported(obs: &RecordingObserver) -> Vec<String> {
+    let (_, _, headers) = obs
+        .requests_sent()
+        .pop()
+        .expect("a request was reported sent");
+    let mut lines: Vec<String> = headers
+        .iter()
+        .map(|(name, value)| format!("{}: {}", name.as_str(), value.to_str().unwrap()))
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// The point of the whole exercise: what an observer is told was sent is what was sent.
+///
+/// Every header this crate can write, it writes -- so nothing is left for the HTTP client to
+/// default in after the report has been emitted. `host` is the documented exception, added by
+/// the connection from the URL that is reported alongside the headers.
+#[tokio::test]
+async fn the_reported_headers_are_the_headers_on_the_wire() {
+    let srv = TestServer::new()
+        .default_route(RouteConfig::echo_request_headers())
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/headers"))
+        .with_destination(RequestDestination::Document)
+        .build();
+    let on_the_wire = headers_on_the_wire(&fetcher, req).await;
+
+    let mut expected = headers_reported(&obs);
+    expected.push(format!("host: {}", srv.socket_addr()));
+    expected.sort();
+
+    assert_eq!(on_the_wire, expected);
+    shutdown.cancel();
+}
+
+/// The same guarantee for a request with a body, where `content-length` is the header the
+/// connection would otherwise have computed for itself, below anything that could report it.
+#[tokio::test]
+async fn a_body_s_content_length_is_reported_and_sent() {
+    let srv = TestServer::new()
+        .default_route(RouteConfig::echo_request_headers())
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(RecordingCtx(obs.clone())));
+
+    let req = FetchRequest::builder(Method::POST, srv.url("/submit"))
+        .with_body(RequestBody::json(r#"{"a":1}"#))
+        .build();
+    let on_the_wire = headers_on_the_wire(&fetcher, req).await;
+
+    let reported = headers_reported(&obs);
+    assert!(
+        reported.iter().any(|l| l == "content-length: 7"),
+        "the body's length is reported: {reported:?}"
+    );
+
+    let mut expected = reported;
+    expected.push(format!("host: {}", srv.socket_addr()));
+    expected.sort();
+
+    assert_eq!(on_the_wire, expected);
+    shutdown.cancel();
+}
+
+/// `Accept` is composed from the destination rather than left to the client, which would send
+/// a bare `*/*` for everything -- and send it after the report was emitted.
+#[tokio::test]
+async fn accept_is_shaped_by_the_destination() {
+    let srv = TestServer::new()
+        .default_route(RouteConfig::echo_request_header("accept"))
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+
+    let cases = [
+        (
+            RequestDestination::Document,
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ),
+        (
+            RequestDestination::Image,
+            "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
+        ),
+        (RequestDestination::Style, "text/css,*/*;q=0.1"),
+        (RequestDestination::Script, "*/*"),
+    ];
+    for (destination, expected) in cases {
+        let req = FetchRequest::builder(Method::GET, srv.url("/accept"))
+            .with_destination(destination)
+            .build();
+        match fetcher.fetch(req).await {
+            FetchResult::Buffered { body, .. } => {
+                assert_eq!(String::from_utf8_lossy(&body), expected, "{destination:?}")
+            }
+            other => panic!("expected Buffered, got {other:?}"),
+        }
+    }
+    shutdown.cancel();
+}
+
 /// Every hop reports its response headers, so a redirect chain accounts for each round-trip
 /// it waited on rather than only the one that produced the body.
 #[tokio::test]

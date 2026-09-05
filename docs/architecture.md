@@ -611,13 +611,35 @@ request is not a failure and reports only `Cancelled`.
 **Request and body reporting.** `RequestSent` carries the method, URL and headers of the
 request the HTTP client assembled for one hop, emitted once those headers are final — after
 credentials and conditional headers are added, and after a redirect has restarted from the
-caller's set. Everything this crate computes is included: cookies from the jar, `Referer`,
-`Origin`, the `Sec-Fetch-*` set. The client's user agent is included too, but only because
-`NetPolicy::with_user_agent` was told what it is — a client's default headers are merged when a
-request executes, not when it is built, and are never exposed for reading. `accept-encoding` is
-set by the fetcher rather than left to the client, precisely so that it can be reported. It is
-still not a byte-exact wire capture: `host` (or `:authority`) and transfer framing are added by
-the connection, below any layer where a typed header map exists, and neither is guessed at. `BodyPreview` carries the leading bytes of a response body, and is emitted
+caller's set. For a request made through the `Fetcher`, those are the headers that go on the
+wire rather than an approximation of them, and `tests/e2e.rs` holds that to the wire by
+comparing the reported set against what a mock server received.
+
+The guarantee rests on writing every header here instead of leaving one to the HTTP client. A
+client merges its own default headers when a request *executes*, not when it is built, and never
+exposes them for reading, so anything left to it would be sent unreported — which is why
+`accept` and `accept-encoding` are composed by the fetcher rather than defaulted by the client,
+and why `content-length` is set from the body instead of being computed by the connection.
+Everything the crate derives is included for the same reason: cookies from the jar, `Referer`,
+`Origin`, the `Sec-Fetch-*` set. The user agent is the one value that cannot be written per
+request, being configured on the client; it is reported from what `NetPolicy::with_user_agent`
+was told, and a policy that was told nothing reports none rather than guessing.
+
+What is left is created by the connection, and is determined by what is reported rather than
+being a free choice: `host` — `:authority` over HTTP/2, where it is not a header field at all —
+is the authority of the reported URL, and `transfer-encoding: chunked` frames a body of unknown
+length over HTTP/1.1, which is precisely the case where no `content-length` is reported. Two
+narrower gaps remain: HTTP/2 drops headers that only mean something to HTTP/1.1, so a
+hand-set `connection` or `te` is reported and not sent; and a proxy configured with credentials
+gets its `Proxy-Authorization` from the client, on the invisible `CONNECT` tunnel for an
+`https` target. Which proxy applies to a URL is the client's decision, environment-derived
+proxies included, so the crate does not restate it. None of this holds on `wasm32`, where the
+browser's `fetch()` owns the connection and strips every header the Fetch spec forbids a caller
+from setting — `accept-encoding`, `content-length`, `cookie`, `origin`, `referer`, the
+`sec-fetch-*` set — before applying its own; they are still computed and reported, because that
+is what the request asked for and the browser's substitutes are not observable.
+
+`BodyPreview` carries the leading bytes of a response body, and is emitted
 only when `NetObserver::body_capture_limit(headers, content_length)` returns a limit — asked
 once per response with the headers in hand, defaulting to `None`, so an oversized or unwanted
 body is refused before anything is copied. The body is teed as the consumer reads it rather

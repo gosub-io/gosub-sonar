@@ -69,26 +69,49 @@ pub enum NetEvent {
     /// between legs, since credentials and conditional headers are added for a single send
     /// and a method downgrade drops the body.
     ///
-    /// These are the headers of the request the client assembled, plus the user agent the
-    /// policy was told about -- which together is as close to the wire as the HTTP client
-    /// lets anyone see.
+    /// For a request made through [`Fetcher`](crate::net::fetcher::Fetcher), these are the
+    /// headers that go on the wire, not an approximation of them.
     ///
-    /// The user agent needs that help because a client's default headers are merged when a
-    /// request is *executed*, not when it is built, and are never exposed for reading; see
-    /// [`NetPolicy::with_user_agent`](crate::net::fetch::NetPolicy::with_user_agent). A
-    /// policy that was told nothing reports no user agent rather than guessing.
+    /// That holds because the fetcher writes every header itself instead of letting the HTTP
+    /// client fill one in. A client merges its own default headers when a request is
+    /// *executed*, not when it is built, and never exposes them for reading -- so anything
+    /// left to it would be sent unreported. `accept` and `accept-encoding` are therefore
+    /// composed here rather than defaulted by the client, and `content-length` is set from the
+    /// body rather than computed by the connection. Everything this crate derives is included
+    /// for the same reason: cookies from the jar, `Referer`, `Origin`, the `Sec-Fetch-*` set,
+    /// credentials, conditional cache headers.
     ///
-    /// Everything this crate computes for the request is included -- cookies from the jar,
-    /// `Referer`, `Origin`, the `Sec-Fetch-*` set, credentials, conditional cache headers --
-    /// because all of it is written before the request is built.
+    /// The user agent is the one value that cannot be written per request, because it is
+    /// configured on the client. It is reported from what
+    /// [`NetPolicy::with_user_agent`](crate::net::fetch::NetPolicy::with_user_agent) was told;
+    /// a policy that was told nothing reports no user agent rather than guessing.
     ///
-    /// One thing is still missing, and is deliberately not guessed at: the connection adds
-    /// `host` (or, over HTTP/2, `:authority`) and transfer framing below this layer, where
-    /// nothing typed is observable at all.
+    /// Two headers are created below this layer, by the connection, and are deliberately not
+    /// guessed at. Both are determined by what is reported here rather than being free
+    /// choices: `host` -- `:authority` over HTTP/2, where it is not a header field at all --
+    /// is the authority of `url`, and `transfer-encoding: chunked` frames a body of unknown
+    /// length over HTTP/1.1, which is exactly the case where no `content-length` appears
+    /// below.
     ///
-    /// `accept-encoding` used to be missing too. It is now set by the fetcher rather than
-    /// left to the HTTP client, so it is reported like any other header -- true by
-    /// construction rather than by guessing what the client would have sent.
+    /// Two narrower gaps are worth knowing about. Over HTTP/2 the connection drops headers
+    /// that only mean something to HTTP/1.1 (`connection`, `transfer-encoding`, `upgrade`,
+    /// `keep-alive`, and `te` unless it is `trailers`), so a caller that sets one of those by
+    /// hand sees it reported and not sent. And when a proxy is configured with credentials,
+    /// the client adds `proxy-authorization` itself -- on the `CONNECT` tunnel for an `https`
+    /// target, which is a separate request that no observer sees, or on the request itself for
+    /// an `http` one. Which proxy applies to a URL is the client's decision, including proxies
+    /// it reads from the environment, so this crate does not restate it.
+    ///
+    /// Requests made through [`fetch_response_complete`](crate::net::fetch::fetch_response_complete)
+    /// with a caller-provided client keep everything above except the guarantee: that client's
+    /// default headers are its own, and cannot be read back.
+    ///
+    /// On `wasm32` the guarantee does not hold at all, and the report is the request this crate
+    /// composed rather than the one that went out. The browser's `fetch()` owns the connection
+    /// there, and strips every header the Fetch spec forbids a caller from setting --
+    /// `accept-encoding`, `content-length`, `cookie`, `origin`, `referer`, the `sec-fetch-*`
+    /// set -- before applying its own. They are still computed and reported, because that is
+    /// what the request asked for and the browser's substitutes are not observable.
     RequestSent {
         /// Target of this hop
         url: Url,
