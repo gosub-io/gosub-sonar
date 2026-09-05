@@ -93,14 +93,19 @@ pub enum NetEvent {
     /// length over HTTP/1.1, which is exactly the case where no `content-length` appears
     /// below.
     ///
-    /// Two narrower gaps are worth knowing about. Over HTTP/2 the connection drops headers
-    /// that only mean something to HTTP/1.1 (`connection`, `transfer-encoding`, `upgrade`,
+    /// `proxy-authorization` is reported for a proxy configured through
+    /// [`ProxyConfig::Rules`](crate::net::proxy::ProxyConfig::Rules), computed with the same
+    /// matcher the client decides with rather than a second implementation of it. Two cases
+    /// stay with the client: an `https` target, where the credentials go on the `CONNECT`
+    /// tunnel -- a separate request no observer sees, carrying nothing on the request reported
+    /// here -- and [`ProxyConfig::System`](crate::net::proxy::ProxyConfig::System), where the
+    /// proxy comes from the environment and restating it would mean guessing at inputs this
+    /// crate never saw.
+    ///
+    /// One narrower gap is worth knowing about: over HTTP/2 the connection drops headers that
+    /// only mean something to HTTP/1.1 (`connection`, `transfer-encoding`, `upgrade`,
     /// `keep-alive`, and `te` unless it is `trailers`), so a caller that sets one of those by
-    /// hand sees it reported and not sent. And when a proxy is configured with credentials,
-    /// the client adds `proxy-authorization` itself -- on the `CONNECT` tunnel for an `https`
-    /// target, which is a separate request that no observer sees, or on the request itself for
-    /// an `http` one. Which proxy applies to a URL is the client's decision, including proxies
-    /// it reads from the environment, so this crate does not restate it.
+    /// hand sees it reported and not sent.
     ///
     /// Requests made through [`fetch_response_complete`](crate::net::fetch::fetch_response_complete)
     /// with a caller-provided client keep everything above except the guarantee: that client's

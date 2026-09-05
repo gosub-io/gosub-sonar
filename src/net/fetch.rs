@@ -116,6 +116,10 @@ pub type ProtocolSinkFn = Box<dyn Fn(&Url, http::Version) + Send + Sync>;
 /// Callback type for answering an authentication challenge.
 pub type AuthChallengeFn = Box<dyn Fn(&AuthChallenge) -> Option<Credentials> + Send + Sync>;
 
+/// Callback type for the `Proxy-Authorization` a configured proxy needs for one URL.
+#[cfg(not(target_arch = "wasm32"))]
+pub type ProxyAuthorizationFn = Box<dyn Fn(&Url) -> Option<http::HeaderValue> + Send + Sync>;
+
 /// Network-level request policies threaded through the fetch stack.
 ///
 /// Bundles the URL allowlist check and the cookie-jar query so both can be applied at
@@ -172,6 +176,17 @@ pub struct NetPolicy {
     /// `None` reports no user agent rather than inventing one, which is the honest answer
     /// for a client this crate did not build. Set via [`NetPolicy::with_user_agent`].
     pub user_agent: Option<http::HeaderValue>,
+    /// The `Proxy-Authorization` a configured proxy needs for a given URL, asked per hop.
+    ///
+    /// Like the user agent, this exists so that a header the client would add on its own is
+    /// written -- and therefore reported -- here instead. Unlike the user agent it depends on
+    /// the URL, since which proxy applies is a per-request decision.
+    ///
+    /// `None` leaves the header to the client, which is the honest answer when the proxy in
+    /// use was not configured through this crate. Set via
+    /// [`NetPolicy::with_proxy_authorization`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub proxy_authorization: Option<ProxyAuthorizationFn>,
 }
 
 impl Default for NetPolicy {
@@ -190,6 +205,8 @@ impl Default for NetPolicy {
             credentials: None,
             #[cfg(not(target_arch = "wasm32"))]
             cache: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            proxy_authorization: None,
         }
     }
 }
@@ -216,6 +233,9 @@ impl NetPolicy {
             credentials: None,
             #[cfg(not(target_arch = "wasm32"))]
             cache: None,
+            // Filled in by the fetcher, which is what knows how its proxies were configured.
+            #[cfg(not(target_arch = "wasm32"))]
+            proxy_authorization: None,
         }
     }
 
@@ -224,6 +244,15 @@ impl NetPolicy {
     /// dropped rather than reported wrongly.
     pub fn with_user_agent(mut self, user_agent: Option<&str>) -> Self {
         self.user_agent = user_agent.and_then(|ua| http::HeaderValue::from_str(ua).ok());
+        self
+    }
+
+    /// Tell the policy how to compute the `Proxy-Authorization` for a URL, so that
+    /// [`NetEvent::RequestSent`] reports the header rather than leaving the client to add it
+    /// after the report was emitted.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_proxy_authorization(mut self, f: ProxyAuthorizationFn) -> Self {
+        self.proxy_authorization = Some(f);
         self
     }
 
@@ -1594,6 +1623,18 @@ async fn get_with_redirects(
                 }
                 for (name, value) in conditional.iter() {
                     hop_headers.insert(name.clone(), value.clone());
+                }
+                // Written here rather than left to the client, which would add it while
+                // executing the request -- after this hop was reported. Only when nothing has
+                // already answered a `407` for this hop, which is both the credential that was
+                // actually accepted and what the client itself would defer to.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(ref proxy_authorization) = policy.proxy_authorization {
+                    if !hop_headers.contains_key(header::PROXY_AUTHORIZATION) {
+                        if let Some(value) = proxy_authorization(&url) {
+                            hop_headers.insert(header::PROXY_AUTHORIZATION, value);
+                        }
+                    }
                 }
                 let mut req_builder = client
                     .request(current_method.clone(), url.clone())

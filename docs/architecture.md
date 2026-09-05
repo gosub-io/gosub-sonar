@@ -630,10 +630,13 @@ being a free choice: `host` — `:authority` over HTTP/2, where it is not a head
 is the authority of the reported URL, and `transfer-encoding: chunked` frames a body of unknown
 length over HTTP/1.1, which is precisely the case where no `content-length` is reported. Two
 narrower gaps remain: HTTP/2 drops headers that only mean something to HTTP/1.1, so a
-hand-set `connection` or `te` is reported and not sent; and a proxy configured with credentials
-gets its `Proxy-Authorization` from the client, on the invisible `CONNECT` tunnel for an
-`https` target. Which proxy applies to a URL is the client's decision, environment-derived
-proxies included, so the crate does not restate it. None of this holds on `wasm32`, where the
+hand-set `connection` or `te` is reported and not sent; and `Proxy-Authorization` stays with the
+client for an `https` target, where it rides the invisible `CONNECT` tunnel, and for
+`ProxyConfig::System`, where the proxy comes from the environment. For `ProxyConfig::Rules` on
+an `http` target it is reported, computed through `hyper_util`'s proxy matcher — the same code
+the client matches with, so scope, `no_proxy` and the Basic encoding cannot drift from it; a
+second implementation would not merely misreport a header, it would send credentials to a host
+that was never meant to see them. None of this holds on `wasm32`, where the
 browser's `fetch()` owns the connection and strips every header the Fetch spec forbids a caller
 from setting — `accept-encoding`, `content-length`, `cookie`, `origin`, `referer`, the
 `sec-fetch-*` set — before applying its own; they are still computed and reported, because that

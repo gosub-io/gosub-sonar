@@ -25,16 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     hyper computes the same value while encoding the request and honours an existing one, so
     this changes what can be observed, not what goes out.
 
+  - `proxy-authorization` is computed for a proxy configured through `ProxyConfig::Rules`,
+    using `hyper_util`'s proxy matcher — the same code the HTTP client matches with, so scope,
+    `no_proxy` and the Basic encoding cannot drift from it. It stays with the client for an
+    `https` target, where the credentials ride the `CONNECT` tunnel and never appear on the
+    request, and for `ProxyConfig::System`, where the proxy comes from the environment.
+
   What remains is created by the connection and determined by what is reported: `host` (or
   `:authority`) is the authority of the reported URL, and `transfer-encoding: chunked` frames a
   body of unknown length over HTTP/1.1 — exactly the case where no `content-length` is reported.
-  `Proxy-Authorization` for a configured proxy still comes from the client. See
-  `NetEvent::RequestSent` for the full account
+  See `NetEvent::RequestSent` for the full account
 - The HTTP cache now matches `Vary: accept` correctly, as a consequence: the stored variant is
   keyed on the `accept` the request really carried instead of on its absence
 
 ### Added
 
+- `NetPolicy::with_proxy_authorization`, telling a policy how to compute the
+  `Proxy-Authorization` for a URL. Set by the `Fetcher` from its own `ProxyConfig`; a caller
+  driving `fetch_response_complete` directly can set it for a client it configured itself
 - `RouteConfig::echo_request_headers` in `test-support`, answering with every request header
   line as it arrived — the only way to assert on the whole header set a request carried,
   including anything the HTTP client added on its own

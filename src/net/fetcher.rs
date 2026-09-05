@@ -902,7 +902,12 @@ fn build_policy(
         .with_user_agent(cfg.user_agent.as_deref());
     #[cfg(not(target_arch = "wasm32"))]
     let policy = {
+        // Same reason as the user agent: the client would attach `Proxy-Authorization` itself,
+        // while executing the request, and an observer would never see the header its own
+        // configuration put there.
+        let proxy = cfg.proxy.clone();
         let policy = policy
+            .with_proxy_authorization(Box::new(move |url| proxy.proxy_authorization(url)))
             .with_hsts(cfg.hsts.clone())
             .with_cache(cfg.cache.clone());
         match cfg.cors_preflight_cache.clone() {

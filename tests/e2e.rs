@@ -10,9 +10,9 @@ use gosub_sonar::{
     simple_get, AuthChallenge, AuthScheme, AuthTarget, BlockReason, CacheMode, CorsError,
     CredentialStore, Credentials, FetchRequest, FetchResult, Fetcher, FetcherConfig,
     FetcherContext, HttpCache, InMemoryCredentialStore, InMemoryHttpCache, Initiator, NetError,
-    NetObserver, NullContext, NullEmitter, ProtectionSpace, RequestBody, RequestCredentials,
-    RequestDestination, RequestId, RequestMode, RequestReference, ResourceKind, ResponseTainting,
-    SharedBody, DEFAULT_USER_AGENT,
+    NetObserver, NullContext, NullEmitter, ProtectionSpace, ProxyConfig, ProxyRule, RequestBody,
+    RequestCredentials, RequestDestination, RequestId, RequestMode, RequestReference, ResourceKind,
+    ResponseTainting, SharedBody, DEFAULT_USER_AGENT,
 };
 use http::Method;
 use std::sync::Arc;
@@ -497,6 +497,53 @@ async fn a_body_s_content_length_is_reported_and_sent() {
 
     let mut expected = reported;
     expected.push(format!("host: {}", srv.socket_addr()));
+    expected.sort();
+
+    assert_eq!(on_the_wire, expected);
+    shutdown.cancel();
+}
+
+/// A proxy the embedder configured with credentials gets `Proxy-Authorization` from this crate
+/// rather than from the HTTP client, so the header appears in the report -- and is byte-identical
+/// to the one the client would have attached, because the mock server standing in for the proxy
+/// is what the assertion reads it from.
+#[tokio::test]
+async fn a_configured_proxy_s_authorization_is_reported_and_sent() {
+    // The mock server plays the proxy: a plain-http request through one is sent to the proxy in
+    // absolute form, so every path lands on the default route.
+    let proxy = TestServer::new()
+        .default_route(RouteConfig::echo_request_headers())
+        .start()
+        .await;
+    let obs = Arc::new(RecordingObserver::default());
+    let cfg = FetcherConfig {
+        proxy: ProxyConfig::Rules(vec![ProxyRule::all(format!(
+            "http://{}",
+            proxy.socket_addr()
+        ))
+        .with_basic_auth("alice", "hunter2")]),
+        ..FetcherConfig::default()
+    };
+    let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(RecordingCtx(obs.clone()))).unwrap());
+    let shutdown = CancellationToken::new();
+    let (f, c) = (fetcher.clone(), shutdown.clone());
+    tokio::spawn(async move { f.run(c).await });
+
+    let target = Url::parse("http://proxied.example/resource").unwrap();
+    let req = FetchRequest::builder(Method::GET, target.clone()).build();
+    let on_the_wire = headers_on_the_wire(&fetcher, req).await;
+
+    let reported = headers_reported(&obs);
+    assert!(
+        // base64("alice:hunter2")
+        reported
+            .iter()
+            .any(|l| l == "proxy-authorization: Basic YWxpY2U6aHVudGVyMg=="),
+        "the proxy credentials are reported: {reported:?}"
+    );
+
+    let mut expected = reported;
+    expected.push(format!("host: {}", target.host_str().unwrap()));
     expected.sort();
 
     assert_eq!(on_the_wire, expected);

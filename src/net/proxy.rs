@@ -26,6 +26,8 @@
 //! [`FetcherConfig::proxy`]: crate::net::fetcher::FetcherConfig::proxy
 
 use anyhow::Context;
+use hyper_util::client::proxy::matcher as proxy_matcher;
+use url::Url;
 
 /// Which request URLs a [`ProxyRule`] applies to.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
@@ -180,6 +182,52 @@ impl ProxyRule {
 
         Ok(proxy)
     }
+
+    /// The `Proxy-Authorization` this rule would put on a plain-`http` request to `dst`, or
+    /// `None` when the rule does not apply to it or carries no credentials.
+    ///
+    /// Matched with `hyper_util`'s proxy matcher, built exactly as `reqwest::Proxy` builds it,
+    /// rather than by re-deciding scope and `no_proxy` here: the answer has to be the client's
+    /// answer, and a second implementation of CIDR and domain-suffix matching would be a second
+    /// chance to disagree with it. Getting it wrong does not merely misreport a header -- it
+    /// sends credentials to a host that was never meant to see them.
+    fn non_tunnel_authorization(&self, dst: &http::Uri) -> Option<http::HeaderValue> {
+        let auth = self.auth.as_ref()?;
+
+        let mut proxy_url = Url::parse(&self.url).ok()?;
+        if let ProxyAuth::Basic {
+            ref username,
+            ref password,
+        } = *auth
+        {
+            // Where `reqwest::Proxy::basic_auth` puts them, so the matcher derives the same
+            // header from the same place.
+            proxy_url.set_username(username).ok()?;
+            proxy_url.set_password(Some(password)).ok()?;
+        }
+
+        let builder = proxy_matcher::Matcher::builder();
+        let builder = match self.scope {
+            ProxyScope::Http => builder.http(proxy_url.to_string()),
+            ProxyScope::Https => builder.https(proxy_url.to_string()),
+            ProxyScope::All => builder.all(proxy_url.to_string()),
+        };
+        let intercept = builder
+            .no(self.no_proxy.clone().unwrap_or_default())
+            .build()
+            .intercept(dst)?;
+
+        // A socks proxy authenticates inside its own handshake, so no header is sent for one
+        // however it was configured.
+        if !matches!(intercept.uri().scheme_str(), Some("http") | Some("https")) {
+            return None;
+        }
+
+        match *auth {
+            ProxyAuth::Basic { .. } => intercept.basic_auth().cloned(),
+            ProxyAuth::Custom(ref value) => value.parse().ok(),
+        }
+    }
 }
 
 /// How the fetcher chooses a proxy for outgoing requests.
@@ -202,6 +250,41 @@ impl ProxyConfig {
     /// A single proxy for all schemes, with no bypass list — the common case.
     pub fn single(url: impl Into<String>) -> Self {
         ProxyConfig::Rules(vec![ProxyRule::all(url)])
+    }
+
+    /// The `Proxy-Authorization` the HTTP client will attach to a request for `url`, so that
+    /// [`NetEvent::RequestSent`](crate::net::events::NetEvent::RequestSent) reports a header
+    /// this crate would otherwise only watch the client add.
+    ///
+    /// Answers only for an `http` URL, and only for [`ProxyConfig::Rules`]:
+    ///
+    /// - An `https` request is tunnelled, and the client puts the credentials on the `CONNECT`
+    ///   request instead. That is a separate exchange no observer sees, and it carries no
+    ///   header on the request this reports.
+    /// - [`ProxyConfig::System`] leaves the choice of proxy to the client, which reads it from
+    ///   the environment. Restating that here would mean guessing at inputs this crate never
+    ///   saw, which is the opposite of the point.
+    ///
+    /// Rules are consulted in order and the first one that both matches and carries credentials
+    /// answers -- which is the client's rule, not this crate's ([reqwest `Client::proxy_auth`]).
+    /// In a list where an earlier rule matches without credentials and a later one matches with
+    /// them, the client attaches the later rule's credentials while connecting through the
+    /// earlier rule's proxy. That is worth knowing about, and worth reporting truthfully, which
+    /// is the whole reason this mirrors the client instead of deciding for itself.
+    ///
+    /// [reqwest `Client::proxy_auth`]: https://docs.rs/reqwest/0.13.4/src/reqwest/async_impl/client.rs.html
+    pub(crate) fn proxy_authorization(&self, url: &Url) -> Option<http::HeaderValue> {
+        if url.scheme() != "http" {
+            return None;
+        }
+        let rules = match *self {
+            ProxyConfig::Rules(ref rules) => rules,
+            ProxyConfig::System | ProxyConfig::Disabled => return None,
+        };
+        let dst: http::Uri = url.as_str().parse().ok()?;
+        rules
+            .iter()
+            .find_map(|rule| rule.non_tunnel_authorization(&dst))
     }
 
     /// Apply this configuration to a client builder.
@@ -252,6 +335,105 @@ mod tests {
         assert_eq!(ProxyRule::http("http://p:8080").scope, ProxyScope::Http);
         assert_eq!(ProxyRule::all("http://p:8080").scope, ProxyScope::All);
         assert!(ProxyRule::all("http://p:8080").auth.is_none());
+    }
+
+    /// The `Proxy-Authorization` reported for `url` under `cfg`, as a string.
+    fn authorization(cfg: &ProxyConfig, url: &str) -> Option<String> {
+        cfg.proxy_authorization(&Url::parse(url).unwrap())
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    fn credentialed(rule: ProxyRule) -> ProxyConfig {
+        ProxyConfig::Rules(vec![rule.with_basic_auth("alice", "hunter2")])
+    }
+
+    /// The value the client would attach, computed the same way: `Basic base64(user:password)`.
+    /// `tests/e2e.rs` holds this to what a proxy actually receives.
+    #[test]
+    fn basic_credentials_are_reported_for_a_matching_rule() {
+        let cfg = credentialed(ProxyRule::all("http://proxy.corp:8080"));
+        assert_eq!(
+            authorization(&cfg, "http://target.example/page").as_deref(),
+            Some("Basic YWxpY2U6aHVudGVyMg==")
+        );
+    }
+
+    /// An https request is tunnelled with `CONNECT`, and the credentials go on the tunnel --
+    /// a separate exchange, carrying nothing on the request reported here. Reporting the
+    /// header anyway would claim the origin server was sent proxy credentials.
+    #[test]
+    fn an_https_target_reports_nothing_because_it_is_tunnelled() {
+        let cfg = credentialed(ProxyRule::all("http://proxy.corp:8080"));
+        assert_eq!(authorization(&cfg, "https://target.example/page"), None);
+    }
+
+    #[test]
+    fn a_rule_that_does_not_apply_reports_nothing() {
+        // Scope: an https-only rule never sees a plain-http request.
+        let scoped = credentialed(ProxyRule::https("http://proxy.corp:8080"));
+        assert_eq!(authorization(&scoped, "http://target.example/"), None);
+
+        // Bypass list, in each of its shapes.
+        let bypassing = credentialed(
+            ProxyRule::all("http://proxy.corp:8080").bypassing("target.example, 10.0.0.0/8"),
+        );
+        assert_eq!(authorization(&bypassing, "http://target.example/"), None);
+        assert_eq!(authorization(&bypassing, "http://10.1.2.3/"), None);
+        assert!(authorization(&bypassing, "http://elsewhere.example/").is_some());
+
+        // No credentials to send.
+        let bare = ProxyConfig::single("http://proxy.corp:8080");
+        assert_eq!(authorization(&bare, "http://target.example/"), None);
+    }
+
+    /// A socks proxy authenticates inside its own handshake, so the client sends no header
+    /// however the rule was written -- and neither do we.
+    #[test]
+    fn a_socks_proxy_reports_no_header() {
+        let cfg = credentialed(ProxyRule::all("socks5://proxy.corp:1080"));
+        assert_eq!(authorization(&cfg, "http://target.example/"), None);
+    }
+
+    #[test]
+    fn a_custom_authorization_is_reported_verbatim() {
+        let cfg = ProxyConfig::Rules(vec![
+            ProxyRule::all("http://proxy.corp:8080").with_custom_auth("Bearer token-value")
+        ]);
+        assert_eq!(
+            authorization(&cfg, "http://target.example/").as_deref(),
+            Some("Bearer token-value")
+        );
+    }
+
+    /// The first rule that both matches and carries credentials answers, which is the rule the
+    /// client itself would take the header from -- including the case where an earlier rule
+    /// matches without credentials, where the client attaches these while connecting through
+    /// that earlier proxy. Mirrored rather than corrected: the report has to describe what the
+    /// client does.
+    #[test]
+    fn the_first_matching_credentialed_rule_answers() {
+        let cfg = ProxyConfig::Rules(vec![
+            ProxyRule::all("http://first.corp:8080"),
+            ProxyRule::all("http://second.corp:8080").with_basic_auth("alice", "hunter2"),
+        ]);
+        assert_eq!(
+            authorization(&cfg, "http://target.example/").as_deref(),
+            Some("Basic YWxpY2U6aHVudGVyMg==")
+        );
+    }
+
+    /// The environment is the client's to read, so a system-proxy configuration is left to it
+    /// rather than restated from inputs this crate never saw.
+    #[test]
+    fn system_and_disabled_report_nothing() {
+        assert_eq!(
+            authorization(&ProxyConfig::System, "http://target.example/"),
+            None
+        );
+        assert_eq!(
+            authorization(&ProxyConfig::Disabled, "http://target.example/"),
+            None
+        );
     }
 
     #[test]
