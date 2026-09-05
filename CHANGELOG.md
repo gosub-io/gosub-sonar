@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-05
+
 ### Changed
 
 - `NetEvent::RequestSent` now reports the headers a `Fetcher` request actually carries, rather
@@ -24,7 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `content-length` is set from the body for buffered bodies too, not only for streamed ones.
     hyper computes the same value while encoding the request and honours an existing one, so
     this changes what can be observed, not what goes out.
-
   - `proxy-authorization` is computed for a proxy configured through `ProxyConfig::Rules`,
     using `hyper_util`'s proxy matcher — the same code the HTTP client matches with, so scope,
     `no_proxy` and the Basic encoding cannot drift from it. It stays with the client for an
@@ -504,7 +505,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.3...HEAD
+[0.6.3]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.5.1...v0.6.0
