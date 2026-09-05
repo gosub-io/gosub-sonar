@@ -1,6 +1,6 @@
 [package]
 name = "gosub-sonar"
-version = "0.6.2"
+version = "0.6.3"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Gosub Community <info@gosub.io>"]
@@ -41,6 +41,12 @@ reqwest = { version = "0.13.3", features = ["rustls", "stream", "blocking", "gzi
 # `Service` and nothing else. Both are already in the tree via reqwest.
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
+# The proxy matcher reqwest itself matches with, so `ProxyConfig::proxy_authorization` can
+# answer "which proxy will this URL go through, and what credentials will it be sent" with the
+# same code that decides it rather than a re-implementation. Already in the tree via reqwest,
+# which enables this same feature; must stay on the version reqwest resolves to, or the two
+# answers can drift.
+hyper-util = { version = "0.1", features = ["client-proxy"] }
 # TLS for the test-support mock server, which needs a real certificate to exercise HTTPS-only
 # behaviour such as HSTS. Optional here and mirrored in dev-dependencies so plain `cargo test`
 # and downstream `test-support` builds both resolve them (same arrangement as flate2).

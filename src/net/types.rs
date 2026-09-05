@@ -482,11 +482,19 @@ impl RequestBody {
         self.len() == Some(0)
     }
 
-    /// Build the reqwest body for one hop. The returned length, when present, must be sent
-    /// as an explicit `Content-Length`: a wrapped stream is unsized as far as reqwest knows.
+    /// Build the reqwest body for one hop, with the `Content-Length` to send alongside it.
+    ///
+    /// The length is returned rather than left to the connection so that the header can be set
+    /// -- and therefore reported -- by this crate. hyper computes the same value at encode
+    /// time and honours an existing one ("if the user already set specific headers, we should
+    /// respect them"), so setting it changes what can be observed, not what goes out.
+    ///
+    /// `None` means send no header: an empty body gets none from hyper either, and a stream
+    /// with no declared length is framed as `transfer-encoding: chunked` by the connection.
     pub(crate) fn to_reqwest_body(&self) -> std::io::Result<(reqwest::Body, Option<u64>)> {
         match &self.payload {
-            Payload::Bytes(b) => Ok((reqwest::Body::from(b.clone()), None)),
+            Payload::Bytes(b) if b.is_empty() => Ok((reqwest::Body::from(b.clone()), None)),
+            Payload::Bytes(b) => Ok((reqwest::Body::from(b.clone()), Some(b.len() as u64))),
             #[cfg(not(target_arch = "wasm32"))]
             Payload::Stream { open, len } => {
                 let reader = open()?;

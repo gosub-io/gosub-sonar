@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "gosub-sonar"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -601,6 +601,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "http",
+ "hyper-util",
  "log",
  "parking_lot",
  "psl",
