@@ -122,6 +122,10 @@ pub enum RouteConfig {
     /// `<absent>` when the request carried no such header. The name is matched
     /// case-insensitively. Use to verify any header a request actually carried.
     EchoRequestHeader(String),
+    /// Respond 200 with every request header line as the body, one `name: value` per line,
+    /// exactly as they arrived. Use to verify the *whole* header set a request carried, which
+    /// is the only way to catch a header the HTTP client added on its own.
+    EchoRequestHeaders,
     /// 302 redirect to `target` that also carries a `Referrer-Policy: policy` header.
     /// Use to verify a policy change applied mid-redirect-chain.
     RedirectWithReferrerPolicy {
@@ -401,6 +405,10 @@ impl RouteConfig {
     /// Shorthand for [`RouteConfig::EchoRequestHeader`]
     pub fn echo_request_header(name: impl Into<String>) -> Self {
         Self::EchoRequestHeader(name.into())
+    }
+    /// Shorthand for [`RouteConfig::EchoRequestHeaders`]
+    pub fn echo_request_headers() -> Self {
+        Self::EchoRequestHeaders
     }
     /// Shorthand for [`RouteConfig::RedirectWithReferrerPolicy`]
     pub fn redirect_with_referrer_policy(
@@ -735,6 +743,16 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
                 .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()))
                 .unwrap_or_else(|| "<absent>".to_string());
             send_response(&mut stream, 200, value.as_bytes()).await;
+        }
+        RouteConfig::EchoRequestHeaders => {
+            // Skip the request line; everything up to the blank line is a header.
+            let headers = req
+                .lines()
+                .skip(1)
+                .take_while(|l| !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            send_response(&mut stream, 200, headers.as_bytes()).await;
         }
         RouteConfig::HangAfterConnect => {
             // Hold the connection open without sending anything.

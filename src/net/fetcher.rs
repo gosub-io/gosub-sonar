@@ -11,6 +11,7 @@ use crate::net::fetch::{
     blocked, fetch_response_complete, fetch_response_top, hop_checks, HopCheck, NetPolicy,
     RequestInit, ResponseTop,
 };
+use crate::net::fetch_metadata::RequestDestination;
 use crate::net::fetcher_context::FetcherContext;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::hsts::{self, HstsStore, InMemoryHstsStore};
@@ -666,11 +667,74 @@ fn effective_mixed_content(req: &FetchRequest, cfg: &FetcherConfig) -> MixedCont
     req.mixed_content.unwrap_or(cfg.mixed_content)
 }
 
+/// The `Accept` value sent for a destination when the caller did not set one.
+///
+/// Browsers vary the header by what the resource will be used as, and servers negotiate on it:
+/// a URL that can answer with either HTML or JSON needs to be told which one is wanted. The
+/// values follow the shape browsers send, without a vendor's exact list -- the point is a
+/// truthful, destination-appropriate preference, not impersonating a particular browser.
+///
+/// Every value here is CORS-safelisted ([Fetch] §4.6), so setting one never turns a simple
+/// cross-origin request into a preflighted one.
+///
+/// [Fetch]: https://fetch.spec.whatwg.org/#cors-safelisted-request-header
+fn default_accept(destination: RequestDestination) -> &'static str {
+    use RequestDestination as D;
+    match destination {
+        // Markup that a navigation or a nested browsing context will parse as a document.
+        D::Document | D::Iframe | D::Frame | D::Object | D::Embed => {
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        }
+        D::Image => "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
+        D::Style => "text/css,*/*;q=0.1",
+        // Scripts, fonts, media, workers, manifests, reports, and bare `fetch()`: no format
+        // preference to express, and a narrow value here would reject servers that answer
+        // with an unusual but perfectly loadable type.
+        _ => "*/*",
+    }
+}
+
 /// Build a [`RequestInit`] from a [`FetchRequest`], injecting a `Content-Type` header from
 /// the body descriptor when the headers don't already contain one, and carrying the request's
 /// initiating origin plus the fetcher's mixed content policy down to the redirect loop.
 fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
     let mut headers = req.headers.clone();
+
+    // `accept` and `accept-encoding` are set here rather than left to the HTTP client.
+    //
+    // The client would otherwise add both itself -- `accept: */*` from the default header map
+    // it is constructed with, `accept-encoding` from the codecs it was compiled with -- and it
+    // merges those defaults when the request executes, after the point anything can read them
+    // (reqwest `Client::execute_request`, not `RequestBuilder::build`). That left them as the
+    // headers this stack genuinely sent and could not report, and an inspector that shows every
+    // header except two is worse than useless, because nothing tells you which two are missing.
+    //
+    // Writing them here makes them true by construction instead of by guesswork: these are the
+    // values that go on the wire, and `NetEvent::RequestSent` carries them like any other
+    // header. Both are inserted only when the caller did not set one, which is also how the
+    // client would have treated them.
+    if !headers.contains_key(header::ACCEPT) {
+        // What the client would send is a bare `*/*` for everything. A destination-shaped
+        // value is what a browser sends and what content negotiation expects, so a server
+        // choosing between an HTML and a JSON representation gets told which one is wanted.
+        if let Ok(value) = default_accept(req.destination).parse() {
+            headers.insert(header::ACCEPT, value);
+        }
+    }
+    if !headers.contains_key(header::ACCEPT_ENCODING) {
+        // Matches what `build_client` enables for a decoding client, so responses are still
+        // decoded exactly as before; a caller that asked for raw bytes advertises nothing it
+        // cannot decode and gets the bytes untouched.
+        let advertised = if req.auto_decode {
+            "gzip, br, deflate"
+        } else {
+            "identity"
+        };
+        if let Ok(value) = advertised.parse() {
+            headers.insert(header::ACCEPT_ENCODING, value);
+        }
+    }
+
     let body = req.body.as_ref().map(|b| {
         if let Some(ref ct) = b.content_type {
             if !headers.contains_key(header::CONTENT_TYPE) {
@@ -838,7 +902,12 @@ fn build_policy(
         .with_user_agent(cfg.user_agent.as_deref());
     #[cfg(not(target_arch = "wasm32"))]
     let policy = {
+        // Same reason as the user agent: the client would attach `Proxy-Authorization` itself,
+        // while executing the request, and an observer would never see the header its own
+        // configuration put there.
+        let proxy = cfg.proxy.clone();
         let policy = policy
+            .with_proxy_authorization(Box::new(move |url| proxy.proxy_authorization(url)))
             .with_hsts(cfg.hsts.clone())
             .with_cache(cfg.cache.clone());
         match cfg.cors_preflight_cache.clone() {
@@ -2658,6 +2727,117 @@ mod tests {
             "bypassed host should be requested in origin-form, not as an absolute URI"
         );
         shutdown.cancel();
+    }
+
+    #[test]
+    fn accept_is_set_here_so_it_can_be_reported() {
+        let cfg = FetcherConfig::default();
+        let accept = |destination| {
+            let req =
+                FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
+                    .with_destination(destination)
+                    .build();
+            make_request_init(&req, &cfg)
+                .headers
+                .get(header::ACCEPT)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        assert_eq!(
+            accept(RequestDestination::Document).as_deref(),
+            Some("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+        );
+        assert_eq!(
+            accept(RequestDestination::Style).as_deref(),
+            Some("text/css,*/*;q=0.1")
+        );
+        // A destination with no format preference still gets a value, because the client
+        // would otherwise supply this one itself after the request was reported.
+        assert_eq!(accept(RequestDestination::Script).as_deref(), Some("*/*"));
+    }
+
+    #[test]
+    fn a_caller_s_own_accept_is_left_alone() {
+        let cfg = FetcherConfig::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "application/json".parse().unwrap());
+        let req = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
+            .with_headers(headers)
+            .with_destination(RequestDestination::Document)
+            .build();
+        assert_eq!(
+            make_request_init(&req, &cfg)
+                .headers
+                .get(header::ACCEPT)
+                .map(|v| v.to_str().unwrap()),
+            Some("application/json")
+        );
+    }
+
+    /// Nothing this crate sets by default may turn a simple cross-origin request into a
+    /// preflighted one -- an added header that is not CORS-safelisted would do exactly that.
+    #[test]
+    fn the_default_accept_values_stay_cors_safelisted() {
+        for destination in [
+            RequestDestination::Document,
+            RequestDestination::Image,
+            RequestDestination::Style,
+            RequestDestination::Script,
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT, default_accept(destination).parse().unwrap());
+            assert!(
+                crate::net::cors::unsafe_request_header_names(&headers).is_empty(),
+                "{destination:?} accept value forces a preflight"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_encoding_is_set_here_so_it_can_be_reported() {
+        let cfg = FetcherConfig::default();
+
+        // A decoding request advertises what build_client can actually decode.
+        let req = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
+            .with_auto_decode(true)
+            .build();
+        assert_eq!(
+            make_request_init(&req, &cfg)
+                .headers
+                .get(header::ACCEPT_ENCODING)
+                .map(|v| v.to_str().unwrap()),
+            Some("gzip, br, deflate")
+        );
+
+        // A caller that wants the bytes untouched advertises nothing.
+        let raw = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
+            .with_auto_decode(false)
+            .build();
+        assert_eq!(
+            make_request_init(&raw, &cfg)
+                .headers
+                .get(header::ACCEPT_ENCODING)
+                .map(|v| v.to_str().unwrap()),
+            Some("identity")
+        );
+    }
+
+    #[test]
+    fn a_caller_s_own_accept_encoding_is_left_alone() {
+        let cfg = FetcherConfig::default();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT_ENCODING, "zstd".parse().unwrap());
+        let req = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
+            .with_headers(headers)
+            .with_auto_decode(true)
+            .build();
+        assert_eq!(
+            make_request_init(&req, &cfg)
+                .headers
+                .get(header::ACCEPT_ENCODING)
+                .map(|v| v.to_str().unwrap()),
+            Some("zstd")
+        );
     }
 
     #[test]

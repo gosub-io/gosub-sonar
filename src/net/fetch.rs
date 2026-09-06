@@ -116,6 +116,10 @@ pub type ProtocolSinkFn = Box<dyn Fn(&Url, http::Version) + Send + Sync>;
 /// Callback type for answering an authentication challenge.
 pub type AuthChallengeFn = Box<dyn Fn(&AuthChallenge) -> Option<Credentials> + Send + Sync>;
 
+/// Callback type for the `Proxy-Authorization` a configured proxy needs for one URL.
+#[cfg(not(target_arch = "wasm32"))]
+pub type ProxyAuthorizationFn = Box<dyn Fn(&Url) -> Option<http::HeaderValue> + Send + Sync>;
+
 /// Network-level request policies threaded through the fetch stack.
 ///
 /// Bundles the URL allowlist check and the cookie-jar query so both can be applied at
@@ -172,6 +176,17 @@ pub struct NetPolicy {
     /// `None` reports no user agent rather than inventing one, which is the honest answer
     /// for a client this crate did not build. Set via [`NetPolicy::with_user_agent`].
     pub user_agent: Option<http::HeaderValue>,
+    /// The `Proxy-Authorization` a configured proxy needs for a given URL, asked per hop.
+    ///
+    /// Like the user agent, this exists so that a header the client would add on its own is
+    /// written -- and therefore reported -- here instead. Unlike the user agent it depends on
+    /// the URL, since which proxy applies is a per-request decision.
+    ///
+    /// `None` leaves the header to the client, which is the honest answer when the proxy in
+    /// use was not configured through this crate. Set via
+    /// [`NetPolicy::with_proxy_authorization`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub proxy_authorization: Option<ProxyAuthorizationFn>,
 }
 
 impl Default for NetPolicy {
@@ -190,6 +205,8 @@ impl Default for NetPolicy {
             credentials: None,
             #[cfg(not(target_arch = "wasm32"))]
             cache: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            proxy_authorization: None,
         }
     }
 }
@@ -216,6 +233,9 @@ impl NetPolicy {
             credentials: None,
             #[cfg(not(target_arch = "wasm32"))]
             cache: None,
+            // Filled in by the fetcher, which is what knows how its proxies were configured.
+            #[cfg(not(target_arch = "wasm32"))]
+            proxy_authorization: None,
         }
     }
 
@@ -224,6 +244,15 @@ impl NetPolicy {
     /// dropped rather than reported wrongly.
     pub fn with_user_agent(mut self, user_agent: Option<&str>) -> Self {
         self.user_agent = user_agent.and_then(|ua| http::HeaderValue::from_str(ua).ok());
+        self
+    }
+
+    /// Tell the policy how to compute the `Proxy-Authorization` for a URL, so that
+    /// [`NetEvent::RequestSent`] reports the header rather than leaving the client to add it
+    /// after the report was emitted.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_proxy_authorization(mut self, f: ProxyAuthorizationFn) -> Self {
+        self.proxy_authorization = Some(f);
         self
     }
 
@@ -1595,6 +1624,18 @@ async fn get_with_redirects(
                 for (name, value) in conditional.iter() {
                     hop_headers.insert(name.clone(), value.clone());
                 }
+                // Written here rather than left to the client, which would add it while
+                // executing the request -- after this hop was reported. Only when nothing has
+                // already answered a `407` for this hop, which is both the credential that was
+                // actually accepted and what the client itself would defer to.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(ref proxy_authorization) = policy.proxy_authorization {
+                    if !hop_headers.contains_key(header::PROXY_AUTHORIZATION) {
+                        if let Some(value) = proxy_authorization(&url) {
+                            hop_headers.insert(header::PROXY_AUTHORIZATION, value);
+                        }
+                    }
+                }
                 let mut req_builder = client
                     .request(current_method.clone(), url.clone())
                     .headers(hop_headers);
@@ -1602,6 +1643,10 @@ async fn get_with_redirects(
                     // Built fresh per send so a streamed body can be replayed on 307/308 and for an
                     // authenticated retry of this hop.
                     let (hop_body, explicit_len) = body.to_reqwest_body()?;
+                    // Set here rather than left to the connection, which would otherwise
+                    // compute the same number while encoding the request -- below any layer
+                    // holding a header map, and so below anything that could report it. A
+                    // stream needs it regardless, being unsized as far as the client knows.
                     if let Some(len) = explicit_len {
                         if !current_headers.contains_key(header::CONTENT_LENGTH) {
                             req_builder = req_builder.header(header::CONTENT_LENGTH, len);
@@ -1609,21 +1654,25 @@ async fn get_with_redirects(
                     }
                     req_builder = req_builder.body(hop_body);
                 }
-                // Built rather than sent straight away, so the request line reported is the
-                // one the client actually assembled. `build()` has by then applied the
-                // client's own defaults -- its user agent, its configured default headers --
-                // on top of what this stack set. Reporting the headers we handed over would
-                // describe what was asked for, which is not the same thing, and the gap
-                // between the two is exactly what a developer opens a network panel to find.
+                // Built rather than sent straight away, so what is reported is the request the
+                // client assembled rather than the arguments it was handed.
                 //
                 // Reported here rather than beside `Started`: the headers are only final for
                 // this hop at this point. Credentials and conditional headers are added just
                 // above, and a redirect starts over from the caller's set, so an earlier
                 // event would describe a request that was never sent.
                 //
-                // A few headers are still added below this layer by the connection itself --
-                // `host` or `:authority`, and transfer framing. Those never reach a
-                // `reqwest::Request`, and are not guessed at here.
+                // `build()` does not merge the client's own default headers -- those are
+                // applied when the request executes, which is after this. For a client built
+                // by `Fetcher` that costs nothing, because every header it would default is
+                // written by this crate before the request is assembled. The user agent is the
+                // exception, since it is configured on the client and cannot be read back, so
+                // `NetPolicy::with_user_agent` carries the value and it is filled in below.
+                //
+                // What is left is added by the connection and determined by the protocol:
+                // `host` (or `:authority` over HTTP/2), and `transfer-encoding: chunked` on
+                // HTTP/1.1 for a body of unknown length. Neither reaches a `reqwest::Request`,
+                // and neither is guessed at here.
                 let request = req_builder.build().map_err(|e| {
                     send_error(
                         e,
