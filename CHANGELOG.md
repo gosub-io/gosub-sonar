@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-12
+
+### Added
+
+- `net::transport`, with `TransportError { kind, message }` and `TransportErrorKind` (`Connect`,
+  `Timeout`, `Redirect`, `Body`, `Decode`, `Request`, `Builder`, `Other`): sonar's own account of
+  a transport failure. Match on `kind`. `message` is the client's description with its source
+  chain flattened into one line, for logs and error pages only - the wording belongs to the HTTP
+  client and changes between its releases. `TransportErrorKind` is `#[non_exhaustive]`, since a
+  client can learn to tell apart failures it used to lump together
+
+### Changed
+
+- **Breaking:** `NetError::Reqwest(Arc<reqwest::Error>)` is replaced by
+  `NetError::Transport(TransportError)`. The old variant put `reqwest` in sonar's public API: an
+  embedder wanting to tell a host that never answered from a body that stopped part way had to
+  depend on `reqwest` itself, at the version sonar happened to resolve, and ask it directly.
+  Sonar is the one place that knows which client is in use, so it classifies. Nothing in sonar
+  ever constructed the old variant - it was reachable only through its `From` impl, which is
+  also gone
+- **Breaking:** a failed `send()` now fails with `NetError::Transport` instead of
+  `NetError::Read(anyhow)`. This is the part that mattered: `Read` is the stack's catch-all, so a
+  dead host and a truncated body arrived as the same variant, and the difference could only be
+  recovered by downcasting through the `anyhow` chain to a `reqwest::Error`. TLS handshake
+  failures still become `NetError::Tls` first, and the context string `anyhow` used to carry is
+  now the head of `TransportError::message`
+- **Breaking:** an error on the response body stream is likewise `NetError::Transport` (kind
+  `Body` or `Decode`) rather than `NetError::Read`
+
 ## [0.6.3] - 2026-09-05
 
 ### Changed
@@ -505,7 +534,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.3...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.0...v0.6.1
