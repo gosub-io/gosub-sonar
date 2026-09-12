@@ -402,6 +402,9 @@ API documentation is on [docs.rs](https://docs.rs/gosub-sonar). Design notes:
 - [net-design.md](https://github.com/gosub-io/gosub-sonar/blob/main/docs/net-design.md) — scheduler design (coalescing, priorities, fan-out)
 - [pump.md](https://github.com/gosub-io/gosub-sonar/blob/main/docs/pump.md) — how streamed bodies are pumped to subscribers
 
+Cutting and publishing a version is described in
+[RELEASING.md](https://github.com/gosub-io/gosub-sonar/blob/main/RELEASING.md).
+
 ## License
 
 MIT — see [LICENSE](https://github.com/gosub-io/gosub-sonar/blob/main/LICENSE).
