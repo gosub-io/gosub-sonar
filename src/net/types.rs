@@ -8,6 +8,7 @@ use crate::net::referrer::{self, ReferrerPolicy};
 use crate::net::request_ref::RequestReference;
 use crate::net::shared_body::SharedBody;
 use crate::net::tls::TlsError;
+use crate::net::transport::TransportError;
 use crate::net::utils::{normalize_url, short_hash, BytesAsyncReader};
 use crate::types::{PeekBuf, RequestId};
 use bytes::Bytes;
@@ -208,9 +209,10 @@ pub enum NetError {
         url: Url,
     },
 
-    /// Error reported by the underlying HTTP client
-    #[error("net error: reqwest: {0}")]
-    Reqwest(#[from] Arc<reqwest::Error>),
+    /// Failure reported by the HTTP transport: nothing connected, the client's own deadline
+    /// expired, the body stopped part way. [`TransportError::kind`] says which.
+    #[error("net error: {0}")]
+    Transport(#[from] TransportError),
 
     /// TLS handshake failed (expired certificate, unknown issuer, wrong host name, ...).
     /// Native only.

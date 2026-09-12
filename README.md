@@ -54,7 +54,7 @@ Add to your `Cargo.toml` (the scheduler API also uses these companion crates dir
 
 ```toml
 [dependencies]
-gosub-sonar = "0.6"
+gosub-sonar = "0.7"
 http = "1"
 tokio = { version = "1", features = ["rt", "macros"] }
 tokio-util = "0.7"
@@ -401,6 +401,9 @@ API documentation is on [docs.rs](https://docs.rs/gosub-sonar). Design notes:
 - [architecture.md](https://github.com/gosub-io/gosub-sonar/blob/main/docs/architecture.md) — overall structure of the fetch stack
 - [net-design.md](https://github.com/gosub-io/gosub-sonar/blob/main/docs/net-design.md) — scheduler design (coalescing, priorities, fan-out)
 - [pump.md](https://github.com/gosub-io/gosub-sonar/blob/main/docs/pump.md) — how streamed bodies are pumped to subscribers
+
+Cutting and publishing a version is described in
+[RELEASING.md](https://github.com/gosub-io/gosub-sonar/blob/main/RELEASING.md).
 
 ## License
 

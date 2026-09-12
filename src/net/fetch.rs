@@ -18,6 +18,7 @@ use crate::net::hsts::{self, HstsStore};
 use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
 use crate::net::observer::NetObserver;
 use crate::net::referrer::{self, ReferrerPolicy};
+use crate::net::transport::TransportError;
 use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody, RequestCredentials};
 use crate::net::utils::BytesAsyncReader;
 use crate::types::PeekBuf;
@@ -612,10 +613,11 @@ async fn fetch_response_top_inner(
         from_cache: false,
     };
 
-    // Peek the stream up to PEEK_MAX bytes
+    // Peek the stream up to PEEK_MAX bytes. A body that stops part way is a transport failure,
+    // so it is classified here rather than left as an opaque read error.
     let mut body_stream = resp
         .bytes_stream()
-        .map_err(|e| NetError::Read(Arc::new(anyhow!(e))));
+        .map_err(|e| NetError::Transport(TransportError::from_client(&e)));
     let mut received_net: u64 = 0;
     let mut peek_buf_vec: Vec<u8> = Vec::with_capacity(PEEK_MAX);
     let mut excess: Option<Bytes> = None;
@@ -1122,7 +1124,11 @@ pub async fn fetch_response_complete(
 }
 
 /// Map a failed `send()` to a `NetError`: TLS handshake failures become `NetError::Tls` (plus a
-/// `NetEvent::TlsFailed`), everything else is wrapped in `Read` as before.
+/// `NetEvent::TlsFailed`), everything else becomes a classified `NetError::Transport`.
+///
+/// Classified here rather than left to the caller: a send that never got a connection and one
+/// whose body stopped part way read the same from above, and separating them means asking the
+/// HTTP client.
 fn send_error(
     e: reqwest::Error,
     url: &Url,
@@ -1139,7 +1145,9 @@ fn send_error(
     }
     #[cfg(target_arch = "wasm32")]
     let _ = (url, observer);
-    NetError::Read(Arc::new(anyhow::Error::from(e).context(what.to_string())))
+    let mut err = TransportError::from_client(&e);
+    err.message = format!("{what}: {}", err.message);
+    NetError::Transport(err)
 }
 
 /// A hop's response: what the server sent, or what the cache had.

@@ -42,6 +42,7 @@ pub use net::simple::{sync_fetch, sync_get};
 pub use net::tls::{
     Fingerprint, InMemoryTlsOverrideStore, TlsError, TlsErrorKind, TlsOverrideStore,
 };
+pub use net::transport::{TransportError, TransportErrorKind};
 pub use net::types::{
     BlockReason, BoxedAsyncRead, FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta,
     Initiator, NetError, Priority, RequestBody, RequestCredentials, ResourceKind,

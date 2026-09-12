@@ -708,16 +708,22 @@ error can fan out to many listeners:
 
 | Variant | Meaning |
 |---------|---------|
-| `Reqwest` | Underlying `reqwest` client error. |
+| `Blocked` | Hop refused by policy. Carries a `BlockReason` (mixed content, URL policy, unsupported scheme, not cached, CORS) and the URL of the hop that was refused. |
+| `Transport` | The HTTP client failed. Carries a `TransportError`: a `kind` (`Connect`, `Timeout`, `Redirect`, `Body`, `Decode`, `Request`, `Builder`, `Other`) and the client's own message with its source chain flattened into it. |
 | `Tls` | TLS handshake failed. Carries a `TlsError` (kind, host, message, and with overrides enabled the certificate and fingerprint); also emitted as `NetEvent::TlsFailed`. Native-only. |
 | `Redirect` | Redirect resolution failed (missing `Location`, bad scheme, too many hops, blocked). |
 | `Io` | I/O error reading the body. |
 | `Cancelled` | Request cancelled. |
 | `Timeout` | Idle or total-body timeout. |
 | `Read` | Body read/assembly error (e.g. exceeded `max_bytes`). |
-| `Other` | Anything else (e.g. URL blocked by policy). |
+| `Other` | Anything else. |
 
 Errors are delivered as `FetchResult::Error(NetError)` to every coalesced listener.
+
+`Transport` spares a caller from reaching past sonar to the client to find out what went wrong:
+a send that never connected and a body that stopped part way read the same from above, and only
+sonar knows which client is under it. Match on `kind`; `message` is the client's own wording and
+changes between its releases.
 
 ---
 
