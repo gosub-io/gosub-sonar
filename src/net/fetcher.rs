@@ -751,6 +751,18 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
         .with_fetch_metadata(req.destination, req.mode, req.initiator == Initiator::User)
         .with_credentials(req.credentials)
         .with_cache(req.cache_mode, req.auto_decode)
+        .with_timeout(req.req_timeout)
+}
+
+/// The read idle timeout in force for `req`: its own override, else the fetcher's.
+fn effective_read_idle_timeout(req: &FetchRequest, cfg: &FetcherConfig) -> Duration {
+    req.read_idle_timeout.unwrap_or(cfg.read_idle_timeout)
+}
+
+/// The total body timeout in force for `req`: its own override, else the fetcher's. The
+/// override can lift the deadline as well as set one.
+fn effective_total_body_timeout(req: &FetchRequest, cfg: &FetcherConfig) -> Option<Duration> {
+    req.total_body_timeout.unwrap_or(cfg.total_body_timeout)
 }
 
 /// Build a reqwest client from `FetcherConfig`.
@@ -950,8 +962,8 @@ async fn perform_streaming(
         capacity: SHARED_MAX_CAPACITY,
         buf_size: 16 * 1024,
         cancel: Some(cancel.clone()),
-        idle_timeout: Some(cfg.read_idle_timeout),
-        total_timeout: cfg.total_body_timeout,
+        idle_timeout: Some(effective_read_idle_timeout(req, cfg)),
+        total_timeout: effective_total_body_timeout(req, cfg),
         // The reader counts only post-peek bytes — the peek was already read off the stream —
         // so subtract it from the budget. A body of exactly max_bytes is delivered in full.
         max_size: req
@@ -984,8 +996,8 @@ async fn perform_buffered(
         cancel.clone(),
         observer,
         req.max_bytes,
-        cfg.read_idle_timeout,
-        cfg.total_body_timeout,
+        effective_read_idle_timeout(req, cfg),
+        effective_total_body_timeout(req, cfg),
         policy,
     )
     .await?;
@@ -1086,6 +1098,9 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            req_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1117,6 +1132,9 @@ mod tests {
                 mode: Default::default(),
                 credentials: Default::default(),
                 cache_mode: Default::default(),
+                req_timeout: None,
+                read_idle_timeout: None,
+                total_body_timeout: None,
                 streaming: false,
                 auto_decode: true,
                 max_bytes: None,
@@ -1340,6 +1358,9 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            req_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1496,6 +1517,9 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            req_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
             streaming: true,
             auto_decode: true,
             max_bytes: None,
@@ -2013,6 +2037,176 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// Drive one request through a fresh fetcher built from `cfg`, returning its result and
+    /// how long it took. Shuts the fetcher down afterwards.
+    async fn fetch_one(cfg: FetcherConfig, req: FetchRequest) -> (FetchResult, Duration) {
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let started = std::time::Instant::now();
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, CancellationToken::new(), tx).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("fetch must finish within the test budget")
+            .unwrap();
+        shutdown.cancel();
+        (result, started.elapsed())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_req_timeout_shortens_the_fetcher_timeout() {
+        let srv = start_server().await;
+        // The fetcher allows 5 s for headers; the request allows 200 ms.
+        let req = FetchRequest::builder(Method::GET, srv.url("/hang"))
+            .with_req_timeout(Duration::from_millis(200))
+            .build();
+        let (result, elapsed) = fetch_one(test_config(), req).await;
+        assert!(result.is_error(), "the per-request timeout should fire");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the request's own 200 ms timeout should have fired, not the fetcher's 5 s one \
+             (took {elapsed:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_req_timeout_extends_the_fetcher_timeout() {
+        let srv = TestServer::new()
+            .route(
+                "/late",
+                RouteConfig::delay(Duration::from_millis(300), b"ok".to_vec()),
+            )
+            .start()
+            .await;
+        let cfg = FetcherConfig {
+            req_timeout: Duration::from_millis(50),
+            ..test_config()
+        };
+
+        // Under the fetcher's own timeout the server is too slow.
+        let (result, _) =
+            fetch_one(cfg.clone(), make_req(srv.url("/late"), Priority::Normal).0).await;
+        assert!(result.is_error(), "50 ms is not enough for a 300 ms server");
+
+        // The same request with its own, longer budget goes through.
+        let req = FetchRequest::builder(Method::GET, srv.url("/late"))
+            .with_req_timeout(Duration::from_secs(3))
+            .build();
+        let (result, _) = fetch_one(cfg, req).await;
+        match result {
+            FetchResult::Buffered { meta, body } => {
+                assert_eq!(meta.status, 200);
+                assert_eq!(&body[..], b"ok");
+            }
+            other => panic!("expected a buffered 200, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_read_idle_timeout_overrides_the_fetcher_timeout() {
+        // Sends headers and 8 KiB of body, more than the peek window, and then goes silent: the
+        // stall lands in the body read loop, which is what the idle timeout governs. The
+        // fetcher tolerates 2 s of silence; the request tolerates 100 ms.
+        let srv = TestServer::new()
+            .route(
+                "/stall",
+                RouteConfig::stall_mid_body(8 * 1024, Duration::from_secs(30)),
+            )
+            .start()
+            .await;
+        let req = FetchRequest::builder(Method::GET, srv.url("/stall"))
+            .with_read_idle_timeout(Duration::from_millis(100))
+            .build();
+        let (result, elapsed) = fetch_one(test_config(), req).await;
+        assert!(
+            result.is_error(),
+            "the per-request idle timeout should fire"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the request's own 100 ms idle timeout should have fired (took {elapsed:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_total_body_timeout_overrides_the_fetcher_timeout() {
+        let srv = start_server().await;
+        // `/dribble-big` takes ~360 ms to deliver; the fetcher allows 10 s for the body, the
+        // request 50 ms. Chunks keep arriving, so only the total deadline can end it.
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_total_body_timeout(Duration::from_millis(50))
+            .build();
+        let (result, elapsed) = fetch_one(test_config(), req).await;
+        assert!(
+            result.is_error(),
+            "the per-request total body timeout should fire"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the request's own 50 ms budget should have fired (took {elapsed:?})"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_total_body_timeout_can_be_lifted() {
+        let srv = start_server().await;
+        let cfg = FetcherConfig {
+            total_body_timeout: Some(Duration::from_millis(50)),
+            ..test_config()
+        };
+
+        // Under the fetcher's own 50 ms budget the ~360 ms body does not make it.
+        let (result, _) = fetch_one(
+            cfg.clone(),
+            make_req(srv.url("/dribble-big"), Priority::Normal).0,
+        )
+        .await;
+        assert!(result.is_error(), "50 ms is not enough for a 360 ms body");
+
+        // With the deadline lifted for this request the whole body arrives.
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .without_total_body_timeout()
+            .build();
+        let (result, _) = fetch_one(cfg, req).await;
+        match result {
+            FetchResult::Buffered { meta, body } => {
+                assert_eq!(meta.status, 200);
+                assert_eq!(body.len(), 12 * 1024);
+            }
+            other => panic!("expected the full buffered body, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_total_body_timeout_applies_to_a_stream() {
+        let srv = start_server().await;
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_streaming(true)
+            .with_total_body_timeout(Duration::from_millis(50))
+            .build();
+        let (result, _) = fetch_one(test_config(), req).await;
+        let FetchResult::Stream {
+            shared, peek_buf, ..
+        } = result
+        else {
+            panic!("expected a stream, got {result:?}");
+        };
+        let mut reader = crate::net::shared_body::SharedBody::combined_reader(peek_buf, shared);
+        let mut sink = Vec::new();
+        use tokio::io::AsyncReadExt;
+        let read = tokio::time::timeout(Duration::from_secs(2), reader.read_to_end(&mut sink))
+            .await
+            .expect("the stream must end within the test budget");
+        assert!(
+            read.is_err(),
+            "the body should end with the per-request total timeout error"
+        );
+    }
+
     /// Drive one request through a fetcher configured with `cfg_policy`, where the request
     /// itself carries `req_policy`, and report whether it was blocked.
     async fn mixed_content_blocked(
@@ -2152,6 +2346,9 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            req_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -2516,6 +2713,9 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            req_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
             streaming: false,
             auto_decode,
             max_bytes: None,

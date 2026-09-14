@@ -104,6 +104,11 @@ shutdown.cancel();
 For per-subscriber cancellation use `fetcher.fetch_with_cancel(req, token)`; for full control
 over the reply channel use `fetcher.submit(req, cancel, reply_tx)`.
 
+The timeouts in `FetcherConfig` apply to every request, and a request can override them for
+itself: `with_req_timeout` (waiting for headers, per hop), `with_read_idle_timeout` (silence
+between body chunks), and `with_total_body_timeout` (the whole body). A large download that must
+not be cut off by the fetcher-wide body deadline uses `without_total_body_timeout()`.
+
 See the `examples/` directory for runnable versions.
 
 ### Hooking into the fetcher

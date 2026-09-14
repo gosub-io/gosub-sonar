@@ -307,6 +307,12 @@ Cancellation is layered with `tokio_util::sync::CancellationToken`:
 Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enforced by `reqwest`;
 `read_idle_timeout` (max gap between reads) and `total_body_timeout` (whole-body budget) are
 enforced in the read loops of `fetch_response_complete` and the `ProgressReader`/`SharedBody` path.
+A `FetchRequest` can override `req_timeout`, `read_idle_timeout`, and `total_body_timeout` for
+itself (`with_req_timeout`, `with_read_idle_timeout`, `with_total_body_timeout`,
+`without_total_body_timeout`); `make_request_init` and `effective_*_timeout` in `fetcher.rs`
+resolve request over config. The overrides are not part of the coalescing key, so a follower
+runs under the leader's timeouts. `connect_timeout` has no per-request form: `reqwest` applies
+it to the connection, not the request.
 
 ---
 
