@@ -12,7 +12,7 @@ use crate::net::transport::TransportError;
 use crate::net::utils::{normalize_url, short_hash, BytesAsyncReader};
 use crate::types::{PeekBuf, RequestId};
 use bytes::Bytes;
-use http::{header, HeaderMap, Method};
+use http::{header, HeaderMap, HeaderName, Method};
 use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::pin::Pin;
@@ -593,6 +593,9 @@ pub struct FetchRequest {
     /// or no cache at all. Inert when the fetcher has no
     /// [`cache`](crate::net::fetcher::FetcherConfig::cache). See [`cache`](mod@crate::net::cache).
     pub cache_mode: CacheMode,
+    /// Overrides [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order)
+    /// for this one request; `None` uses the fetcher-wide setting.
+    pub header_order: Option<Vec<HeaderName>>,
     /// Overrides [`FetcherConfig::req_timeout`](crate::net::fetcher::FetcherConfig::req_timeout)
     /// for this one request: the time allowed from sending the first request byte until the
     /// response headers arrive. `None` uses the fetcher-wide setting.
@@ -825,6 +828,7 @@ pub struct FetchRequestBuilder {
     mode: RequestMode,
     credentials: RequestCredentials,
     cache_mode: CacheMode,
+    header_order: Option<Vec<HeaderName>>,
     req_timeout: Option<Duration>,
     read_idle_timeout: Option<Duration>,
     total_body_timeout: Option<Option<Duration>>,
@@ -854,6 +858,7 @@ impl FetchRequestBuilder {
             mode: RequestMode::default(),
             credentials: RequestCredentials::default(),
             cache_mode: CacheMode::default(),
+            header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
@@ -1025,6 +1030,13 @@ impl FetchRequestBuilder {
         self
     }
 
+    /// Sets the order in which headers are sent, overriding the fetcher's
+    /// [`header_order`](crate::net::fetcher::FetcherConfig::header_order).
+    pub fn with_header_order(mut self, order: impl IntoIterator<Item = HeaderName>) -> Self {
+        self.header_order = Some(order.into_iter().collect());
+        self
+    }
+
     /// Sets the HTTP method of the request
     pub fn with_method(mut self, method: Method) -> Self {
         self.method = method;
@@ -1059,6 +1071,7 @@ impl FetchRequestBuilder {
             mode: self.mode,
             credentials: self.credentials,
             cache_mode: self.cache_mode,
+            header_order: self.header_order,
             req_timeout: self.req_timeout,
             read_idle_timeout: self.read_idle_timeout,
             total_body_timeout: self.total_body_timeout,
@@ -1171,6 +1184,18 @@ mod tests {
             .build();
         assert_eq!(req.headers[header::ACCEPT], "text/html");
         assert_eq!(req.headers[header::USER_AGENT], "custom/1.0");
+    }
+
+    #[test]
+    fn builder_header_order() {
+        let url = Url::parse("http://a/").unwrap();
+        let req = FetchRequest::builder(Method::GET, url.clone()).build();
+        assert_eq!(req.header_order, None);
+
+        let req = FetchRequest::builder(Method::GET, url)
+            .with_header_order([header::HOST, header::ACCEPT])
+            .build();
+        assert_eq!(req.header_order, Some(vec![header::HOST, header::ACCEPT]));
     }
 
     #[tokio::test(flavor = "current_thread")]

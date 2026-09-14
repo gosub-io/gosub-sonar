@@ -25,7 +25,7 @@ use crate::net::tls::TlsOverrideStore;
 use crate::net::types::{FetchRequest, FetchResult, Initiator, NetError, Priority};
 use crate::net::utils::{short_url, spawn_named, Waiter};
 use dashmap::{DashMap, Entry};
-use http::header;
+use http::{header, HeaderName};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, Notify, Semaphore};
@@ -85,6 +85,23 @@ pub struct FetcherConfig {
     /// identify your application to servers and CDNs. `None` sends no `User-Agent` header.
     /// For a browser engine use something like `"Mozilla/5.0 (compatible; MyBrowser/1.0)"`.
     pub user_agent: Option<String>,
+
+    /// Order in which request headers are sent. `None` sends them in insertion order: the
+    /// caller's headers, then the ones this crate adds, then `user-agent` and `host` from the
+    /// client. Some servers fingerprint clients on this order, so a browser engine will want
+    /// to match the browser it imitates.
+    ///
+    /// Named headers go first, in this order; unnamed ones follow in insertion order. Names
+    /// without a header are skipped. `host` and `user-agent` can be named too. Not applied to
+    /// `transfer-encoding: chunked` or the HTTP/2 pseudo-headers, which the connection writes.
+    ///
+    /// No `host` is sent to an origin known to speak HTTP/2 (`:authority` carries it). Since
+    /// the protocol is only known after the first response, the first request to an h2 origin
+    /// still carries a `host` matching `:authority`.
+    ///
+    /// Overridable per request with [`FetchRequest::header_order`]. Not part of the coalescing
+    /// key. Native-only: on wasm32 the browser orders headers.
+    pub header_order: Option<Vec<HeaderName>>,
 
     /// Store backing HTTP Strict Transport Security.
     ///
@@ -182,6 +199,7 @@ impl Default for FetcherConfig {
             pool_idle_timeout: Some(Duration::from_secs(90)),
             tcp_keepalive: Some(Duration::from_secs(60)),
             user_agent: Some(DEFAULT_USER_AGENT.to_string()),
+            header_order: None,
             #[cfg(not(target_arch = "wasm32"))]
             hsts: Some(Arc::new(InMemoryHstsStore::new())),
             #[cfg(not(target_arch = "wasm32"))]
@@ -751,6 +769,11 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
         .with_fetch_metadata(req.destination, req.mode, req.initiator == Initiator::User)
         .with_credentials(req.credentials)
         .with_cache(req.cache_mode, req.auto_decode)
+        .with_header_order(
+            req.header_order
+                .clone()
+                .or_else(|| cfg.header_order.clone()),
+        )
         .with_timeout(req.req_timeout)
 }
 
@@ -885,9 +908,14 @@ impl OriginTable {
         }
     }
 
+    /// True once a response from this origin came in over HTTP/2 or HTTP/3.
+    fn speaks_h2(&self, url: &Url) -> bool {
+        self.slots_for(url).h2.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     fn limit_for(&self, url: &Url) -> usize {
-        if self.slots_for(url).h2.load(Ordering::Acquire) {
+        if self.speaks_h2(url) {
             self.cfg.h2_per_origin
         } else {
             self.cfg.h1_per_origin
@@ -904,8 +932,10 @@ fn build_policy(
     ctx: &Arc<dyn FetcherContext>,
     origins: Arc<OriginTable>,
 ) -> NetPolicy {
+    let hint_origins = origins.clone();
     let policy = NetPolicy::from_context(ctx)
         .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)))
+        .with_protocol_hint(Box::new(move |url| hint_origins.speaks_h2(url)))
         .with_credential_store(cfg.credentials.clone())
         // The same user agent `build_client` puts on the client. Passed along only so
         // `NetEvent::RequestSent` can report it: reqwest merges a client default when the
@@ -1029,7 +1059,9 @@ mod tests {
     use crate::net::proxy::ProxyRule;
     use crate::net::request_ref::RequestReference;
     use crate::net::test_support::{RouteConfig, TestServer};
-    use crate::net::types::{BlockReason, FetchRequest, Initiator, ResourceKind};
+    use crate::net::types::{
+        BlockReason, FetchRequest, FetchRequestBuilder, Initiator, ResourceKind,
+    };
     use crate::types::RequestId;
     use http::{HeaderMap, Method};
     use std::sync::Arc;
@@ -1098,6 +1130,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
@@ -1132,6 +1165,7 @@ mod tests {
                 mode: Default::default(),
                 credentials: Default::default(),
                 cache_mode: Default::default(),
+                header_order: None,
                 req_timeout: None,
                 read_idle_timeout: None,
                 total_body_timeout: None,
@@ -1358,6 +1392,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
@@ -1517,6 +1552,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
@@ -2037,6 +2073,116 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// GET `/echo-headers` (which echoes the raw request headers) through a fetcher built
+    /// from `cfg`, with `custom` applied to the request. Returns the echoed header lines.
+    async fn echo_headers(
+        cfg: FetcherConfig,
+        custom: impl FnOnce(FetchRequestBuilder) -> FetchRequestBuilder,
+    ) -> String {
+        let srv = TestServer::new()
+            .route("/echo-headers", RouteConfig::echo_request_headers())
+            .start()
+            .await;
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-first", "1".parse().unwrap());
+        headers.insert("x-second", "2".parse().unwrap());
+        let req = custom(
+            FetchRequest::builder(Method::GET, srv.url("/echo-headers")).with_headers(headers),
+        )
+        .build();
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, CancellationToken::new(), tx).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.cancel();
+        match result {
+            FetchResult::Buffered { body, .. } => String::from_utf8_lossy(&body).into_owned(),
+            other => panic!("expected a buffered echo, got {other:?}"),
+        }
+    }
+
+    /// Header names from echoed header lines, in wire order.
+    fn header_names(echo: &str) -> Vec<String> {
+        echo.lines()
+            .filter_map(|l| l.split(':').next())
+            .map(|n| n.trim().to_ascii_lowercase())
+            .collect()
+    }
+
+    fn position(names: &[String], name: &str) -> usize {
+        names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("{name} not in {names:?}"))
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn header_order_defaults_to_insertion_order() {
+        let names = header_names(&echo_headers(test_config(), |b| b).await);
+        // caller's headers, then ours, then the client's user-agent and host
+        assert!(position(&names, "x-first") < position(&names, "x-second"));
+        assert!(position(&names, "x-second") < position(&names, "accept"));
+        assert!(position(&names, "accept") < position(&names, "user-agent"));
+        assert!(position(&names, "user-agent") < position(&names, "host"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_header_order_is_sent() {
+        let cfg = FetcherConfig {
+            header_order: Some(vec![
+                header::HOST,
+                header::USER_AGENT,
+                header::ACCEPT,
+                HeaderName::from_static("x-second"),
+            ]),
+            ..test_config()
+        };
+        let names = header_names(&echo_headers(cfg, |b| b).await);
+        assert_eq!(&names[..4], ["host", "user-agent", "accept", "x-second"]);
+        // unnamed headers keep their relative order after the named ones
+        assert!(position(&names, "x-first") > 3);
+        assert!(position(&names, "x-first") < position(&names, "accept-encoding"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_header_order_overrides_fetcher_order() {
+        let cfg = FetcherConfig {
+            header_order: Some(vec![header::HOST, header::USER_AGENT]),
+            ..test_config()
+        };
+        let echo = echo_headers(cfg, |b| {
+            b.with_header_order([
+                HeaderName::from_static("x-second"),
+                header::ACCEPT,
+                header::HOST,
+            ])
+        })
+        .await;
+        assert_eq!(&header_names(&echo)[..3], ["x-second", "accept", "host"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn header_order_keeps_caller_user_agent() {
+        let cfg = FetcherConfig {
+            header_order: Some(vec![header::USER_AGENT, header::HOST]),
+            ..test_config()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, "custom/1.0".parse().unwrap());
+        let echo = echo_headers(cfg, |b| b.with_headers(headers)).await;
+        let lower = echo.to_ascii_lowercase();
+        assert!(lower.starts_with("user-agent: custom/1.0"), "{echo}");
+        assert_eq!(lower.matches("user-agent:").count(), 1, "{echo}");
+    }
+
     /// Drive one request through a fresh fetcher built from `cfg`, returning its result and
     /// how long it took. Shuts the fetcher down afterwards.
     async fn fetch_one(cfg: FetcherConfig, req: FetchRequest) -> (FetchResult, Duration) {
@@ -2346,6 +2492,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
@@ -2713,6 +2860,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,

@@ -25,7 +25,7 @@ use crate::types::PeekBuf;
 use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
 use futures_util::{stream, StreamExt, TryStreamExt};
-use http::{header, HeaderMap, Method};
+use http::{header, HeaderMap, HeaderName, Method};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -114,6 +114,9 @@ pub type CookieSinkFn = Box<dyn Fn(&Url, &[&str]) + Send + Sync>;
 /// Callback type for reporting the HTTP version of a response.
 pub type ProtocolSinkFn = Box<dyn Fn(&Url, http::Version) + Send + Sync>;
 
+/// Callback type for asking whether a URL's origin is known to speak HTTP/2 or HTTP/3.
+pub type ProtocolHintFn = Box<dyn Fn(&Url) -> bool + Send + Sync>;
+
 /// Callback type for answering an authentication challenge.
 pub type AuthChallengeFn = Box<dyn Fn(&AuthChallenge) -> Option<Credentials> + Send + Sync>;
 
@@ -144,6 +147,11 @@ pub struct NetPolicy {
     /// wasm32 (the browser's `fetch()` doesn't expose the version). Set via
     /// [`NetPolicy::with_protocol_sink`].
     pub on_protocol: ProtocolSinkFn,
+    /// Whether a URL's origin is known to speak HTTP/2 or HTTP/3. Used when applying a
+    /// [`RequestInit::header_order`]: no `host` header is added for such origins, since h2
+    /// carries it in `:authority`. Defaults to `false` for every URL. Set via
+    /// [`NetPolicy::with_protocol_hint`].
+    pub speaks_h2: ProtocolHintFn,
     /// HSTS store consulted to upgrade each hop, and updated from each hop's response.
     /// `None` disables HSTS. Set via [`NetPolicy::with_hsts`].
     #[cfg(not(target_arch = "wasm32"))]
@@ -197,6 +205,7 @@ impl Default for NetPolicy {
             cookies_for: Box::new(|_| None),
             on_cookies: Box::new(|_, _| {}),
             on_protocol: Box::new(|_, _| {}),
+            speaks_h2: Box::new(|_| false),
             user_agent: None,
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
@@ -224,6 +233,7 @@ impl NetPolicy {
             cookies_for: Box::new(move |url| ctx_cookies.cookies_for(url)),
             on_cookies: Box::new(move |url, values| ctx_sink.on_cookies_received(url, values)),
             on_protocol: Box::new(|_, _| {}),
+            speaks_h2: Box::new(|_| false),
             // Filled in by the fetcher, which is what knows how its client was built.
             user_agent: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -260,6 +270,12 @@ impl NetPolicy {
     /// Attaches a callback that receives the URL and HTTP version of every response.
     pub fn with_protocol_sink(mut self, sink: ProtocolSinkFn) -> Self {
         self.on_protocol = sink;
+        self
+    }
+
+    /// Attaches a callback that says whether a URL's origin is known to speak HTTP/2 or HTTP/3.
+    pub fn with_protocol_hint(mut self, hint: ProtocolHintFn) -> Self {
+        self.speaks_h2 = hint;
         self
     }
 
@@ -349,6 +365,9 @@ pub struct RequestInit {
     /// Whether the HTTP client decompresses the body. A cache entry records it, since a decoded
     /// body is not the bytes a raw caller asked for.
     pub auto_decode: bool,
+    /// Order in which headers are sent, applied per hop; `None` keeps insertion order. See
+    /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
+    pub header_order: Option<Vec<HeaderName>>,
     /// Time allowed from sending the first request byte until the response headers arrive,
     /// applied to every hop. `None` leaves it to the client's own request timeout.
     pub timeout: Option<Duration>,
@@ -390,6 +409,7 @@ impl RequestInit {
             credentials: RequestCredentials::default(),
             cache_mode: CacheMode::default(),
             auto_decode: true,
+            header_order: None,
             timeout: None,
         }
     }
@@ -452,6 +472,82 @@ impl RequestInit {
         self.timeout = timeout;
         self
     }
+
+    /// Sets the order in which headers are sent. `None` keeps insertion order.
+    pub fn with_header_order(mut self, order: Option<Vec<HeaderName>>) -> Self {
+        self.header_order = order;
+        self
+    }
+}
+
+/// Reorder `headers` so the names in `order` come first (all values of a name together), with
+/// the remaining headers after them in insertion order. Names without a header are skipped;
+/// duplicates in `order` count once. hyper writes headers in map order, so this is the wire
+/// order.
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_header_order(headers: &mut HeaderMap, order: &[HeaderName]) {
+    if order.is_empty() {
+        return;
+    }
+    let original = std::mem::take(headers);
+    let mut ordered = HeaderMap::with_capacity(original.len());
+    for name in order {
+        if ordered.contains_key(name) {
+            continue;
+        }
+        for value in original.get_all(name) {
+            ordered.append(name.clone(), value.clone());
+        }
+    }
+    for (name, value) in original.iter() {
+        if !order.contains(name) {
+            ordered.append(name.clone(), value.clone());
+        }
+    }
+    *headers = ordered;
+}
+
+/// The `Host` value hyper-util would add for `url`: host, plus the port if not the default.
+#[cfg(not(target_arch = "wasm32"))]
+fn host_header_value(url: &Url) -> Option<http::HeaderValue> {
+    let host = url.host_str()?;
+    let value = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    http::HeaderValue::from_str(&value).ok()
+}
+
+/// Apply `order` to the request's headers. No-op when `order` is `None`.
+///
+/// reqwest appends the default `user-agent` and hyper-util the `host` at execute time, after
+/// anything we can reorder, so both are inserted here (if absent) with the values they would
+/// get. `host` only when `place_host`: hyper-util adds it on HTTP/1 connections only, and we
+/// don't know the connection yet, so the caller decides from what it has seen of the origin.
+#[cfg(not(target_arch = "wasm32"))]
+fn order_hop_headers(
+    mut request: reqwest::Request,
+    order: Option<&[HeaderName]>,
+    user_agent: Option<&http::HeaderValue>,
+    place_host: bool,
+) -> reqwest::Request {
+    let Some(order) = order else {
+        return request;
+    };
+    let host = if place_host {
+        host_header_value(request.url())
+    } else {
+        None
+    };
+    let headers = request.headers_mut();
+    if let Some(ua) = user_agent {
+        headers.entry(header::USER_AGENT).or_insert(ua.clone());
+    }
+    if let Some(host) = host {
+        headers.entry(header::HOST).or_insert(host);
+    }
+    apply_header_order(headers, order);
+    request
 }
 
 /// Peek buffer size (first bytes of body). Used for detecting mime type
@@ -1706,6 +1802,13 @@ async fn get_with_redirects(
                         &observer,
                     )
                 })?;
+                #[cfg(not(target_arch = "wasm32"))]
+                let request = order_hop_headers(
+                    request,
+                    init.header_order.as_deref(),
+                    policy.user_agent.as_ref(),
+                    !(policy.speaks_h2)(&url),
+                );
                 let mut reported = request.headers().clone();
                 // Only when the assembled request does not already carry one: a header set
                 // per-request wins over the client default, and reporting the default over
@@ -2063,6 +2166,7 @@ async fn get_with_redirects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::net::auth::{AuthScheme, InMemoryCredentialStore};
     use crate::net::referrer::ReferrerPolicy;
     use crate::net::test_support::{CacheRouteOptions, RecordingObserver, RouteConfig, TestServer};
@@ -2072,6 +2176,165 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio_util::sync::CancellationToken;
+
+    fn names(headers: &HeaderMap) -> Vec<String> {
+        headers
+            .iter()
+            .map(|(n, _)| n.as_str().to_string())
+            .collect()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn apply_header_order_named_first_rest_in_place() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-a", "1".parse().unwrap());
+        headers.insert(header::ACCEPT, "*/*".parse().unwrap());
+        headers.insert("x-b", "2".parse().unwrap());
+        headers.insert(header::HOST, "example.org".parse().unwrap());
+        headers.insert("x-c", "3".parse().unwrap());
+
+        super::apply_header_order(&mut headers, &[header::HOST, header::ACCEPT]);
+
+        assert_eq!(names(&headers), ["host", "accept", "x-a", "x-b", "x-c"]);
+        assert_eq!(headers[header::HOST], "example.org");
+        assert_eq!(headers["x-c"], "3");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn apply_header_order_keeps_repeated_values_together() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-a", "1".parse().unwrap());
+        headers.append(header::COOKIE, "a=1".parse().unwrap());
+        headers.append("x-b", "2".parse().unwrap());
+        headers.append(header::COOKIE, "b=2".parse().unwrap());
+
+        super::apply_header_order(&mut headers, &[header::COOKIE]);
+
+        let cookies: Vec<_> = headers
+            .get_all(header::COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+        assert_eq!(names(&headers), ["cookie", "cookie", "x-a", "x-b"]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn apply_header_order_skips_absent_and_duplicate_names() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-a", "1".parse().unwrap());
+        headers.insert("x-b", "2".parse().unwrap());
+
+        super::apply_header_order(
+            &mut headers,
+            &[
+                header::HOST,
+                HeaderName::from_static("x-b"),
+                HeaderName::from_static("x-b"),
+            ],
+        );
+
+        assert_eq!(names(&headers), ["x-b", "x-a"]);
+        assert_eq!(headers.len(), 2);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn apply_header_order_empty_is_noop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-b", "2".parse().unwrap());
+        headers.insert("x-a", "1".parse().unwrap());
+        super::apply_header_order(&mut headers, &[]);
+        assert_eq!(names(&headers), ["x-b", "x-a"]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn hop_request() -> reqwest::Request {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-a", "1".parse().unwrap());
+        headers.insert(header::ACCEPT, "*/*".parse().unwrap());
+        reqwest::Client::new()
+            .get("http://example.org:8080/")
+            .headers(headers)
+            .build()
+            .unwrap()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn order_hop_headers_adds_host_and_user_agent() {
+        let ua = http::HeaderValue::from_static("ua/1");
+        let order = [header::HOST, header::USER_AGENT, header::ACCEPT];
+        let request = super::order_hop_headers(hop_request(), Some(&order), Some(&ua), true);
+        assert_eq!(
+            names(request.headers()),
+            ["host", "user-agent", "accept", "x-a"]
+        );
+        assert_eq!(request.headers()[header::HOST], "example.org:8080");
+        assert_eq!(request.headers()[header::USER_AGENT], "ua/1");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn order_hop_headers_no_host_for_h2_origin() {
+        let ua = http::HeaderValue::from_static("ua/1");
+        let order = [header::HOST, header::USER_AGENT, header::ACCEPT];
+        let request = super::order_hop_headers(hop_request(), Some(&order), Some(&ua), false);
+        assert_eq!(names(request.headers()), ["user-agent", "accept", "x-a"]);
+        assert!(!request.headers().contains_key(header::HOST));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn order_hop_headers_keeps_caller_host_and_user_agent() {
+        let ua = http::HeaderValue::from_static("default/1");
+        let mut request = hop_request();
+        request
+            .headers_mut()
+            .insert(header::USER_AGENT, "mine/2".parse().unwrap());
+        request
+            .headers_mut()
+            .insert(header::HOST, "other.example".parse().unwrap());
+        let order = [header::HOST, header::USER_AGENT];
+        let request = super::order_hop_headers(request, Some(&order), Some(&ua), true);
+        assert_eq!(
+            names(request.headers()),
+            ["host", "user-agent", "x-a", "accept"]
+        );
+        assert_eq!(request.headers()[header::USER_AGENT], "mine/2");
+        assert_eq!(request.headers()[header::HOST], "other.example");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn order_hop_headers_none_is_noop() {
+        let ua = http::HeaderValue::from_static("ua/1");
+        let request = super::order_hop_headers(hop_request(), None, Some(&ua), true);
+        assert_eq!(names(request.headers()), ["x-a", "accept"]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn host_header_value_port_handling() {
+        let host = |u: &str| {
+            super::host_header_value(&Url::parse(u).unwrap())
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        assert_eq!(host("https://example.org/").as_deref(), Some("example.org"));
+        assert_eq!(
+            host("https://example.org:443/").as_deref(),
+            Some("example.org")
+        );
+        assert_eq!(
+            host("http://example.org:8080/").as_deref(),
+            Some("example.org:8080")
+        );
+        assert_eq!(host("http://[::1]:8080/").as_deref(), Some("[::1]:8080"));
+        assert_eq!(host("data:text/plain,hi"), None);
+    }
 
     struct TestObserver;
     impl NetObserver for TestObserver {
