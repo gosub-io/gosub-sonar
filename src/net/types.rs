@@ -17,6 +17,7 @@ use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, ReadBuf};
 use url::{Origin, Url};
 
@@ -592,6 +593,26 @@ pub struct FetchRequest {
     /// or no cache at all. Inert when the fetcher has no
     /// [`cache`](crate::net::fetcher::FetcherConfig::cache). See [`cache`](mod@crate::net::cache).
     pub cache_mode: CacheMode,
+    /// Overrides [`FetcherConfig::req_timeout`](crate::net::fetcher::FetcherConfig::req_timeout)
+    /// for this one request: the time allowed from sending the first request byte until the
+    /// response headers arrive. `None` uses the fetcher-wide setting.
+    ///
+    /// Applies to every hop of a redirect chain separately. When this request is coalesced
+    /// onto an identical in-flight one, the timeouts of the request that started the fetch
+    /// apply; see [`generate_request_key`](Self::generate_request_key).
+    pub req_timeout: Option<Duration>,
+    /// Overrides
+    /// [`FetcherConfig::read_idle_timeout`](crate::net::fetcher::FetcherConfig::read_idle_timeout)
+    /// for this one request: the longest silence tolerated between two body chunks. `None`
+    /// uses the fetcher-wide setting.
+    pub read_idle_timeout: Option<Duration>,
+    /// Overrides
+    /// [`FetcherConfig::total_body_timeout`](crate::net::fetcher::FetcherConfig::total_body_timeout)
+    /// for this one request: the wall-clock budget for the whole body after the headers.
+    ///
+    /// `None` uses the fetcher-wide setting. `Some(None)` removes the deadline for this request
+    /// alone, which is what a large download wants; `Some(Some(d))` sets it to `d`.
+    pub total_body_timeout: Option<Option<Duration>>,
     /// HTTP Headers (unified).
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
@@ -804,6 +825,9 @@ pub struct FetchRequestBuilder {
     mode: RequestMode,
     credentials: RequestCredentials,
     cache_mode: CacheMode,
+    req_timeout: Option<Duration>,
+    read_idle_timeout: Option<Duration>,
+    total_body_timeout: Option<Option<Duration>>,
     body: Option<RequestBody>,
 }
 
@@ -830,6 +854,9 @@ impl FetchRequestBuilder {
             mode: RequestMode::default(),
             credentials: RequestCredentials::default(),
             cache_mode: CacheMode::default(),
+            req_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
             body: None,
         }
     }
@@ -954,6 +981,50 @@ impl FetchRequestBuilder {
         self
     }
 
+    /// Overrides the fetcher's request timeout for this request: the time allowed from sending
+    /// the first request byte until the response headers arrive, per hop. Default: the
+    /// fetcher's [`req_timeout`](crate::net::fetcher::FetcherConfig::req_timeout).
+    pub fn with_req_timeout(mut self, timeout: Duration) -> Self {
+        self.req_timeout = Some(timeout);
+        self
+    }
+
+    /// Overrides the fetcher's read idle timeout for this request: the longest silence
+    /// tolerated between two body chunks. Default: the fetcher's
+    /// [`read_idle_timeout`](crate::net::fetcher::FetcherConfig::read_idle_timeout).
+    pub fn with_read_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.read_idle_timeout = Some(timeout);
+        self
+    }
+
+    /// Overrides the fetcher's total body timeout for this request: the wall-clock budget for
+    /// the whole body once the headers are in. Default: the fetcher's
+    /// [`total_body_timeout`](crate::net::fetcher::FetcherConfig::total_body_timeout). See
+    /// [`without_total_body_timeout`](Self::without_total_body_timeout) to lift it instead.
+    pub fn with_total_body_timeout(mut self, timeout: Duration) -> Self {
+        self.total_body_timeout = Some(Some(timeout));
+        self
+    }
+
+    /// Removes the total body deadline for this request alone, whatever the fetcher's
+    /// [`total_body_timeout`](crate::net::fetcher::FetcherConfig::total_body_timeout) says.
+    /// For large downloads; the read idle timeout still catches a stalled body.
+    pub fn without_total_body_timeout(mut self) -> Self {
+        self.total_body_timeout = Some(None);
+        self
+    }
+
+    /// Sets the `User-Agent` header for this request, overriding the fetcher's
+    /// [`user_agent`](crate::net::fetcher::FetcherConfig::user_agent). A value that is not a
+    /// valid header value is ignored. Call it after
+    /// [`with_headers`](Self::with_headers), which replaces the whole header map.
+    pub fn with_user_agent(mut self, user_agent: &str) -> Self {
+        if let Ok(value) = http::HeaderValue::from_str(user_agent) {
+            self.headers.insert(header::USER_AGENT, value);
+        }
+        self
+    }
+
     /// Sets the HTTP method of the request
     pub fn with_method(mut self, method: Method) -> Self {
         self.method = method;
@@ -988,6 +1059,9 @@ impl FetchRequestBuilder {
             mode: self.mode,
             credentials: self.credentials,
             cache_mode: self.cache_mode,
+            req_timeout: self.req_timeout,
+            read_idle_timeout: self.read_idle_timeout,
+            total_body_timeout: self.total_body_timeout,
             body: self.body,
         }
     }
@@ -1054,6 +1128,50 @@ mod tests {
     use super::*;
     use cow_utils::CowUtils;
     use tokio::io::AsyncReadExt;
+
+    #[test]
+    fn builder_leaves_timeouts_to_the_fetcher_by_default() {
+        let req = FetchRequest::builder(Method::GET, Url::parse("http://a/").unwrap()).build();
+        assert_eq!(req.req_timeout, None);
+        assert_eq!(req.read_idle_timeout, None);
+        assert_eq!(req.total_body_timeout, None);
+        assert!(!req.headers.contains_key(header::USER_AGENT));
+    }
+
+    #[test]
+    fn builder_sets_per_request_timeouts_and_user_agent() {
+        let req = FetchRequest::builder(Method::GET, Url::parse("http://a/").unwrap())
+            .with_req_timeout(Duration::from_secs(1))
+            .with_read_idle_timeout(Duration::from_secs(2))
+            .with_total_body_timeout(Duration::from_secs(3))
+            .with_user_agent("custom/1.0")
+            .build();
+        assert_eq!(req.req_timeout, Some(Duration::from_secs(1)));
+        assert_eq!(req.read_idle_timeout, Some(Duration::from_secs(2)));
+        assert_eq!(req.total_body_timeout, Some(Some(Duration::from_secs(3))));
+        assert_eq!(req.headers[header::USER_AGENT], "custom/1.0");
+    }
+
+    #[test]
+    fn builder_can_lift_the_total_body_timeout() {
+        let req = FetchRequest::builder(Method::GET, Url::parse("http://a/").unwrap())
+            .with_total_body_timeout(Duration::from_secs(3))
+            .without_total_body_timeout()
+            .build();
+        assert_eq!(req.total_body_timeout, Some(None));
+    }
+
+    #[test]
+    fn builder_user_agent_survives_with_headers_when_set_after_it() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "text/html".parse().unwrap());
+        let req = FetchRequest::builder(Method::GET, Url::parse("http://a/").unwrap())
+            .with_headers(headers)
+            .with_user_agent("custom/1.0")
+            .build();
+        assert_eq!(req.headers[header::ACCEPT], "text/html");
+        assert_eq!(req.headers[header::USER_AGENT], "custom/1.0");
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn bodystream_from_bytes_reads_all() {

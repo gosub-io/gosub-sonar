@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Per-request timeout overrides on `FetchRequest`: `req_timeout`, `read_idle_timeout`, and
+  `total_body_timeout` each override the same-named `FetcherConfig` setting for one request and
+  inherit it when unset. The builder gains `with_req_timeout`, `with_read_idle_timeout`,
+  `with_total_body_timeout`, and `without_total_body_timeout`, the last for a large download
+  that must not be cut off by the fetcher-wide body deadline. The overrides do not take part in
+  the coalescing key: a request that joins an identical in-flight one runs under the timeouts
+  of the request that started it. `connect_timeout` stays fetcher-wide, as the client applies
+  it per connection rather than per request (#10)
+- `FetchRequestBuilder::with_user_agent`, a shorthand for setting the `User-Agent` header on one
+  request over the fetcher's `user_agent`
+- `RequestInit::timeout` (and `with_timeout`) for callers of the `net::fetch` functions directly:
+  bounds each hop's wait for response headers in place of the client's own request timeout
+
+
 ## [0.7.0] - 2026-09-12
 
 ### Added

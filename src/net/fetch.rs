@@ -349,6 +349,9 @@ pub struct RequestInit {
     /// Whether the HTTP client decompresses the body. A cache entry records it, since a decoded
     /// body is not the bytes a raw caller asked for.
     pub auto_decode: bool,
+    /// Time allowed from sending the first request byte until the response headers arrive,
+    /// applied to every hop. `None` leaves it to the client's own request timeout.
+    pub timeout: Option<Duration>,
 }
 
 impl Default for RequestInit {
@@ -387,6 +390,7 @@ impl RequestInit {
             credentials: RequestCredentials::default(),
             cache_mode: CacheMode::default(),
             auto_decode: true,
+            timeout: None,
         }
     }
 
@@ -439,6 +443,13 @@ impl RequestInit {
     pub fn with_cache(mut self, mode: CacheMode, auto_decode: bool) -> Self {
         self.cache_mode = mode;
         self.auto_decode = auto_decode;
+        self
+    }
+
+    /// Bounds each hop's wait for response headers, overriding the client's request timeout.
+    /// `None` leaves the client's own timeout in force.
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
         self
     }
 }
@@ -1647,6 +1658,12 @@ async fn get_with_redirects(
                 let mut req_builder = client
                     .request(current_method.clone(), url.clone())
                     .headers(hop_headers);
+                // A per-request timeout replaces the client's for this request only, so it
+                // can be set shorter or longer than the client-wide default. Redirects and
+                // authenticated retries come back through here, so every hop gets a fresh one.
+                if let Some(timeout) = init.timeout {
+                    req_builder = req_builder.timeout(timeout);
+                }
                 if let Some(ref body) = current_body {
                     // Built fresh per send so a streamed body can be replayed on 307/308 and for an
                     // authenticated retry of this hop.
