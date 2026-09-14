@@ -21,7 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request over the fetcher's `user_agent`
 - `RequestInit::timeout` (and `with_timeout`) for callers of the `net::fetch` functions directly:
   bounds each hop's wait for response headers in place of the client's own request timeout
-
+- `FetcherConfig::header_order`, overridable per request with `FetchRequest::header_order`
+  (`with_header_order` on the builder): the order in which request headers are sent. Named
+  headers go first, in that order; the rest follow in insertion order. `host` and `user-agent`
+  can be named too; the fetcher now inserts them itself instead of leaving them for the client
+  to append last. No `host` is sent to an origin known to speak HTTP/2. Unset, headers are
+  sent in insertion order as before. Native only (#115)
+- `NetPolicy::speaks_h2` (`with_protocol_hint`): whether a URL's origin is known to speak
+  HTTP/2 or HTTP/3. The fetcher wires it to its per-origin protocol table
+- `RequestInit::header_order` (`with_header_order`) for direct users of `net::fetch`
 
 ## [0.7.0] - 2026-09-12
 

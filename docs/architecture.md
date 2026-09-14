@@ -197,7 +197,7 @@ Defined in `src/net/types.rs` (and `src/types.rs`):
 
 | Type | Role |
 |------|------|
-| `FetchRequest` | Everything about a request: `url`, `method`, `headers`, `priority`, `streaming`, `auto_decode`, `body`, `max_bytes`, plus correlation fields (`reference`, `req_id`, `kind`, `initiator`). Build via `FetchRequest::builder(method, url)`. `generate_request_key()` derives the **coalescing key** from url/method/headers; it returns `None` for methods other than GET/HEAD, which are never coalesced. |
+| `FetchRequest` | Everything about a request: `url`, `method`, `headers`, `priority`, `streaming`, `auto_decode`, `body`, `max_bytes`, `header_order`, plus correlation fields (`reference`, `req_id`, `kind`, `initiator`). Build via `FetchRequest::builder(method, url)`. `generate_request_key()` derives the **coalescing key** from url/method/headers; it returns `None` for methods other than GET/HEAD, which are never coalesced. |
 | `FetchResult` | The outcome sent back: `Stream { meta, peek_buf, shared }`, `Buffered { meta, body }`, or `Error(NetError)`. |
 | `FetchResultMeta` | Response metadata: `final_url`, `status`, `status_text`, `headers`, `content_length`, `content_type`, `has_body`. |
 | `Priority` | `High` / `Normal` (default) / `Low` / `Idle`. |
@@ -224,7 +224,10 @@ and two layers of semaphores:
 
 `FetcherConfig` (in `fetcher.rs`) also carries `connect_timeout` (5s), `req_timeout` (60s),
 `read_idle_timeout` (15s), `total_body_timeout` (180s), a `user_agent` (defaults to
-`gosub-sonar/<crate version>`), and a `proxy`
+`gosub-sonar/<crate version>`), an optional `header_order` (applied per hop by
+`order_hop_headers` in `fetch.rs`, which also inserts `host` and `user-agent` so they can be
+placed; `host` is skipped for origins the `OriginTable` has seen on HTTP/2, via
+`NetPolicy::speaks_h2`), and a `proxy`
 (`proxy.rs`) that defaults to reading `HTTP_PROXY` and friends from the environment. The fetcher
 builds **two** `reqwest` clients: one with automatic gzip/brotli/deflate decoding (`auto_decode:
 true`) and one that returns raw bytes (`auto_decode: false`); the flag is part of the coalescing
