@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `FetcherConfig::redirect_timeout` (default 30 s): a wall-clock budget for following
+  redirects, counted from the first redirect response up to the final response headers.
+  Until now only the hop count was capped, so a chain of slow hops could take up to
+  `MAX_REDIRECTS` times the request timeout. A request that is not redirected is unaffected.
+  `None` disables the budget. Overridable per request with `FetchRequest::redirect_timeout`
+  (`with_redirect_timeout` / `without_redirect_timeout` on the builder), and available to
+  direct users of `net::fetch` as `RequestInit::redirect_timeout` (`with_redirect_timeout`),
+  where it defaults to no limit as before (#16)
+
+
+### Added
+
 - Per-request timeout overrides on `FetchRequest`: `req_timeout`, `read_idle_timeout`, and
   `total_body_timeout` each override the same-named `FetcherConfig` setting for one request and
   inherit it when unset. The builder gains `with_req_timeout`, `with_read_idle_timeout`,

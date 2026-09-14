@@ -371,6 +371,10 @@ pub struct RequestInit {
     /// Time allowed from sending the first request byte until the response headers arrive,
     /// applied to every hop. `None` leaves it to the client's own request timeout.
     pub timeout: Option<Duration>,
+    /// Wall-clock budget for following redirects. Starts when the first redirect response
+    /// arrives and must cover every later hop up to the final response headers. `None` sets
+    /// no limit; the hop count is still capped.
+    pub redirect_timeout: Option<Duration>,
 }
 
 impl Default for RequestInit {
@@ -411,6 +415,7 @@ impl RequestInit {
             auto_decode: true,
             header_order: None,
             timeout: None,
+            redirect_timeout: None,
         }
     }
 
@@ -476,6 +481,13 @@ impl RequestInit {
     /// Sets the order in which headers are sent. `None` keeps insertion order.
     pub fn with_header_order(mut self, order: Option<Vec<HeaderName>>) -> Self {
         self.header_order = order;
+        self
+    }
+
+    /// Bounds the time spent following redirects, counted from the first redirect response.
+    /// `None` sets no limit.
+    pub fn with_redirect_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.redirect_timeout = timeout;
         self
     }
 }
@@ -1438,7 +1450,11 @@ async fn get_with_redirects(
     #[cfg(not(target_arch = "wasm32"))]
     let credentials_include = init.credentials == RequestCredentials::Include;
 
-    for _ in 0..MAX_REDIRECTS {
+    // Armed by the first redirect; `None` until then, and for good without a budget.
+    let mut redirect_deadline: Option<tokio::time::Instant> = None;
+
+    // `redirects` counts the redirects followed so far.
+    for redirects in 0..MAX_REDIRECTS {
         // HSTS upgrade first: a stored policy forces `https` for a known host regardless of the
         // mixed-content setting. `hop_checks` then re-checks the scheme and mixed content on the
         // (possibly upgraded) URL and runs `url_allowed` last, so the policy hook always vets the
@@ -1826,6 +1842,13 @@ async fn get_with_redirects(
 
                 let fut = client.execute(request);
                 tokio::pin!(fut);
+                let deadline = async {
+                    match redirect_deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::pin!(deadline);
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     requested_at = chrono::Utc::now();
@@ -1835,6 +1858,13 @@ async fn get_with_redirects(
                     _ = cancel.cancelled() => {
                         observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled net.get_with_redirects" });
                         return Err(NetError::Cancelled("cancelled net.get_with_redirects".into()));
+                    }
+                    _ = &mut deadline => {
+                        return Err(NetError::Timeout(format!(
+                            "redirect chain exceeded {:?} after {} redirects",
+                            init.redirect_timeout.unwrap_or_default(),
+                            redirects
+                        )));
                     }
                     r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer))?
                 };
@@ -2030,6 +2060,14 @@ async fn get_with_redirects(
                 #[cfg(not(target_arch = "wasm32"))]
                 store: pending_store,
             });
+        }
+
+        // The budget starts here rather than at the first request, so a request that is not
+        // redirected is bounded by the request timeout alone.
+        if redirect_deadline.is_none() {
+            redirect_deadline = init
+                .redirect_timeout
+                .map(|budget| tokio::time::Instant::now() + budget);
         }
 
         // A redirect is stored now: the caller never sees its body, and a stored `301` lets the
@@ -3054,6 +3092,18 @@ mod tests {
             .route("/hop2", RouteConfig::redirect_to("/hop3"))
             .route("/hop3", RouteConfig::ok(b"final"))
             .route(
+                "/slow-hop1",
+                RouteConfig::redirect_with_delay("/slow-hop2", Duration::from_millis(150)),
+            )
+            .route(
+                "/slow-hop2",
+                RouteConfig::redirect_with_delay("/hop3", Duration::from_millis(150)),
+            )
+            .route(
+                "/late-redirect",
+                RouteConfig::redirect_with_delay("/hop3", Duration::from_millis(300)),
+            )
+            .route(
                 "/chunked",
                 RouteConfig::chunked(vec![b"hel", b"lo ", b"wor", b"ld"]),
             )
@@ -3380,6 +3430,61 @@ mod tests {
         .unwrap();
         assert_eq!(meta.status, 200);
         assert_eq!(&body[..], b"final");
+    }
+
+    /// GET `path` with `redirect_timeout`, returning the result and how long it took.
+    async fn get_with_redirect_timeout(
+        srv: &crate::net::test_support::TestServerHandle,
+        path: &str,
+        redirect_timeout: Option<Duration>,
+    ) -> (Result<(FetchResultMeta, Bytes), NetError>, Duration) {
+        let started = Instant::now();
+        let res = super::fetch_response_complete(
+            client(),
+            srv.url(path),
+            RequestInit::get(HeaderMap::new()).with_redirect_timeout(redirect_timeout),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await;
+        (res, started.elapsed())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_timeout_ends_a_slow_chain() {
+        let srv = server().await;
+        // The first redirect arms the budget; the next hop takes 150 ms, the budget is 100 ms.
+        let (res, elapsed) =
+            get_with_redirect_timeout(&srv, "/slow-hop1", Some(Duration::from_millis(100))).await;
+        assert!(
+            matches!(res, Err(NetError::Timeout(_))),
+            "expected a timeout, got {res:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_timeout_starts_at_the_first_redirect() {
+        let srv = server().await;
+        // The first hop takes 300 ms to answer with its redirect; that wait is the request
+        // timeout's business, not the redirect budget's.
+        let (res, _) =
+            get_with_redirect_timeout(&srv, "/late-redirect", Some(Duration::from_millis(100)))
+                .await;
+        let (meta, body) = res.unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"final");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_redirect_timeout_by_default() {
+        let srv = server().await;
+        let (res, _) = get_with_redirect_timeout(&srv, "/slow-hop1", None).await;
+        assert_eq!(res.unwrap().0.status, 200);
     }
 
     #[tokio::test(flavor = "current_thread")]

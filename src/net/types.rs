@@ -616,6 +616,12 @@ pub struct FetchRequest {
     /// `None` uses the fetcher-wide setting. `Some(None)` removes the deadline for this request
     /// alone, which is what a large download wants; `Some(Some(d))` sets it to `d`.
     pub total_body_timeout: Option<Option<Duration>>,
+    /// Overrides
+    /// [`FetcherConfig::redirect_timeout`](crate::net::fetcher::FetcherConfig::redirect_timeout)
+    /// for this one request: the wall-clock budget for following redirects, counted from the
+    /// first redirect response. `None` uses the fetcher-wide setting, `Some(None)` removes the
+    /// budget for this request, `Some(Some(d))` sets it to `d`.
+    pub redirect_timeout: Option<Option<Duration>>,
     /// HTTP Headers (unified).
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
@@ -832,6 +838,7 @@ pub struct FetchRequestBuilder {
     req_timeout: Option<Duration>,
     read_idle_timeout: Option<Duration>,
     total_body_timeout: Option<Option<Duration>>,
+    redirect_timeout: Option<Option<Duration>>,
     body: Option<RequestBody>,
 }
 
@@ -862,6 +869,7 @@ impl FetchRequestBuilder {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            redirect_timeout: None,
             body: None,
         }
     }
@@ -1019,6 +1027,20 @@ impl FetchRequestBuilder {
         self
     }
 
+    /// Overrides the fetcher's redirect budget for this request: the wall-clock time allowed
+    /// for following redirects, counted from the first redirect response. Default: the
+    /// fetcher's [`redirect_timeout`](crate::net::fetcher::FetcherConfig::redirect_timeout).
+    pub fn with_redirect_timeout(mut self, timeout: Duration) -> Self {
+        self.redirect_timeout = Some(Some(timeout));
+        self
+    }
+
+    /// Removes the redirect budget for this request alone. The hop count is still capped.
+    pub fn without_redirect_timeout(mut self) -> Self {
+        self.redirect_timeout = Some(None);
+        self
+    }
+
     /// Sets the `User-Agent` header for this request, overriding the fetcher's
     /// [`user_agent`](crate::net::fetcher::FetcherConfig::user_agent). A value that is not a
     /// valid header value is ignored. Call it after
@@ -1075,6 +1097,7 @@ impl FetchRequestBuilder {
             req_timeout: self.req_timeout,
             read_idle_timeout: self.read_idle_timeout,
             total_body_timeout: self.total_body_timeout,
+            redirect_timeout: self.redirect_timeout,
             body: self.body,
         }
     }
@@ -1163,6 +1186,23 @@ mod tests {
         assert_eq!(req.read_idle_timeout, Some(Duration::from_secs(2)));
         assert_eq!(req.total_body_timeout, Some(Some(Duration::from_secs(3))));
         assert_eq!(req.headers[header::USER_AGENT], "custom/1.0");
+    }
+
+    #[test]
+    fn builder_redirect_timeout() {
+        let url = Url::parse("http://a/").unwrap();
+        let req = FetchRequest::builder(Method::GET, url.clone()).build();
+        assert_eq!(req.redirect_timeout, None);
+
+        let req = FetchRequest::builder(Method::GET, url.clone())
+            .with_redirect_timeout(Duration::from_secs(3))
+            .build();
+        assert_eq!(req.redirect_timeout, Some(Some(Duration::from_secs(3))));
+
+        let req = FetchRequest::builder(Method::GET, url)
+            .without_redirect_timeout()
+            .build();
+        assert_eq!(req.redirect_timeout, Some(None));
     }
 
     #[test]
