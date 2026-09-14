@@ -67,6 +67,12 @@ pub struct FetcherConfig {
     /// Wall-clock deadline for receiving the entire response body after headers.
     /// `None` disables the deadline (useful for very large downloads).
     pub total_body_timeout: Option<Duration>,
+    /// Wall-clock budget for following redirects. Starts when the first redirect response
+    /// arrives and must cover every later hop up to the final response headers, so a chain
+    /// of slow hops cannot take up to `MAX_REDIRECTS` times `req_timeout`. A request that is
+    /// not redirected is unaffected. `None` disables the budget; the hop count is still
+    /// capped. Overridable per request via [`FetchRequest::redirect_timeout`].
+    pub redirect_timeout: Option<Duration>,
 
     /// Maximum idle connections kept in the pool **per host**.
     /// Without a cap, reqwest keeps every connection ever opened until it idles out.
@@ -195,6 +201,7 @@ impl Default for FetcherConfig {
             req_timeout: Duration::from_secs(60),
             read_idle_timeout: Duration::from_secs(15),
             total_body_timeout: Some(Duration::from_secs(180)),
+            redirect_timeout: Some(Duration::from_secs(30)),
             pool_max_idle_per_host: 6,
             pool_idle_timeout: Some(Duration::from_secs(90)),
             tcp_keepalive: Some(Duration::from_secs(60)),
@@ -775,6 +782,7 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
                 .or_else(|| cfg.header_order.clone()),
         )
         .with_timeout(req.req_timeout)
+        .with_redirect_timeout(req.redirect_timeout.unwrap_or(cfg.redirect_timeout))
 }
 
 /// The read idle timeout in force for `req`: its own override, else the fetcher's.
@@ -1091,6 +1099,14 @@ mod tests {
                 RouteConfig::delay(Duration::from_millis(50), b"coalesced".to_vec()),
             )
             .route("/hang", RouteConfig::hang_after_connect())
+            .route(
+                "/slow-hop1",
+                RouteConfig::redirect_with_delay("/slow-hop2", Duration::from_millis(150)),
+            )
+            .route(
+                "/slow-hop2",
+                RouteConfig::redirect_with_delay("/fast", Duration::from_millis(150)),
+            )
             .route("/fast", RouteConfig::ok(b"x"))
             // 12 KiB dribbled in 1 KiB chunks: headers arrive immediately, the body takes
             // ~360 ms, so tests can watch a stream while it is still in progress.
@@ -1134,6 +1150,7 @@ mod tests {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            redirect_timeout: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1169,6 +1186,7 @@ mod tests {
                 req_timeout: None,
                 read_idle_timeout: None,
                 total_body_timeout: None,
+                redirect_timeout: None,
                 streaming: false,
                 auto_decode: true,
                 max_bytes: None,
@@ -1396,6 +1414,7 @@ mod tests {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            redirect_timeout: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1556,6 +1575,7 @@ mod tests {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            redirect_timeout: None,
             streaming: true,
             auto_decode: true,
             max_bytes: None,
@@ -2353,6 +2373,49 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_redirect_timeout_overrides_fetcher_timeout() {
+        let srv = start_server().await;
+        // ~300 ms of redirect hops. The fetcher allows 5 s; the request allows 100 ms.
+        let cfg = FetcherConfig {
+            redirect_timeout: Some(Duration::from_secs(5)),
+            ..test_config()
+        };
+        let req = FetchRequest::builder(Method::GET, srv.url("/slow-hop1"))
+            .with_redirect_timeout(Duration::from_millis(100))
+            .build();
+        let (result, elapsed) = fetch_one(cfg, req).await;
+        assert!(result.is_error(), "expected a timeout, got {result:?}");
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_redirect_timeout_can_be_lifted() {
+        let srv = start_server().await;
+        let cfg = FetcherConfig {
+            redirect_timeout: Some(Duration::from_millis(100)),
+            ..test_config()
+        };
+        let (result, _) = fetch_one(
+            cfg.clone(),
+            make_req(srv.url("/slow-hop1"), Priority::Normal).0,
+        )
+        .await;
+        assert!(result.is_error(), "100 ms is not enough for 300 ms of hops");
+
+        let req = FetchRequest::builder(Method::GET, srv.url("/slow-hop1"))
+            .without_redirect_timeout()
+            .build();
+        let (result, _) = fetch_one(cfg, req).await;
+        match result {
+            FetchResult::Buffered { meta, body } => {
+                assert_eq!(meta.status, 200);
+                assert_eq!(&body[..], b"x");
+            }
+            other => panic!("expected a buffered 200, got {other:?}"),
+        }
+    }
+
     /// Drive one request through a fetcher configured with `cfg_policy`, where the request
     /// itself carries `req_policy`, and report whether it was blocked.
     async fn mixed_content_blocked(
@@ -2496,6 +2559,7 @@ mod tests {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            redirect_timeout: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -2864,6 +2928,7 @@ mod tests {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            redirect_timeout: None,
             streaming: false,
             auto_decode,
             max_bytes: None,
