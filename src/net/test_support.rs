@@ -97,6 +97,14 @@ pub enum RouteConfig {
         /// Path to redirect to
         path: String,
     },
+    /// Wait `delay`, then 302 redirect to another `path` on this server. Use to exercise the
+    /// redirect chain deadline.
+    RedirectWithDelay {
+        /// Path to redirect to
+        target: String,
+        /// Sleep before responding
+        delay: Duration,
+    },
     /// 307 redirect to another `path` on this server. Unlike the 302 variants, the client
     /// must preserve the method and replay the request body.
     Redirect307(String),
@@ -370,6 +378,13 @@ impl RouteConfig {
             path: path.into(),
         }
     }
+    /// Shorthand for [`RouteConfig::RedirectWithDelay`]
+    pub fn redirect_with_delay(path: impl Into<String>, delay: Duration) -> Self {
+        Self::RedirectWithDelay {
+            target: path.into(),
+            delay,
+        }
+    }
     /// Shorthand for [`RouteConfig::Redirect307`]
     pub fn redirect_307(path: impl Into<String>) -> Self {
         Self::Redirect307(path.into())
@@ -609,6 +624,14 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             let hdr = format!(
                 "HTTP/1.1 302 Found\r\nLocation: {}{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 target, path
+            );
+            let _ = stream.write_all(hdr.as_bytes()).await;
+        }
+        RouteConfig::RedirectWithDelay { target, delay } => {
+            tokio::time::sleep(delay).await;
+            let hdr = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {}{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                base, target
             );
             let _ = stream.write_all(hdr.as_bytes()).await;
         }

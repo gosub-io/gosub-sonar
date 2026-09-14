@@ -316,7 +316,9 @@ only, honouring `Retry-After`. Streams are retried only until headers arrive.
 Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enforced by `reqwest`
 (`req_timeout` is reqwest's total request timeout, so it covers the body as well as the headers);
 `read_idle_timeout` (max gap between reads) and `total_body_timeout` (whole-body budget) are
-enforced in the read loops of `fetch_response_complete` and the `ProgressReader`/`SharedBody` path.
+enforced in the read loops of `fetch_response_complete` and the `ProgressReader`/`SharedBody` path;
+`redirect_timeout` (budget for the redirect chain, armed by the first redirect) is enforced in
+`get_with_redirects` around each hop's send.
 A `FetchRequest` can override `req_timeout`, `read_idle_timeout`, and `total_body_timeout` for
 itself (`with_req_timeout`, `with_read_idle_timeout`, `with_total_body_timeout`,
 `without_total_body_timeout`); `make_request_init` and `effective_*_timeout` in `fetcher.rs`
@@ -346,7 +348,8 @@ connection goes to exactly the addresses it returns (a rebound name can't redire
 connection). Return `Err` to refuse a host. `url_allowed` checks URLs, the resolver checks
 addresses; a policy usually wants both. Native-only.
 
-Redirects are handled manually in `get_with_redirects` (up to `MAX_REDIRECTS` = 20 hops) with
+Redirects are handled manually in `get_with_redirects` (up to `MAX_REDIRECTS` = 20 hops and
+within `redirect_timeout`) with
 browser-matching semantics:
 
 - Method/body downgraded on 301/302/303, preserved on 307/308 (RFC 7231 §6.4).
