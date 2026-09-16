@@ -59,6 +59,17 @@ pub enum RouteConfig {
     OkWithHeaders(Vec<(String, String)>, Vec<u8>),
     /// Respond with `code` and `body` immediately.
     Status(u16, Vec<u8>),
+    /// Respond with `code` and `headers` to the first `failures` requests, then 200 + `body`.
+    StatusThenOk {
+        /// Status of the failing responses
+        code: u16,
+        /// Extra response headers on the failing responses, e.g. `Retry-After`
+        headers: Vec<(String, String)>,
+        /// How many requests fail before one succeeds
+        failures: usize,
+        /// Body of the successful response
+        body: Vec<u8>,
+    },
     /// Wait `delay` before sending 200 + `body` (simulates a slow server).
     Delay(Duration, Vec<u8>),
     /// Send headers and `initial` body bytes immediately, then stall for `stall` before
@@ -317,6 +328,15 @@ impl RouteConfig {
     pub fn status(code: u16, body: impl Into<Vec<u8>>) -> Self {
         Self::Status(code, body.into())
     }
+    /// Shorthand for [`RouteConfig::StatusThenOk`] without extra headers
+    pub fn status_then_ok(code: u16, failures: usize, body: impl Into<Vec<u8>>) -> Self {
+        Self::StatusThenOk {
+            code,
+            headers: Vec::new(),
+            failures,
+            body: body.into(),
+        }
+    }
     /// Shorthand for [`RouteConfig::Delay`]
     pub fn delay(d: Duration, body: impl Into<Vec<u8>>) -> Self {
         Self::Delay(d, body.into())
@@ -510,6 +530,28 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
         RouteConfig::Delay(d, body) => {
             tokio::time::sleep(d).await;
             send_response(&mut stream, 200, &body).await;
+        }
+        RouteConfig::StatusThenOk {
+            code,
+            headers,
+            failures,
+            body,
+        } => {
+            if hit_no > failures {
+                send_response(&mut stream, 200, &body).await;
+            } else {
+                let extra: String = headers
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {v}\r\n"))
+                    .collect();
+                let hdr = format!(
+                    "HTTP/1.1 {} {}\r\n{}Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    code,
+                    reason(code),
+                    extra
+                );
+                let _ = stream.write_all(hdr.as_bytes()).await;
+            }
         }
         RouteConfig::StallMidBody { initial, stall } => {
             // Declare more bytes than we send so the client waits.
@@ -1300,6 +1342,23 @@ impl RecordingObserver {
     /// True when no events have been recorded.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+impl RecordingObserver {
+    /// `(attempt, reason)` of each [`NetEvent::Retrying`] recorded, in order.
+    pub fn retries(&self) -> Vec<(u32, String)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Retrying {
+                    attempt, reason, ..
+                } => Some((*attempt, reason.clone())),
+                _ => None,
+            })
+            .collect()
     }
 }
 

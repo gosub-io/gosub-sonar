@@ -35,6 +35,7 @@ pub use net::observer::NetObserver;
 pub use net::proxy::{ProxyAuth, ProxyConfig, ProxyRule, ProxyScope};
 pub use net::referrer::ReferrerPolicy;
 pub use net::request_ref::RequestReference;
+pub use net::retry::RetryPolicy;
 pub use net::shared_body::SharedBody;
 pub use net::simple::simple_get;
 #[cfg(not(target_arch = "wasm32"))]

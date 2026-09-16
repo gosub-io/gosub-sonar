@@ -109,6 +109,10 @@ itself: `with_req_timeout` (waiting for headers, per hop), `with_read_idle_timeo
 between body chunks), and `with_total_body_timeout` (the whole body). A large download that must
 not be cut off by the fetcher-wide body deadline uses `without_total_body_timeout()`.
 
+Transient failures (connect errors, broken transfers, 502/503/504) are retried for idempotent
+requests, twice with backoff by default. `FetcherConfig::retry` holds the `RetryPolicy` (`None`
+disables); `with_retry` / `without_retry` override it per request. `Retry-After` is honoured.
+
 `FetcherConfig::header_order` (or `with_header_order` on a request) sets the order in which
 headers are sent, `host` and `user-agent` included. Some servers fingerprint clients on header
 order, so a browser engine can match the browser it imitates. Native only.

@@ -90,10 +90,10 @@ impl TransportError {
             TransportErrorKind::Connect
         } else if e.is_redirect() {
             TransportErrorKind::Redirect
+        } else if e.is_body() || wraps_body_error(e) {
+            TransportErrorKind::Body
         } else if e.is_decode() {
             TransportErrorKind::Decode
-        } else if e.is_body() {
-            TransportErrorKind::Body
         } else if e.is_builder() {
             TransportErrorKind::Builder
         } else if e.is_request() {
@@ -107,6 +107,37 @@ impl TransportError {
             message: flatten(e),
         }
     }
+}
+
+/// Whether a broken transfer sits somewhere under `e`. A decoding client reports one as a
+/// decode error, wrapping either the client's own body error or an `io::Error` whose kind says
+/// the connection ended. `io::Error::source()` skips its inner error, so that is descended into
+/// by hand.
+fn wraps_body_error(e: &reqwest::Error) -> bool {
+    use std::io::ErrorKind::*;
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = cur {
+        if err
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_body())
+        {
+            return true;
+        }
+        let io = err.downcast_ref::<std::io::Error>();
+        if io.is_some_and(|io| {
+            matches!(
+                io.kind(),
+                UnexpectedEof | ConnectionReset | ConnectionAborted | BrokenPipe
+            )
+        }) {
+            return true;
+        }
+        cur = match io.and_then(|io| io.get_ref()) {
+            Some(inner) => Some(inner),
+            None => err.source(),
+        };
+    }
+    false
 }
 
 /// Join an error with its source chain into one line.
@@ -156,6 +187,33 @@ mod tests {
             err.message.len() > e.to_string().len(),
             "source chain was not flattened into the message: {:?}",
             err.message
+        );
+    }
+
+    /// With decompression on, the client reports a transfer that broke off as a decode error.
+    /// It is a transfer failure all the same.
+    #[tokio::test]
+    async fn a_transfer_that_breaks_behind_the_decoder_is_a_body_failure() {
+        use crate::net::test_support::{RouteConfig, TestServer};
+        let srv = TestServer::new()
+            .route("/drop", RouteConfig::drop_mid_body(100, 10_000))
+            .start()
+            .await;
+        let e = reqwest::Client::builder()
+            .gzip(true)
+            .build()
+            .unwrap()
+            .get(srv.url("/drop"))
+            .send()
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap_err();
+        assert!(e.is_decode(), "{e:?}");
+        assert_eq!(
+            TransportError::from_client(&e).kind,
+            TransportErrorKind::Body
         );
     }
 
