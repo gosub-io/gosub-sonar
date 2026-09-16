@@ -957,6 +957,7 @@ fn build_policy(
         let proxy = cfg.proxy.clone();
         let policy = policy
             .with_proxy_authorization(Box::new(move |url| proxy.proxy_authorization(url)))
+            .with_dns_resolver(cfg.dns_resolver.clone())
             .with_hsts(cfg.hsts.clone())
             .with_cache(cfg.cache.clone());
         match cfg.cors_preflight_cache.clone() {

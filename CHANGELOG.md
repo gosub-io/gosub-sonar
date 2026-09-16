@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security:** a `FetcherConfig::dns_resolver` never saw an IP-literal host. The client
+  connects to a literal without resolving it, so a resolver refusing internal ranges could be
+  sidestepped with `http://169.254.169.254/` or `http://[::1]/`, on the initial URL or a
+  redirect. The fetcher now asks the resolver about a literal host itself, with the literal
+  as the name; a refusal fails the hop as a refused name does. `NetPolicy::dns_resolver`
+  (native only) carries it for direct users of `net::fetch`
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect
