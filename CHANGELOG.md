@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A caller coalesced onto a streamed fetch could receive a truncated body with a clean end:
+  every listener shared one body, whichever subscribed first started it, and later ones
+  missed what had been pushed. The fetcher now reserves a seat per listener
+  (`SharedBody::reserve`); chunks are kept, up to 4 MiB, until every seat is claimed, so each
+  listener starts from the beginning, and a seat claimed past that gets an error instead of a
+  short body
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect

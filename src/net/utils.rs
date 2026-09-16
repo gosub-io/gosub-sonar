@@ -178,6 +178,9 @@ impl Waiter {
                     }
                 }
 
+                // Every listener starts from the beginning however late it subscribes.
+                shared.reserve(streaming_ls.len() + usize::from(!buffered_ls.is_empty()));
+
                 for tx in streaming_ls {
                     let res = FetchResult::Stream {
                         meta: meta.clone(),
@@ -454,6 +457,50 @@ mod tests {
         let r2 = rx2.await.unwrap();
         assert!(matches!(r1, FetchResult::Error(_)));
         assert!(matches!(r2, FetchResult::Error(_)));
+    }
+
+    /// A coalesced streaming listener that subscribes after another has read the body still
+    /// gets all of it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_streaming_listener_gets_the_whole_body() {
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let waiter = Waiter::new_arc();
+        waiter.register(tx1, true);
+        waiter.register(tx2, true);
+
+        let shared = Arc::new(SharedBody::new(8));
+        let shared_clone = shared.clone();
+        tokio::spawn(async move {
+            shared_clone.push(Bytes::from_static(b"-tail"));
+            shared_clone.finish();
+        });
+        waiter
+            .finish(FetchResult::Stream {
+                meta: dummy_meta(),
+                peek_buf: PeekBuf::from_slice(b"head"),
+                shared,
+            })
+            .await;
+
+        let read = |r: FetchResult| async move {
+            match r {
+                FetchResult::Stream {
+                    peek_buf, shared, ..
+                } => {
+                    let mut out = Vec::new();
+                    SharedBody::combined_reader(peek_buf, shared)
+                        .read_to_end(&mut out)
+                        .await
+                        .unwrap();
+                    out
+                }
+                other => panic!("expected a stream, got {other:?}"),
+            }
+        };
+        // the first listener drains the body before the second even subscribes
+        assert_eq!(read(rx1.await.unwrap()).await, b"head-tail");
+        assert_eq!(read(rx2.await.unwrap()).await, b"head-tail");
     }
 
     #[tokio::test(flavor = "current_thread")]
