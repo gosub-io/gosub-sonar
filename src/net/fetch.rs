@@ -308,6 +308,7 @@ impl Default for NetPolicy {
             proxy_authorization: None,
             #[cfg(not(target_arch = "wasm32"))]
             proxy_for: None,
+            #[cfg(not(target_arch = "wasm32"))]
             dns_resolver: None,
         }
     }
@@ -343,6 +344,7 @@ impl NetPolicy {
             proxy_authorization: None,
             #[cfg(not(target_arch = "wasm32"))]
             proxy_for: None,
+            #[cfg(not(target_arch = "wasm32"))]
             dns_resolver: None,
         }
     }
