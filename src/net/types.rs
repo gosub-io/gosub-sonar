@@ -6,6 +6,7 @@ use crate::net::fetch_metadata::{RequestDestination, RequestMode};
 use crate::net::mixed_content::{is_origin_potentially_trustworthy, MixedContentPolicy};
 use crate::net::referrer::{self, ReferrerPolicy};
 use crate::net::request_ref::RequestReference;
+use crate::net::retry::RetryPolicy;
 use crate::net::shared_body::SharedBody;
 use crate::net::tls::TlsError;
 use crate::net::transport::TransportError;
@@ -616,6 +617,9 @@ pub struct FetchRequest {
     /// `None` uses the fetcher-wide setting. `Some(None)` removes the deadline for this request
     /// alone, which is what a large download wants; `Some(Some(d))` sets it to `d`.
     pub total_body_timeout: Option<Option<Duration>>,
+    /// Overrides [`FetcherConfig::retry`](crate::net::fetcher::FetcherConfig::retry) for this
+    /// request. `None` inherits, `Some(None)` disables, `Some(Some(p))` uses `p`.
+    pub retry: Option<Option<RetryPolicy>>,
     /// HTTP Headers (unified).
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
@@ -832,6 +836,7 @@ pub struct FetchRequestBuilder {
     req_timeout: Option<Duration>,
     read_idle_timeout: Option<Duration>,
     total_body_timeout: Option<Option<Duration>>,
+    retry: Option<Option<RetryPolicy>>,
     body: Option<RequestBody>,
 }
 
@@ -862,6 +867,7 @@ impl FetchRequestBuilder {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            retry: None,
             body: None,
         }
     }
@@ -1019,6 +1025,19 @@ impl FetchRequestBuilder {
         self
     }
 
+    /// Sets the retry policy for this request, overriding the fetcher's
+    /// [`retry`](crate::net::fetcher::FetcherConfig::retry).
+    pub fn with_retry(mut self, policy: RetryPolicy) -> Self {
+        self.retry = Some(Some(policy));
+        self
+    }
+
+    /// Disables retries for this request.
+    pub fn without_retry(mut self) -> Self {
+        self.retry = Some(None);
+        self
+    }
+
     /// Sets the `User-Agent` header for this request, overriding the fetcher's
     /// [`user_agent`](crate::net::fetcher::FetcherConfig::user_agent). A value that is not a
     /// valid header value is ignored. Call it after
@@ -1075,6 +1094,7 @@ impl FetchRequestBuilder {
             req_timeout: self.req_timeout,
             read_idle_timeout: self.read_idle_timeout,
             total_body_timeout: self.total_body_timeout,
+            retry: self.retry,
             body: self.body,
         }
     }
@@ -1163,6 +1183,27 @@ mod tests {
         assert_eq!(req.read_idle_timeout, Some(Duration::from_secs(2)));
         assert_eq!(req.total_body_timeout, Some(Some(Duration::from_secs(3))));
         assert_eq!(req.headers[header::USER_AGENT], "custom/1.0");
+    }
+
+    #[test]
+    fn builder_retry() {
+        let url = Url::parse("http://a/").unwrap();
+        let req = FetchRequest::builder(Method::GET, url.clone()).build();
+        assert_eq!(req.retry, None);
+
+        let policy = RetryPolicy {
+            max_retries: 5,
+            ..RetryPolicy::default()
+        };
+        let req = FetchRequest::builder(Method::GET, url.clone())
+            .with_retry(policy.clone())
+            .build();
+        assert_eq!(req.retry, Some(Some(policy)));
+
+        let req = FetchRequest::builder(Method::GET, url)
+            .without_retry()
+            .build();
+        assert_eq!(req.retry, Some(None));
     }
 
     #[test]

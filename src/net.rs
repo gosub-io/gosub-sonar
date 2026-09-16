@@ -36,6 +36,7 @@ pub mod proxy;
 pub mod pump;
 pub mod referrer;
 pub mod request_ref;
+pub mod retry;
 pub mod shared_body;
 pub mod simple;
 pub mod tls;

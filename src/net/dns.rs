@@ -181,6 +181,8 @@ mod tests {
             connect_timeout: Duration::from_secs(2),
             req_timeout: Duration::from_secs(5),
             dns_resolver: Some(resolver),
+            // these tests count lookups
+            retry: None,
             ..FetcherConfig::default()
         }
     }

@@ -307,6 +307,10 @@ Cancellation is layered with `tokio_util::sync::CancellationToken`:
 - A `shutdown` token passed to `Fetcher::run` stops the whole scheduler and unblocks pending
   semaphore acquisitions.
 
+Retries (`retry.rs`): `perform_buffered` and `perform_streaming` wrap each attempt in
+`with_retries`, which re-sends after a backoff on a retryable error or status, idempotent methods
+only, honouring `Retry-After`. Streams are retried only until headers arrive.
+
 Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enforced by `reqwest`;
 `read_idle_timeout` (max gap between reads) and `total_body_timeout` (whole-body budget) are
 enforced in the read loops of `fetch_response_complete` and the `ProgressReader`/`SharedBody` path.

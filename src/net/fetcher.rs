@@ -19,6 +19,7 @@ use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::proxy::ProxyConfig;
+use crate::net::retry::{self, RetryPolicy};
 use crate::net::shared_body::{ReaderOptions, SharedBody};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::tls::TlsOverrideStore;
@@ -183,6 +184,11 @@ pub struct FetcherConfig {
     /// Native-only: on wasm32 the browser's `fetch()` owns name resolution.
     #[cfg(not(target_arch = "wasm32"))]
     pub dns_resolver: Option<Arc<dyn DnsResolver>>,
+
+    /// Retry of transient failures (connect errors, broken transfers, 502/503/504) for
+    /// idempotent requests. Defaults to two retries with backoff; `None` disables.
+    /// Overridable per request via [`FetchRequest::retry`]. See [`retry`](mod@crate::net::retry).
+    pub retry: Option<RetryPolicy>,
 }
 
 impl Default for FetcherConfig {
@@ -214,6 +220,7 @@ impl Default for FetcherConfig {
             proxy: ProxyConfig::default(),
             #[cfg(not(target_arch = "wasm32"))]
             dns_resolver: None,
+            retry: Some(RetryPolicy::default()),
         }
     }
 }
@@ -960,6 +967,14 @@ fn build_policy(
     policy
 }
 
+/// Request override if set, else the fetcher's.
+fn effective_retry<'a>(req: &'a FetchRequest, cfg: &'a FetcherConfig) -> Option<&'a RetryPolicy> {
+    match &req.retry {
+        Some(own) => own.as_ref(),
+        None => cfg.retry.as_ref(),
+    }
+}
+
 async fn perform_streaming(
     client: &reqwest::Client,
     observer: Arc<dyn NetObserver + Send + Sync>,
@@ -969,19 +984,29 @@ async fn perform_streaming(
     ctx: Arc<dyn FetcherContext>,
     origins: Arc<OriginTable>,
 ) -> Result<FetchResult, NetError> {
-    let policy = build_policy(cfg, &ctx, origins);
-
+    let client = Arc::new(client.clone());
+    // Only the header phase is retried; the body goes straight to the caller.
     let ResponseTop {
         meta,
         peek_buf,
         reader,
-    } = fetch_response_top(
-        Arc::new(client.clone()),
-        req.url.clone(),
-        make_request_init(req, cfg),
-        cancel.clone(),
-        observer.clone(),
-        policy,
+    } = retry::with_retries(
+        effective_retry(req, cfg),
+        &req.method,
+        &req.url,
+        &cancel,
+        &observer,
+        || {
+            fetch_response_top(
+                client.clone(),
+                req.url.clone(),
+                make_request_init(req, cfg),
+                cancel.clone(),
+                observer.clone(),
+                build_policy(cfg, &ctx, origins.clone()),
+            )
+        },
+        |top| (top.meta.status, &top.meta.headers),
     )
     .await?;
 
@@ -1017,18 +1042,27 @@ async fn perform_buffered(
     ctx: Arc<dyn FetcherContext>,
     origins: Arc<OriginTable>,
 ) -> Result<FetchResult, NetError> {
-    let policy = build_policy(cfg, &ctx, origins);
-
-    let (meta, body) = fetch_response_complete(
-        Arc::new(client.clone()),
-        req.url.clone(),
-        make_request_init(req, cfg),
-        cancel.clone(),
-        observer,
-        req.max_bytes,
-        effective_read_idle_timeout(req, cfg),
-        effective_total_body_timeout(req, cfg),
-        policy,
+    let client = Arc::new(client.clone());
+    let (meta, body) = retry::with_retries(
+        effective_retry(req, cfg),
+        &req.method,
+        &req.url,
+        &cancel,
+        &observer,
+        || {
+            fetch_response_complete(
+                client.clone(),
+                req.url.clone(),
+                make_request_init(req, cfg),
+                cancel.clone(),
+                observer.clone(),
+                req.max_bytes,
+                effective_read_idle_timeout(req, cfg),
+                effective_total_body_timeout(req, cfg),
+                build_policy(cfg, &ctx, origins.clone()),
+            )
+        },
+        |(meta, _)| (meta.status, &meta.headers),
     )
     .await?;
 
@@ -1058,7 +1092,8 @@ mod tests {
     use crate::net::fetcher_context::NullContext;
     use crate::net::proxy::ProxyRule;
     use crate::net::request_ref::RequestReference;
-    use crate::net::test_support::{RouteConfig, TestServer};
+    use crate::net::test_support::{RecordingObserver, RouteConfig, TestServer};
+    use crate::net::transport::TransportErrorKind;
     use crate::net::types::{
         BlockReason, FetchRequest, FetchRequestBuilder, Initiator, ResourceKind,
     };
@@ -1076,6 +1111,8 @@ mod tests {
             req_timeout: Duration::from_secs(5),
             read_idle_timeout: Duration::from_secs(2),
             total_body_timeout: Some(Duration::from_secs(10)),
+            // Tests expecting errors want them immediately. Retry tests opt in.
+            retry: None,
             ..FetcherConfig::default()
         }
     }
@@ -1106,6 +1143,27 @@ mod tests {
                 RouteConfig::delay(Duration::from_millis(60), b"ok".to_vec()),
             )
             .route("/not-found", RouteConfig::status(404, b"not found"))
+            .route("/drop", RouteConfig::drop_mid_body(100, 10_000))
+            .route("/flaky", RouteConfig::status_then_ok(503, 2, b"recovered"))
+            .route("/down", RouteConfig::status_then_ok(503, 100, b"never"))
+            .route(
+                "/flaky-retry-after",
+                RouteConfig::StatusThenOk {
+                    code: 503,
+                    headers: vec![("Retry-After".into(), "0".into())],
+                    failures: 1,
+                    body: b"recovered".to_vec(),
+                },
+            )
+            .route(
+                "/down-retry-after",
+                RouteConfig::StatusThenOk {
+                    code: 503,
+                    headers: vec![("Retry-After".into(), "3600".into())],
+                    failures: 100,
+                    body: b"never".to_vec(),
+                },
+            )
             .route("/error", RouteConfig::status(500, b"server error"))
             .start()
             .await
@@ -1134,6 +1192,7 @@ mod tests {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            retry: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1169,6 +1228,7 @@ mod tests {
                 req_timeout: None,
                 read_idle_timeout: None,
                 total_body_timeout: None,
+                retry: None,
                 streaming: false,
                 auto_decode: true,
                 max_bytes: None,
@@ -1396,6 +1456,7 @@ mod tests {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            retry: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -1556,6 +1617,7 @@ mod tests {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            retry: None,
             streaming: true,
             auto_decode: true,
             max_bytes: None,
@@ -2353,6 +2415,213 @@ mod tests {
         );
     }
 
+    fn quick_retry() -> RetryPolicy {
+        RetryPolicy {
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(20),
+            ..RetryPolicy::default()
+        }
+    }
+
+    fn retrying_config() -> FetcherConfig {
+        FetcherConfig {
+            retry: Some(quick_retry()),
+            ..test_config()
+        }
+    }
+
+    /// Context handing out one shared `RecordingObserver`.
+    struct Recording(Arc<RecordingObserver>);
+    impl FetcherContext for Recording {
+        fn observer_for(
+            &self,
+            _: RequestReference,
+            _: RequestId,
+            _: ResourceKind,
+            _: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            self.0.clone()
+        }
+        fn on_ref_active(&self, _: RequestReference) {}
+        fn on_ref_done(&self, _: RequestReference) {}
+    }
+
+    /// `fetch_one` with a recording observer.
+    async fn fetch_recorded(
+        cfg: FetcherConfig,
+        req: FetchRequest,
+    ) -> (FetchResult, Arc<RecordingObserver>) {
+        fetch_recorded_within(cfg, req, Duration::from_secs(5)).await
+    }
+
+    async fn fetch_recorded_within(
+        cfg: FetcherConfig,
+        req: FetchRequest,
+        budget: Duration,
+    ) -> (FetchResult, Arc<RecordingObserver>) {
+        let log = Arc::new(RecordingObserver::new());
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(Recording(log.clone()))).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, CancellationToken::new(), tx).await;
+        let result = tokio::time::timeout(budget, rx).await.unwrap().unwrap();
+        shutdown.cancel();
+        (result, log)
+    }
+
+    fn status_of(result: &FetchResult) -> u16 {
+        match result {
+            FetchResult::Buffered { meta, .. } | FetchResult::Stream { meta, .. } => meta.status,
+            FetchResult::Error(e) => panic!("expected a response, got {e}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_recovers_from_transient_5xx() {
+        let srv = start_server().await;
+        let (result, log) = fetch_recorded(
+            retrying_config(),
+            make_req(srv.url("/flaky"), Priority::Normal).0,
+        )
+        .await;
+        match result {
+            FetchResult::Buffered { meta, body } => {
+                assert_eq!(meta.status, 200);
+                assert_eq!(&body[..], b"recovered");
+            }
+            other => panic!("expected the recovered body, got {other:?}"),
+        }
+        assert_eq!(srv.hit_count("/flaky"), 3);
+        let retries = log.retries();
+        assert_eq!(retries.len(), 2, "{retries:?}");
+        assert_eq!(retries[0].0, 1);
+        assert_eq!(retries[1].0, 2);
+        assert!(retries[0].1.contains("503"), "{retries:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_recovers_a_stream() {
+        let srv = start_server().await;
+        let req = FetchRequest::builder(Method::GET, srv.url("/flaky"))
+            .with_streaming(true)
+            .build();
+        let (result, _) = fetch_recorded(retrying_config(), req).await;
+        assert!(matches!(result, FetchResult::Stream { .. }), "{result:?}");
+        assert_eq!(status_of(&result), 200);
+        assert_eq!(srv.hit_count("/flaky"), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_gives_up_after_max_retries() {
+        let srv = start_server().await;
+        let (result, _) = fetch_recorded(
+            retrying_config(),
+            make_req(srv.url("/down"), Priority::Normal).0,
+        )
+        .await;
+        assert_eq!(status_of(&result), 503);
+        assert_eq!(srv.hit_count("/down"), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_skips_non_idempotent_methods() {
+        let srv = start_server().await;
+        let req = FetchRequest::builder(Method::POST, srv.url("/flaky"))
+            .with_body(crate::net::types::RequestBody::text("x"))
+            .build();
+        let (result, log) = fetch_recorded(retrying_config(), req).await;
+        assert_eq!(status_of(&result), 503);
+        assert_eq!(srv.hit_count("/flaky"), 1);
+        assert!(log.retries().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_honours_retry_after() {
+        let srv = start_server().await;
+        let (result, _) = fetch_recorded(
+            retrying_config(),
+            make_req(srv.url("/flaky-retry-after"), Priority::Normal).0,
+        )
+        .await;
+        assert_eq!(status_of(&result), 200);
+        assert_eq!(srv.hit_count("/flaky-retry-after"), 2);
+
+        // Retry-After: 3600 exceeds the 20 ms cap, so no retry.
+        let (result, log) = fetch_recorded(
+            retrying_config(),
+            make_req(srv.url("/down-retry-after"), Priority::Normal).0,
+        )
+        .await;
+        assert_eq!(status_of(&result), 503);
+        assert_eq!(srv.hit_count("/down-retry-after"), 1);
+        assert!(log.retries().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_retries_a_refused_connection() {
+        // Windows takes seconds to refuse a closed loopback port, so give the connect plenty
+        // of room; a timeout is not retried and would end the sequence early.
+        let cfg = FetcherConfig {
+            connect_timeout: Duration::from_secs(20),
+            ..retrying_config()
+        };
+        let (result, log) = fetch_recorded_within(
+            cfg,
+            make_req(Url::parse("http://127.0.0.1:1/").unwrap(), Priority::Normal).0,
+            Duration::from_secs(90),
+        )
+        .await;
+        let retries = log.retries();
+        match &result {
+            FetchResult::Error(NetError::Transport(t)) => match t.kind {
+                TransportErrorKind::Connect => assert_eq!(retries.len(), 2, "{retries:?}"),
+                TransportErrorKind::Timeout => assert!(retries.len() <= 2, "{retries:?}"),
+                _ => panic!("unexpected error kind: {t:?}"),
+            },
+            other => panic!("expected a transport error, got {other:?}"),
+        }
+        for (_, reason) in &retries {
+            assert!(reason.contains("connect"), "{reason}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn retry_retries_a_broken_transfer() {
+        let srv = start_server().await;
+        let (result, log) = fetch_recorded(
+            retrying_config(),
+            make_req(srv.url("/drop"), Priority::Normal).0,
+        )
+        .await;
+        assert!(result.is_error(), "{result:?}");
+        assert_eq!(srv.hit_count("/drop"), 3);
+        assert_eq!(log.retries().len(), 2, "{:?}", log.retries());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_request_retry_overrides_fetcher_retry() {
+        let srv = start_server().await;
+        // fetcher retries, request opts out
+        let req = FetchRequest::builder(Method::GET, srv.url("/flaky"))
+            .without_retry()
+            .build();
+        let (result, _) = fetch_recorded(retrying_config(), req).await;
+        assert_eq!(status_of(&result), 503);
+        assert_eq!(srv.hit_count("/flaky"), 1);
+
+        // fetcher does not retry, request opts in (/flaky has failed once by now)
+        let req = FetchRequest::builder(Method::GET, srv.url("/flaky"))
+            .with_retry(quick_retry())
+            .build();
+        let (result, _) = fetch_recorded(test_config(), req).await;
+        assert_eq!(status_of(&result), 200);
+        assert_eq!(srv.hit_count("/flaky"), 3);
+    }
+
     /// Drive one request through a fetcher configured with `cfg_policy`, where the request
     /// itself carries `req_policy`, and report whether it was blocked.
     async fn mixed_content_blocked(
@@ -2496,6 +2765,7 @@ mod tests {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            retry: None,
             streaming: false,
             auto_decode: true,
             max_bytes: None,
@@ -2864,6 +3134,7 @@ mod tests {
             req_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
+            retry: None,
             streaming: false,
             auto_decode,
             max_bytes: None,

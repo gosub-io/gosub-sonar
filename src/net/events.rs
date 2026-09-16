@@ -199,13 +199,25 @@ pub enum NetEvent {
     /// matching every cause it might have.
     ///
     /// A cancelled request is not a failure: it reports [`NetEvent::Cancelled`] and
-    /// nothing else. Every request therefore ends in exactly one of [`NetEvent::Finished`],
-    /// `Failed`, or [`NetEvent::Cancelled`].
+    /// nothing else. Every attempt therefore ends in exactly one of [`NetEvent::Finished`],
+    /// `Failed`, or [`NetEvent::Cancelled`]. A retried attempt's `Failed` is followed by
+    /// [`NetEvent::Retrying`] and a new [`NetEvent::Started`].
     Failed {
         /// URL that failed to load
         url: Url,
         /// Error that caused the failure
         error: anyhow::Error,
+    },
+    /// A failed request will be re-sent after `delay`. See [`retry`](mod@crate::net::retry).
+    Retrying {
+        /// URL being retried
+        url: Url,
+        /// Retry number, from 1
+        attempt: u32,
+        /// Wait before the next attempt
+        delay: Duration,
+        /// Why the previous attempt failed
+        reason: String,
     },
     /// TLS handshake failed for this hop. The request fails with the same error as
     /// [`NetError::Tls`](crate::net::types::NetError::Tls), and [`NetEvent::Failed`]
