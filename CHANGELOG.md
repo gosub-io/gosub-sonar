@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security:** HSTS was recorded from responses over a connection whose certificate the user
+  had accepted through `tls_overrides`, against RFC 6797 §8.1; one click-through on an
+  attacker's certificate could pin the host for a year. Such responses now leave HSTS alone.
+  `NetPolicy::tls_overrides` (native only) carries the store for direct users of `net::fetch`
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect

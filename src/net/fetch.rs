@@ -18,6 +18,8 @@ use crate::net::hsts::{self, HstsStore};
 use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
 use crate::net::observer::NetObserver;
 use crate::net::referrer::{self, ReferrerPolicy};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::tls::TlsOverrideStore;
 use crate::net::transport::TransportError;
 use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody, RequestCredentials};
 use crate::net::utils::BytesAsyncReader;
@@ -62,6 +64,19 @@ pub(crate) fn blocked(
         reason,
     });
     NetError::Blocked { reason, url }
+}
+
+/// Whether `resp`'s connection was accepted through the override store. Needs a client built
+/// with `tls_info`, which the fetcher does when overrides are enabled.
+#[cfg(not(target_arch = "wasm32"))]
+fn over_accepted_override(policy: &NetPolicy, resp: &reqwest::Response) -> bool {
+    let (Some(store), Some(host)) = (policy.tls_overrides.as_ref(), resp.url().host_str()) else {
+        return false;
+    };
+    resp.extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(|info| info.peer_certificate())
+        .is_some_and(|der| store.is_accepted(host, &crate::net::tls::fingerprint(der)))
 }
 
 /// What [`hop_checks`] decided about one hop.
@@ -156,6 +171,10 @@ pub struct NetPolicy {
     /// `None` disables HSTS. Set via [`NetPolicy::with_hsts`].
     #[cfg(not(target_arch = "wasm32"))]
     pub hsts: Option<Arc<dyn HstsStore>>,
+    /// The client's TLS override store, if any. A response over an accepted override does not
+    /// update HSTS (RFC 6797 §8.1). Set via [`NetPolicy::with_tls_overrides`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub tls_overrides: Option<Arc<dyn TlsOverrideStore>>,
     /// Cache of CORS preflight grants. `None` still preflights when the spec requires it,
     /// asking the server every time. Set via [`NetPolicy::with_cors_preflight_cache`].
     #[cfg(not(target_arch = "wasm32"))]
@@ -210,6 +229,8 @@ impl Default for NetPolicy {
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
+            tls_overrides: None,
+            #[cfg(not(target_arch = "wasm32"))]
             cors_preflight: None,
             on_auth_challenge: Box::new(|_| None),
             credentials: None,
@@ -238,6 +259,8 @@ impl NetPolicy {
             user_agent: None,
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            tls_overrides: None,
             #[cfg(not(target_arch = "wasm32"))]
             cors_preflight: None,
             on_auth_challenge: Box::new(move |challenge| ctx_auth.on_auth_challenge(challenge)),
@@ -283,6 +306,13 @@ impl NetPolicy {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_hsts(mut self, store: Option<Arc<dyn HstsStore>>) -> Self {
         self.hsts = store;
+        self
+    }
+
+    /// Attaches the store for [`NetPolicy::tls_overrides`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_tls_overrides(mut self, store: Option<Arc<dyn TlsOverrideStore>>) -> Self {
+        self.tls_overrides = store;
         self
     }
 
@@ -1861,9 +1891,12 @@ async fn get_with_redirects(
 
                 // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
                 // a site first arms it, and that response is consumed below.
+                // RFC 6797 §8.1: not from a connection the user clicked through.
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ref store) = policy.hsts {
-                    hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
+                    if !over_accepted_override(&policy, &resp) {
+                        hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
+                    }
                 }
 
                 // The CORS check (Fetch §4.10.3) runs on *every* response of a cors-tainted chain —
