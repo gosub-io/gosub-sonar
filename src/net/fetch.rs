@@ -2142,9 +2142,9 @@ async fn get_with_redirects(
             }
         }
 
-        // A cross-origin redirect from a hop the request's own origin had already left taints
-        // the Origin header for the rest of the chain (Fetch, HTTP-redirect fetch). The first
-        // cross-origin hop still sends the real origin, which CORS depends on.
+        // Fetch's redirect-taint, per hop: a redirect to another origin from a hop that was
+        // itself not the request's origin taints the chain, and `Origin` reads `null` from
+        // then on. The first cross-origin hop still sends the real origin, which CORS needs.
         if let Some(ref o) = origin {
             if to.origin() != from.origin() && *o != from.origin() {
                 origin_tainted = true;
@@ -3945,6 +3945,32 @@ mod tests {
                 MixedContentPolicy::default(),
             );
         assert_eq!(header_seen_by_server(&away, "/hop", init).await, "null");
+    }
+
+    /// The other side of the rule: hops that stay on the origin the chain crossed into do not
+    /// taint, so `Origin` keeps its real value (Fetch, redirect-taint).
+    #[tokio::test(flavor = "current_thread")]
+    async fn origin_header_survives_same_origin_hops_after_a_cross_origin_redirect() {
+        let home = TestServer::new()
+            .route("/", RouteConfig::ok(b""))
+            .start()
+            .await;
+        let away = TestServer::new()
+            .route("/hop1", RouteConfig::redirect_to("/hop2"))
+            .route("/hop2", RouteConfig::redirect_to("/origin"))
+            .route("/origin", RouteConfig::echo_request_header("origin"))
+            .start()
+            .await;
+        let init = RequestInit::get(HeaderMap::new())
+            .with_fetch_metadata(RequestDestination::Empty, RequestMode::Websocket, false)
+            .with_mixed_content(
+                Some(home.base_url().origin()),
+                MixedContentPolicy::default(),
+            );
+        assert_eq!(
+            header_seen_by_server(&away, "/hop1", init).await,
+            home.base_url().origin().ascii_serialization()
+        );
     }
 
     /// A block must be observable, not just returned. Devtools has no other way to report why a
