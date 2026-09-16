@@ -206,6 +206,27 @@ impl ProxyRule {
             proxy_url.set_password(Some(password)).ok()?;
         }
 
+        let intercept = self.intercept(proxy_url, dst)?;
+        match *auth {
+            ProxyAuth::Basic { .. } => intercept.basic_auth().cloned(),
+            ProxyAuth::Custom(ref value) => value.parse().ok(),
+        }
+    }
+
+    /// The http(s) proxy this rule routes a plain-`http` request to `dst` through, without
+    /// credentials; `None` if the rule does not apply or names a socks proxy.
+    fn non_tunnel_proxy(&self, dst: &http::Uri) -> Option<Url> {
+        let proxy_url = Url::parse(&self.url).ok()?;
+        let intercept = self.intercept(proxy_url, dst)?;
+        let mut proxy = Url::parse(&intercept.uri().to_string()).ok()?;
+        let _ = proxy.set_username("");
+        let _ = proxy.set_password(None);
+        Some(proxy)
+    }
+
+    /// Match `dst` with `hyper_util`'s matcher, as `reqwest::Proxy` does. Socks proxies are
+    /// filtered out: they authenticate in their own handshake and send no header.
+    fn intercept(&self, proxy_url: Url, dst: &http::Uri) -> Option<proxy_matcher::Intercept> {
         let builder = proxy_matcher::Matcher::builder();
         let builder = match self.scope {
             ProxyScope::Http => builder.http(proxy_url.to_string()),
@@ -216,17 +237,7 @@ impl ProxyRule {
             .no(self.no_proxy.clone().unwrap_or_default())
             .build()
             .intercept(dst)?;
-
-        // A socks proxy authenticates inside its own handshake, so no header is sent for one
-        // however it was configured.
-        if !matches!(intercept.uri().scheme_str(), Some("http") | Some("https")) {
-            return None;
-        }
-
-        match *auth {
-            ProxyAuth::Basic { .. } => intercept.basic_auth().cloned(),
-            ProxyAuth::Custom(ref value) => value.parse().ok(),
-        }
+        matches!(intercept.uri().scheme_str(), Some("http") | Some("https")).then_some(intercept)
     }
 }
 
@@ -285,6 +296,33 @@ impl ProxyConfig {
         rules
             .iter()
             .find_map(|rule| rule.non_tunnel_authorization(&dst))
+    }
+
+    /// The http(s) proxy a plain-`http` request to `url` goes through, without credentials;
+    /// `None` for https (tunnelled via CONNECT, so no 407 response can come from the proxy),
+    /// direct, or socks. Decides whether a 407 counts as a proxy challenge.
+    /// [`ProxyConfig::System`] is answered from the environment with the client's own matcher.
+    pub(crate) fn plain_http_proxy(&self, url: &Url) -> Option<Url> {
+        if url.scheme() != "http" {
+            return None;
+        }
+        let dst: http::Uri = url.as_str().parse().ok()?;
+        match *self {
+            ProxyConfig::Rules(ref rules) => {
+                rules.iter().find_map(|rule| rule.non_tunnel_proxy(&dst))
+            }
+            ProxyConfig::System => {
+                let intercept = proxy_matcher::Matcher::from_system().intercept(&dst)?;
+                if !matches!(intercept.uri().scheme_str(), Some("http") | Some("https")) {
+                    return None;
+                }
+                let mut proxy = Url::parse(&intercept.uri().to_string()).ok()?;
+                let _ = proxy.set_username("");
+                let _ = proxy.set_password(None);
+                Some(proxy)
+            }
+            ProxyConfig::Disabled => None,
+        }
     }
 
     /// Apply this configuration to a client builder.
@@ -512,5 +550,34 @@ mod tests {
     fn apply_propagates_rule_errors() {
         let cfg = ProxyConfig::single("not a url");
         assert!(cfg.apply(reqwest::Client::builder()).is_err());
+    }
+
+    #[test]
+    fn plain_http_proxy_names_the_proxy_for_http_only() {
+        let cfg = ProxyConfig::Rules(vec![
+            ProxyRule::all("http://user:pw@proxy.test:3128").bypassing("internal.test")
+        ]);
+        let proxy = |u: &str| cfg.plain_http_proxy(&Url::parse(u).unwrap());
+        assert_eq!(
+            proxy("http://example.test/").map(|u| u.to_string()),
+            Some("http://proxy.test:3128/".to_string()),
+            "credentials are left out"
+        );
+        assert_eq!(
+            proxy("https://example.test/"),
+            None,
+            "an https request tunnels"
+        );
+        assert_eq!(proxy("http://internal.test/"), None, "no_proxy is honoured");
+
+        let socks = ProxyConfig::Rules(vec![ProxyRule::all("socks5://proxy.test:1080")]);
+        assert_eq!(
+            socks.plain_http_proxy(&Url::parse("http://example.test/").unwrap()),
+            None
+        );
+        assert_eq!(
+            ProxyConfig::Disabled.plain_http_proxy(&Url::parse("http://example.test/").unwrap()),
+            None
+        );
     }
 }

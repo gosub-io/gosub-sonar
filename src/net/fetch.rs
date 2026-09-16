@@ -124,6 +124,10 @@ pub type AuthChallengeFn = Box<dyn Fn(&AuthChallenge) -> Option<Credentials> + S
 #[cfg(not(target_arch = "wasm32"))]
 pub type ProxyAuthorizationFn = Box<dyn Fn(&Url) -> Option<http::HeaderValue> + Send + Sync>;
 
+/// Callback type returning the http(s) proxy a plain-`http` request goes through.
+#[cfg(not(target_arch = "wasm32"))]
+pub type ProxyForFn = Box<dyn Fn(&Url) -> Option<Url> + Send + Sync>;
+
 /// Network-level request policies threaded through the fetch stack.
 ///
 /// Bundles the URL allowlist check and the cookie-jar query so both can be applied at
@@ -196,6 +200,11 @@ pub struct NetPolicy {
     /// [`NetPolicy::with_proxy_authorization`].
     #[cfg(not(target_arch = "wasm32"))]
     pub proxy_authorization: Option<ProxyAuthorizationFn>,
+    /// The http(s) proxy a plain-`http` request goes through, without credentials. A `407` is
+    /// only treated as a proxy challenge on a hop this names; any other `407` is returned as
+    /// is. `None` (default): no hop is proxied. Set via [`NetPolicy::with_proxy_for`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub proxy_for: Option<ProxyForFn>,
 }
 
 impl Default for NetPolicy {
@@ -217,6 +226,8 @@ impl Default for NetPolicy {
             cache: None,
             #[cfg(not(target_arch = "wasm32"))]
             proxy_authorization: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            proxy_for: None,
         }
     }
 }
@@ -247,6 +258,8 @@ impl NetPolicy {
             // Filled in by the fetcher, which is what knows how its proxies were configured.
             #[cfg(not(target_arch = "wasm32"))]
             proxy_authorization: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            proxy_for: None,
         }
     }
 
@@ -264,6 +277,13 @@ impl NetPolicy {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_proxy_authorization(mut self, f: ProxyAuthorizationFn) -> Self {
         self.proxy_authorization = Some(f);
+        self
+    }
+
+    /// Attaches the callback for [`NetPolicy::proxy_for`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_proxy_for(mut self, f: ProxyForFn) -> Self {
+        self.proxy_for = Some(f);
         self
     }
 
@@ -1917,6 +1937,15 @@ async fn get_with_redirects(
                     break HopResponse::Network(resp);
                 };
 
+                // Only the proxy carrying a plain-http hop can send a 407 we see: over https
+                // the proxy's 407 fails the CONNECT tunnel and comes back as a send error. So a
+                // 407 *response* on an https or direct hop is the origin server's, and
+                // answering it would leak the proxy credentials (or the password dialog) to
+                // any server that sends the status. wasm32: the browser owns the proxy.
+                #[cfg(not(target_arch = "wasm32"))]
+                let proxy = policy.proxy_for.as_ref().and_then(|f| f(&url));
+                #[cfg(target_arch = "wasm32")]
+                let proxy: Option<Url> = None;
                 let may_answer = match target {
                     // Server credentials follow the request's credentials mode, and are only
                     // attached to a chain the CORS regime left untainted. `Authorization` is not a
@@ -1925,12 +1954,17 @@ async fn get_with_redirects(
                     // produce. Navigations and requests without a document origin stay basic, and
                     // those are the ones a browser shows its password dialog for.
                     AuthTarget::Server => attach_credentials && tainting == ResponseTainting::Basic,
-                    // A proxy challenge is about the hop to the proxy. `Proxy-Authorization` never
-                    // reaches the origin server, so neither CORS nor the credentials mode has a say.
-                    // On wasm32 the browser owns the proxy connection and forbids the header.
-                    AuthTarget::Proxy => cfg!(not(target_arch = "wasm32")),
+                    // `Proxy-Authorization` never reaches the origin, so CORS and the credentials
+                    // mode don't apply; only whether there is a proxy to answer.
+                    AuthTarget::Proxy => proxy.is_some(),
                 };
-                let challenges = auth::parse_challenges(resp.headers(), target, &url, auth_attempt);
+                let challenges = auth::parse_challenges(
+                    resp.headers(),
+                    target,
+                    &url,
+                    auth_attempt,
+                    proxy.as_ref(),
+                );
                 let answer = if may_answer && auth_attempt < MAX_AUTH_ATTEMPTS {
                     // What was sent last time has just been rejected: drop it so the store stops
                     // handing back a password the server no longer takes.
@@ -4553,14 +4587,19 @@ mod tests {
         );
     }
 
-    /// A `407` is answered with `Proxy-Authorization`, and its protection space is not tied to
-    /// the origin the request was going to.
+    /// A `407` from the hop's proxy is answered with `Proxy-Authorization`; the protection
+    /// space is the proxy's, not the target origin's.
     #[tokio::test(flavor = "current_thread")]
     async fn a_proxy_challenge_is_answered_with_proxy_authorization() {
         let srv = auth_server().await;
         let store = Arc::new(InMemoryCredentialStore::new());
         let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
-        let policy = policy.with_credential_store(Some(store.clone()));
+        // the test server plays the proxy
+        let proxy_url = srv.base_url();
+        let proxy_origin = proxy_url.origin().ascii_serialization();
+        let policy = policy
+            .with_credential_store(Some(store.clone()))
+            .with_proxy_for(Box::new(move |_| Some(proxy_url.clone())));
 
         let (meta, body) = auth_fetch(
             &srv,
@@ -4580,11 +4619,44 @@ mod tests {
             store.credentials_for(&ProtectionSpace {
                 target: AuthTarget::Proxy,
                 scheme: AuthScheme::Basic,
-                origin: None,
+                origin: Some(proxy_origin),
                 realm: "corp".into(),
             }),
             Some(Credentials::basic("user", "pass"))
         );
+    }
+
+    /// A `407` on an unproxied hop comes from the origin server: returned as is, no stored
+    /// credentials or hook involved.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_407_from_an_unproxied_hop_is_not_answered() {
+        let srv = auth_server().await;
+        let store = Arc::new(InMemoryCredentialStore::new());
+        store.store(
+            ProtectionSpace {
+                target: AuthTarget::Proxy,
+                scheme: AuthScheme::Basic,
+                origin: None,
+                realm: "corp".into(),
+            },
+            Credentials::basic("user", "pass"),
+        );
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+        let policy = policy.with_credential_store(Some(store));
+
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/via-proxy",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 407);
+        assert_eq!(srv.hit_count("/via-proxy"), 1, "never re-sent");
+        assert!(seen.lock().unwrap().is_empty(), "the hook was not asked");
     }
 
     /// `RequestCredentials::Omit` means no credentials of any kind, so the challenge is not even

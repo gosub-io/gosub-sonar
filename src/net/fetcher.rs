@@ -955,8 +955,10 @@ fn build_policy(
         // while executing the request, and an observer would never see the header its own
         // configuration put there.
         let proxy = cfg.proxy.clone();
+        let proxy_for = cfg.proxy.clone();
         let policy = policy
             .with_proxy_authorization(Box::new(move |url| proxy.proxy_authorization(url)))
+            .with_proxy_for(Box::new(move |url| proxy_for.plain_http_proxy(url)))
             .with_hsts(cfg.hsts.clone())
             .with_cache(cfg.cache.clone());
         match cfg.cors_preflight_cache.clone() {
