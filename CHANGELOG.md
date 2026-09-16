@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security:** a buffered fetch without `max_bytes` grew its body without limit, and with
+  decompression on (the default) a small gzip bomb could expand to gigabytes. New
+  `FetcherConfig::max_body_bytes` (default 64 MiB) caps buffered fetches that set no
+  `max_bytes` of their own, and buffered callers joined onto a streamed fetch. `None`
+  restores the old behaviour; a request lifts it with `with_max_bytes(usize::MAX)`
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect
