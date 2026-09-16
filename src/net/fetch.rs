@@ -64,6 +64,23 @@ pub(crate) fn blocked(
     NetError::Blocked { reason, url }
 }
 
+/// `url` without its `user:password@`, warning the observer when there was one. The client
+/// would turn embedded credentials into an `Authorization` header, which lets a page or a
+/// redirect send credentials of its choosing along with the user's cookies; browsers do not
+/// send them either. Credentials for a server come from the auth hook, after a challenge.
+fn without_credentials(mut url: Url, observer: &Arc<dyn NetObserver + Send + Sync>) -> Url {
+    if url.username().is_empty() && url.password().is_none() {
+        return url;
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    observer.on_event(NetEvent::Warning {
+        url: url.clone(),
+        message: "credentials embedded in the URL were dropped".into(),
+    });
+    url
+}
+
 /// What [`hop_checks`] decided about one hop.
 pub(crate) enum HopCheck {
     /// Send the request to this URL, which may be an upgraded form of the one checked.
@@ -607,6 +624,7 @@ pub async fn fetch_response_top(
     observer: Arc<dyn NetObserver + Send + Sync>,
     policy: NetPolicy,
 ) -> Result<ResponseTop, NetError> {
+    let url = without_credentials(url, &observer);
     let result =
         fetch_response_top_inner(client, url.clone(), init, cancel, observer.clone(), policy).await;
 
@@ -1406,6 +1424,9 @@ fn credentials_for_challenges(
 /// - `Authorization` and `Cookie` are stripped on cross-origin redirects (RFC 9110 §15.4);
 ///   the cookie jar is re-queried for the new origin.
 /// - Only `http` and `https` targets are followed; other schemes are rejected.
+/// - Credentials embedded in the URL (`user:password@`) are dropped, from the initial URL
+///   and from every `Location`, so the client never turns them into an `Authorization`
+///   header. A cross-origin or cors-mode `Location` with credentials is refused outright.
 /// - Insecure hops requested by a secure `init.origin` are blocked or upgraded per
 ///   `init.mixed_content`, re-evaluated at every hop so a redirect cannot escape the check.
 /// - `Referer` is recomputed from `init.referrer` and `init.referrer_policy` at every hop, since
@@ -2135,6 +2156,7 @@ async fn get_with_redirects(
                 BlockReason::Cors(CorsError::CredentialedRedirect),
             ));
         }
+        let to = without_credentials(to, &observer);
 
         // Method and body semantics per RFC 7231 §6.4
         match status {
@@ -3414,6 +3436,88 @@ mod tests {
         .unwrap();
         assert_eq!(meta.status, 200);
         assert_eq!(&body[..], b"final");
+    }
+
+    /// `user:password@` in a URL would become an `Authorization` header in the client.
+    #[tokio::test(flavor = "current_thread")]
+    async fn credentials_in_the_initial_url_are_dropped() {
+        let srv = TestServer::new()
+            .route("/echo-headers", RouteConfig::echo_request_headers())
+            .start()
+            .await;
+        let mut url = srv.url("/echo-headers");
+        url.set_username("user").unwrap();
+        url.set_password(Some("pw")).unwrap();
+
+        let rec = Arc::new(RecordingObserver::new());
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            url,
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert!(
+            !String::from_utf8_lossy(&body)
+                .to_ascii_lowercase()
+                .contains("authorization:"),
+            "{body:?}"
+        );
+        assert_eq!(meta.final_url.username(), "");
+        assert_eq!(meta.final_url.password(), None);
+        let sent = rec.requests_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.username(), "", "reported without credentials");
+    }
+
+    /// Same-origin, so not refused like a cross-origin one, but still not sent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn credentials_in_a_same_origin_location_are_dropped() {
+        let srv = TestServer::new()
+            .route("/echo-headers", RouteConfig::echo_request_headers())
+            .route(
+                "/hop",
+                RouteConfig::redirect_to_with_credentials("user:pw", "/echo-headers"),
+            )
+            .start()
+            .await;
+
+        let rec = Arc::new(RecordingObserver::new());
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert!(
+            !String::from_utf8_lossy(&body)
+                .to_ascii_lowercase()
+                .contains("authorization:"),
+            "{body:?}"
+        );
+        assert_eq!(meta.final_url.username(), "");
+        assert_eq!(meta.final_url.password(), None);
+        assert!(rec
+            .requests_sent()
+            .iter()
+            .all(|(_, url, _)| url.username().is_empty()));
     }
 
     #[tokio::test(flavor = "current_thread")]
