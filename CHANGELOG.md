@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The coalescing key covered only a fixed set of headers, so two in-flight GETs differing in
+  any other header (an API key, `If-None-Match`, `Cache-Control`), in a GET body, or in
+  `max_bytes` shared one response: a cross-user leak for a fetcher shared without a document
+  origin, and a `304` or an over-cap body for the wrong caller otherwise. The key now hashes
+  every header in a fixed order, the body, and the cap; a request with a streamed body is
+  never coalesced
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect
