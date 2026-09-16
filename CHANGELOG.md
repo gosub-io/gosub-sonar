@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security:** with `tls_overrides` enabled, TLS session resumption let a connection skip
+  certificate verification, so a revoked override, or HSTS armed after a click-through, did
+  not apply until the session ticket expired. Resumption is now off for that client
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect

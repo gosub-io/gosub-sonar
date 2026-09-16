@@ -2002,6 +2002,27 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// A revoked override must not live on through TLS session resumption: rustls does not
+    /// re-verify a resumed session, so the config must not resume.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_revoked_override_is_not_resumed() {
+        let store = Arc::new(crate::net::tls::InMemoryTlsOverrideStore::new());
+        let cfg = FetcherConfig {
+            tls_overrides: Some(store.clone()),
+            ..test_config()
+        };
+        let (srv, fetcher, shutdown) = tls_server_and_fetcher(cfg, Arc::new(NullContext)).await;
+
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        store.accept("tls.test", tls.fingerprint.unwrap());
+        assert!(!fetch_root(&fetcher, &srv).await.is_error());
+
+        store.revoke("tls.test");
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::UnknownIssuer);
+        shutdown.cancel();
+    }
+
     /// The `fetch` convenience must deliver the same result as the manual
     /// submit/handle/oneshot ritual, and a stopped fetcher must resolve to an error
     /// rather than hanging.

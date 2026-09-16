@@ -110,7 +110,7 @@ impl std::error::Error for TlsError {}
 ///
 /// The in-memory default is not persisted; implement this to remember overrides across
 /// restarts. Revoking only affects new connections, an already verified pooled connection stays
-/// open.
+/// open. Session resumption is off with overrides enabled, so every new connection verifies.
 pub trait TlsOverrideStore: Send + Sync {
     /// Whether `fingerprint` is accepted for `host`.
     fn is_accepted(&self, host: &str, fingerprint: &Fingerprint) -> bool;
@@ -194,6 +194,9 @@ pub(crate) fn client_config(
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // A resumed session skips certificate verification, so a revoked override (or a newly
+    // armed HSTS entry) would not apply until the ticket expired. Every connection verifies.
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(config)
 }
 
