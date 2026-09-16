@@ -553,12 +553,16 @@ pub trait CorsPreflightCache: Send + Sync {
 }
 
 /// In-process [`CorsPreflightCache`] with no persistence; expired entries are pruned on
-/// insertion.
+/// insertion, and past [`MAX_PREFLIGHT_ENTRIES`] the grant expiring soonest is dropped.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Default)]
 pub struct InMemoryPreflightCache {
     entries: parking_lot::RwLock<std::collections::HashMap<PreflightKey, PreflightEntry>>,
 }
+
+/// Most grants an [`InMemoryPreflightCache`] holds.
+#[cfg(not(target_arch = "wasm32"))]
+pub const MAX_PREFLIGHT_ENTRIES: usize = 1024;
 
 /// (serialized origin, URL without fragment, credentials flag).
 #[cfg(not(target_arch = "wasm32"))]
@@ -610,7 +614,17 @@ impl CorsPreflightCache for InMemoryPreflightCache {
             now + chrono::TimeDelta::from_std(allows.max_age).unwrap_or(chrono::TimeDelta::zero());
         let mut entries = self.entries.write();
         entries.retain(|_, (_, exp)| *exp > now);
-        entries.insert(Self::key(origin, url, credentials), (allows, expires));
+        let key = Self::key(origin, url, credentials);
+        if entries.len() >= MAX_PREFLIGHT_ENTRIES && !entries.contains_key(&key) {
+            if let Some(soonest) = entries
+                .iter()
+                .min_by_key(|(_, (_, exp))| *exp)
+                .map(|(k, _)| k.clone())
+            {
+                entries.remove(&soonest);
+            }
+        }
+        entries.insert(key, (allows, expires));
     }
 }
 
@@ -618,6 +632,30 @@ impl CorsPreflightCache for InMemoryPreflightCache {
 mod tests {
     use super::*;
     use http::HeaderValue;
+
+    #[test]
+    fn the_preflight_cache_is_bounded() {
+        let cache = InMemoryPreflightCache::new();
+        let now = Utc::now();
+        let allows = |secs: u64| PreflightAllows {
+            methods: Vec::new(),
+            methods_wildcard: false,
+            headers: Vec::new(),
+            headers_wildcard: false,
+            max_age: Duration::from_secs(secs),
+        };
+        for i in 0..MAX_PREFLIGHT_ENTRIES {
+            let url = Url::parse(&format!("https://api.test/{i}")).unwrap();
+            // entry 0 expires soonest
+            cache.put("https://a.test", &url, false, allows(100 + i as u64), now);
+        }
+        let extra = Url::parse("https://api.test/extra").unwrap();
+        cache.put("https://a.test", &extra, false, allows(1000), now);
+        assert_eq!(cache.entries.read().len(), MAX_PREFLIGHT_ENTRIES);
+        let first = Url::parse("https://api.test/0").unwrap();
+        assert!(cache.get("https://a.test", &first, false, now).is_none());
+        assert!(cache.get("https://a.test", &extra, false, now).is_some());
+    }
 
     fn origin(s: &str) -> url::Origin {
         Url::parse(s).unwrap().origin()

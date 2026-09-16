@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The in-memory stores grew without bound: `InMemoryPreflightCache` (now at most 1024
+  grants, the soonest-expiring dropped first), `InMemoryCredentialStore` (256 protection
+  spaces, oldest first), `InMemoryHstsStore` (4096 hosts, expired swept then soonest-expiring
+  dropped) and `InMemoryTlsOverrideStore` (256 pairs, oldest first). The limits are the
+  `MAX_*` constants in each module
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect

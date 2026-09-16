@@ -120,10 +120,15 @@ pub trait TlsOverrideStore: Send + Sync {
     fn revoke(&self, host: &str);
 }
 
-/// In-memory [`TlsOverrideStore`].
+/// Most (host, fingerprint) pairs an [`InMemoryTlsOverrideStore`] holds.
+pub const MAX_TLS_OVERRIDES: usize = 256;
+
+/// In-memory [`TlsOverrideStore`]. Past [`MAX_TLS_OVERRIDES`] the pair accepted longest ago
+/// is dropped.
 #[derive(Default)]
 pub struct InMemoryTlsOverrideStore {
-    accepted: parking_lot::Mutex<std::collections::HashSet<(String, Fingerprint)>>,
+    accepted: parking_lot::Mutex<std::collections::HashMap<(String, Fingerprint), u64>>,
+    clock: std::sync::atomic::AtomicU64,
 }
 
 impl InMemoryTlsOverrideStore {
@@ -147,18 +152,30 @@ impl TlsOverrideStore for InMemoryTlsOverrideStore {
     fn is_accepted(&self, host: &str, fingerprint: &Fingerprint) -> bool {
         self.accepted
             .lock()
-            .contains(&(host.to_ascii_lowercase(), *fingerprint))
+            .contains_key(&(host.to_ascii_lowercase(), *fingerprint))
     }
 
     fn accept(&self, host: &str, fingerprint: Fingerprint) {
-        self.accepted
-            .lock()
-            .insert((host.to_ascii_lowercase(), fingerprint));
+        let stamp = self
+            .clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = (host.to_ascii_lowercase(), fingerprint);
+        let mut accepted = self.accepted.lock();
+        if accepted.len() >= MAX_TLS_OVERRIDES && !accepted.contains_key(&key) {
+            if let Some(oldest) = accepted
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone())
+            {
+                accepted.remove(&oldest);
+            }
+        }
+        accepted.insert(key, stamp);
     }
 
     fn revoke(&self, host: &str) {
         let host = host.to_ascii_lowercase();
-        self.accepted.lock().retain(|(h, _)| *h != host);
+        self.accepted.lock().retain(|(h, _), _| *h != host);
     }
 }
 
@@ -382,6 +399,18 @@ mod tests {
     use super::*;
     use rustls::{AlertDescription, CertificateError};
     use url::Url;
+
+    #[test]
+    fn the_override_store_is_bounded() {
+        let store = InMemoryTlsOverrideStore::new();
+        let fp = |i: usize| fingerprint(&i.to_le_bytes());
+        for i in 0..=MAX_TLS_OVERRIDES {
+            store.accept("x.test", fp(i));
+        }
+        assert_eq!(store.len(), MAX_TLS_OVERRIDES);
+        assert!(!store.is_accepted("x.test", &fp(0)), "oldest dropped");
+        assert!(store.is_accepted("x.test", &fp(MAX_TLS_OVERRIDES)));
+    }
 
     // Same nesting as hyper/reqwest produce: io::Error(Other) > io::Error(InvalidData) > rustls
     fn wrapped(e: rustls::Error) -> anyhow::Error {
