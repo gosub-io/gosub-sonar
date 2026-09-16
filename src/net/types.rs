@@ -625,8 +625,8 @@ pub struct FetchRequest {
     /// for this one request; `None` uses the fetcher-wide setting.
     pub header_order: Option<Vec<HeaderName>>,
     /// Overrides [`FetcherConfig::req_timeout`](crate::net::fetcher::FetcherConfig::req_timeout)
-    /// for this one request: the time allowed from sending the first request byte until the
-    /// response headers arrive. `None` uses the fetcher-wide setting.
+    /// for this one request: the deadline for a hop, headers and body. `None` uses the
+    /// fetcher-wide setting.
     ///
     /// Applies to every hop of a redirect chain separately. When this request is coalesced
     /// onto an identical in-flight one, the timeouts of the request that started the fetch
@@ -642,7 +642,8 @@ pub struct FetchRequest {
     /// for this one request: the wall-clock budget for the whole body after the headers.
     ///
     /// `None` uses the fetcher-wide setting. `Some(None)` removes the deadline for this request
-    /// alone, which is what a large download wants; `Some(Some(d))` sets it to `d`.
+    /// alone; `Some(Some(d))` sets it to `d`. A large download also needs a `req_timeout` long
+    /// enough, since that one covers the body too.
     pub total_body_timeout: Option<Option<Duration>>,
     /// Overrides [`FetcherConfig::retry`](crate::net::fetcher::FetcherConfig::retry) for this
     /// request. `None` inherits, `Some(None)` disables, `Some(Some(p))` uses `p`.
@@ -1022,9 +1023,9 @@ impl FetchRequestBuilder {
         self
     }
 
-    /// Overrides the fetcher's request timeout for this request: the time allowed from sending
-    /// the first request byte until the response headers arrive, per hop. Default: the
-    /// fetcher's [`req_timeout`](crate::net::fetcher::FetcherConfig::req_timeout).
+    /// Overrides the fetcher's request timeout for this request: the deadline for a hop,
+    /// headers and body. Default: the fetcher's
+    /// [`req_timeout`](crate::net::fetcher::FetcherConfig::req_timeout).
     pub fn with_req_timeout(mut self, timeout: Duration) -> Self {
         self.req_timeout = Some(timeout);
         self
@@ -1049,7 +1050,8 @@ impl FetchRequestBuilder {
 
     /// Removes the total body deadline for this request alone, whatever the fetcher's
     /// [`total_body_timeout`](crate::net::fetcher::FetcherConfig::total_body_timeout) says.
-    /// For large downloads; the read idle timeout still catches a stalled body.
+    /// For large downloads, together with a `with_req_timeout` long enough for the body; the
+    /// read idle timeout still catches a stalled one.
     pub fn without_total_body_timeout(mut self) -> Self {
         self.total_body_timeout = Some(None);
         self

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Docs: `req_timeout` is the client's total per-hop timeout and covers the body, not only
+  the wait for headers, so a large download needs it raised along with `total_body_timeout`.
+  A TLS override is keyed by host and certificate, not port
 - The coalescing key joined raw header values with `;` and `=`, so a value containing them
   could read as the next field and two different requests could spell one key. The raw
   components are now length-prefixed

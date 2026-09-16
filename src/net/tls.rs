@@ -11,8 +11,10 @@
 //! then asks [`FetcherContext::tls_override`]. The [`TlsError`] from this path includes the
 //! certificate and its fingerprint, so the embedder can show it and call
 //! [`TlsOverrideStore::accept`] when the user clicks through, then retry. Overrides are per
-//! (host, certificate). Not allowed for HSTS hosts (RFC 6797 §12.1) or for handshake failures
-//! that aren't about the certificate.
+//! (host, certificate); the port is not part of it, since the verifier only sees the server
+//! name, so an override for `host:8443` also covers `host:443` for the same certificate. Not
+//! allowed for HSTS hosts (RFC 6797 §12.1) or for handshake failures that aren't about the
+//! certificate.
 //!
 //! Native only. On wasm32 the browser does TLS and we never see the error details.
 //!
@@ -106,7 +108,8 @@ impl fmt::Display for TlsError {
 
 impl std::error::Error for TlsError {}
 
-/// Certificates the user accepted despite a verification error, keyed by (host, fingerprint).
+/// Certificates the user accepted despite a verification error, keyed by (host, fingerprint);
+/// the port is not part of the key (see the [module docs](self)).
 ///
 /// The in-memory default is not persisted; implement this to remember overrides across
 /// restarts. Revoking only affects new connections, an already verified pooled connection stays

@@ -61,12 +61,14 @@ pub struct FetcherConfig {
     pub h2_per_origin: usize,
     /// Timeout for the TCP + TLS handshake.  Applies before any bytes are sent.
     pub connect_timeout: Duration,
-    /// Timeout from sending the first request byte until the response headers arrive.
+    /// Deadline for one hop, from sending its first byte until its body has been read. The
+    /// client enforces it, and it covers the body as well as the wait for headers, so a
+    /// download longer than this fails whatever `total_body_timeout` says.
     pub req_timeout: Duration,
     /// Maximum silence between consecutive body chunks before the read is aborted.
     pub read_idle_timeout: Duration,
     /// Wall-clock deadline for receiving the entire response body after headers.
-    /// `None` disables the deadline (useful for very large downloads).
+    /// `None` disables the deadline; for a very large download raise `req_timeout` too.
     pub total_body_timeout: Option<Duration>,
 
     /// Maximum idle connections kept in the pool **per host**.

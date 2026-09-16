@@ -368,8 +368,8 @@ pub struct RequestInit {
     /// Order in which headers are sent, applied per hop; `None` keeps insertion order. See
     /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
     pub header_order: Option<Vec<HeaderName>>,
-    /// Time allowed from sending the first request byte until the response headers arrive,
-    /// applied to every hop. `None` leaves it to the client's own request timeout.
+    /// Deadline for each hop, from its first byte sent until its body is read. `None` leaves
+    /// it to the client's own request timeout.
     pub timeout: Option<Duration>,
 }
 
