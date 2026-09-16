@@ -1764,6 +1764,22 @@ async fn get_with_redirects(
 
         let hop = match cache_hit {
             Some(entry) => {
+                // The CORS check applies to a response wherever it came from (Fetch §4.10.3).
+                // The entry may have been stored by a same-origin fetch, which needed no
+                // `Access-Control-Allow-Origin`; handing it to a cross-origin caller would read
+                // it past the check the network path enforces. Blocked rather than re-sent,
+                // as browsers do: a server whose allow-origin depends on `Origin` says
+                // `Vary: Origin`, and then the entry is not a match in the first place.
+                #[cfg(not(target_arch = "wasm32"))]
+                if tainting == ResponseTainting::Cors {
+                    if let Some(ref o) = origin {
+                        if let Err(e) =
+                            cors::cors_check(o, origin_tainted, credentials_include, &entry.headers)
+                        {
+                            return Err(blocked(&observer, url, BlockReason::Cors(e)));
+                        }
+                    }
+                }
                 observer.on_event(NetEvent::Cache {
                     url: url.clone(),
                     outcome: CacheOutcome::Hit,
@@ -4957,6 +4973,80 @@ mod tests {
         assert_eq!(&body[..], b"hit-1", "the stored body, not a second request");
         assert_eq!(srv.hit_count("/fresh"), 1, "the server was not asked again");
         assert_eq!(rec.cache_outcomes(), vec![CacheOutcome::Hit]);
+    }
+
+    /// A stored response is CORS-checked like a fresh one: an entry stored by a same-origin
+    /// fetch carries no `Access-Control-Allow-Origin`, and a cross-origin caller must not
+    /// read it from the cache when it could not read it from the network.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cache_hit_is_cors_checked() {
+        let srv = TestServer::new()
+            .route(
+                "/private",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(60, b"secret".to_vec())),
+            )
+            .route(
+                "/public",
+                RouteConfig::Cacheable(CacheRouteOptions {
+                    extra_headers: vec![("Access-Control-Allow-Origin".into(), "*".into())],
+                    ..CacheRouteOptions::max_age(60, b"open".to_vec())
+                }),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+        cache_fetch(&srv, "/private", RequestInit::default(), policy, observer()).await;
+        let (policy, _) = (NetPolicy::default().with_cache(Some(cache.clone())), ());
+        cache_fetch(&srv, "/public", RequestInit::default(), policy, observer()).await;
+        assert_eq!(cache.len(), 2);
+
+        let cors_from_other = || {
+            RequestInit::get(HeaderMap::new())
+                .with_mixed_content(
+                    Some(Url::parse("http://other.test/").unwrap().origin()),
+                    MixedContentPolicy::Allow,
+                )
+                .with_fetch_metadata(RequestDestination::Empty, RequestMode::Cors, false)
+                .with_credentials(RequestCredentials::Omit)
+        };
+
+        let rec = Arc::new(RecordingObserver::new());
+        let res = super::fetch_response_complete(
+            client(),
+            srv.url("/private"),
+            cors_from_other(),
+            CancellationToken::new(),
+            rec.clone(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default().with_cache(Some(cache.clone())),
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(NetError::Blocked {
+                    reason: BlockReason::Cors(_),
+                    ..
+                })
+            ),
+            "{res:?}"
+        );
+        assert_eq!(srv.hit_count("/private"), 1, "blocked, not re-fetched");
+
+        // An entry that does allow the origin is served from the cache.
+        let (meta, body) = cache_fetch(
+            &srv,
+            "/public",
+            cors_from_other(),
+            NetPolicy::default().with_cache(Some(cache.clone())),
+            observer(),
+        )
+        .await;
+        assert!(meta.from_cache);
+        assert_eq!(&body[..], b"open");
+        assert_eq!(srv.hit_count("/public"), 1);
     }
 
     /// A stale entry is revalidated, and a `304` reuses the stored body.
