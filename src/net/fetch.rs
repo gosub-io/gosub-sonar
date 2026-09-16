@@ -122,6 +122,16 @@ fn over_accepted_override(policy: &NetPolicy, resp: &reqwest::Response) -> bool 
         .is_some_and(|der| store.is_accepted(host, &crate::net::tls::fingerprint(der)))
 }
 
+/// The text of a `Location` header. Servers send non-ASCII targets as UTF-8; anything that is
+/// not valid UTF-8 is decoded byte for byte, as browsers do. Either way the URL parser then
+/// percent-encodes what it has to.
+fn location_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    }
+}
+
 /// What [`hop_checks`] decided about one hop.
 pub(crate) enum HopCheck {
     /// Send the request to this URL, which may be an upgraded form of the one checked.
@@ -476,8 +486,8 @@ pub struct RequestInit {
     /// Order in which headers are sent, applied per hop; `None` keeps insertion order. See
     /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
     pub header_order: Option<Vec<HeaderName>>,
-    /// Time allowed from sending the first request byte until the response headers arrive,
-    /// applied to every hop. `None` leaves it to the client's own request timeout.
+    /// Deadline for each hop, from its first byte sent until its body is read. `None` leaves
+    /// it to the client's own request timeout.
     pub timeout: Option<Duration>,
 }
 
@@ -2240,13 +2250,14 @@ async fn get_with_redirects(
         let loc = hop
             .headers()
             .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
+            .map(|v| location_text(v.as_bytes()))
             .ok_or_else(|| {
                 NetError::Redirect(Arc::new(anyhow!(
                     "redirect status {} without Location header",
                     status
                 )))
             })?;
+        let loc = loc.as_str();
 
         let to = from.join(loc).map_err(|e| {
             NetError::Redirect(Arc::new(anyhow!("invalid redirect URL '{}': {}", loc, e)))
@@ -2306,9 +2317,9 @@ async fn get_with_redirects(
             }
         }
 
-        // A cross-origin redirect from a hop the request's own origin had already left taints
-        // the Origin header for the rest of the chain (Fetch, HTTP-redirect fetch). The first
-        // cross-origin hop still sends the real origin, which CORS depends on.
+        // Fetch's redirect-taint, per hop: a redirect to another origin from a hop that was
+        // itself not the request's origin taints the chain, and `Origin` reads `null` from
+        // then on. The first cross-origin hop still sends the real origin, which CORS needs.
         if let Some(ref o) = origin {
             if to.origin() != from.origin() && *o != from.origin() {
                 origin_tainted = true;
@@ -3628,6 +3639,39 @@ mod tests {
             .all(|(_, url, _)| url.username().is_empty()));
     }
 
+    #[test]
+    fn location_text_decodes_utf8_then_bytes() {
+        assert_eq!(location_text(b"/plain"), "/plain");
+        assert_eq!(location_text("/caf\u{e9}".as_bytes()), "/caf\u{e9}");
+        assert_eq!(location_text(b"/caf\xe9"), "/caf\u{e9}", "latin-1 byte");
+    }
+
+    /// A `Location` with non-ASCII characters is followed, percent-encoded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_non_ascii_location_is_followed() {
+        let srv = TestServer::new()
+            .route("/hop", RouteConfig::redirect_to("/caf\u{e9}"))
+            .route("/caf%C3%A9", RouteConfig::ok(b"bonjour"))
+            .start()
+            .await;
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"bonjour");
+        assert_eq!(meta.final_url.path(), "/caf%C3%A9");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cancel_during_redirect_chain() {
         let srv = server().await;
@@ -4191,6 +4235,32 @@ mod tests {
                 MixedContentPolicy::default(),
             );
         assert_eq!(header_seen_by_server(&away, "/hop", init).await, "null");
+    }
+
+    /// The other side of the rule: hops that stay on the origin the chain crossed into do not
+    /// taint, so `Origin` keeps its real value (Fetch, redirect-taint).
+    #[tokio::test(flavor = "current_thread")]
+    async fn origin_header_survives_same_origin_hops_after_a_cross_origin_redirect() {
+        let home = TestServer::new()
+            .route("/", RouteConfig::ok(b""))
+            .start()
+            .await;
+        let away = TestServer::new()
+            .route("/hop1", RouteConfig::redirect_to("/hop2"))
+            .route("/hop2", RouteConfig::redirect_to("/origin"))
+            .route("/origin", RouteConfig::echo_request_header("origin"))
+            .start()
+            .await;
+        let init = RequestInit::get(HeaderMap::new())
+            .with_fetch_metadata(RequestDestination::Empty, RequestMode::Websocket, false)
+            .with_mixed_content(
+                Some(home.base_url().origin()),
+                MixedContentPolicy::default(),
+            );
+        assert_eq!(
+            header_seen_by_server(&away, "/hop1", init).await,
+            home.base_url().origin().ascii_serialization()
+        );
     }
 
     /// A block must be observable, not just returned. Devtools has no other way to report why a

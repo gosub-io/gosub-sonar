@@ -187,7 +187,9 @@ End to end, a fetch through the scheduler goes:
    buffer for buffered listeners (see [coalescing](#coalescing--fan-out)).
 
 7. **Cleanup.** The entry's `done` token fires, it is removed from `inflight_map`, and
-   `FetcherContext::on_ref_done` is called. The spawned task ends and the slots are released.
+   `FetcherContext::on_ref_done` is called. The spawned task ends and the slots are released;
+   a streamed fetch hands its slots to the body reader instead, so they come back when the
+   body ends.
 
 ---
 
@@ -311,7 +313,8 @@ Retries (`retry.rs`): `perform_buffered` and `perform_streaming` wrap each attem
 `with_retries`, which re-sends after a backoff on a retryable error or status, idempotent methods
 only, honouring `Retry-After`. Streams are retried only until headers arrive.
 
-Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enforced by `reqwest`;
+Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enforced by `reqwest`
+(`req_timeout` is reqwest's total request timeout, so it covers the body as well as the headers);
 `read_idle_timeout` (max gap between reads) and `total_body_timeout` (whole-body budget) are
 enforced in the read loops of `fetch_response_complete` and the `ProgressReader`/`SharedBody` path.
 A `FetchRequest` can override `req_timeout`, `read_idle_timeout`, and `total_body_timeout` for

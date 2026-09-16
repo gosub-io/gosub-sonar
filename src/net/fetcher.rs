@@ -61,12 +61,14 @@ pub struct FetcherConfig {
     pub h2_per_origin: usize,
     /// Timeout for the TCP + TLS handshake.  Applies before any bytes are sent.
     pub connect_timeout: Duration,
-    /// Timeout from sending the first request byte until the response headers arrive.
+    /// Deadline for one hop, from sending its first byte until its body has been read. The
+    /// client enforces it, and it covers the body as well as the wait for headers, so a
+    /// download longer than this fails whatever `total_body_timeout` says.
     pub req_timeout: Duration,
     /// Maximum silence between consecutive body chunks before the read is aborted.
     pub read_idle_timeout: Duration,
     /// Wall-clock deadline for receiving the entire response body after headers.
-    /// `None` disables the deadline (useful for very large downloads).
+    /// `None` disables the deadline; for a very large download raise `req_timeout` too.
     pub total_body_timeout: Option<Duration>,
     /// Largest body a buffered fetch holds in memory, counted after decompression, for a
     /// request that sets no [`FetchRequest::max_bytes`] of its own. Also caps a buffered
@@ -644,20 +646,42 @@ impl Fetcher {
             spawn_named(&title, async move {
                 let slots = per_origin.slots_for(&req.url);
 
-                let g = tokio::select! { p = global.acquire_owned() => Some(p), _ = shutdown_child.cancelled() => None };
-                if g.is_none() {
-                    return;
-                }
-
-                let h = tokio::select! { p = slots.sem.acquire() => Some(p), _ = shutdown_child.cancelled() => None };
-                if h.is_none() {
-                    return;
-                }
+                // Waiting for slots ends early on shutdown, or once every subscriber has
+                // cancelled. Either way the entry below is still cleaned up like a finished
+                // fetch, so nothing stays in the in-flight map and every listener hears.
+                let acquire = async {
+                    let global_permit = tokio::select! {
+                        p = global.acquire_owned() => p.ok()?,
+                        _ = shutdown_child.cancelled() => return None,
+                        _ = cancel_parent.cancelled() => return None,
+                    };
+                    let origin_permit = tokio::select! {
+                        p = slots.sem.acquire() => {
+                            p.ok()?.forget();
+                            OriginPermit(slots.clone())
+                        }
+                        _ = shutdown_child.cancelled() => return None,
+                        _ = cancel_parent.cancelled() => return None,
+                    };
+                    Some(SlotGuards {
+                        _global: global_permit,
+                        _origin: origin_permit,
+                    })
+                };
+                // Held here until the task ends, or by the body of a streamed fetch.
+                let mut held = acquire.await;
 
                 let should_stream =
                     req.streaming || inflight_entry2.wants_streaming.load(Ordering::Relaxed);
 
-                let result = if should_stream {
+                let result = if held.is_none() {
+                    let why = if shutdown_child.is_cancelled() {
+                        "fetcher shut down before the request was sent"
+                    } else {
+                        "cancelled before the request was sent"
+                    };
+                    Err(NetError::Cancelled(why.into()))
+                } else if let (true, Some(slot_guards)) = (should_stream, held.take()) {
                     perform_streaming(
                         &client,
                         observer.clone(),
@@ -666,6 +690,7 @@ impl Fetcher {
                         cancel_parent.clone(),
                         ctx_clone.clone(),
                         per_origin.clone(),
+                        slot_guards,
                     )
                     .await
                 } else {
@@ -696,6 +721,7 @@ impl Fetcher {
                 inflight_entry2.done.cancel();
 
                 ctx_clone.on_ref_done(req.reference);
+                drop(held);
             });
         }
     }
@@ -896,6 +922,39 @@ struct OriginSlots {
     h2: AtomicBool,
 }
 
+/// A slot taken from one origin's semaphore, given back on drop.
+struct OriginPermit(Arc<OriginSlots>);
+
+impl Drop for OriginPermit {
+    fn drop(&mut self) {
+        self.0.sem.add_permits(1);
+    }
+}
+
+/// The connection slots a fetch holds: one global, one for its origin. A buffered fetch
+/// keeps them until it has delivered; a streamed one hands them to its body, so the
+/// connection stays counted until the body ends.
+struct SlotGuards {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _origin: OriginPermit,
+}
+
+/// A body reader that keeps the fetch's slots until it is dropped.
+struct HoldsSlots<R> {
+    inner: R,
+    _slots: SlotGuards,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HoldsSlots<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
 /// Per-origin connection semaphores, keyed by serialized origin.
 struct OriginTable {
     cfg: FetcherConfig,
@@ -1002,6 +1061,7 @@ fn effective_retry<'a>(req: &'a FetchRequest, cfg: &'a FetcherConfig) -> Option<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn perform_streaming(
     client: &reqwest::Client,
     observer: Arc<dyn NetObserver + Send + Sync>,
@@ -1010,6 +1070,7 @@ async fn perform_streaming(
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
     origins: Arc<OriginTable>,
+    slots: SlotGuards,
 ) -> Result<FetchResult, NetError> {
     let client = Arc::new(client.clone());
     // Only the header phase is retried; the body goes straight to the caller.
@@ -1050,6 +1111,10 @@ async fn perform_streaming(
             .map(|max| max.saturating_sub(peek_buf.len()) as u64),
     };
 
+    let reader = HoldsSlots {
+        inner: reader,
+        _slots: slots,
+    };
     Ok(FetchResult::Stream {
         meta,
         peek_buf,
@@ -2720,6 +2785,131 @@ mod tests {
             .build();
         let (result, _) = fetch_one(cfg, req).await;
         assert!(matches!(result, FetchResult::Stream { .. }), "{result:?}");
+    }
+
+    /// A streamed body keeps its connection slots until it is read, so the connection it
+    /// still occupies counts against the limits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_streamed_body_holds_its_connection_slot() {
+        use tokio::io::AsyncReadExt;
+        let srv = start_server().await;
+        let cfg = FetcherConfig {
+            global_slots: 1,
+            h1_per_origin: 1,
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_streaming(true)
+            .build();
+        let FetchResult::Stream {
+            shared, peek_buf, ..
+        } = fetcher.fetch(req).await
+        else {
+            panic!("expected a stream");
+        };
+
+        // unread body: the only slot is taken
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(200),
+            fetcher.fetch(make_req(srv.url("/fast"), Priority::Normal).0),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a second fetch got a slot while a body was open"
+        );
+
+        let mut out = Vec::new();
+        SharedBody::combined_reader(peek_buf, shared)
+            .read_to_end(&mut out)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 12 * 1024);
+
+        // body done: the slot is back
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            fetcher.fetch(make_req(srv.url("/fast"), Priority::Normal).0),
+        )
+        .await
+        .expect("slot released once the body was read");
+        assert_eq!(status_of(&result), 200);
+        shutdown.cancel();
+    }
+
+    /// A request still waiting for a slot at shutdown is answered and cleaned up like any
+    /// other, rather than left in the in-flight map with its listeners hanging.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_while_waiting_for_a_slot_cleans_up() {
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl FetcherContext for Counting {
+            fn observer_for(
+                &self,
+                _: RequestReference,
+                _: RequestId,
+                _: ResourceKind,
+                _: Initiator,
+            ) -> Arc<dyn NetObserver + Send + Sync> {
+                Arc::new(crate::net::null_emitter::NullEmitter)
+            }
+            fn on_ref_active(&self, _: RequestReference) {}
+            fn on_ref_done(&self, _: RequestReference) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let srv = start_server().await;
+        let ctx = Arc::new(Counting(Default::default()));
+        let cfg = FetcherConfig {
+            global_slots: 1,
+            req_timeout: Duration::from_millis(500),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        // A holds the only slot until its timeout; B waits for it.
+        let (tx_a, rx_a) = oneshot::channel();
+        fetcher
+            .submit(
+                make_req(srv.url("/hang"), Priority::Normal).0,
+                CancellationToken::new(),
+                tx_a,
+            )
+            .await;
+        let (tx_b, rx_b) = oneshot::channel();
+        fetcher
+            .submit(
+                make_req(srv.url("/fast"), Priority::Normal).0,
+                CancellationToken::new(),
+                tx_b,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fetcher.inflight_map.len(), 2);
+
+        shutdown.cancel();
+        let b = tokio::time::timeout(Duration::from_millis(300), rx_b)
+            .await
+            .expect("B answered at shutdown")
+            .unwrap();
+        assert!(
+            matches!(b, FetchResult::Error(NetError::Cancelled(_))),
+            "{b:?}"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(3), rx_a).await;
+        assert_eq!(fetcher.inflight_map.len(), 0, "nothing left in flight");
+        assert_eq!(ctx.0.load(Ordering::Relaxed), 2, "on_ref_done for both");
     }
 
     /// Drive one request through a fetcher configured with `cfg_policy`, where the request

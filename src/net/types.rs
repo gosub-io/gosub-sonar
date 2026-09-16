@@ -375,6 +375,9 @@ enum Payload {
         open: BodyStreamFactory,
         len: Option<u64>,
     },
+    /// A file on disk, opened and measured at each send.
+    #[cfg(not(target_arch = "wasm32"))]
+    File(std::path::PathBuf),
 }
 
 impl Default for Payload {
@@ -390,6 +393,8 @@ impl Debug for RequestBody {
             Payload::Bytes(b) => d.field("bytes", &b.len()),
             #[cfg(not(target_arch = "wasm32"))]
             Payload::Stream { len, .. } => d.field("stream", len),
+            #[cfg(not(target_arch = "wasm32"))]
+            Payload::File(path) => d.field("file", path),
         };
         d.field("content_type", &self.content_type).finish()
     }
@@ -446,21 +451,17 @@ impl RequestBody {
         }
     }
 
-    /// Body streamed from a file on disk, opened at send time.
-    ///
-    /// `Content-Length` is taken from its current size, so the file must not change until
-    /// the request completes.
+    /// Body streamed from a regular file on disk, opened at each send (a redirect replays
+    /// it). `Content-Length` is the size of the file as opened, so a file that changes
+    /// between sends is sent whole each time. Fails now if the path is not a regular file.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn file(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
-        let len = std::fs::metadata(&path)?.len();
-        Ok(Self::stream(
-            move || {
-                let f = std::fs::File::open(&path)?;
-                Ok(Box::pin(tokio::fs::File::from_std(f)) as BoxedAsyncRead)
-            },
-            Some(len),
-        ))
+        regular_file(&std::fs::metadata(&path)?)?;
+        Ok(Self {
+            payload: Payload::File(path),
+            content_type: None,
+        })
     }
 
     /// The buffered bytes, or `None` when the body is streamed.
@@ -468,16 +469,19 @@ impl RequestBody {
         match &self.payload {
             Payload::Bytes(b) => Some(b),
             #[cfg(not(target_arch = "wasm32"))]
-            Payload::Stream { .. } => None,
+            Payload::Stream { .. } | Payload::File(_) => None,
         }
     }
 
-    /// Number of body bytes, or `None` for a stream without a declared length.
+    /// Number of body bytes, or `None` for a stream without a declared length. For a file,
+    /// its size now.
     pub fn len(&self) -> Option<u64> {
         match &self.payload {
             Payload::Bytes(b) => Some(b.len() as u64),
             #[cfg(not(target_arch = "wasm32"))]
             Payload::Stream { len, .. } => *len,
+            #[cfg(not(target_arch = "wasm32"))]
+            Payload::File(path) => std::fs::metadata(path).ok().map(|m| m.len()),
         }
     }
 
@@ -505,7 +509,30 @@ impl RequestBody {
                 let stream = tokio_util::io::ReaderStream::new(reader);
                 Ok((reqwest::Body::wrap_stream(stream), *len))
             }
+            // Length from the handle that is sent, so it matches what is read.
+            #[cfg(not(target_arch = "wasm32"))]
+            Payload::File(path) => {
+                let f = std::fs::File::open(path)?;
+                let len = regular_file(&f.metadata()?)?;
+                let reader = Box::pin(tokio::fs::File::from_std(f)) as BoxedAsyncRead;
+                let stream = tokio_util::io::ReaderStream::new(reader);
+                Ok((reqwest::Body::wrap_stream(stream), Some(len)))
+            }
         }
+    }
+}
+
+/// The length of a regular file, or an error for anything else (a FIFO or device has no
+/// length and may never end).
+#[cfg(not(target_arch = "wasm32"))]
+fn regular_file(meta: &std::fs::Metadata) -> std::io::Result<u64> {
+    if meta.is_file() {
+        Ok(meta.len())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "request body must be a regular file",
+        ))
     }
 }
 
@@ -599,8 +626,8 @@ pub struct FetchRequest {
     /// for this one request; `None` uses the fetcher-wide setting.
     pub header_order: Option<Vec<HeaderName>>,
     /// Overrides [`FetcherConfig::req_timeout`](crate::net::fetcher::FetcherConfig::req_timeout)
-    /// for this one request: the time allowed from sending the first request byte until the
-    /// response headers arrive. `None` uses the fetcher-wide setting.
+    /// for this one request: the deadline for a hop, headers and body. `None` uses the
+    /// fetcher-wide setting.
     ///
     /// Applies to every hop of a redirect chain separately. When this request is coalesced
     /// onto an identical in-flight one, the timeouts of the request that started the fetch
@@ -616,7 +643,8 @@ pub struct FetchRequest {
     /// for this one request: the wall-clock budget for the whole body after the headers.
     ///
     /// `None` uses the fetcher-wide setting. `Some(None)` removes the deadline for this request
-    /// alone, which is what a large download wants; `Some(Some(d))` sets it to `d`.
+    /// alone; `Some(Some(d))` sets it to `d`. A large download also needs a `req_timeout` long
+    /// enough, since that one covers the body too.
     pub total_body_timeout: Option<Option<Duration>>,
     /// Overrides [`FetcherConfig::retry`](crate::net::fetcher::FetcherConfig::retry) for this
     /// request. `None` inherits, `Some(None)` disables, `Some(Some(p))` uses `p`.
@@ -818,14 +846,17 @@ impl FetchRequest {
             CacheMode::OnlyIfCached => "only-if-cached",
         };
 
+        // Raw values are length-prefixed: a `;` or `=` inside one must not read as the next
+        // field, or two different requests could spell the same key.
+        let lp = |s: &str| format!("{}:{}", s.len(), s);
         Some(format!(
             "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={};Cache={};H={};B={};MB={}",
             self.method,
-            url,
-            range,
-            accept,
-            accept_lang,
-            accept_enc,
+            lp(&url),
+            lp(range),
+            lp(accept),
+            lp(accept_lang),
+            lp(accept_enc),
             auth_hash,
             cookie_hash,
             mixed_content,
@@ -1025,9 +1056,9 @@ impl FetchRequestBuilder {
         self
     }
 
-    /// Overrides the fetcher's request timeout for this request: the time allowed from sending
-    /// the first request byte until the response headers arrive, per hop. Default: the
-    /// fetcher's [`req_timeout`](crate::net::fetcher::FetcherConfig::req_timeout).
+    /// Overrides the fetcher's request timeout for this request: the deadline for a hop,
+    /// headers and body. Default: the fetcher's
+    /// [`req_timeout`](crate::net::fetcher::FetcherConfig::req_timeout).
     pub fn with_req_timeout(mut self, timeout: Duration) -> Self {
         self.req_timeout = Some(timeout);
         self
@@ -1052,7 +1083,8 @@ impl FetchRequestBuilder {
 
     /// Removes the total body deadline for this request alone, whatever the fetcher's
     /// [`total_body_timeout`](crate::net::fetcher::FetcherConfig::total_body_timeout) says.
-    /// For large downloads; the read idle timeout still catches a stalled body.
+    /// For large downloads, together with a `with_req_timeout` long enough for the body; the
+    /// read idle timeout still catches a stalled one.
     pub fn without_total_body_timeout(mut self) -> Self {
         self.total_body_timeout = Some(None);
         self
@@ -1194,6 +1226,29 @@ mod tests {
     use super::*;
     use cow_utils::CowUtils;
     use tokio::io::AsyncReadExt;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_file_body_is_measured_when_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body");
+        std::fs::write(&path, b"12345").unwrap();
+        let body = RequestBody::file(&path).unwrap();
+        assert_eq!(body.len(), Some(5));
+        assert_eq!(body.to_reqwest_body().unwrap().1, Some(5));
+
+        std::fs::write(&path, b"1234567890").unwrap();
+        assert_eq!(
+            body.to_reqwest_body().unwrap().1,
+            Some(10),
+            "measured at send"
+        );
+
+        assert!(
+            RequestBody::file(dir.path()).is_err(),
+            "a directory is refused"
+        );
+    }
 
     #[test]
     fn builder_leaves_timeouts_to_the_fetcher_by_default() {
@@ -1348,12 +1403,13 @@ mod tests {
             // FM: default destination and mode, no initiating origin, no user navigation.
             // Cred and Cache: the default credentials mode and normal HTTP caching.
             // H: every header, sorted. B=n: no body. MB=n: no size cap.
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include;Cache=default;H={};B=n;MB=n",
-            fr.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash, all_headers
+            "M={};U={}:{};R=10:bytes=0-99;A=9:text/html;AL=5:en-US;AE=4:gzip;Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include;Cache=default;H={};B=n;MB=n",
+            fr.method, url_norm.len(), url_norm, auth_hash, cookie_hash, all_headers
         );
 
         assert_eq!(key, expected);
-        assert!(key.starts_with("M=GET;U=https://example.org/a/b"));
+        assert!(key.starts_with("M=GET;U="));
+        assert!(key.contains("https://example.org/a/b"));
         assert!(!key.contains("#frag"));
     }
 
@@ -1409,6 +1465,27 @@ mod tests {
             )
             .is_none(),
             "a streamed body is never coalesced"
+        );
+    }
+
+    /// A `;` or `=` inside a header value must not let two different requests share a key.
+    #[test]
+    fn coalescing_key_fields_cannot_run_into_each_other() {
+        let url = Url::parse("https://example.org/a").unwrap();
+        let key_for = |accept: &str, lang: &str, enc: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT, accept.parse().unwrap());
+            headers.insert(header::ACCEPT_LANGUAGE, lang.parse().unwrap());
+            headers.insert(header::ACCEPT_ENCODING, enc.parse().unwrap());
+            FetchRequest::builder(Method::GET, url.clone())
+                .with_headers(headers)
+                .build()
+                .generate_request_key()
+                .unwrap()
+        };
+        assert_ne!(
+            key_for("a;AL=b;AE=c", "", ""),
+            key_for("a", "b", "c;AL=;AE=")
         );
     }
 
