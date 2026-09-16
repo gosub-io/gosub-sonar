@@ -286,10 +286,15 @@ pub trait CredentialStore: Send + Sync {
     fn forget(&self, space: &ProtectionSpace);
 }
 
-/// In-memory [`CredentialStore`].
+/// Most protection spaces an [`InMemoryCredentialStore`] remembers.
+pub const MAX_CREDENTIAL_ENTRIES: usize = 256;
+
+/// In-memory [`CredentialStore`]. Past [`MAX_CREDENTIAL_ENTRIES`] the space stored longest
+/// ago is forgotten.
 #[derive(Default)]
 pub struct InMemoryCredentialStore {
-    entries: parking_lot::Mutex<std::collections::HashMap<ProtectionSpace, Credentials>>,
+    entries: parking_lot::Mutex<std::collections::HashMap<ProtectionSpace, (Credentials, u64)>>,
+    clock: std::sync::atomic::AtomicU64,
 }
 
 impl InMemoryCredentialStore {
@@ -316,11 +321,24 @@ impl InMemoryCredentialStore {
 
 impl CredentialStore for InMemoryCredentialStore {
     fn credentials_for(&self, space: &ProtectionSpace) -> Option<Credentials> {
-        self.entries.lock().get(space).cloned()
+        self.entries.lock().get(space).map(|(c, _)| c.clone())
     }
 
     fn store(&self, space: ProtectionSpace, credentials: Credentials) {
-        self.entries.lock().insert(space, credentials);
+        let stamp = self
+            .clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut entries = self.entries.lock();
+        if entries.len() >= MAX_CREDENTIAL_ENTRIES && !entries.contains_key(&space) {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
+        entries.insert(space, (credentials, stamp));
     }
 
     fn forget(&self, space: &ProtectionSpace) {
@@ -492,6 +510,28 @@ fn base64_encode(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_credential_store_is_bounded() {
+        let store = InMemoryCredentialStore::new();
+        let space = |i: usize| ProtectionSpace {
+            target: AuthTarget::Server,
+            scheme: AuthScheme::Basic,
+            origin: Some(format!("https://h{i}.test")),
+            realm: "r".into(),
+        };
+        for i in 0..=MAX_CREDENTIAL_ENTRIES {
+            store.store(space(i), Credentials::basic("u", "p"));
+        }
+        assert_eq!(store.len(), MAX_CREDENTIAL_ENTRIES);
+        assert!(
+            store.credentials_for(&space(0)).is_none(),
+            "oldest forgotten"
+        );
+        assert!(store
+            .credentials_for(&space(MAX_CREDENTIAL_ENTRIES))
+            .is_some());
+    }
 
     fn url() -> Url {
         Url::parse("https://example.com/protected").unwrap()

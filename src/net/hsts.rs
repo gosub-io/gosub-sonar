@@ -56,7 +56,12 @@ pub trait HstsStore: Send + Sync {
     fn remove(&self, host: &str);
 }
 
-/// The default [`HstsStore`]: an in-memory map that does not survive a restart.
+/// Most hosts an [`InMemoryHstsStore`] holds.
+pub const MAX_HSTS_ENTRIES: usize = 4096;
+
+/// The default [`HstsStore`]: an in-memory map that does not survive a restart. Past
+/// [`MAX_HSTS_ENTRIES`], expired entries are swept and then the one expiring soonest is
+/// dropped.
 #[derive(Debug, Default)]
 pub struct InMemoryHstsStore {
     entries: DashMap<String, HstsEntry>,
@@ -85,6 +90,20 @@ impl HstsStore for InMemoryHstsStore {
     }
 
     fn store(&self, host: &str, entry: HstsEntry) {
+        if self.entries.len() >= MAX_HSTS_ENTRIES && !self.entries.contains_key(host) {
+            let now = Utc::now();
+            self.entries.retain(|_, e| e.expires_at > now);
+            if self.entries.len() >= MAX_HSTS_ENTRIES {
+                let soonest = self
+                    .entries
+                    .iter()
+                    .min_by_key(|e| e.value().expires_at)
+                    .map(|e| e.key().clone());
+                if let Some(host) = soonest {
+                    self.entries.remove(&host);
+                }
+            }
+        }
         self.entries.insert(host.to_string(), entry);
     }
 
@@ -268,6 +287,30 @@ pub(crate) fn upgrade(url: &Url) -> Url {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hsts_store_is_bounded() {
+        let store = InMemoryHstsStore::new();
+        let now = Utc::now();
+        let entry = |days: i64| HstsEntry {
+            expires_at: now + chrono::TimeDelta::days(days),
+            include_subdomains: false,
+        };
+        store.store("expired.test", entry(-1));
+        for i in 0..MAX_HSTS_ENTRIES - 1 {
+            store.store(&format!("h{i}.test"), entry(2 + i as i64));
+        }
+        assert_eq!(store.len(), MAX_HSTS_ENTRIES);
+        // full: the expired one is swept first
+        store.store("new1.test", entry(1000));
+        assert_eq!(store.len(), MAX_HSTS_ENTRIES);
+        assert!(store.load("expired.test").is_none());
+        // full again: the one expiring soonest goes
+        store.store("new2.test", entry(1000));
+        assert_eq!(store.len(), MAX_HSTS_ENTRIES);
+        assert!(store.load("h0.test").is_none());
+        assert!(store.load("new2.test").is_some());
+    }
 
     fn now() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).expect("valid fixed timestamp")

@@ -10,6 +10,8 @@ use crate::net::cache::{CacheEntry, CacheMode, CacheOutcome};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::cors::CorsPreflightCache;
 use crate::net::cors::{self, CorsError, ResponseTainting};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::dns::DnsResolver;
 use crate::net::events::NetEvent;
 use crate::net::fetch_metadata::{self, RequestDestination, RequestMode, SecFetchSite};
 use crate::net::fetcher_context::FetcherContext;
@@ -18,6 +20,8 @@ use crate::net::hsts::{self, HstsStore};
 use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
 use crate::net::observer::NetObserver;
 use crate::net::referrer::{self, ReferrerPolicy};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::tls::TlsOverrideStore;
 use crate::net::transport::TransportError;
 use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody, RequestCredentials};
 use crate::net::utils::BytesAsyncReader;
@@ -62,6 +66,70 @@ pub(crate) fn blocked(
         reason,
     });
     NetError::Blocked { reason, url }
+}
+
+/// `url` without its `user:password@`, warning the observer when there was one. The client
+/// would turn embedded credentials into an `Authorization` header, which lets a page or a
+/// redirect send credentials of its choosing along with the user's cookies; browsers do not
+/// send them either. Credentials for a server come from the auth hook, after a challenge.
+fn without_credentials(mut url: Url, observer: &Arc<dyn NetObserver + Send + Sync>) -> Url {
+    if url.username().is_empty() && url.password().is_none() {
+        return url;
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    observer.on_event(NetEvent::Warning {
+        url: url.clone(),
+        message: "credentials embedded in the URL were dropped".into(),
+    });
+    url
+}
+
+/// The host of `url` when it is an IP literal, without brackets.
+#[cfg(not(target_arch = "wasm32"))]
+fn ip_literal(url: &Url) -> Option<String> {
+    match url.host()? {
+        url::Host::Ipv4(a) => Some(a.to_string()),
+        url::Host::Ipv6(a) => Some(a.to_string()),
+        url::Host::Domain(_) => None,
+    }
+}
+
+/// Hand a response's `Set-Cookie` values to the policy's jar. Returns whether there were any.
+fn report_set_cookie(policy: &NetPolicy, url: &Url, headers: &HeaderMap) -> bool {
+    let values: Vec<&str> = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if values.is_empty() {
+        return false;
+    }
+    (policy.on_cookies)(url, &values);
+    true
+}
+
+/// Whether `resp`'s connection was accepted through the override store. Needs a client built
+/// with `tls_info`, which the fetcher does when overrides are enabled.
+#[cfg(not(target_arch = "wasm32"))]
+fn over_accepted_override(policy: &NetPolicy, resp: &reqwest::Response) -> bool {
+    let (Some(store), Some(host)) = (policy.tls_overrides.as_ref(), resp.url().host_str()) else {
+        return false;
+    };
+    resp.extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(|info| info.peer_certificate())
+        .is_some_and(|der| store.is_accepted(host, &crate::net::tls::fingerprint(der)))
+}
+
+/// The text of a `Location` header. Servers send non-ASCII targets as UTF-8; anything that is
+/// not valid UTF-8 is decoded byte for byte, as browsers do. Either way the URL parser then
+/// percent-encodes what it has to.
+fn location_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    }
 }
 
 /// What [`hop_checks`] decided about one hop.
@@ -142,9 +210,10 @@ pub struct NetPolicy {
     /// Called on each hop after cross-origin cookie stripping, so the jar is always consulted
     /// for the correct origin.
     pub cookies_for: CookieJarFn,
-    /// Called with the raw `Set-Cookie` values of each redirect (3xx) response, so cookies set
-    /// mid-chain (e.g. a session cookie on a login 302) reach the jar before the next hop.
-    /// The final response's cookies are reported by the fetcher, not here.
+    /// Called with the raw `Set-Cookie` values of every response, redirect hops included, so a
+    /// cookie set mid-chain (a session cookie on a login 302) reaches the jar before the next
+    /// hop. Not called for a hop the request's credentials mode kept cookies off (Fetch: only
+    /// with *includeCredentials*), so a `credentials: omit` request cannot write the jar.
     pub on_cookies: CookieSinkFn,
     /// Called with the URL and HTTP version of every response in the chain, redirects included.
     /// The fetcher uses this to pick the h1 or h2 per-origin connection limit. Not called on
@@ -160,6 +229,10 @@ pub struct NetPolicy {
     /// `None` disables HSTS. Set via [`NetPolicy::with_hsts`].
     #[cfg(not(target_arch = "wasm32"))]
     pub hsts: Option<Arc<dyn HstsStore>>,
+    /// The client's TLS override store, if any. A response over an accepted override does not
+    /// update HSTS (RFC 6797 §8.1). Set via [`NetPolicy::with_tls_overrides`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub tls_overrides: Option<Arc<dyn TlsOverrideStore>>,
     /// Cache of CORS preflight grants. `None` still preflights when the spec requires it,
     /// asking the server every time. Set via [`NetPolicy::with_cors_preflight_cache`].
     #[cfg(not(target_arch = "wasm32"))]
@@ -205,6 +278,11 @@ pub struct NetPolicy {
     /// is. `None` (default): no hop is proxied. Set via [`NetPolicy::with_proxy_for`].
     #[cfg(not(target_arch = "wasm32"))]
     pub proxy_for: Option<ProxyForFn>,
+    /// The resolver a hop with an IP-literal host is checked against; see
+    /// [`dns`](mod@crate::net::dns). `None` skips the check. Set via
+    /// [`NetPolicy::with_dns_resolver`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub dns_resolver: Option<Arc<dyn DnsResolver>>,
 }
 
 impl Default for NetPolicy {
@@ -219,6 +297,8 @@ impl Default for NetPolicy {
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
+            tls_overrides: None,
+            #[cfg(not(target_arch = "wasm32"))]
             cors_preflight: None,
             on_auth_challenge: Box::new(|_| None),
             credentials: None,
@@ -228,6 +308,8 @@ impl Default for NetPolicy {
             proxy_authorization: None,
             #[cfg(not(target_arch = "wasm32"))]
             proxy_for: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            dns_resolver: None,
         }
     }
 }
@@ -250,6 +332,8 @@ impl NetPolicy {
             #[cfg(not(target_arch = "wasm32"))]
             hsts: None,
             #[cfg(not(target_arch = "wasm32"))]
+            tls_overrides: None,
+            #[cfg(not(target_arch = "wasm32"))]
             cors_preflight: None,
             on_auth_challenge: Box::new(move |challenge| ctx_auth.on_auth_challenge(challenge)),
             credentials: None,
@@ -260,6 +344,8 @@ impl NetPolicy {
             proxy_authorization: None,
             #[cfg(not(target_arch = "wasm32"))]
             proxy_for: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            dns_resolver: None,
         }
     }
 
@@ -287,6 +373,13 @@ impl NetPolicy {
         self
     }
 
+    /// Attaches the resolver for [`NetPolicy::dns_resolver`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_dns_resolver(mut self, resolver: Option<Arc<dyn DnsResolver>>) -> Self {
+        self.dns_resolver = resolver;
+        self
+    }
+
     /// Attaches a callback that receives the URL and HTTP version of every response.
     pub fn with_protocol_sink(mut self, sink: ProtocolSinkFn) -> Self {
         self.on_protocol = sink;
@@ -303,6 +396,13 @@ impl NetPolicy {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_hsts(mut self, store: Option<Arc<dyn HstsStore>>) -> Self {
         self.hsts = store;
+        self
+    }
+
+    /// Attaches the store for [`NetPolicy::tls_overrides`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_tls_overrides(mut self, store: Option<Arc<dyn TlsOverrideStore>>) -> Self {
+        self.tls_overrides = store;
         self
     }
 
@@ -388,8 +488,8 @@ pub struct RequestInit {
     /// Order in which headers are sent, applied per hop; `None` keeps insertion order. See
     /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
     pub header_order: Option<Vec<HeaderName>>,
-    /// Time allowed from sending the first request byte until the response headers arrive,
-    /// applied to every hop. `None` leaves it to the client's own request timeout.
+    /// Deadline for each hop, from its first byte sent until its body is read. `None` leaves
+    /// it to the client's own request timeout.
     pub timeout: Option<Duration>,
 }
 
@@ -607,6 +707,7 @@ pub async fn fetch_response_top(
     observer: Arc<dyn NetObserver + Send + Sync>,
     policy: NetPolicy,
 ) -> Result<ResponseTop, NetError> {
+    let url = without_credentials(url, &observer);
     let result =
         fetch_response_top_inner(client, url.clone(), init, cancel, observer.clone(), policy).await;
 
@@ -1406,6 +1507,9 @@ fn credentials_for_challenges(
 /// - `Authorization` and `Cookie` are stripped on cross-origin redirects (RFC 9110 §15.4);
 ///   the cookie jar is re-queried for the new origin.
 /// - Only `http` and `https` targets are followed; other schemes are rejected.
+/// - Credentials embedded in the URL (`user:password@`) are dropped, from the initial URL
+///   and from every `Location`, so the client never turns them into an `Authorization`
+///   header. A cross-origin or cors-mode `Location` with credentials is refused outright.
 /// - Insecure hops requested by a secure `init.origin` are blocked or upgraded per
 ///   `init.mixed_content`, re-evaluated at every hop so a redirect cannot escape the check.
 /// - `Referer` is recomputed from `init.referrer` and `init.referrer_policy` at every hop, since
@@ -1483,6 +1587,26 @@ async fn get_with_redirects(
                     });
                     url = target;
                 }
+            }
+        }
+
+        // The client connects to an IP literal without asking the resolver, so a policy in
+        // it would never see e.g. 169.254.169.254. Ask it here with the literal as the name;
+        // an Err refuses the hop like a refused name would. The returned addresses are unused.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(resolver), Some(literal)) = (policy.dns_resolver.as_ref(), ip_literal(&url)) {
+            let refused = tokio::select! {
+                _ = cancel.cancelled() => {
+                    observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled net.get_with_redirects" });
+                    return Err(NetError::Cancelled("cancelled net.get_with_redirects".into()));
+                }
+                r = resolver.resolve(&literal) => r.err(),
+            };
+            if let Some(e) = refused {
+                return Err(NetError::Transport(TransportError {
+                    kind: crate::net::transport::TransportErrorKind::Connect,
+                    message: format!("dns error: {e}"),
+                }));
             }
         }
 
@@ -1683,7 +1807,8 @@ async fn get_with_redirects(
         };
         if attach_credentials && !current_headers.contains_key(header::COOKIE) {
             if let Some(cookie_str) = (policy.cookies_for)(&url) {
-                if let Ok(val) = cookie_str.parse() {
+                if let Ok(mut val) = cookie_str.parse::<http::HeaderValue>() {
+                    val.set_sensitive(true);
                     current_headers.insert(header::COOKIE, val);
                 }
             }
@@ -1743,6 +1868,22 @@ async fn get_with_redirects(
 
         let hop = match cache_hit {
             Some(entry) => {
+                // The CORS check applies to a response wherever it came from (Fetch §4.10.3).
+                // The entry may have been stored by a same-origin fetch, which needed no
+                // `Access-Control-Allow-Origin`; handing it to a cross-origin caller would read
+                // it past the check the network path enforces. Blocked rather than re-sent,
+                // as browsers do: a server whose allow-origin depends on `Origin` says
+                // `Vary: Origin`, and then the entry is not a match in the first place.
+                #[cfg(not(target_arch = "wasm32"))]
+                if tainting == ResponseTainting::Cors {
+                    if let Some(ref o) = origin {
+                        if let Err(e) =
+                            cors::cors_check(o, origin_tainted, credentials_include, &entry.headers)
+                        {
+                            return Err(blocked(&observer, url, BlockReason::Cors(e)));
+                        }
+                    }
+                }
                 observer.on_event(NetEvent::Cache {
                     url: url.clone(),
                     outcome: CacheOutcome::Hit,
@@ -1766,7 +1907,8 @@ async fn get_with_redirects(
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ref proxy_authorization) = policy.proxy_authorization {
                     if !hop_headers.contains_key(header::PROXY_AUTHORIZATION) {
-                        if let Some(value) = proxy_authorization(&url) {
+                        if let Some(mut value) = proxy_authorization(&url) {
+                            value.set_sensitive(true);
                             hop_headers.insert(header::PROXY_AUTHORIZATION, value);
                         }
                     }
@@ -1881,9 +2023,12 @@ async fn get_with_redirects(
 
                 // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
                 // a site first arms it, and that response is consumed below.
+                // RFC 6797 §8.1: not from a connection the user clicked through.
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ref store) = policy.hsts {
-                    hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
+                    if !over_accepted_override(&policy, &resp) {
+                        hsts::record(store.as_ref(), &url, resp.headers(), chrono::Utc::now());
+                    }
                 }
 
                 // The CORS check (Fetch §4.10.3) runs on *every* response of a cors-tainted chain —
@@ -2057,6 +2202,9 @@ async fn get_with_redirects(
         };
 
         if !hop.is_redirection() {
+            if attach_credentials {
+                report_set_cookie(&policy, &url, hop.headers());
+            }
             return Ok(ChainOutcome {
                 response: hop,
                 url: url.clone(),
@@ -2097,27 +2245,21 @@ async fn get_with_redirects(
         // Report Set-Cookie values on this hop to the jar before following the redirect —
         // login flows commonly set the session cookie on a 302. Dropping our Cookie header
         // makes the next hop re-query the now-updated jar instead of resending a stale value.
-        let set_cookies: Vec<&str> = hop
-            .headers()
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
-        if !set_cookies.is_empty() {
-            (policy.on_cookies)(&from, &set_cookies);
+        if attach_credentials && report_set_cookie(&policy, &from, hop.headers()) {
             current_headers.remove(header::COOKIE);
         }
 
         let loc = hop
             .headers()
             .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
+            .map(|v| location_text(v.as_bytes()))
             .ok_or_else(|| {
                 NetError::Redirect(Arc::new(anyhow!(
                     "redirect status {} without Location header",
                     status
                 )))
             })?;
+        let loc = loc.as_str();
 
         let to = from.join(loc).map_err(|e| {
             NetError::Redirect(Arc::new(anyhow!("invalid redirect URL '{}': {}", loc, e)))
@@ -2135,6 +2277,7 @@ async fn get_with_redirects(
                 BlockReason::Cors(CorsError::CredentialedRedirect),
             ));
         }
+        let to = without_credentials(to, &observer);
 
         // Method and body semantics per RFC 7231 §6.4
         match status {
@@ -2176,9 +2319,9 @@ async fn get_with_redirects(
             }
         }
 
-        // A cross-origin redirect from a hop the request's own origin had already left taints
-        // the Origin header for the rest of the chain (Fetch, HTTP-redirect fetch). The first
-        // cross-origin hop still sends the real origin, which CORS depends on.
+        // Fetch's redirect-taint, per hop: a redirect to another origin from a hop that was
+        // itself not the request's origin taints the chain, and `Origin` reads `null` from
+        // then on. The first cross-origin hop still sends the real origin, which CORS needs.
         if let Some(ref o) = origin {
             if to.origin() != from.origin() && *o != from.origin() {
                 origin_tainted = true;
@@ -3416,6 +3559,121 @@ mod tests {
         assert_eq!(&body[..], b"final");
     }
 
+    /// `user:password@` in a URL would become an `Authorization` header in the client.
+    #[tokio::test(flavor = "current_thread")]
+    async fn credentials_in_the_initial_url_are_dropped() {
+        let srv = TestServer::new()
+            .route("/echo-headers", RouteConfig::echo_request_headers())
+            .start()
+            .await;
+        let mut url = srv.url("/echo-headers");
+        url.set_username("user").unwrap();
+        url.set_password(Some("pw")).unwrap();
+
+        let rec = Arc::new(RecordingObserver::new());
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            url,
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert!(
+            !String::from_utf8_lossy(&body)
+                .to_ascii_lowercase()
+                .contains("authorization:"),
+            "{body:?}"
+        );
+        assert_eq!(meta.final_url.username(), "");
+        assert_eq!(meta.final_url.password(), None);
+        let sent = rec.requests_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.username(), "", "reported without credentials");
+    }
+
+    /// Same-origin, so not refused like a cross-origin one, but still not sent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn credentials_in_a_same_origin_location_are_dropped() {
+        let srv = TestServer::new()
+            .route("/echo-headers", RouteConfig::echo_request_headers())
+            .route(
+                "/hop",
+                RouteConfig::redirect_to_with_credentials("user:pw", "/echo-headers"),
+            )
+            .start()
+            .await;
+
+        let rec = Arc::new(RecordingObserver::new());
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, 200);
+        assert!(
+            !String::from_utf8_lossy(&body)
+                .to_ascii_lowercase()
+                .contains("authorization:"),
+            "{body:?}"
+        );
+        assert_eq!(meta.final_url.username(), "");
+        assert_eq!(meta.final_url.password(), None);
+        assert!(rec
+            .requests_sent()
+            .iter()
+            .all(|(_, url, _)| url.username().is_empty()));
+    }
+
+    #[test]
+    fn location_text_decodes_utf8_then_bytes() {
+        assert_eq!(location_text(b"/plain"), "/plain");
+        assert_eq!(location_text("/caf\u{e9}".as_bytes()), "/caf\u{e9}");
+        assert_eq!(location_text(b"/caf\xe9"), "/caf\u{e9}", "latin-1 byte");
+    }
+
+    /// A `Location` with non-ASCII characters is followed, percent-encoded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_non_ascii_location_is_followed() {
+        let srv = TestServer::new()
+            .route("/hop", RouteConfig::redirect_to("/caf\u{e9}"))
+            .route("/caf%C3%A9", RouteConfig::ok(b"bonjour"))
+            .start()
+            .await;
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"bonjour");
+        assert_eq!(meta.final_url.path(), "/caf%C3%A9");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn cancel_during_redirect_chain() {
         let srv = server().await;
@@ -3981,6 +4239,32 @@ mod tests {
         assert_eq!(header_seen_by_server(&away, "/hop", init).await, "null");
     }
 
+    /// The other side of the rule: hops that stay on the origin the chain crossed into do not
+    /// taint, so `Origin` keeps its real value (Fetch, redirect-taint).
+    #[tokio::test(flavor = "current_thread")]
+    async fn origin_header_survives_same_origin_hops_after_a_cross_origin_redirect() {
+        let home = TestServer::new()
+            .route("/", RouteConfig::ok(b""))
+            .start()
+            .await;
+        let away = TestServer::new()
+            .route("/hop1", RouteConfig::redirect_to("/hop2"))
+            .route("/hop2", RouteConfig::redirect_to("/origin"))
+            .route("/origin", RouteConfig::echo_request_header("origin"))
+            .start()
+            .await;
+        let init = RequestInit::get(HeaderMap::new())
+            .with_fetch_metadata(RequestDestination::Empty, RequestMode::Websocket, false)
+            .with_mixed_content(
+                Some(home.base_url().origin()),
+                MixedContentPolicy::default(),
+            );
+        assert_eq!(
+            header_seen_by_server(&away, "/hop1", init).await,
+            home.base_url().origin().ascii_serialization()
+        );
+    }
+
     /// A block must be observable, not just returned. Devtools has no other way to report why a
     /// resource never loaded, and nothing else in the test suite asserts the event is emitted.
     #[tokio::test(flavor = "current_thread")]
@@ -4339,6 +4623,85 @@ mod tests {
 
     /// When a redirect hop sets cookies but no jar is wired up, the pre-existing Cookie header is
     /// dropped for subsequent hops rather than resending a value the server just replaced.
+    type SeenCookies = Arc<std::sync::Mutex<Vec<(Url, String)>>>;
+
+    /// Records every `Set-Cookie` handed to the jar, keyed by the URL it came from.
+    fn recording_jar() -> (NetPolicy, SeenCookies) {
+        let seen: SeenCookies = Default::default();
+        let sink = seen.clone();
+        let policy = NetPolicy {
+            on_cookies: Box::new(move |url, values| {
+                let mut seen = sink.lock().unwrap();
+                for v in values {
+                    seen.push((url.clone(), v.to_string()));
+                }
+            }),
+            ..NetPolicy::default()
+        };
+        (policy, seen)
+    }
+
+    fn set_cookie_server() -> crate::net::test_support::TestServer {
+        TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_with_cookie("/final", "mid=1; Path=/"),
+            )
+            .route(
+                "/final",
+                RouteConfig::ok_with_headers(&[("Set-Cookie", "end=1; Path=/")], b"ok"),
+            )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_cookie_reaches_the_jar_with_credentials() {
+        let srv = set_cookie_server().start().await;
+        let (policy, seen) = recording_jar();
+        let (meta, _) = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], (srv.url("/hop"), "mid=1; Path=/".to_string()));
+        assert_eq!(seen[1], (srv.url("/final"), "end=1; Path=/".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_cookie_is_ignored_without_credentials() {
+        let srv = set_cookie_server().start().await;
+        let (policy, seen) = recording_jar();
+        let (meta, _) = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()).with_credentials(RequestCredentials::Omit),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn redirect_set_cookie_drops_stale_cookie_header() {
         let srv = server().await;
@@ -4853,6 +5216,80 @@ mod tests {
         assert_eq!(&body[..], b"hit-1", "the stored body, not a second request");
         assert_eq!(srv.hit_count("/fresh"), 1, "the server was not asked again");
         assert_eq!(rec.cache_outcomes(), vec![CacheOutcome::Hit]);
+    }
+
+    /// A stored response is CORS-checked like a fresh one: an entry stored by a same-origin
+    /// fetch carries no `Access-Control-Allow-Origin`, and a cross-origin caller must not
+    /// read it from the cache when it could not read it from the network.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cache_hit_is_cors_checked() {
+        let srv = TestServer::new()
+            .route(
+                "/private",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(60, b"secret".to_vec())),
+            )
+            .route(
+                "/public",
+                RouteConfig::Cacheable(CacheRouteOptions {
+                    extra_headers: vec![("Access-Control-Allow-Origin".into(), "*".into())],
+                    ..CacheRouteOptions::max_age(60, b"open".to_vec())
+                }),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+        cache_fetch(&srv, "/private", RequestInit::default(), policy, observer()).await;
+        let (policy, _) = (NetPolicy::default().with_cache(Some(cache.clone())), ());
+        cache_fetch(&srv, "/public", RequestInit::default(), policy, observer()).await;
+        assert_eq!(cache.len(), 2);
+
+        let cors_from_other = || {
+            RequestInit::get(HeaderMap::new())
+                .with_mixed_content(
+                    Some(Url::parse("http://other.test/").unwrap().origin()),
+                    MixedContentPolicy::Allow,
+                )
+                .with_fetch_metadata(RequestDestination::Empty, RequestMode::Cors, false)
+                .with_credentials(RequestCredentials::Omit)
+        };
+
+        let rec = Arc::new(RecordingObserver::new());
+        let res = super::fetch_response_complete(
+            client(),
+            srv.url("/private"),
+            cors_from_other(),
+            CancellationToken::new(),
+            rec.clone(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            NetPolicy::default().with_cache(Some(cache.clone())),
+        )
+        .await;
+        assert!(
+            matches!(
+                res,
+                Err(NetError::Blocked {
+                    reason: BlockReason::Cors(_),
+                    ..
+                })
+            ),
+            "{res:?}"
+        );
+        assert_eq!(srv.hit_count("/private"), 1, "blocked, not re-fetched");
+
+        // An entry that does allow the origin is served from the cache.
+        let (meta, body) = cache_fetch(
+            &srv,
+            "/public",
+            cors_from_other(),
+            NetPolicy::default().with_cache(Some(cache.clone())),
+            observer(),
+        )
+        .await;
+        assert!(meta.from_cache);
+        assert_eq!(&body[..], b"open");
+        assert_eq!(srv.hit_count("/public"), 1);
     }
 
     /// A stale entry is revalidated, and a `304` reuses the stored body.

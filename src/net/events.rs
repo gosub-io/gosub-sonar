@@ -122,7 +122,8 @@ pub enum NetEvent {
         url: Url,
         /// HTTP method for this hop
         method: Method,
-        /// Headers this stack set for this hop
+        /// Headers this stack set for this hop. Real values, cookies and credentials
+        /// included; those are marked sensitive, so `{:?}` prints them redacted.
         headers: HeaderMap,
     },
 

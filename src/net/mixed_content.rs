@@ -11,7 +11,9 @@
 //! [`FetchRequest::mixed_content`].
 //!
 //! To wire it up, set [`FetcherConfig::mixed_content`] for the fetcher-wide default and
-//! [`FetchRequest::origin`] to the initiating document. Without an origin the check is inert.
+//! [`FetchRequest::origin`] to the initiating document. Without an origin the check is inert,
+//! and so it is for a document opened from a `file:` URL: its origin is opaque, so nothing it
+//! loads is mixed content, as in browsers.
 //!
 //! On `wasm32` the browser follows redirects itself and cannot be asked not to, so only the
 //! initial URL is checked; the browser blocks the hops sonar never sees.
@@ -89,7 +91,9 @@ pub fn is_potentially_trustworthy(url: &Url) -> bool {
 
 /// Returns `true` if `origin` is a *potentially trustworthy origin*.
 ///
-/// An opaque (serialised as `"null"`) origin is never trustworthy.
+/// An opaque (serialised as `"null"`) origin is never trustworthy. That includes the origin of
+/// a `file:` URL, which the URL standard makes opaque, even though a `file:` *URL* counts as
+/// trustworthy in [`is_potentially_trustworthy`].
 pub fn is_origin_potentially_trustworthy(origin: &Origin) -> bool {
     match origin {
         Origin::Opaque(_) => false,
@@ -264,6 +268,24 @@ mod tests {
             MixedContentAction::Block,
             "a loopback document is a secure context and must still block mixed content"
         );
+    }
+
+    /// A local page is not protected: its subresources are never mixed content.
+    #[test]
+    fn file_document_is_not_protected() {
+        let doc = Url::parse("file:///home/me/index.html").unwrap().origin();
+        assert!(!is_origin_potentially_trustworthy(&doc));
+        assert_eq!(
+            evaluate(
+                MixedContentPolicy::Block,
+                Some(&doc),
+                &Url::parse("http://cdn.test/app.js").unwrap()
+            ),
+            MixedContentAction::Allow
+        );
+        assert!(is_potentially_trustworthy(
+            &Url::parse("file:///home/me/index.html").unwrap()
+        ));
     }
 
     #[test]

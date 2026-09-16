@@ -90,6 +90,13 @@ pub enum RouteConfig {
     },
     /// 302 redirect to another `path` on this server.
     RedirectTo(String),
+    /// 302 redirect to `path` on this server with `user:password@` in front of the host.
+    RedirectToWithCredentials {
+        /// The `user:password` part
+        userinfo: String,
+        /// Path to redirect to
+        path: String,
+    },
     /// 307 redirect to another `path` on this server. Unlike the 302 variants, the client
     /// must preserve the method and replay the request body.
     Redirect307(String),
@@ -353,6 +360,16 @@ impl RouteConfig {
     pub fn redirect_to(path: impl Into<String>) -> Self {
         Self::RedirectTo(path.into())
     }
+    /// Shorthand for [`RouteConfig::RedirectToWithCredentials`]
+    pub fn redirect_to_with_credentials(
+        userinfo: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Self {
+        Self::RedirectToWithCredentials {
+            userinfo: userinfo.into(),
+            path: path.into(),
+        }
+    }
     /// Shorthand for [`RouteConfig::Redirect307`]
     pub fn redirect_307(path: impl Into<String>) -> Self {
         Self::Redirect307(path.into())
@@ -584,6 +601,14 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             let hdr = format!(
                 "HTTP/1.1 302 Found\r\nLocation: {}{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 base, target
+            );
+            let _ = stream.write_all(hdr.as_bytes()).await;
+        }
+        RouteConfig::RedirectToWithCredentials { userinfo, path } => {
+            let target = base.replacen("://", &format!("://{userinfo}@"), 1);
+            let hdr = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {}{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                target, path
             );
             let _ = stream.write_all(hdr.as_bytes()).await;
         }

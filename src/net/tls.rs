@@ -11,8 +11,10 @@
 //! then asks [`FetcherContext::tls_override`]. The [`TlsError`] from this path includes the
 //! certificate and its fingerprint, so the embedder can show it and call
 //! [`TlsOverrideStore::accept`] when the user clicks through, then retry. Overrides are per
-//! (host, certificate). Not allowed for HSTS hosts (RFC 6797 §12.1) or for handshake failures
-//! that aren't about the certificate.
+//! (host, certificate); the port is not part of it, since the verifier only sees the server
+//! name, so an override for `host:8443` also covers `host:443` for the same certificate. Not
+//! allowed for HSTS hosts (RFC 6797 §12.1) or for handshake failures that aren't about the
+//! certificate.
 //!
 //! Native only. On wasm32 the browser does TLS and we never see the error details.
 //!
@@ -106,11 +108,12 @@ impl fmt::Display for TlsError {
 
 impl std::error::Error for TlsError {}
 
-/// Certificates the user accepted despite a verification error, keyed by (host, fingerprint).
+/// Certificates the user accepted despite a verification error, keyed by (host, fingerprint);
+/// the port is not part of the key (see the [module docs](self)).
 ///
 /// The in-memory default is not persisted; implement this to remember overrides across
 /// restarts. Revoking only affects new connections, an already verified pooled connection stays
-/// open.
+/// open. Session resumption is off with overrides enabled, so every new connection verifies.
 pub trait TlsOverrideStore: Send + Sync {
     /// Whether `fingerprint` is accepted for `host`.
     fn is_accepted(&self, host: &str, fingerprint: &Fingerprint) -> bool;
@@ -120,10 +123,15 @@ pub trait TlsOverrideStore: Send + Sync {
     fn revoke(&self, host: &str);
 }
 
-/// In-memory [`TlsOverrideStore`].
+/// Most (host, fingerprint) pairs an [`InMemoryTlsOverrideStore`] holds.
+pub const MAX_TLS_OVERRIDES: usize = 256;
+
+/// In-memory [`TlsOverrideStore`]. Past [`MAX_TLS_OVERRIDES`] the pair accepted longest ago
+/// is dropped.
 #[derive(Default)]
 pub struct InMemoryTlsOverrideStore {
-    accepted: parking_lot::Mutex<std::collections::HashSet<(String, Fingerprint)>>,
+    accepted: parking_lot::Mutex<std::collections::HashMap<(String, Fingerprint), u64>>,
+    clock: std::sync::atomic::AtomicU64,
 }
 
 impl InMemoryTlsOverrideStore {
@@ -147,18 +155,30 @@ impl TlsOverrideStore for InMemoryTlsOverrideStore {
     fn is_accepted(&self, host: &str, fingerprint: &Fingerprint) -> bool {
         self.accepted
             .lock()
-            .contains(&(host.to_ascii_lowercase(), *fingerprint))
+            .contains_key(&(host.to_ascii_lowercase(), *fingerprint))
     }
 
     fn accept(&self, host: &str, fingerprint: Fingerprint) {
-        self.accepted
-            .lock()
-            .insert((host.to_ascii_lowercase(), fingerprint));
+        let stamp = self
+            .clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let key = (host.to_ascii_lowercase(), fingerprint);
+        let mut accepted = self.accepted.lock();
+        if accepted.len() >= MAX_TLS_OVERRIDES && !accepted.contains_key(&key) {
+            if let Some(oldest) = accepted
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(k, _)| k.clone())
+            {
+                accepted.remove(&oldest);
+            }
+        }
+        accepted.insert(key, stamp);
     }
 
     fn revoke(&self, host: &str) {
         let host = host.to_ascii_lowercase();
-        self.accepted.lock().retain(|(h, _)| *h != host);
+        self.accepted.lock().retain(|(h, _), _| *h != host);
     }
 }
 
@@ -194,6 +214,9 @@ pub(crate) fn client_config(
         .with_custom_certificate_verifier(Arc::new(verifier))
         .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // A resumed session skips certificate verification, so a revoked override (or a newly
+    // armed HSTS entry) would not apply until the ticket expired. Every connection verifies.
+    config.resumption = rustls::client::Resumption::disabled();
     Ok(config)
 }
 
@@ -382,6 +405,18 @@ mod tests {
     use super::*;
     use rustls::{AlertDescription, CertificateError};
     use url::Url;
+
+    #[test]
+    fn the_override_store_is_bounded() {
+        let store = InMemoryTlsOverrideStore::new();
+        let fp = |i: usize| fingerprint(&i.to_le_bytes());
+        for i in 0..=MAX_TLS_OVERRIDES {
+            store.accept("x.test", fp(i));
+        }
+        assert_eq!(store.len(), MAX_TLS_OVERRIDES);
+        assert!(!store.is_accepted("x.test", &fp(0)), "oldest dropped");
+        assert!(store.is_accepted("x.test", &fp(MAX_TLS_OVERRIDES)));
+    }
 
     // Same nesting as hyper/reqwest produce: io::Error(Other) > io::Error(InvalidData) > rustls
     fn wrapped(e: rustls::Error) -> anyhow::Error {

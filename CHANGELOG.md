@@ -7,22 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Security:** any `407` was treated as a proxy challenge, so an origin server could obtain
-  the stored proxy credentials (keyed by realm alone) or trigger the embedder's password
-  dialog. A `407` now counts only on a plain-`http` hop that `FetcherConfig::proxy` routes
-  through an http(s) proxy (over `https` a proxy's 407 fails the CONNECT tunnel and never
-  arrives as a response), and proxy credentials are keyed by the proxy's origin plus realm
-
-### Changed
-
-- **Breaking:** `AuthChallenge::proxy` (the proxy that sent a 407), a fifth `proxy` argument
-  on `parse_challenges`, and `ProtectionSpace::origin` set to the proxy's origin for proxy
-  challenges. `NetPolicy::proxy_for` (native only) for direct users of `net::fetch`; unset, no
-  407 is answered
-
-
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect
@@ -33,11 +17,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   disables. Per-request override via `FetchRequest::retry` (`with_retry` / `without_retry`)
   (#11)
 
+### Changed
+
+- **Breaking:** `AuthChallenge::proxy` (the proxy that sent a 407), a fifth `proxy` argument
+  on `parse_challenges`, and `ProtectionSpace::origin` set to the proxy's origin for proxy
+  challenges. `NetPolicy::proxy_for` (native only) for direct users of `net::fetch`; unset, no
+  407 is answered
+- `NetPolicy::on_cookies` now also receives the final response's `Set-Cookie` values; the
+  fetcher no longer reports them separately. Same sink for fetcher users; direct users of
+  `net::fetch` with their own `on_cookies` now see every response
+
 ### Fixed
 
+- **Security:** any `407` was treated as a proxy challenge, so an origin server could obtain
+  the stored proxy credentials (keyed by realm alone) or trigger the embedder's password
+  dialog. A `407` now counts only on a plain-`http` hop that `FetcherConfig::proxy` routes
+  through an http(s) proxy (over `https` a proxy's 407 fails the CONNECT tunnel and never
+  arrives as a response), and proxy credentials are keyed by the proxy's origin plus realm
 - A transfer that broke off while the client was decompressing it is now
   `TransportErrorKind::Body`, not `Decode`: the client wraps the underlying body error in a
   decode error, and the classification looked no further than the outer one
+- **Security:** a `Cache-Control: max-age`, `max-stale`, `min-fresh` or `Age` value beyond
+  what a duration can hold panicked the fetcher task on the next request for that URL, and
+  later requests for it hung on the dead in-flight entry. Delta-seconds are now parsed as RFC
+  9111 §1.2.2 says: digits only, anything above 2^31 treated as 2^31
+- **Security:** `user:password@` in a URL was passed to the client, which turns it into an
+  `Authorization` header: a same-origin `Location` with credentials (the cross-origin and
+  cors-mode cases were already refused) or a subresource URL with them sent attacker-chosen
+  Basic credentials along with the user's cookies, and the password reached the `Started`,
+  `RequestSent` and `Redirected` events and `final_url`. Credentials are now dropped from the
+  initial URL and from every `Location`, with a `Warning` event, before anything else sees
+  the URL
+- **Security:** a response served from the HTTP cache skipped the CORS check. An entry stored
+  by a same-origin fetch carries no `Access-Control-Allow-Origin`, and a cross-origin
+  `cors`-mode request for the same URL was handed its body from the cache when the network
+  path would have refused it. A cache hit on a CORS-tainted chain is now checked like a fresh
+  response and blocked with `BlockReason::Cors` when it fails, as browsers do
+- **Security:** a `FetcherConfig::dns_resolver` never saw an IP-literal host. The client
+  connects to a literal without resolving it, so a resolver refusing internal ranges could be
+  sidestepped with `http://169.254.169.254/` or `http://[::1]/`, on the initial URL or a
+  redirect. The fetcher now asks the resolver about a literal host itself, with the literal
+  as the name; a refusal fails the hop as a refused name does. `NetPolicy::dns_resolver`
+  (native only) carries it for direct users of `net::fetch`
+- **Security:** `Set-Cookie` was written to the jar whatever the request's credentials mode,
+  so a `credentials: omit` (or cross-origin `same-origin`) request let the server plant or
+  overwrite cookies. Cookies are now only reported for a hop the credentials mode attached
+  cookies to, as Fetch specifies
+- **Security:** with `tls_overrides` enabled, TLS session resumption let a connection skip
+  certificate verification, so a revoked override, or HSTS armed after a click-through, did
+  not apply until the session ticket expired. Resumption is now off for that client
+- **Security:** HSTS was recorded from responses over a connection whose certificate the user
+  had accepted through `tls_overrides`, against RFC 6797 §8.1; one click-through on an
+  attacker's certificate could pin the host for a year. Such responses now leave HSTS alone.
+  `NetPolicy::tls_overrides` (native only) carries the store for direct users of `net::fetch`
+- **Security:** a buffered fetch without `max_bytes` grew its body without limit, and with
+  decompression on (the default) a small gzip bomb could expand to gigabytes. New
+  `FetcherConfig::max_body_bytes` (default 64 MiB) caps buffered fetches that set no
+  `max_bytes` of their own, and buffered callers joined onto a streamed fetch. `None`
+  restores the old behaviour; a request lifts it with `with_max_bytes(usize::MAX)`
+- **Security:** the fetcher logged every submitted request with `{:?}` at debug level,
+  headers included, so `RUST_LOG=debug` wrote `Authorization` and `Cookie` values to the log.
+  The log line is now the request id, method and URL without credentials, and
+  `Authorization`, `Proxy-Authorization` and `Cookie` values are marked sensitive on
+  submission and where the fetcher adds them, so any `{:?}` of a request or a
+  `NetEvent::RequestSent` prints them redacted
+- A caller coalesced onto a streamed fetch could receive a truncated body with a clean end:
+  every listener shared one body, whichever subscribed first started it, and later ones
+  missed what had been pushed. The fetcher now reserves a seat per listener
+  (`SharedBody::reserve`); chunks are kept, up to 4 MiB, until every seat is claimed, so each
+  listener starts from the beginning, and a seat claimed past that gets an error instead of a
+  short body
+- `InMemoryHttpCache` eviction scanned every entry, cloning each key, for every entry it
+  dropped, so a full cache turned each store into a stall under the lock; it now keeps keys
+  in LRU order and evicts in O(log n). Entries are charged for their URL and `Vary` list as
+  well as the response, so many tiny bodies under long URLs no longer sit outside the budget.
+  Eviction is per key: all variants of a URL go together
+- The coalescing key covered only a fixed set of headers, so two in-flight GETs differing in
+  any other header (an API key, `If-None-Match`, `Cache-Control`), in a GET body, or in
+  `max_bytes` shared one response: a cross-user leak for a fetcher shared without a document
+  origin, and a `304` or an over-cap body for the wrong caller otherwise. The key now hashes
+  every header in a fixed order, the body, and the cap; a request with a streamed body is
+  never coalesced
+- A request still waiting for a connection slot when the fetcher shut down, or when all its
+  subscribers had cancelled, was abandoned: its in-flight entry stayed in the map, its
+  listeners never heard, and `on_ref_done` was not called. It now ends with
+  `NetError::Cancelled` and is cleaned up like a finished fetch
+- A `Location` header with non-ASCII bytes was treated as absent and the redirect failed. It
+  is now decoded as UTF-8, or byte for byte when it is not UTF-8, and followed
+  percent-encoded, as browsers do
+- Docs: `req_timeout` is the client's total per-hop timeout and covers the body, not only
+  the wait for headers, so a large download needs it raised along with `total_body_timeout`.
+  A TLS override is keyed by host and certificate, not port. Mixed content does not apply to
+  a document opened from a `file:` URL, whose origin is opaque
+- The coalescing key joined raw header values with `;` and `=`, so a value containing them
+  could read as the next field and two different requests could spell one key. The raw
+  components are now length-prefixed
+- A streamed fetch gave its connection slots back as soon as the headers arrived, so the
+  connection its body still occupied went uncounted against `global_slots` and the per-origin
+  limits. The slots now travel with the body and are released when it ends
+- The simple helpers (`simple_get`, `sync_get`, `sync_fetch`) no longer follow a redirect
+  from `https` down to `http`, refuse a `file:` path that is not a regular file (a FIFO would
+  have blocked forever), and `simple_get` reads files without blocking the async runtime.
+  Their docs now say what they do not check
+- `RequestBody::file` declared `Content-Length` from the file's size at construction and
+  reopened the file at each send, so a file that changed in between was sent truncated or
+  failed mid-transfer. The length now comes from the handle being sent, and only a regular
+  file is accepted
+- The in-memory stores grew without bound: `InMemoryPreflightCache` (now at most 1024
+  grants, the soonest-expiring dropped first), `InMemoryCredentialStore` (256 protection
+  spaces, oldest first), `InMemoryHstsStore` (4096 hosts, expired swept then soonest-expiring
+  dropped) and `InMemoryTlsOverrideStore` (256 pairs, oldest first). The limits are the
+  `MAX_*` constants in each module
 
 ## [0.7.0] - 2026-09-12
 

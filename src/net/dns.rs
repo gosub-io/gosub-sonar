@@ -9,6 +9,14 @@
 //! underlying client consults, so every lookup — including each redirect hop the fetcher
 //! follows — passes through it, and connections go to exactly the addresses it returns.
 //!
+//! An IP-literal host (`http://10.0.0.5/`, `http://[::1]/`) is never resolved by the client,
+//! so the fetcher asks the resolver about it itself, with the literal as `host`: `Err`
+//! refuses the hop, and the returned addresses are ignored. A policy therefore has to
+//! classify literals too, as the example below does by resolving them like any name.
+//!
+//! Through an HTTP proxy, or a `socks4a`/`socks5h` one, the proxy resolves the target and
+//! the resolver only sees the proxy's host.
+//!
 //! ```no_run
 //! use std::net::SocketAddr;
 //! use std::sync::Arc;
@@ -67,7 +75,8 @@ pub type Resolving = Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, DnsErro
 /// Resolves hostnames for the [`Fetcher`](crate::net::fetcher::Fetcher)'s outgoing
 /// connections.
 ///
-/// `host` is the bare hostname from the URL being connected to — no port, no scheme. The
+/// `host` is the bare hostname from the URL being connected to — no port, no scheme — or
+/// an IP literal (see the [module docs](self)). The
 /// port on the returned addresses is ignored when the URL names one explicitly; otherwise
 /// a port of `0` is replaced by the scheme's default (80/443), so resolvers that don't
 /// carry port information should return `0`.
@@ -354,6 +363,54 @@ mod tests {
         let result = fetch(&fetcher, url).await;
         assert!(result.is_error(), "expected an error, got {result:?}");
         assert_eq!(resolver.seen(), vec!["sonar-refused.test"]);
+        shutdown.cancel();
+    }
+
+    /// An IP literal never reaches the resolver through the client, so the fetcher asks it
+    /// directly; a refusal blocks the hop and an answer lets it through.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ip_literal_is_put_to_the_resolver() {
+        let srv = TestServer::new()
+            .route("/fast", RouteConfig::ok(b"x"))
+            .start()
+            .await;
+        let addr = srv.socket_addr();
+        let url = Url::parse(&format!("http://127.0.0.1:{}/fast", addr.port())).unwrap();
+
+        let resolver = MapResolver::new(&[]);
+        let (fetcher, shutdown) = spawn_fetcher(config_with(resolver.clone()));
+        let result = fetch(&fetcher, url.clone()).await;
+        assert!(result.is_error(), "expected an error, got {result:?}");
+        assert_eq!(resolver.seen(), vec!["127.0.0.1"]);
+        assert_eq!(srv.hit_count("/fast"), 0);
+        shutdown.cancel();
+
+        let resolver = MapResolver::new(&[("127.0.0.1", addr)]);
+        let (fetcher, shutdown) = spawn_fetcher(config_with(resolver.clone()));
+        assert!(!fetch(&fetcher, url).await.is_error());
+        assert_eq!(resolver.seen(), vec!["127.0.0.1"]);
+        assert_eq!(srv.hit_count("/fast"), 1);
+        shutdown.cancel();
+    }
+
+    /// A redirect onto an IP literal is checked like the initial URL.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redirect_to_an_ip_literal_is_put_to_the_resolver() {
+        let srv = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute("http://127.0.0.1:1/x"),
+            )
+            .start()
+            .await;
+        let addr = srv.socket_addr();
+        let resolver = MapResolver::new(&[("sonar-dns.test", addr)]);
+        let (fetcher, shutdown) = spawn_fetcher(config_with(resolver.clone()));
+
+        let url = Url::parse(&format!("http://sonar-dns.test:{}/hop", addr.port())).unwrap();
+        let result = fetch(&fetcher, url).await;
+        assert!(result.is_error(), "expected an error, got {result:?}");
+        assert_eq!(resolver.seen(), vec!["sonar-dns.test", "127.0.0.1"]);
         shutdown.cancel();
     }
 

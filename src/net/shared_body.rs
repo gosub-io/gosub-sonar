@@ -95,7 +95,18 @@ struct State {
     has_subscriber: bool,
     /// The error the body ended with, if any; handed to subscribers that attach after the end.
     error: Option<NetError>,
+    /// Subscriptions promised by [`SharedBody::reserve`] and not yet made. While any is
+    /// outstanding, chunks are kept in `replay` so a late one starts from the beginning.
+    seats: usize,
+    /// Chunks kept for outstanding seats; `None` once not needed or no longer complete.
+    replay: Option<Vec<Bytes>>,
+    replay_bytes: usize,
+    /// A chunk went by that `replay` does not hold, so a seat claimed now cannot be complete.
+    replay_gone: bool,
 }
+
+/// Most bytes kept for late seat holders. Past this, a late seat gets an error instead.
+const REPLAY_CAP: usize = 4 * 1024 * 1024;
 
 /// One subscriber's queue, plus the flag that tells its stream why the queue
 /// closed: dropped for lagging (an error is due) or finished (a clean end).
@@ -121,7 +132,26 @@ impl SharedBody {
                 first_subscriber: Arc::new(Notify::new()),
                 has_subscriber: false,
                 error: None,
+                seats: 0,
+                replay: None,
+                replay_bytes: 0,
+                replay_gone: false,
             })),
+        }
+    }
+
+    /// Promise `n` subscriptions to come. Until they are made, every chunk pushed is kept (up
+    /// to a few MiB) so each of them starts from the beginning of the body, however late it
+    /// subscribes; a seat claimed once that is no longer possible yields an error, never a
+    /// silently shortened body. Call before the first subscriber attaches.
+    pub fn reserve(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let mut st = self.inner.lock();
+        st.seats += n;
+        if st.replay.is_none() && !st.replay_gone {
+            st.replay = Some(Vec::new());
         }
     }
 
@@ -134,9 +164,27 @@ impl SharedBody {
     ///   additional pushes are ignored.
     pub fn push(&self, chunk: Bytes) {
         let (subs, mut to_remove) = {
-            let st = self.inner.lock();
+            let mut st = self.inner.lock();
             if st.closed {
                 return;
+            }
+            if st.seats > 0 {
+                let fits = st.replay_bytes + chunk.len() <= REPLAY_CAP;
+                match st.replay.as_mut() {
+                    Some(kept) if fits => {
+                        kept.push(chunk.clone());
+                        st.replay_bytes += chunk.len();
+                    }
+                    _ => {
+                        st.replay = None;
+                        st.replay_gone = true;
+                    }
+                }
+            } else if st.replay.is_some() {
+                st.replay = None;
+                st.replay_gone = true;
+            } else {
+                st.replay_gone = true;
             }
             let subs: Vec<(u64, mpsc::Sender<_>, Arc<std::sync::atomic::AtomicBool>)> = st
                 .subs
@@ -214,7 +262,8 @@ impl SharedBody {
 
     /// Subscribes **from now on**, returning a stream of body chunks.
     ///
-    /// Chunks produced **before** subscribing are **not** replayed. A body from
+    /// Chunks produced **before** subscribing are **not** replayed, unless a seat was
+    /// [reserved](Self::reserve) for this subscriber. A body from
     /// [`from_reader`](Self::from_reader) doesn't start reading until the first subscriber
     /// attaches, so the first subscriber always sees the whole body; later ones only what
     /// follows. Subscribing after the body ended yields the error it ended with, or nothing.
@@ -225,13 +274,37 @@ impl SharedBody {
         &self,
         max_queue: usize,
     ) -> BoxStream<'static, Result<Bytes, NetError>> {
-        let (rx, id, lagged) = {
+        let (rx, id, lagged, prefix) = {
             let mut st = self.inner.lock();
+            // A seat holder gets what went by first, or an error if that is incomplete.
+            let prefix: Vec<Bytes> = if st.seats > 0 {
+                st.seats -= 1;
+                let prefix = match st.replay.clone() {
+                    Some(kept) => kept,
+                    None if st.replay_gone => {
+                        return stream::once(async {
+                            Err(NetError::Read(Arc::new(anyhow::anyhow!(
+                                "body subscribed too late: earlier data is no longer held"
+                            ))))
+                        })
+                        .boxed()
+                    }
+                    None => Vec::new(),
+                };
+                if st.seats == 0 {
+                    st.replay = None;
+                    st.replay_bytes = 0;
+                }
+                prefix
+            } else {
+                Vec::new()
+            };
             if st.closed {
-                return match st.error.clone() {
+                let tail = match st.error.clone() {
                     Some(e) => stream::once(async move { Err(e) }).boxed(),
                     None => stream::empty::<Result<Bytes, NetError>>().boxed(),
                 };
+                return stream::iter(prefix.into_iter().map(Ok)).chain(tail).boxed();
             }
 
             let (tx, rx) = mpsc::channel(max_queue);
@@ -251,12 +324,13 @@ impl SharedBody {
                 // notify_one stores a permit if the pump isn't waiting yet
                 st.first_subscriber.notify_one();
             }
-            (rx, id, lagged)
+            (rx, id, lagged, prefix)
         };
 
         SubStream {
             id,
             parent: self.inner.clone(),
+            prefix: prefix.into(),
             inner: ReceiverStream::new(rx),
             lagged,
             lag_reported: false,
@@ -554,6 +628,8 @@ impl SharedBody {
 struct SubStream {
     id: u64,
     parent: Arc<Mutex<State>>,
+    /// Replayed chunks, yielded before anything live.
+    prefix: std::collections::VecDeque<Bytes>,
     inner: ReceiverStream<Result<Bytes, NetError>>,
     /// Set by the producer when it dropped this subscriber for lagging.
     lagged: Arc<std::sync::atomic::AtomicBool>,
@@ -565,6 +641,9 @@ impl Stream for SubStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if let Some(chunk) = this.prefix.pop_front() {
+            return Poll::Ready(Some(Ok(chunk)));
+        }
         match Pin::new(&mut this.inner).poll_next(cx) {
             // The queue closed. Dropped for lagging, that is an error the
             // consumer gets once before the end; finished, a clean end.
@@ -618,6 +697,78 @@ mod tests {
         let expected2: &[u8] = b" world";
         assert_eq!((&b1[..], &b2[..]), (expected1, expected2));
         assert!(s2.next().await.is_none());
+    }
+
+    async fn collect(
+        mut s: BoxStream<'static, Result<Bytes, NetError>>,
+    ) -> Result<Vec<u8>, NetError> {
+        let mut out = Vec::new();
+        while let Some(item) = s.next().await {
+            out.extend_from_slice(&item?);
+        }
+        Ok(out)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reserved_late_subscriber_starts_from_the_beginning() {
+        let sb = SharedBody::new(8);
+        sb.reserve(2);
+        let s1 = sb.subscribe_stream();
+        sb.push(Bytes::from_static(b"a"));
+        sb.push(Bytes::from_static(b"b"));
+        let s2 = sb.subscribe_stream();
+        sb.push(Bytes::from_static(b"c"));
+        sb.finish();
+        assert_eq!(collect(s1).await.unwrap(), b"abc");
+        assert_eq!(collect(s2).await.unwrap(), b"abc");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reserved_subscriber_after_the_end_gets_the_whole_body() {
+        let sb = SharedBody::new(8);
+        sb.reserve(1);
+        sb.push(Bytes::from_static(b"all"));
+        sb.push(Bytes::from_static(b" of it"));
+        sb.finish();
+        assert_eq!(collect(sb.subscribe_stream()).await.unwrap(), b"all of it");
+
+        let sb = SharedBody::new(8);
+        sb.reserve(1);
+        sb.push(Bytes::from_static(b"part"));
+        sb.error(NetError::Cancelled("cut".into()));
+        let mut s = sb.subscribe_stream();
+        assert_eq!(
+            s.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"part")
+        );
+        assert!(matches!(s.next().await, Some(Err(NetError::Cancelled(_)))));
+        assert!(s.next().await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_seat_past_the_replay_cap_gets_an_error_not_a_short_body() {
+        let sb = SharedBody::new(8);
+        sb.reserve(2);
+        let _s1 = sb.subscribe_stream();
+        let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
+        for _ in 0..5 {
+            sb.push(chunk.clone());
+        }
+        let mut s2 = sb.subscribe_stream();
+        assert!(matches!(s2.next().await, Some(Err(_))));
+        assert!(s2.next().await.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unreserved_late_subscriber_still_sees_only_what_follows() {
+        let sb = SharedBody::new(8);
+        let s1 = sb.subscribe_stream();
+        sb.push(Bytes::from_static(b"a"));
+        let s2 = sb.subscribe_stream();
+        sb.push(Bytes::from_static(b"b"));
+        sb.finish();
+        assert_eq!(collect(s1).await.unwrap(), b"ab");
+        assert_eq!(collect(s2).await.unwrap(), b"b");
     }
 
     #[tokio::test(flavor = "current_thread")]

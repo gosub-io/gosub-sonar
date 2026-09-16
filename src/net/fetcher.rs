@@ -61,13 +61,20 @@ pub struct FetcherConfig {
     pub h2_per_origin: usize,
     /// Timeout for the TCP + TLS handshake.  Applies before any bytes are sent.
     pub connect_timeout: Duration,
-    /// Timeout from sending the first request byte until the response headers arrive.
+    /// Deadline for one hop, from sending its first byte until its body has been read. The
+    /// client enforces it, and it covers the body as well as the wait for headers, so a
+    /// download longer than this fails whatever `total_body_timeout` says.
     pub req_timeout: Duration,
     /// Maximum silence between consecutive body chunks before the read is aborted.
     pub read_idle_timeout: Duration,
     /// Wall-clock deadline for receiving the entire response body after headers.
-    /// `None` disables the deadline (useful for very large downloads).
+    /// `None` disables the deadline; for a very large download raise `req_timeout` too.
     pub total_body_timeout: Option<Duration>,
+    /// Largest body a buffered fetch holds in memory, counted after decompression, for a
+    /// request that sets no [`FetchRequest::max_bytes`] of its own. Also caps a buffered
+    /// caller joined onto a streamed fetch. Default 64 MiB; `None` removes the cap. A
+    /// streamed fetch is only capped by the request's own `max_bytes`.
+    pub max_body_bytes: Option<usize>,
 
     /// Maximum idle connections kept in the pool **per host**.
     /// Without a cap, reqwest keeps every connection ever opened until it idles out.
@@ -201,6 +208,7 @@ impl Default for FetcherConfig {
             req_timeout: Duration::from_secs(60),
             read_idle_timeout: Duration::from_secs(15),
             total_body_timeout: Some(Duration::from_secs(180)),
+            max_body_bytes: Some(64 * 1024 * 1024),
             pool_max_idle_per_host: 6,
             pool_idle_timeout: Some(Duration::from_secs(90)),
             tcp_keepalive: Some(Duration::from_secs(60)),
@@ -440,7 +448,20 @@ impl Fetcher {
         cancel: CancellationToken,
         reply_tx: oneshot::Sender<FetchResult>,
     ) {
-        log::debug!("Submitting fetch request: {:?}", req);
+        let mut req = req;
+        // So a `{:?}` of the request anywhere prints credentials redacted.
+        crate::net::utils::mark_sensitive(&mut req.headers);
+        if log::log_enabled!(log::Level::Debug) {
+            let mut shown = req.url.clone();
+            let _ = shown.set_username("");
+            let _ = shown.set_password(None);
+            log::debug!(
+                "Submitting fetch request {} {} {}",
+                req.req_id,
+                req.method,
+                short_url(&shown, 200)
+            );
+        }
 
         let mut lane = match req.priority {
             Priority::High => self.q_high.lock().await,
@@ -599,7 +620,7 @@ impl Fetcher {
                 let err = FetchResult::Error(blocked(&observer, req.url.clone(), reason));
                 // Remove before finish — see the registration comment above for the ordering.
                 self.inflight_map.remove(&key_str);
-                inflight_entry.waiter.finish(err).await;
+                inflight_entry.waiter.finish(err, None).await;
                 inflight_entry.done.cancel();
                 self.ctx.on_ref_done(req.reference);
                 continue;
@@ -625,20 +646,42 @@ impl Fetcher {
             spawn_named(&title, async move {
                 let slots = per_origin.slots_for(&req.url);
 
-                let g = tokio::select! { p = global.acquire_owned() => Some(p), _ = shutdown_child.cancelled() => None };
-                if g.is_none() {
-                    return;
-                }
-
-                let h = tokio::select! { p = slots.sem.acquire() => Some(p), _ = shutdown_child.cancelled() => None };
-                if h.is_none() {
-                    return;
-                }
+                // Waiting for slots ends early on shutdown, or once every subscriber has
+                // cancelled. Either way the entry below is still cleaned up like a finished
+                // fetch, so nothing stays in the in-flight map and every listener hears.
+                let acquire = async {
+                    let global_permit = tokio::select! {
+                        p = global.acquire_owned() => p.ok()?,
+                        _ = shutdown_child.cancelled() => return None,
+                        _ = cancel_parent.cancelled() => return None,
+                    };
+                    let origin_permit = tokio::select! {
+                        p = slots.sem.acquire() => {
+                            p.ok()?.forget();
+                            OriginPermit(slots.clone())
+                        }
+                        _ = shutdown_child.cancelled() => return None,
+                        _ = cancel_parent.cancelled() => return None,
+                    };
+                    Some(SlotGuards {
+                        _global: global_permit,
+                        _origin: origin_permit,
+                    })
+                };
+                // Held here until the task ends, or by the body of a streamed fetch.
+                let mut held = acquire.await;
 
                 let should_stream =
                     req.streaming || inflight_entry2.wants_streaming.load(Ordering::Relaxed);
 
-                let result = if should_stream {
+                let result = if held.is_none() {
+                    let why = if shutdown_child.is_cancelled() {
+                        "fetcher shut down before the request was sent"
+                    } else {
+                        "cancelled before the request was sent"
+                    };
+                    Err(NetError::Cancelled(why.into()))
+                } else if let (true, Some(slot_guards)) = (should_stream, held.take()) {
                     perform_streaming(
                         &client,
                         observer.clone(),
@@ -647,6 +690,7 @@ impl Fetcher {
                         cancel_parent.clone(),
                         ctx_clone.clone(),
                         per_origin.clone(),
+                        slot_guards,
                     )
                     .await
                 } else {
@@ -672,11 +716,12 @@ impl Fetcher {
                 // and later arrivals find the map vacant and start a fresh fetch instead.
                 inflight.remove(&key_for_remove);
 
-                inflight_entry2.waiter.finish(fr).await;
+                inflight_entry2.waiter.finish(fr, cfg.max_body_bytes).await;
 
                 inflight_entry2.done.cancel();
 
                 ctx_clone.on_ref_done(req.reference);
+                drop(held);
             });
         }
     }
@@ -842,11 +887,15 @@ fn build_client(
             .deflate(decode);
         // overrides need our own verifier, so we build the rustls config ourselves
         b = match &cfg.tls_overrides {
-            Some(store) => b.tls_backend_preconfigured(crate::net::tls::client_config(
-                store.clone(),
-                ctx.clone(),
-                cfg.hsts.clone(),
-            )?),
+            // tls_info: responses carry their peer certificate, for the HSTS check
+            Some(store) => {
+                b.tls_info(true)
+                    .tls_backend_preconfigured(crate::net::tls::client_config(
+                        store.clone(),
+                        ctx.clone(),
+                        cfg.hsts.clone(),
+                    )?)
+            }
             None => b.use_rustls_tls(),
         };
         if let Some(ref ua) = cfg.user_agent {
@@ -871,6 +920,39 @@ fn build_client(
 struct OriginSlots {
     sem: Semaphore,
     h2: AtomicBool,
+}
+
+/// A slot taken from one origin's semaphore, given back on drop.
+struct OriginPermit(Arc<OriginSlots>);
+
+impl Drop for OriginPermit {
+    fn drop(&mut self) {
+        self.0.sem.add_permits(1);
+    }
+}
+
+/// The connection slots a fetch holds: one global, one for its origin. A buffered fetch
+/// keeps them until it has delivered; a streamed one hands them to its body, so the
+/// connection stays counted until the body ends.
+struct SlotGuards {
+    _global: tokio::sync::OwnedSemaphorePermit,
+    _origin: OriginPermit,
+}
+
+/// A body reader that keeps the fetch's slots until it is dropped.
+struct HoldsSlots<R> {
+    inner: R,
+    _slots: SlotGuards,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HoldsSlots<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
 }
 
 /// Per-origin connection semaphores, keyed by serialized origin.
@@ -959,7 +1041,9 @@ fn build_policy(
         let policy = policy
             .with_proxy_authorization(Box::new(move |url| proxy.proxy_authorization(url)))
             .with_proxy_for(Box::new(move |url| proxy_for.plain_http_proxy(url)))
+            .with_dns_resolver(cfg.dns_resolver.clone())
             .with_hsts(cfg.hsts.clone())
+            .with_tls_overrides(cfg.tls_overrides.clone())
             .with_cache(cfg.cache.clone());
         match cfg.cors_preflight_cache.clone() {
             Some(cache) => policy.with_cors_preflight_cache(cache),
@@ -977,6 +1061,7 @@ fn effective_retry<'a>(req: &'a FetchRequest, cfg: &'a FetcherConfig) -> Option<
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn perform_streaming(
     client: &reqwest::Client,
     observer: Arc<dyn NetObserver + Send + Sync>,
@@ -985,6 +1070,7 @@ async fn perform_streaming(
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
     origins: Arc<OriginTable>,
+    slots: SlotGuards,
 ) -> Result<FetchResult, NetError> {
     let client = Arc::new(client.clone());
     // Only the header phase is retried; the body goes straight to the caller.
@@ -1012,9 +1098,6 @@ async fn perform_streaming(
     )
     .await?;
 
-    // Notify the context's cookie jar about any Set-Cookie headers in the response
-    notify_cookies(&ctx, &meta);
-
     let opts = ReaderOptions {
         capacity: SHARED_MAX_CAPACITY,
         buf_size: 16 * 1024,
@@ -1028,6 +1111,10 @@ async fn perform_streaming(
             .map(|max| max.saturating_sub(peek_buf.len()) as u64),
     };
 
+    let reader = HoldsSlots {
+        inner: reader,
+        _slots: slots,
+    };
     Ok(FetchResult::Stream {
         meta,
         peek_buf,
@@ -1058,7 +1145,7 @@ async fn perform_buffered(
                 make_request_init(req, cfg),
                 cancel.clone(),
                 observer.clone(),
-                req.max_bytes,
+                req.max_bytes.or(cfg.max_body_bytes),
                 effective_read_idle_timeout(req, cfg),
                 effective_total_body_timeout(req, cfg),
                 build_policy(cfg, &ctx, origins.clone()),
@@ -1068,24 +1155,8 @@ async fn perform_buffered(
     )
     .await?;
 
-    // Notify the context's cookie jar about any Set-Cookie headers in the response
-    notify_cookies(&ctx, &meta);
-
     // `body` is already an `Arc`-backed `Bytes`; moving it into the result is zero-copy.
     Ok(FetchResult::Buffered { meta, body })
-}
-
-/// Extract `Set-Cookie` header values from `meta` and forward them to the context.
-fn notify_cookies(ctx: &Arc<dyn FetcherContext>, meta: &crate::net::types::FetchResultMeta) {
-    let values: Vec<&str> = meta
-        .headers
-        .get_all(header::SET_COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect();
-    if !values.is_empty() {
-        ctx.on_cookies_received(&meta.final_url, &values);
-    }
 }
 
 #[cfg(test)]
@@ -2004,6 +2075,68 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// A revoked override must not live on through TLS session resumption: rustls does not
+    /// re-verify a resumed session, so the config must not resume.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_revoked_override_is_not_resumed() {
+        let store = Arc::new(crate::net::tls::InMemoryTlsOverrideStore::new());
+        let cfg = FetcherConfig {
+            tls_overrides: Some(store.clone()),
+            ..test_config()
+        };
+        let (srv, fetcher, shutdown) = tls_server_and_fetcher(cfg, Arc::new(NullContext)).await;
+
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        store.accept("tls.test", tls.fingerprint.unwrap());
+        assert!(!fetch_root(&fetcher, &srv).await.is_error());
+
+        store.revoke("tls.test");
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::UnknownIssuer);
+        shutdown.cancel();
+    }
+
+    /// A response over a clicked-through certificate must not arm HSTS (RFC 6797 §8.1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_is_not_recorded_over_an_overridden_connection() {
+        let store = Arc::new(crate::net::tls::InMemoryTlsOverrideStore::new());
+        let hsts = Arc::new(InMemoryHstsStore::new());
+        let srv = TestServer::new()
+            .tls("tls.test")
+            .route(
+                "/",
+                RouteConfig::ok_with_headers(
+                    &[("Strict-Transport-Security", "max-age=31536000")],
+                    b"x",
+                ),
+            )
+            .start()
+            .await;
+        let cfg = FetcherConfig {
+            tls_overrides: Some(store.clone()),
+            hsts: Some(hsts.clone()),
+            dns_resolver: Some(Arc::new(Loopback(srv.socket_addr()))),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        store.accept("tls.test", tls.fingerprint.unwrap());
+        match fetch_root(&fetcher, &srv).await {
+            FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 200),
+            other => panic!("expected success after override, got {other:?}"),
+        }
+        assert!(
+            hsts.load("tls.test").is_none(),
+            "HSTS armed over an override"
+        );
+        shutdown.cancel();
+    }
+
     /// The `fetch` convenience must deliver the same result as the manual
     /// submit/handle/oneshot ritual, and a stopped fetcher must resolve to an error
     /// rather than hanging.
@@ -2622,6 +2755,161 @@ mod tests {
         let (result, _) = fetch_recorded(test_config(), req).await;
         assert_eq!(status_of(&result), 200);
         assert_eq!(srv.hit_count("/flaky"), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_body_cap_applies_to_buffered_fetches() {
+        let srv = start_server().await;
+        // /dribble-big is 12 KiB
+        let cfg = FetcherConfig {
+            max_body_bytes: Some(6 * 1024),
+            ..test_config()
+        };
+        let (result, _) = fetch_one(
+            cfg.clone(),
+            make_req(srv.url("/dribble-big"), Priority::Normal).0,
+        )
+        .await;
+        assert!(result.is_error(), "{result:?}");
+
+        // the request's own cap wins
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_max_bytes(20 * 1024)
+            .build();
+        let (result, _) = fetch_one(cfg.clone(), req).await;
+        assert_eq!(status_of(&result), 200);
+
+        // a stream is not capped by the default
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_streaming(true)
+            .build();
+        let (result, _) = fetch_one(cfg, req).await;
+        assert!(matches!(result, FetchResult::Stream { .. }), "{result:?}");
+    }
+
+    /// A streamed body keeps its connection slots until it is read, so the connection it
+    /// still occupies counts against the limits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_streamed_body_holds_its_connection_slot() {
+        use tokio::io::AsyncReadExt;
+        let srv = start_server().await;
+        let cfg = FetcherConfig {
+            global_slots: 1,
+            h1_per_origin: 1,
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_streaming(true)
+            .build();
+        let FetchResult::Stream {
+            shared, peek_buf, ..
+        } = fetcher.fetch(req).await
+        else {
+            panic!("expected a stream");
+        };
+
+        // unread body: the only slot is taken
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(200),
+            fetcher.fetch(make_req(srv.url("/fast"), Priority::Normal).0),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a second fetch got a slot while a body was open"
+        );
+
+        let mut out = Vec::new();
+        SharedBody::combined_reader(peek_buf, shared)
+            .read_to_end(&mut out)
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 12 * 1024);
+
+        // body done: the slot is back
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            fetcher.fetch(make_req(srv.url("/fast"), Priority::Normal).0),
+        )
+        .await
+        .expect("slot released once the body was read");
+        assert_eq!(status_of(&result), 200);
+        shutdown.cancel();
+    }
+
+    /// A request still waiting for a slot at shutdown is answered and cleaned up like any
+    /// other, rather than left in the in-flight map with its listeners hanging.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_while_waiting_for_a_slot_cleans_up() {
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl FetcherContext for Counting {
+            fn observer_for(
+                &self,
+                _: RequestReference,
+                _: RequestId,
+                _: ResourceKind,
+                _: Initiator,
+            ) -> Arc<dyn NetObserver + Send + Sync> {
+                Arc::new(crate::net::null_emitter::NullEmitter)
+            }
+            fn on_ref_active(&self, _: RequestReference) {}
+            fn on_ref_done(&self, _: RequestReference) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let srv = start_server().await;
+        let ctx = Arc::new(Counting(Default::default()));
+        let cfg = FetcherConfig {
+            global_slots: 1,
+            req_timeout: Duration::from_millis(500),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        // A holds the only slot until its timeout; B waits for it.
+        let (tx_a, rx_a) = oneshot::channel();
+        fetcher
+            .submit(
+                make_req(srv.url("/hang"), Priority::Normal).0,
+                CancellationToken::new(),
+                tx_a,
+            )
+            .await;
+        let (tx_b, rx_b) = oneshot::channel();
+        fetcher
+            .submit(
+                make_req(srv.url("/fast"), Priority::Normal).0,
+                CancellationToken::new(),
+                tx_b,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fetcher.inflight_map.len(), 2);
+
+        shutdown.cancel();
+        let b = tokio::time::timeout(Duration::from_millis(300), rx_b)
+            .await
+            .expect("B answered at shutdown")
+            .unwrap();
+        assert!(
+            matches!(b, FetchResult::Error(NetError::Cancelled(_))),
+            "{b:?}"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(3), rx_a).await;
+        assert_eq!(fetcher.inflight_map.len(), 0, "nothing left in flight");
+        assert_eq!(ctx.0.load(Ordering::Relaxed), 2, "on_ref_done for both");
     }
 
     /// Drive one request through a fetcher configured with `cfg_policy`, where the request

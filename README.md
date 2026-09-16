@@ -105,7 +105,7 @@ For per-subscriber cancellation use `fetcher.fetch_with_cancel(req, token)`; for
 over the reply channel use `fetcher.submit(req, cancel, reply_tx)`.
 
 The timeouts in `FetcherConfig` apply to every request, and a request can override them for
-itself: `with_req_timeout` (waiting for headers, per hop), `with_read_idle_timeout` (silence
+itself: `with_req_timeout` (a hop, headers and body), `with_read_idle_timeout` (silence
 between body chunks), and `with_total_body_timeout` (the whole body). A large download that must
 not be cut off by the fetcher-wide body deadline uses `without_total_body_timeout()`.
 
@@ -158,7 +158,9 @@ impl FetcherContext for MyContext {
 ```
 
 `is_url_allowed`, `cookies_for` and `on_cookies_received` are called for the initial URL and
-for every redirect target, so a blocklist or cookie jar can't be bypassed by a redirect. See
+for every redirect target, so a blocklist or cookie jar can't be bypassed by a redirect. The two
+cookie hooks follow the request's credentials mode: a `credentials: omit` request neither sends
+nor stores cookies. See
 `examples/fetcher_context.rs` for a complete one with a cookie jar and an event log.
 
 ### HSTS

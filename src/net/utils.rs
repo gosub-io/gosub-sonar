@@ -149,7 +149,9 @@ impl Waiter {
     ///
     /// Drains the listener list under the lock, releases the lock, then delivers results.
     /// The lock is never held across I/O so slow body streaming does not block new registrations.
-    pub async fn finish(self: &Arc<Self>, result: FetchResult) {
+    ///
+    /// `buffered_cap` bounds the body a buffered listener of a streamed result collects.
+    pub async fn finish(self: &Arc<Self>, result: FetchResult, buffered_cap: Option<usize>) {
         // Drain under lock, release before any async I/O
         let ls: Vec<WaiterEntry> = self.listeners.lock().drain(..).collect();
 
@@ -178,6 +180,9 @@ impl Waiter {
                     }
                 }
 
+                // Every listener starts from the beginning however late it subscribes.
+                shared.reserve(streaming_ls.len() + usize::from(!buffered_ls.is_empty()));
+
                 for tx in streaming_ls {
                     let res = FetchResult::Stream {
                         meta: meta.clone(),
@@ -189,7 +194,7 @@ impl Waiter {
 
                 // Lock is released; stream I/O happens without blocking register()
                 if !buffered_ls.is_empty() {
-                    match stream_to_bytes(peek_buf, shared).await {
+                    match stream_to_bytes(peek_buf, shared, buffered_cap).await {
                         Ok(b) => {
                             let res = FetchResult::Buffered {
                                 meta: meta.clone(),
@@ -219,14 +224,35 @@ impl Waiter {
     }
 }
 
-/// Convert a streaming body to a buffered fetch-result by reading it to the end.
-/// This could be more efficient with allocations, probably.
+/// Mark the values of credential-carrying headers sensitive, so `{:?}` prints them redacted
+/// (and HPACK never indexes them). The values on the wire are unchanged.
+pub(crate) fn mark_sensitive(headers: &mut http::HeaderMap) {
+    use http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
+    for name in [AUTHORIZATION, PROXY_AUTHORIZATION, COOKIE] {
+        let values: Vec<_> = headers.get_all(&name).iter().cloned().collect();
+        if values.is_empty() {
+            continue;
+        }
+        headers.remove(&name);
+        for mut value in values {
+            value.set_sensitive(true);
+            headers.append(name.clone(), value);
+        }
+    }
+}
+
+/// Convert a streaming body to a buffered fetch-result by reading it to the end, failing once
+/// it exceeds `cap` bytes. This could be more efficient with allocations, probably.
 pub async fn stream_to_bytes(
     peek_buf: PeekBuf,
     shared: Arc<SharedBody>,
+    cap: Option<usize>,
 ) -> Result<Bytes, NetError> {
     let mut out = Vec::with_capacity(peek_buf.len() + 8192);
-    let mut reader = SharedBody::combined_reader(peek_buf, shared);
+    let reader = SharedBody::combined_reader(peek_buf, shared);
+    // one byte past the cap tells an oversized body from one of exactly the cap
+    let limit = cap.map_or(u64::MAX, |c| c as u64 + 1);
+    let mut reader = reader.take(limit);
     if let Err(e) = reader.read_to_end(&mut out).await {
         // The reader wraps stream errors in io::Error (see NetError::to_io); recover the
         // original typed NetError when one is carried, otherwise wrap the io::Error once.
@@ -236,6 +262,13 @@ pub async fn stream_to_bytes(
             .cloned()
             .unwrap_or_else(|| NetError::Io(Arc::new(e)));
         return Err(net);
+    }
+    if let Some(cap) = cap {
+        if out.len() > cap {
+            return Err(NetError::Read(Arc::new(anyhow::anyhow!(
+                "body exceeded maximum size of {cap} bytes"
+            ))));
+        }
     }
     Ok(Bytes::from(out))
 }
@@ -361,10 +394,13 @@ mod tests {
         let body = Bytes::from_static(b"BODY");
         let meta = dummy_meta();
         waiter
-            .finish(FetchResult::Buffered {
-                meta: meta.clone(),
-                body: body.clone(),
-            })
+            .finish(
+                FetchResult::Buffered {
+                    meta: meta.clone(),
+                    body: body.clone(),
+                },
+                None,
+            )
             .await;
 
         let r1 = rx1.await.unwrap();
@@ -408,11 +444,14 @@ mod tests {
         let peek_buf = PeekBuf::from_slice(b"PEEK-");
 
         waiter
-            .finish(FetchResult::Stream {
-                meta: meta.clone(),
-                peek_buf: peek_buf.clone(),
-                shared: shared.clone(),
-            })
+            .finish(
+                FetchResult::Stream {
+                    meta: meta.clone(),
+                    peek_buf: peek_buf.clone(),
+                    shared: shared.clone(),
+                },
+                None,
+            )
             .await;
 
         let r_stream = rx_stream.await.unwrap();
@@ -447,13 +486,82 @@ mod tests {
         waiter.register(tx2, true);
 
         waiter
-            .finish(FetchResult::Error(NetError::Cancelled("boom".into())))
+            .finish(FetchResult::Error(NetError::Cancelled("boom".into())), None)
             .await;
 
         let r1 = rx1.await.unwrap();
         let r2 = rx2.await.unwrap();
         assert!(matches!(r1, FetchResult::Error(_)));
         assert!(matches!(r2, FetchResult::Error(_)));
+    }
+
+    #[test]
+    fn mark_sensitive_redacts_credentials_in_debug_output() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer s3cret".parse().unwrap(),
+        );
+        headers.append(http::header::COOKIE, "a=1".parse().unwrap());
+        headers.append(http::header::COOKIE, "b=2".parse().unwrap());
+        headers.insert(http::header::ACCEPT, "*/*".parse().unwrap());
+        mark_sensitive(&mut headers);
+
+        let shown = format!("{headers:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(!shown.contains("a=1"), "{shown}");
+        assert!(shown.contains("*/*"), "{shown}");
+        assert_eq!(headers[http::header::AUTHORIZATION], "Bearer s3cret");
+        let cookies: Vec<_> = headers.get_all(http::header::COOKIE).iter().collect();
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies.iter().all(|v| v.is_sensitive()));
+    }
+
+    /// A coalesced streaming listener that subscribes after another has read the body still
+    /// gets all of it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_streaming_listener_gets_the_whole_body() {
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let waiter = Waiter::new_arc();
+        waiter.register(tx1, true);
+        waiter.register(tx2, true);
+
+        let shared = Arc::new(SharedBody::new(8));
+        let shared_clone = shared.clone();
+        tokio::spawn(async move {
+            shared_clone.push(Bytes::from_static(b"-tail"));
+            shared_clone.finish();
+        });
+        waiter
+            .finish(
+                FetchResult::Stream {
+                    meta: dummy_meta(),
+                    peek_buf: PeekBuf::from_slice(b"head"),
+                    shared,
+                },
+                None,
+            )
+            .await;
+
+        let read = |r: FetchResult| async move {
+            match r {
+                FetchResult::Stream {
+                    peek_buf, shared, ..
+                } => {
+                    let mut out = Vec::new();
+                    SharedBody::combined_reader(peek_buf, shared)
+                        .read_to_end(&mut out)
+                        .await
+                        .unwrap();
+                    out
+                }
+                other => panic!("expected a stream, got {other:?}"),
+            }
+        };
+        // the first listener drains the body before the second even subscribes
+        assert_eq!(read(rx1.await.unwrap()).await, b"head-tail");
+        assert_eq!(read(rx2.await.unwrap()).await, b"head-tail");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -464,10 +572,26 @@ mod tests {
             shared_clone.push(Bytes::from_static(b"-tail"));
             shared_clone.finish();
         });
-        let result = stream_to_bytes(PeekBuf::from_slice(b"head"), shared)
+        let result = stream_to_bytes(PeekBuf::from_slice(b"head"), shared, None)
             .await
             .unwrap();
         assert_eq!(&result[..], b"head-tail");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_to_bytes_enforces_the_cap() {
+        let body = |cap| async move {
+            let shared = Arc::new(SharedBody::new(8));
+            let shared_clone = shared.clone();
+            tokio::spawn(async move {
+                shared_clone.push(Bytes::from_static(b"-tail"));
+                shared_clone.finish();
+            });
+            stream_to_bytes(PeekBuf::from_slice(b"head"), shared, Some(cap)).await
+        };
+        assert_eq!(&body(9).await.unwrap()[..], b"head-tail");
+        let err = body(8).await.unwrap_err();
+        assert!(err.to_string().contains("exceeded"), "{err}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -484,11 +608,14 @@ mod tests {
         });
 
         waiter
-            .finish(FetchResult::Stream {
-                meta: dummy_meta(),
-                peek_buf: PeekBuf::empty(),
-                shared,
-            })
+            .finish(
+                FetchResult::Stream {
+                    meta: dummy_meta(),
+                    peek_buf: PeekBuf::empty(),
+                    shared,
+                },
+                None,
+            )
             .await;
 
         // The typed error must survive the stream→buffered conversion unwrapped: the
