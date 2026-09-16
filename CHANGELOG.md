@@ -9,19 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Security:** any `407` was treated as a proxy challenge, so an origin server could obtain
-  the stored proxy credentials (keyed by realm alone) or trigger the embedder's password
-  dialog. A `407` now counts only on a plain-`http` hop that `FetcherConfig::proxy` routes
-  through an http(s) proxy (over `https` a proxy's 407 fails the CONNECT tunnel and never
-  arrives as a response), and proxy credentials are keyed by the proxy's origin plus realm
-
 ### Changed
 
 - **Breaking:** `AuthChallenge::proxy` (the proxy that sent a 407), a fifth `proxy` argument
   on `parse_challenges`, and `ProtectionSpace::origin` set to the proxy's origin for proxy
   challenges. `NetPolicy::proxy_for` (native only) for direct users of `net::fetch`; unset, no
   407 is answered
-
 
 ### Added
 
