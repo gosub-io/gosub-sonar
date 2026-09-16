@@ -634,12 +634,40 @@ impl FetchRequest {
         FetchRequestBuilder::new(method, url)
     }
 
-    /// Generates a key for coalescing in-flight requests based on the request's method, URL, and headers.
+    /// Generates a key for coalescing in-flight requests: two requests with the same key may
+    /// share one response. Covers the method, URL, every header, the body and the size cap,
+    /// plus the request fields that change what a hop sends or accepts. `None` for a request
+    /// that must not be coalesced: a method other than GET/HEAD, or a streamed body.
     pub fn generate_request_key(&self) -> Option<String> {
         match self.method {
             Method::GET | Method::HEAD => {}
             _ => return None,
         }
+        // The named headers above are the common ones, kept readable; the rest of the map
+        // varies the response just as much (an API key, a conditional header), so all of it
+        // is hashed, in a fixed order so insertion order does not matter.
+        let all_headers = {
+            let mut pairs: Vec<(&str, &[u8])> = self
+                .headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_bytes()))
+                .collect();
+            pairs.sort_unstable();
+            let mut buf = Vec::new();
+            for (n, v) in pairs {
+                buf.extend_from_slice(n.as_bytes());
+                buf.push(b':');
+                buf.extend_from_slice(v);
+                buf.push(b'\n');
+            }
+            format!("{:x}", short_hash(&buf))
+        };
+        let body = match &self.body {
+            None => "n".to_string(),
+            // A streamed body cannot be compared, so the request goes on its own.
+            Some(b) => format!("{:x}", short_hash(b.as_bytes()?)),
+        };
+        let max_bytes = self.max_bytes.map_or("n".to_string(), |m| m.to_string());
 
         let url = normalize_url(&self.url);
         let h = &self.headers;
@@ -791,7 +819,7 @@ impl FetchRequest {
         };
 
         Some(format!(
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={};Cache={}",
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={};Cache={};H={};B={};MB={}",
             self.method,
             url,
             range,
@@ -804,7 +832,10 @@ impl FetchRequest {
             referrer,
             fetch_meta,
             credentials,
-            cache_mode
+            cache_mode,
+            all_headers,
+            body,
+            max_bytes
         ))
     }
 }
@@ -1305,17 +1336,80 @@ mod tests {
         let url_norm = normalize_url(&fr.url);
         let auth_hash = format!("{:x}", short_hash(b"Bearer abc"));
         let cookie_hash = format!("{:x}", short_hash(b"a=1; b=2"));
+        let all_headers = format!(
+            "{:x}",
+            short_hash(
+                b"accept:text/html\naccept-encoding:gzip\naccept-language:en-US\n\
+                  authorization:Bearer abc\ncookie:a=1; b=2\nrange:bytes=0-99\n"
+            )
+        );
         let expected = format!(
             // MC=n: no secure initiating origin. Ref=n: no referrer set, so none is ever sent.
             // FM: default destination and mode, no initiating origin, no user navigation.
             // Cred and Cache: the default credentials mode and normal HTTP caching.
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include;Cache=default",
-            fr.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash
+            // H: every header, sorted. B=n: no body. MB=n: no size cap.
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include;Cache=default;H={};B=n;MB=n",
+            fr.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash, all_headers
         );
 
         assert_eq!(key, expected);
         assert!(key.starts_with("M=GET;U=https://example.org/a/b"));
         assert!(!key.contains("#frag"));
+    }
+
+    #[test]
+    fn coalescing_key_covers_every_header_body_and_cap() {
+        let url = Url::parse("https://example.org/a").unwrap();
+        let with = |headers: &[(&str, &str)]| {
+            let mut map = HeaderMap::new();
+            for (n, v) in headers {
+                map.append(
+                    http::HeaderName::from_bytes(n.as_bytes()).unwrap(),
+                    v.parse().unwrap(),
+                );
+            }
+            FetchRequest::builder(Method::GET, url.clone())
+                .with_headers(map)
+                .build()
+                .generate_request_key()
+                .unwrap()
+        };
+        assert_ne!(
+            with(&[("x-api-key", "one")]),
+            with(&[("x-api-key", "two")]),
+            "an unlisted header varies the key"
+        );
+        assert_ne!(with(&[]), with(&[("if-none-match", "\"v1\"")]));
+        assert_eq!(
+            with(&[("x-a", "1"), ("x-b", "2")]),
+            with(&[("x-b", "2"), ("x-a", "1")]),
+            "insertion order does not"
+        );
+
+        let key_for = |b: FetchRequestBuilder| b.build().generate_request_key();
+        let plain = key_for(FetchRequest::builder(Method::GET, url.clone())).unwrap();
+        assert_ne!(
+            key_for(
+                FetchRequest::builder(Method::GET, url.clone()).with_body(RequestBody::text("q"))
+            )
+            .unwrap(),
+            plain
+        );
+        assert_ne!(
+            key_for(FetchRequest::builder(Method::GET, url.clone()).with_max_bytes(1024)).unwrap(),
+            plain
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        assert!(
+            key_for(
+                FetchRequest::builder(Method::GET, url).with_body(RequestBody::stream(
+                    || Ok(Box::pin(tokio::io::empty())),
+                    None
+                ))
+            )
+            .is_none(),
+            "a streamed body is never coalesced"
+        );
     }
 
     /// A reload has to reach the server, so it cannot be answered by joining a fetch that is
@@ -1332,7 +1426,7 @@ mod tests {
         };
 
         let default = key_for(CacheMode::Default);
-        assert!(default.ends_with(";Cache=default"), "{default}");
+        assert!(default.contains(";Cache=default;"), "{default}");
         assert_ne!(default, key_for(CacheMode::Reload));
         assert_ne!(default, key_for(CacheMode::NoStore));
         assert_ne!(key_for(CacheMode::NoCache), key_for(CacheMode::ForceCache));
