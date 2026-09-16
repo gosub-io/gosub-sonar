@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A streamed fetch gave its connection slots back as soon as the headers arrived, so the
+  connection its body still occupied went uncounted against `global_slots` and the per-origin
+  limits. The slots now travel with the body and are released when it ends
 - The simple helpers (`simple_get`, `sync_get`, `sync_fetch`) no longer follow a redirect
   from `https` down to `http`, refuse a `file:` path that is not a regular file (a FIFO would
   have blocked forever), and `simple_get` reads files without blocking the async runtime.

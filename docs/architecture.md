@@ -187,7 +187,9 @@ End to end, a fetch through the scheduler goes:
    buffer for buffered listeners (see [coalescing](#coalescing--fan-out)).
 
 7. **Cleanup.** The entry's `done` token fires, it is removed from `inflight_map`, and
-   `FetcherContext::on_ref_done` is called. The spawned task ends and the slots are released.
+   `FetcherContext::on_ref_done` is called. The spawned task ends and the slots are released;
+   a streamed fetch hands its slots to the body reader instead, so they come back when the
+   body ends.
 
 ---
 
