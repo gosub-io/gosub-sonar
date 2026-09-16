@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `RequestBody::file` declared `Content-Length` from the file's size at construction and
+  reopened the file at each send, so a file that changed in between was sent truncated or
+  failed mid-transfer. The length now comes from the handle being sent, and only a regular
+  file is accepted
 - The in-memory stores grew without bound: `InMemoryPreflightCache` (now at most 1024
   grants, the soonest-expiring dropped first), `InMemoryCredentialStore` (256 protection
   spaces, oldest first), `InMemoryHstsStore` (4096 hosts, expired swept then soonest-expiring

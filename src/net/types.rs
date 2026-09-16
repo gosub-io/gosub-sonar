@@ -375,6 +375,9 @@ enum Payload {
         open: BodyStreamFactory,
         len: Option<u64>,
     },
+    /// A file on disk, opened and measured at each send.
+    #[cfg(not(target_arch = "wasm32"))]
+    File(std::path::PathBuf),
 }
 
 impl Default for Payload {
@@ -390,6 +393,8 @@ impl Debug for RequestBody {
             Payload::Bytes(b) => d.field("bytes", &b.len()),
             #[cfg(not(target_arch = "wasm32"))]
             Payload::Stream { len, .. } => d.field("stream", len),
+            #[cfg(not(target_arch = "wasm32"))]
+            Payload::File(path) => d.field("file", path),
         };
         d.field("content_type", &self.content_type).finish()
     }
@@ -446,21 +451,17 @@ impl RequestBody {
         }
     }
 
-    /// Body streamed from a file on disk, opened at send time.
-    ///
-    /// `Content-Length` is taken from its current size, so the file must not change until
-    /// the request completes.
+    /// Body streamed from a regular file on disk, opened at each send (a redirect replays
+    /// it). `Content-Length` is the size of the file as opened, so a file that changes
+    /// between sends is sent whole each time. Fails now if the path is not a regular file.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn file(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
-        let len = std::fs::metadata(&path)?.len();
-        Ok(Self::stream(
-            move || {
-                let f = std::fs::File::open(&path)?;
-                Ok(Box::pin(tokio::fs::File::from_std(f)) as BoxedAsyncRead)
-            },
-            Some(len),
-        ))
+        regular_file(&std::fs::metadata(&path)?)?;
+        Ok(Self {
+            payload: Payload::File(path),
+            content_type: None,
+        })
     }
 
     /// The buffered bytes, or `None` when the body is streamed.
@@ -468,16 +469,19 @@ impl RequestBody {
         match &self.payload {
             Payload::Bytes(b) => Some(b),
             #[cfg(not(target_arch = "wasm32"))]
-            Payload::Stream { .. } => None,
+            Payload::Stream { .. } | Payload::File(_) => None,
         }
     }
 
-    /// Number of body bytes, or `None` for a stream without a declared length.
+    /// Number of body bytes, or `None` for a stream without a declared length. For a file,
+    /// its size now.
     pub fn len(&self) -> Option<u64> {
         match &self.payload {
             Payload::Bytes(b) => Some(b.len() as u64),
             #[cfg(not(target_arch = "wasm32"))]
             Payload::Stream { len, .. } => *len,
+            #[cfg(not(target_arch = "wasm32"))]
+            Payload::File(path) => std::fs::metadata(path).ok().map(|m| m.len()),
         }
     }
 
@@ -505,7 +509,30 @@ impl RequestBody {
                 let stream = tokio_util::io::ReaderStream::new(reader);
                 Ok((reqwest::Body::wrap_stream(stream), *len))
             }
+            // Length from the handle that is sent, so it matches what is read.
+            #[cfg(not(target_arch = "wasm32"))]
+            Payload::File(path) => {
+                let f = std::fs::File::open(path)?;
+                let len = regular_file(&f.metadata()?)?;
+                let reader = Box::pin(tokio::fs::File::from_std(f)) as BoxedAsyncRead;
+                let stream = tokio_util::io::ReaderStream::new(reader);
+                Ok((reqwest::Body::wrap_stream(stream), Some(len)))
+            }
         }
+    }
+}
+
+/// The length of a regular file, or an error for anything else (a FIFO or device has no
+/// length and may never end).
+#[cfg(not(target_arch = "wasm32"))]
+fn regular_file(meta: &std::fs::Metadata) -> std::io::Result<u64> {
+    if meta.is_file() {
+        Ok(meta.len())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "request body must be a regular file",
+        ))
     }
 }
 
@@ -1161,6 +1188,29 @@ mod tests {
     use super::*;
     use cow_utils::CowUtils;
     use tokio::io::AsyncReadExt;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_file_body_is_measured_when_sent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("body");
+        std::fs::write(&path, b"12345").unwrap();
+        let body = RequestBody::file(&path).unwrap();
+        assert_eq!(body.len(), Some(5));
+        assert_eq!(body.to_reqwest_body().unwrap().1, Some(5));
+
+        std::fs::write(&path, b"1234567890").unwrap();
+        assert_eq!(
+            body.to_reqwest_body().unwrap().1,
+            Some(10),
+            "measured at send"
+        );
+
+        assert!(
+            RequestBody::file(dir.path()).is_err(),
+            "a directory is refused"
+        );
+    }
 
     #[test]
     fn builder_leaves_timeouts_to_the_fetcher_by_default() {
