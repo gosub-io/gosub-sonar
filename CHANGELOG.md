@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security:** the fetcher logged every submitted request with `{:?}` at debug level,
+  headers included, so `RUST_LOG=debug` wrote `Authorization` and `Cookie` values to the log.
+  The log line is now the request id, method and URL without credentials, and
+  `Authorization`, `Proxy-Authorization` and `Cookie` values are marked sensitive on
+  submission and where the fetcher adds them, so any `{:?}` of a request or a
+  `NetEvent::RequestSent` prints them redacted
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect

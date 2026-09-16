@@ -219,6 +219,23 @@ impl Waiter {
     }
 }
 
+/// Mark the values of credential-carrying headers sensitive, so `{:?}` prints them redacted
+/// (and HPACK never indexes them). The values on the wire are unchanged.
+pub(crate) fn mark_sensitive(headers: &mut http::HeaderMap) {
+    use http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
+    for name in [AUTHORIZATION, PROXY_AUTHORIZATION, COOKIE] {
+        let values: Vec<_> = headers.get_all(&name).iter().cloned().collect();
+        if values.is_empty() {
+            continue;
+        }
+        headers.remove(&name);
+        for mut value in values {
+            value.set_sensitive(true);
+            headers.append(name.clone(), value);
+        }
+    }
+}
+
 /// Convert a streaming body to a buffered fetch-result by reading it to the end.
 /// This could be more efficient with allocations, probably.
 pub async fn stream_to_bytes(
@@ -454,6 +471,28 @@ mod tests {
         let r2 = rx2.await.unwrap();
         assert!(matches!(r1, FetchResult::Error(_)));
         assert!(matches!(r2, FetchResult::Error(_)));
+    }
+
+    #[test]
+    fn mark_sensitive_redacts_credentials_in_debug_output() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer s3cret".parse().unwrap(),
+        );
+        headers.append(http::header::COOKIE, "a=1".parse().unwrap());
+        headers.append(http::header::COOKIE, "b=2".parse().unwrap());
+        headers.insert(http::header::ACCEPT, "*/*".parse().unwrap());
+        mark_sensitive(&mut headers);
+
+        let shown = format!("{headers:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(!shown.contains("a=1"), "{shown}");
+        assert!(shown.contains("*/*"), "{shown}");
+        assert_eq!(headers[http::header::AUTHORIZATION], "Bearer s3cret");
+        let cookies: Vec<_> = headers.get_all(http::header::COOKIE).iter().collect();
+        assert_eq!(cookies.len(), 2);
+        assert!(cookies.iter().all(|v| v.is_sensitive()));
     }
 
     #[tokio::test(flavor = "current_thread")]

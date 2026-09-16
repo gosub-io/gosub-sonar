@@ -1663,7 +1663,8 @@ async fn get_with_redirects(
         };
         if attach_credentials && !current_headers.contains_key(header::COOKIE) {
             if let Some(cookie_str) = (policy.cookies_for)(&url) {
-                if let Ok(val) = cookie_str.parse() {
+                if let Ok(mut val) = cookie_str.parse::<http::HeaderValue>() {
+                    val.set_sensitive(true);
                     current_headers.insert(header::COOKIE, val);
                 }
             }
@@ -1746,7 +1747,8 @@ async fn get_with_redirects(
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ref proxy_authorization) = policy.proxy_authorization {
                     if !hop_headers.contains_key(header::PROXY_AUTHORIZATION) {
-                        if let Some(value) = proxy_authorization(&url) {
+                        if let Some(mut value) = proxy_authorization(&url) {
+                            value.set_sensitive(true);
                             hop_headers.insert(header::PROXY_AUTHORIZATION, value);
                         }
                     }

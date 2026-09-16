@@ -440,7 +440,20 @@ impl Fetcher {
         cancel: CancellationToken,
         reply_tx: oneshot::Sender<FetchResult>,
     ) {
-        log::debug!("Submitting fetch request: {:?}", req);
+        let mut req = req;
+        // So a `{:?}` of the request anywhere prints credentials redacted.
+        crate::net::utils::mark_sensitive(&mut req.headers);
+        if log::log_enabled!(log::Level::Debug) {
+            let mut shown = req.url.clone();
+            let _ = shown.set_username("");
+            let _ = shown.set_password(None);
+            log::debug!(
+                "Submitting fetch request {} {} {}",
+                req.req_id,
+                req.method,
+                short_url(&shown, 200)
+            );
+        }
 
         let mut lane = match req.priority {
             Priority::High => self.q_high.lock().await,
