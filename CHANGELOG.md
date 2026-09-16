@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The coalescing key joined raw header values with `;` and `=`, so a value containing them
+  could read as the next field and two different requests could spell one key. The raw
+  components are now length-prefixed
 - A streamed fetch gave its connection slots back as soon as the headers arrived, so the
   connection its body still occupied went uncounted against `global_slots` and the per-origin
   limits. The slots now travel with the body and are released when it ends

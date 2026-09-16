@@ -816,14 +816,17 @@ impl FetchRequest {
             CacheMode::OnlyIfCached => "only-if-cached",
         };
 
+        // Raw values are length-prefixed: a `;` or `=` inside one must not read as the next
+        // field, or two different requests could spell the same key.
+        let lp = |s: &str| format!("{}:{}", s.len(), s);
         Some(format!(
             "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={};Cache={}",
             self.method,
-            url,
-            range,
-            accept,
-            accept_lang,
-            accept_enc,
+            lp(&url),
+            lp(range),
+            lp(accept),
+            lp(accept_lang),
+            lp(accept_enc),
             auth_hash,
             cookie_hash,
             mixed_content,
@@ -1357,13 +1360,35 @@ mod tests {
             // MC=n: no secure initiating origin. Ref=n: no referrer set, so none is ever sent.
             // FM: default destination and mode, no initiating origin, no user navigation.
             // Cred and Cache: the default credentials mode and normal HTTP caching.
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include;Cache=default",
-            fr.method, url_norm, "bytes=0-99", "text/html", "en-US", "gzip", auth_hash, cookie_hash
+            "M={};U={}:{};R=10:bytes=0-99;A=9:text/html;AL=5:en-US;AE=4:gzip;Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include;Cache=default",
+            fr.method, url_norm.len(), url_norm, auth_hash, cookie_hash
         );
 
         assert_eq!(key, expected);
-        assert!(key.starts_with("M=GET;U=https://example.org/a/b"));
+        assert!(key.starts_with("M=GET;U="));
+        assert!(key.contains("https://example.org/a/b"));
         assert!(!key.contains("#frag"));
+    }
+
+    /// A `;` or `=` inside a header value must not let two different requests share a key.
+    #[test]
+    fn coalescing_key_fields_cannot_run_into_each_other() {
+        let url = Url::parse("https://example.org/a").unwrap();
+        let key_for = |accept: &str, lang: &str, enc: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT, accept.parse().unwrap());
+            headers.insert(header::ACCEPT_LANGUAGE, lang.parse().unwrap());
+            headers.insert(header::ACCEPT_ENCODING, enc.parse().unwrap());
+            FetchRequest::builder(Method::GET, url.clone())
+                .with_headers(headers)
+                .build()
+                .generate_request_key()
+                .unwrap()
+        };
+        assert_ne!(
+            key_for("a;AL=b;AE=c", "", ""),
+            key_for("a", "b", "c;AL=;AE=")
+        );
     }
 
     /// A reload has to reach the server, so it cannot be answered by joining a fetch that is
