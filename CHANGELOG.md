@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security:** `user:password@` in a URL was passed to the client, which turns it into an
+  `Authorization` header: a same-origin `Location` with credentials (the cross-origin and
+  cors-mode cases were already refused) or a subresource URL with them sent attacker-chosen
+  Basic credentials along with the user's cookies, and the password reached the `Started`,
+  `RequestSent` and `Redirected` events and `final_url`. Credentials are now dropped from the
+  initial URL and from every `Location`, with a `Warning` event, before anything else sees
+  the URL
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect
