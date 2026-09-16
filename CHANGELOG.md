@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security:** a `Cache-Control: max-age`, `max-stale`, `min-fresh` or `Age` value beyond
+  what a duration can hold panicked the fetcher task on the next request for that URL, and
+  later requests for it hung on the dead in-flight entry. Delta-seconds are now parsed as RFC
+  9111 §1.2.2 says: digits only, anything above 2^31 treated as 2^31
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect

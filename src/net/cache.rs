@@ -239,7 +239,7 @@ impl CacheEntry {
             .headers
             .get(header::AGE)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<i64>().ok())
+            .and_then(delta_seconds)
             .map(TimeDelta::seconds)
             .unwrap_or_else(TimeDelta::zero);
 
@@ -307,6 +307,24 @@ impl CacheEntry {
     }
 }
 
+/// Largest delta-seconds value used (RFC 9111 §1.2.2: a cache treats anything greater as
+/// 2^31). Keeps every duration below well within `TimeDelta`, which panics past its range.
+const MAX_DELTA_SECS: i64 = 1 << 31;
+
+/// Parse a delta-seconds value (RFC 9111 §1.2.2): digits only, clamped to `MAX_DELTA_SECS`.
+fn delta_seconds(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(
+        value
+            .parse::<i64>()
+            .unwrap_or(MAX_DELTA_SECS)
+            .min(MAX_DELTA_SECS),
+    )
+}
+
 /// The `Cache-Control` directives of a response that this cache acts on.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResponseDirectives {
@@ -338,7 +356,7 @@ impl ResponseDirectives {
                 "immutable" => out.immutable = true,
                 "private" => out.private = true,
                 "public" => out.public = true,
-                "max-age" => out.max_age = value.and_then(|v| v.parse().ok()),
+                "max-age" => out.max_age = value.and_then(|v| delta_seconds(&v)),
                 _ => {}
             }
         }
@@ -373,9 +391,9 @@ impl RequestDirectives {
                 "no-store" => out.no_store = true,
                 "no-cache" => out.no_cache = true,
                 "only-if-cached" => out.only_if_cached = true,
-                "max-age" => out.max_age = value.and_then(|v| v.parse().ok()),
-                "max-stale" => out.max_stale = Some(value.and_then(|v| v.parse().ok())),
-                "min-fresh" => out.min_fresh = value.and_then(|v| v.parse().ok()),
+                "max-age" => out.max_age = value.and_then(|v| delta_seconds(&v)),
+                "max-stale" => out.max_stale = Some(value.and_then(|v| delta_seconds(&v))),
+                "min-fresh" => out.min_fresh = value.and_then(|v| delta_seconds(&v)),
                 _ => {}
             }
         }
@@ -908,6 +926,45 @@ mod tests {
         assert_eq!(stored.freshness_lifetime(), Some(TimeDelta::seconds(120)));
         assert!(stored.is_fresh(at(119)));
         assert!(!stored.is_fresh(at(121)));
+    }
+
+    #[test]
+    fn delta_seconds_parsing() {
+        assert_eq!(delta_seconds("60"), Some(60));
+        assert_eq!(delta_seconds(" 60 "), Some(60));
+        assert_eq!(delta_seconds("0"), Some(0));
+        assert_eq!(delta_seconds("-5"), None);
+        assert_eq!(delta_seconds("+5"), None);
+        assert_eq!(delta_seconds(""), None);
+        assert_eq!(delta_seconds("soon"), None);
+        assert_eq!(delta_seconds("9223372036854775807"), Some(MAX_DELTA_SECS));
+        assert_eq!(
+            delta_seconds("99999999999999999999999"),
+            Some(MAX_DELTA_SECS)
+        );
+    }
+
+    /// Out-of-range values from the server must not panic (`TimeDelta::seconds` does past
+    /// its bounds); they are clamped and the entry still ages.
+    #[test]
+    fn huge_max_age_and_age_do_not_panic() {
+        let stored = entry(&[
+            ("cache-control", "max-age=9223372036854775807"),
+            ("age", "9223372036854775807"),
+        ]);
+        assert_eq!(
+            stored.freshness_lifetime(),
+            Some(TimeDelta::seconds(MAX_DELTA_SECS))
+        );
+        assert!(stored.current_age(at(1)) >= TimeDelta::seconds(MAX_DELTA_SECS));
+        assert!(!stored.is_fresh(at(1)));
+
+        let request = headers(&[(
+            "cache-control",
+            "max-age=9223372036854775807, min-fresh=9223372036854775807, \
+             max-stale=9223372036854775807",
+        )]);
+        let _ = decide(&[stored], &request, true, CacheMode::Default, at(1));
     }
 
     #[test]
