@@ -842,11 +842,15 @@ fn build_client(
             .deflate(decode);
         // overrides need our own verifier, so we build the rustls config ourselves
         b = match &cfg.tls_overrides {
-            Some(store) => b.tls_backend_preconfigured(crate::net::tls::client_config(
-                store.clone(),
-                ctx.clone(),
-                cfg.hsts.clone(),
-            )?),
+            // tls_info: responses carry their peer certificate, for the HSTS check
+            Some(store) => {
+                b.tls_info(true)
+                    .tls_backend_preconfigured(crate::net::tls::client_config(
+                        store.clone(),
+                        ctx.clone(),
+                        cfg.hsts.clone(),
+                    )?)
+            }
             None => b.use_rustls_tls(),
         };
         if let Some(ref ua) = cfg.user_agent {
@@ -961,6 +965,7 @@ fn build_policy(
             .with_proxy_for(Box::new(move |url| proxy_for.plain_http_proxy(url)))
             .with_dns_resolver(cfg.dns_resolver.clone())
             .with_hsts(cfg.hsts.clone())
+            .with_tls_overrides(cfg.tls_overrides.clone())
             .with_cache(cfg.cache.clone());
         match cfg.cors_preflight_cache.clone() {
             Some(cache) => policy.with_cors_preflight_cache(cache),
@@ -2004,6 +2009,47 @@ mod tests {
         store.revoke("tls.test");
         let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
         assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::UnknownIssuer);
+        shutdown.cancel();
+    }
+
+    /// A response over a clicked-through certificate must not arm HSTS (RFC 6797 §8.1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn hsts_is_not_recorded_over_an_overridden_connection() {
+        let store = Arc::new(crate::net::tls::InMemoryTlsOverrideStore::new());
+        let hsts = Arc::new(InMemoryHstsStore::new());
+        let srv = TestServer::new()
+            .tls("tls.test")
+            .route(
+                "/",
+                RouteConfig::ok_with_headers(
+                    &[("Strict-Transport-Security", "max-age=31536000")],
+                    b"x",
+                ),
+            )
+            .start()
+            .await;
+        let cfg = FetcherConfig {
+            tls_overrides: Some(store.clone()),
+            hsts: Some(hsts.clone()),
+            dns_resolver: Some(Arc::new(Loopback(srv.socket_addr()))),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        store.accept("tls.test", tls.fingerprint.unwrap());
+        match fetch_root(&fetcher, &srv).await {
+            FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 200),
+            other => panic!("expected success after override, got {other:?}"),
+        }
+        assert!(
+            hsts.load("tls.test").is_none(),
+            "HSTS armed over an override"
+        );
         shutdown.cancel();
     }
 
