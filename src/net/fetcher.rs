@@ -1013,9 +1013,6 @@ async fn perform_streaming(
     )
     .await?;
 
-    // Notify the context's cookie jar about any Set-Cookie headers in the response
-    notify_cookies(&ctx, &meta);
-
     let opts = ReaderOptions {
         capacity: SHARED_MAX_CAPACITY,
         buf_size: 16 * 1024,
@@ -1069,24 +1066,8 @@ async fn perform_buffered(
     )
     .await?;
 
-    // Notify the context's cookie jar about any Set-Cookie headers in the response
-    notify_cookies(&ctx, &meta);
-
     // `body` is already an `Arc`-backed `Bytes`; moving it into the result is zero-copy.
     Ok(FetchResult::Buffered { meta, body })
-}
-
-/// Extract `Set-Cookie` header values from `meta` and forward them to the context.
-fn notify_cookies(ctx: &Arc<dyn FetcherContext>, meta: &crate::net::types::FetchResultMeta) {
-    let values: Vec<&str> = meta
-        .headers
-        .get_all(header::SET_COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect();
-    if !values.is_empty() {
-        ctx.on_cookies_received(&meta.final_url, &values);
-    }
 }
 
 #[cfg(test)]

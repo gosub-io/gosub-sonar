@@ -93,6 +93,20 @@ fn ip_literal(url: &Url) -> Option<String> {
     }
 }
 
+/// Hand a response's `Set-Cookie` values to the policy's jar. Returns whether there were any.
+fn report_set_cookie(policy: &NetPolicy, url: &Url, headers: &HeaderMap) -> bool {
+    let values: Vec<&str> = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if values.is_empty() {
+        return false;
+    }
+    (policy.on_cookies)(url, &values);
+    true
+}
+
 /// What [`hop_checks`] decided about one hop.
 pub(crate) enum HopCheck {
     /// Send the request to this URL, which may be an upgraded form of the one checked.
@@ -171,9 +185,10 @@ pub struct NetPolicy {
     /// Called on each hop after cross-origin cookie stripping, so the jar is always consulted
     /// for the correct origin.
     pub cookies_for: CookieJarFn,
-    /// Called with the raw `Set-Cookie` values of each redirect (3xx) response, so cookies set
-    /// mid-chain (e.g. a session cookie on a login 302) reach the jar before the next hop.
-    /// The final response's cookies are reported by the fetcher, not here.
+    /// Called with the raw `Set-Cookie` values of every response, redirect hops included, so a
+    /// cookie set mid-chain (a session cookie on a login 302) reaches the jar before the next
+    /// hop. Not called for a hop the request's credentials mode kept cookies off (Fetch: only
+    /// with *includeCredentials*), so a `credentials: omit` request cannot write the jar.
     pub on_cookies: CookieSinkFn,
     /// Called with the URL and HTTP version of every response in the chain, redirects included.
     /// The fetcher uses this to pick the h1 or h2 per-origin connection limit. Not called on
@@ -2140,6 +2155,9 @@ async fn get_with_redirects(
         };
 
         if !hop.is_redirection() {
+            if attach_credentials {
+                report_set_cookie(&policy, &url, hop.headers());
+            }
             return Ok(ChainOutcome {
                 response: hop,
                 url: url.clone(),
@@ -2180,14 +2198,7 @@ async fn get_with_redirects(
         // Report Set-Cookie values on this hop to the jar before following the redirect —
         // login flows commonly set the session cookie on a 302. Dropping our Cookie header
         // makes the next hop re-query the now-updated jar instead of resending a stale value.
-        let set_cookies: Vec<&str> = hop
-            .headers()
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
-        if !set_cookies.is_empty() {
-            (policy.on_cookies)(&from, &set_cookies);
+        if attach_credentials && report_set_cookie(&policy, &from, hop.headers()) {
             current_headers.remove(header::COOKIE);
         }
 
@@ -4505,6 +4516,85 @@ mod tests {
 
     /// When a redirect hop sets cookies but no jar is wired up, the pre-existing Cookie header is
     /// dropped for subsequent hops rather than resending a value the server just replaced.
+    type SeenCookies = Arc<std::sync::Mutex<Vec<(Url, String)>>>;
+
+    /// Records every `Set-Cookie` handed to the jar, keyed by the URL it came from.
+    fn recording_jar() -> (NetPolicy, SeenCookies) {
+        let seen: SeenCookies = Default::default();
+        let sink = seen.clone();
+        let policy = NetPolicy {
+            on_cookies: Box::new(move |url, values| {
+                let mut seen = sink.lock().unwrap();
+                for v in values {
+                    seen.push((url.clone(), v.to_string()));
+                }
+            }),
+            ..NetPolicy::default()
+        };
+        (policy, seen)
+    }
+
+    fn set_cookie_server() -> crate::net::test_support::TestServer {
+        TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_with_cookie("/final", "mid=1; Path=/"),
+            )
+            .route(
+                "/final",
+                RouteConfig::ok_with_headers(&[("Set-Cookie", "end=1; Path=/")], b"ok"),
+            )
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_cookie_reaches_the_jar_with_credentials() {
+        let srv = set_cookie_server().start().await;
+        let (policy, seen) = recording_jar();
+        let (meta, _) = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], (srv.url("/hop"), "mid=1; Path=/".to_string()));
+        assert_eq!(seen[1], (srv.url("/final"), "end=1; Path=/".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_cookie_is_ignored_without_credentials() {
+        let srv = set_cookie_server().start().await;
+        let (policy, seen) = recording_jar();
+        let (meta, _) = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()).with_credentials(RequestCredentials::Omit),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn redirect_set_cookie_drops_stale_cookie_header() {
         let srv = server().await;

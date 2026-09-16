@@ -700,8 +700,9 @@ Implemented by the host and passed to `Fetcher::new`. The bridge between schedul
 - `is_url_allowed(url)` — URL policy hook (default: allow all).
 - `cookies_for(url)` — returns the `Cookie` header value for a request hop (default: none), wired
   into `NetPolicy::cookies_for`.
-- `on_cookies_received(final_url, set_cookie_values)` — called after a response carrying
-  `Set-Cookie` headers, so the host can update its jar.
+- `on_cookies_received(hop_url, set_cookie_values)` — called for every response carrying
+  `Set-Cookie` headers, redirect hops included, when the request's credentials mode attached
+  cookies to that hop; a `credentials: omit` request cannot write the jar.
 - `tls_override(error)` — whether to accept a certificate that failed verification (default:
   no). Only used with `FetcherConfig::tls_overrides`; see
   [TLS errors & overrides](#tls-errors--overrides).
