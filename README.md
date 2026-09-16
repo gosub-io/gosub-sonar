@@ -301,7 +301,9 @@ remembered, since it was computed for that one challenge, so pre-seed the store 
 stable one such as a bearer token.
 
 Server credentials follow `FetchRequest::credentials` and are not attached to CORS-tainted
-requests (`Authorization` is not a CORS-safelisted header). Proxy challenges are native only.
+requests (`Authorization` is not a CORS-safelisted header). Proxy challenges are native only and
+only accepted on a plain-`http` hop that `FetcherConfig::proxy` routes through a proxy; any other
+`407` is returned as is.
 
 ### DNS and SSRF
 

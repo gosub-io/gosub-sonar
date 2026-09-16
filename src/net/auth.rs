@@ -151,6 +151,8 @@ pub struct AuthChallenge {
     /// How many times this hop was already re-sent with credentials. `0` on the first challenge;
     /// a higher value means the credentials given last time were rejected.
     pub attempt: u32,
+    /// The proxy that sent a `407`; `None` for a server challenge.
+    pub proxy: Option<Url>,
 }
 
 impl AuthChallenge {
@@ -170,9 +172,10 @@ impl AuthChallenge {
             scheme: self.scheme.clone(),
             origin: match self.target {
                 AuthTarget::Server => Some(self.url.origin().ascii_serialization()),
-                // A proxy challenge says nothing about which proxy sent it, and one fetcher has
-                // one proxy configuration — see `ProtectionSpace`.
-                AuthTarget::Proxy => None,
+                AuthTarget::Proxy => self
+                    .proxy
+                    .as_ref()
+                    .map(|p| p.origin().ascii_serialization()),
             },
             realm: self.realm.clone().unwrap_or_default(),
         }
@@ -183,8 +186,7 @@ impl AuthChallenge {
 ///
 /// For a server challenge that is the challenged origin plus the realm — credentials for
 /// `https://example.com` never travel to `http://example.com` or to a sibling host. For a proxy
-/// challenge there is no origin: a fetcher has one proxy configuration, so proxy credentials are
-/// keyed by realm alone and reused for every request that goes through it.
+/// challenge it is the proxy's origin plus the realm.
 ///
 /// The scheme is part of the key: a password encoded for `Basic` is not an answer to a `Digest`
 /// challenge of the same realm.
@@ -196,8 +198,8 @@ pub struct ProtectionSpace {
     pub target: AuthTarget,
     /// The scheme the credentials answer.
     pub scheme: AuthScheme,
-    /// Serialized origin of the challenging server (`https://example.com:8443`), `None` for a
-    /// proxy.
+    /// Serialized origin of the challenging server or proxy (`https://example.com:8443`);
+    /// `None` for a proxy challenge with no known proxy.
     pub origin: Option<String>,
     /// The challenge's realm, or the empty string when it named none.
     pub realm: String,
@@ -336,6 +338,7 @@ pub fn parse_challenges(
     target: AuthTarget,
     url: &Url,
     attempt: u32,
+    proxy: Option<&Url>,
 ) -> Vec<AuthChallenge> {
     headers
         .get_all(target.challenge_header())
@@ -354,6 +357,7 @@ pub fn parse_challenges(
             params: raw.params,
             token68: raw.token68,
             attempt,
+            proxy: proxy.cloned(),
         })
         .collect()
 }
@@ -496,7 +500,7 @@ mod tests {
     fn challenges(header: &str) -> Vec<AuthChallenge> {
         let mut headers = HeaderMap::new();
         headers.append(header::WWW_AUTHENTICATE, header.parse().unwrap());
-        parse_challenges(&headers, AuthTarget::Server, &url(), 0)
+        parse_challenges(&headers, AuthTarget::Server, &url(), 0, None)
     }
 
     #[test]
@@ -591,7 +595,7 @@ mod tests {
             header::WWW_AUTHENTICATE,
             r#"Basic realm="x""#.parse().unwrap(),
         );
-        let c = parse_challenges(&headers, AuthTarget::Server, &url(), 1);
+        let c = parse_challenges(&headers, AuthTarget::Server, &url(), 1, None);
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].scheme, AuthScheme::Negotiate);
         assert_eq!(c[1].scheme, AuthScheme::Basic);
@@ -600,7 +604,9 @@ mod tests {
 
     #[test]
     fn a_response_without_a_challenge_header_yields_nothing() {
-        assert!(parse_challenges(&HeaderMap::new(), AuthTarget::Server, &url(), 0).is_empty());
+        assert!(
+            parse_challenges(&HeaderMap::new(), AuthTarget::Server, &url(), 0, None).is_empty()
+        );
         // A stray parameter has no challenge to belong to.
         assert!(challenges(r#"realm="x""#).is_empty());
     }
@@ -612,8 +618,8 @@ mod tests {
             header::PROXY_AUTHENTICATE,
             r#"Basic realm="corp""#.parse().unwrap(),
         );
-        assert!(parse_challenges(&headers, AuthTarget::Server, &url(), 0).is_empty());
-        let c = parse_challenges(&headers, AuthTarget::Proxy, &url(), 0);
+        assert!(parse_challenges(&headers, AuthTarget::Server, &url(), 0, None).is_empty());
+        let c = parse_challenges(&headers, AuthTarget::Proxy, &url(), 0, None);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].target, AuthTarget::Proxy);
     }
@@ -644,7 +650,8 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         headers.append(header::PROXY_AUTHENTICATE, "Basic".parse().unwrap());
-        let proxy = parse_challenges(&headers, AuthTarget::Proxy, &url(), 0)[0].protection_space();
+        let proxy =
+            parse_challenges(&headers, AuthTarget::Proxy, &url(), 0, None)[0].protection_space();
         assert_eq!(proxy.origin, None);
         assert_eq!(proxy.realm, "");
     }
