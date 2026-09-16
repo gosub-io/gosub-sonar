@@ -48,10 +48,12 @@ pub trait FetcherContext: Send + Sync {
         None
     }
 
-    /// Called once after every successful HTTP response that carries `Set-Cookie` headers.
+    /// Called for every response carrying `Set-Cookie` headers, redirect hops included, when
+    /// the request's credentials mode attached cookies to that hop. A `credentials: omit`
+    /// request never reaches this.
     ///
-    /// `url` is the **final** URL (after redirects). `values` is the slice of raw
-    /// `Set-Cookie` header values from the response — one entry per header line.
+    /// `url` is the URL of the hop that sent them. `values` is the slice of raw `Set-Cookie`
+    /// header values from the response — one entry per header line.
     ///
     /// The default implementation does nothing.
     fn on_cookies_received(&self, _url: &Url, _values: &[&str]) {}

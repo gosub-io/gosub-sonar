@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security:** `Set-Cookie` was written to the jar whatever the request's credentials mode,
+  so a `credentials: omit` (or cross-origin `same-origin`) request let the server plant or
+  overwrite cookies. Cookies are now only reported for a hop the credentials mode attached
+  cookies to, as Fetch specifies
+
+### Changed
+
+- `NetPolicy::on_cookies` now also receives the final response's `Set-Cookie` values; the
+  fetcher no longer reports them separately. Same sink for fetcher users; direct users of
+  `net::fetch` with their own `on_cookies` now see every response
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect

@@ -158,7 +158,9 @@ impl FetcherContext for MyContext {
 ```
 
 `is_url_allowed`, `cookies_for` and `on_cookies_received` are called for the initial URL and
-for every redirect target, so a blocklist or cookie jar can't be bypassed by a redirect. See
+for every redirect target, so a blocklist or cookie jar can't be bypassed by a redirect. The two
+cookie hooks follow the request's credentials mode: a `credentials: omit` request neither sends
+nor stores cookies. See
 `examples/fetcher_context.rs` for a complete one with a cookie jar and an event log.
 
 ### HSTS
