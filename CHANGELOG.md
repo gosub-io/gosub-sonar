@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A request still waiting for a connection slot when the fetcher shut down, or when all its
+  subscribers had cancelled, was abandoned: its in-flight entry stayed in the map, its
+  listeners never heard, and `on_ref_done` was not called. It now ends with
+  `NetError::Cancelled` and is cleaned up like a finished fetch
 - A `Location` header with non-ASCII bytes was treated as absent and the redirect failed. It
   is now decoded as UTF-8, or byte for byte when it is not UTF-8, and followed
   percent-encoded, as browsers do

@@ -627,27 +627,42 @@ impl Fetcher {
             spawn_named(&title, async move {
                 let slots = per_origin.slots_for(&req.url);
 
-                let global_permit = tokio::select! {
-                    p = global.acquire_owned() => match p { Ok(p) => p, Err(_) => return },
-                    _ = shutdown_child.cancelled() => return,
-                };
-                let origin_permit = tokio::select! {
-                    p = slots.sem.acquire() => match p {
-                        Ok(p) => { p.forget(); OriginPermit(slots.clone()) }
-                        Err(_) => return,
-                    },
-                    _ = shutdown_child.cancelled() => return,
+                // Waiting for slots ends early on shutdown, or once every subscriber has
+                // cancelled. Either way the entry below is still cleaned up like a finished
+                // fetch, so nothing stays in the in-flight map and every listener hears.
+                let acquire = async {
+                    let global_permit = tokio::select! {
+                        p = global.acquire_owned() => p.ok()?,
+                        _ = shutdown_child.cancelled() => return None,
+                        _ = cancel_parent.cancelled() => return None,
+                    };
+                    let origin_permit = tokio::select! {
+                        p = slots.sem.acquire() => {
+                            p.ok()?.forget();
+                            OriginPermit(slots.clone())
+                        }
+                        _ = shutdown_child.cancelled() => return None,
+                        _ = cancel_parent.cancelled() => return None,
+                    };
+                    Some(SlotGuards {
+                        _global: global_permit,
+                        _origin: origin_permit,
+                    })
                 };
                 // Held here until the task ends, or by the body of a streamed fetch.
-                let mut held = Some(SlotGuards {
-                    _global: global_permit,
-                    _origin: origin_permit,
-                });
+                let mut held = acquire.await;
 
                 let should_stream =
                     req.streaming || inflight_entry2.wants_streaming.load(Ordering::Relaxed);
 
-                let result = if let (true, Some(slot_guards)) = (should_stream, held.take()) {
+                let result = if held.is_none() {
+                    let why = if shutdown_child.is_cancelled() {
+                        "fetcher shut down before the request was sent"
+                    } else {
+                        "cancelled before the request was sent"
+                    };
+                    Err(NetError::Cancelled(why.into()))
+                } else if let (true, Some(slot_guards)) = (should_stream, held.take()) {
                     perform_streaming(
                         &client,
                         observer.clone(),
@@ -2726,6 +2741,75 @@ mod tests {
         .expect("slot released once the body was read");
         assert_eq!(status_of(&result), 200);
         shutdown.cancel();
+    }
+
+    /// A request still waiting for a slot at shutdown is answered and cleaned up like any
+    /// other, rather than left in the in-flight map with its listeners hanging.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_while_waiting_for_a_slot_cleans_up() {
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl FetcherContext for Counting {
+            fn observer_for(
+                &self,
+                _: RequestReference,
+                _: RequestId,
+                _: ResourceKind,
+                _: Initiator,
+            ) -> Arc<dyn NetObserver + Send + Sync> {
+                Arc::new(crate::net::null_emitter::NullEmitter)
+            }
+            fn on_ref_active(&self, _: RequestReference) {}
+            fn on_ref_done(&self, _: RequestReference) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let srv = start_server().await;
+        let ctx = Arc::new(Counting(Default::default()));
+        let cfg = FetcherConfig {
+            global_slots: 1,
+            req_timeout: Duration::from_millis(500),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        // A holds the only slot until its timeout; B waits for it.
+        let (tx_a, rx_a) = oneshot::channel();
+        fetcher
+            .submit(
+                make_req(srv.url("/hang"), Priority::Normal).0,
+                CancellationToken::new(),
+                tx_a,
+            )
+            .await;
+        let (tx_b, rx_b) = oneshot::channel();
+        fetcher
+            .submit(
+                make_req(srv.url("/fast"), Priority::Normal).0,
+                CancellationToken::new(),
+                tx_b,
+            )
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(fetcher.inflight_map.len(), 2);
+
+        shutdown.cancel();
+        let b = tokio::time::timeout(Duration::from_millis(300), rx_b)
+            .await
+            .expect("B answered at shutdown")
+            .unwrap();
+        assert!(
+            matches!(b, FetchResult::Error(NetError::Cancelled(_))),
+            "{b:?}"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(3), rx_a).await;
+        assert_eq!(fetcher.inflight_map.len(), 0, "nothing left in flight");
+        assert_eq!(ctx.0.load(Ordering::Relaxed), 2, "on_ref_done for both");
     }
 
     /// Drive one request through a fetcher configured with `cfg_policy`, where the request
