@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `Location` header with non-ASCII bytes was treated as absent and the redirect failed. It
+  is now decoded as UTF-8, or byte for byte when it is not UTF-8, and followed
+  percent-encoded, as browsers do
 - Docs: `req_timeout` is the client's total per-hop timeout and covers the body, not only
   the wait for headers, so a large download needs it raised along with `total_body_timeout`.
   A TLS override is keyed by host and certificate, not port

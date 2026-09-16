@@ -64,6 +64,16 @@ pub(crate) fn blocked(
     NetError::Blocked { reason, url }
 }
 
+/// The text of a `Location` header. Servers send non-ASCII targets as UTF-8; anything that is
+/// not valid UTF-8 is decoded byte for byte, as browsers do. Either way the URL parser then
+/// percent-encodes what it has to.
+fn location_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    }
+}
+
 /// What [`hop_checks`] decided about one hop.
 pub(crate) enum HopCheck {
     /// Send the request to this URL, which may be an upgraded form of the one checked.
@@ -2077,13 +2087,14 @@ async fn get_with_redirects(
         let loc = hop
             .headers()
             .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
+            .map(|v| location_text(v.as_bytes()))
             .ok_or_else(|| {
                 NetError::Redirect(Arc::new(anyhow!(
                     "redirect status {} without Location header",
                     status
                 )))
             })?;
+        let loc = loc.as_str();
 
         let to = from.join(loc).map_err(|e| {
             NetError::Redirect(Arc::new(anyhow!("invalid redirect URL '{}': {}", loc, e)))
@@ -3380,6 +3391,39 @@ mod tests {
         .unwrap();
         assert_eq!(meta.status, 200);
         assert_eq!(&body[..], b"final");
+    }
+
+    #[test]
+    fn location_text_decodes_utf8_then_bytes() {
+        assert_eq!(location_text(b"/plain"), "/plain");
+        assert_eq!(location_text("/caf\u{e9}".as_bytes()), "/caf\u{e9}");
+        assert_eq!(location_text(b"/caf\xe9"), "/caf\u{e9}", "latin-1 byte");
+    }
+
+    /// A `Location` with non-ASCII characters is followed, percent-encoded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_non_ascii_location_is_followed() {
+        let srv = TestServer::new()
+            .route("/hop", RouteConfig::redirect_to("/caf\u{e9}"))
+            .route("/caf%C3%A9", RouteConfig::ok(b"bonjour"))
+            .start()
+            .await;
+        let (meta, body) = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(&body[..], b"bonjour");
+        assert_eq!(meta.final_url.path(), "/caf%C3%A9");
     }
 
     #[tokio::test(flavor = "current_thread")]
