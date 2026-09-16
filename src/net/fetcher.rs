@@ -68,6 +68,11 @@ pub struct FetcherConfig {
     /// Wall-clock deadline for receiving the entire response body after headers.
     /// `None` disables the deadline (useful for very large downloads).
     pub total_body_timeout: Option<Duration>,
+    /// Largest body a buffered fetch holds in memory, counted after decompression, for a
+    /// request that sets no [`FetchRequest::max_bytes`] of its own. Also caps a buffered
+    /// caller joined onto a streamed fetch. Default 64 MiB; `None` removes the cap. A
+    /// streamed fetch is only capped by the request's own `max_bytes`.
+    pub max_body_bytes: Option<usize>,
 
     /// Maximum idle connections kept in the pool **per host**.
     /// Without a cap, reqwest keeps every connection ever opened until it idles out.
@@ -201,6 +206,7 @@ impl Default for FetcherConfig {
             req_timeout: Duration::from_secs(60),
             read_idle_timeout: Duration::from_secs(15),
             total_body_timeout: Some(Duration::from_secs(180)),
+            max_body_bytes: Some(64 * 1024 * 1024),
             pool_max_idle_per_host: 6,
             pool_idle_timeout: Some(Duration::from_secs(90)),
             tcp_keepalive: Some(Duration::from_secs(60)),
@@ -599,7 +605,7 @@ impl Fetcher {
                 let err = FetchResult::Error(blocked(&observer, req.url.clone(), reason));
                 // Remove before finish — see the registration comment above for the ordering.
                 self.inflight_map.remove(&key_str);
-                inflight_entry.waiter.finish(err).await;
+                inflight_entry.waiter.finish(err, None).await;
                 inflight_entry.done.cancel();
                 self.ctx.on_ref_done(req.reference);
                 continue;
@@ -672,7 +678,7 @@ impl Fetcher {
                 // and later arrivals find the map vacant and start a fresh fetch instead.
                 inflight.remove(&key_for_remove);
 
-                inflight_entry2.waiter.finish(fr).await;
+                inflight_entry2.waiter.finish(fr, cfg.max_body_bytes).await;
 
                 inflight_entry2.done.cancel();
 
@@ -1061,7 +1067,7 @@ async fn perform_buffered(
                 make_request_init(req, cfg),
                 cancel.clone(),
                 observer.clone(),
-                req.max_bytes,
+                req.max_bytes.or(cfg.max_body_bytes),
                 effective_read_idle_timeout(req, cfg),
                 effective_total_body_timeout(req, cfg),
                 build_policy(cfg, &ctx, origins.clone()),
@@ -2671,6 +2677,36 @@ mod tests {
         let (result, _) = fetch_recorded(test_config(), req).await;
         assert_eq!(status_of(&result), 200);
         assert_eq!(srv.hit_count("/flaky"), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_body_cap_applies_to_buffered_fetches() {
+        let srv = start_server().await;
+        // /dribble-big is 12 KiB
+        let cfg = FetcherConfig {
+            max_body_bytes: Some(6 * 1024),
+            ..test_config()
+        };
+        let (result, _) = fetch_one(
+            cfg.clone(),
+            make_req(srv.url("/dribble-big"), Priority::Normal).0,
+        )
+        .await;
+        assert!(result.is_error(), "{result:?}");
+
+        // the request's own cap wins
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_max_bytes(20 * 1024)
+            .build();
+        let (result, _) = fetch_one(cfg.clone(), req).await;
+        assert_eq!(status_of(&result), 200);
+
+        // a stream is not capped by the default
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_streaming(true)
+            .build();
+        let (result, _) = fetch_one(cfg, req).await;
+        assert!(matches!(result, FetchResult::Stream { .. }), "{result:?}");
     }
 
     /// Drive one request through a fetcher configured with `cfg_policy`, where the request

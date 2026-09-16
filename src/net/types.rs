@@ -556,7 +556,8 @@ pub struct FetchRequest {
     pub streaming: bool,
     /// Auto decode the request (if for instance, gzipped), or pass directly through to the caller
     pub auto_decode: bool,
-    /// Maximum amount of (buffered) bytes we can fetch
+    /// Maximum body bytes for this request, counted after decompression. `None`: a buffered
+    /// fetch uses the fetcher's `max_body_bytes`, a stream is uncapped.
     pub max_bytes: Option<usize>,
     /// HTTP Method used
     pub method: Method,
@@ -917,7 +918,8 @@ impl FetchRequestBuilder {
         self
     }
 
-    /// Sets the maximum number of body bytes to buffer (default: unlimited)
+    /// Sets the maximum number of body bytes, overriding the fetcher's `max_body_bytes`.
+    /// `usize::MAX` lifts the cap for this request.
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = Some(max_bytes);
         self
