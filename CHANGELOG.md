@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security:** a response served from the HTTP cache skipped the CORS check. An entry stored
+  by a same-origin fetch carries no `Access-Control-Allow-Origin`, and a cross-origin
+  `cors`-mode request for the same URL was handed its body from the cache when the network
+  path would have refused it. A cache hit on a CORS-tainted chain is now checked like a fresh
+  response and blocked with `BlockReason::Cors` when it fails, as browsers do
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect
