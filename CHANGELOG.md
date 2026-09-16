@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The simple helpers (`simple_get`, `sync_get`, `sync_fetch`) no longer follow a redirect
+  from `https` down to `http`, refuse a `file:` path that is not a regular file (a FIFO would
+  have blocked forever), and `simple_get` reads files without blocking the async runtime.
+  Their docs now say what they do not check
 - `RequestBody::file` declared `Content-Length` from the file's size at construction and
   reopened the file at each send, so a file that changed in between was sent truncated or
   failed mid-transfer. The length now comes from the handle being sent, and only a regular

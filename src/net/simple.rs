@@ -5,6 +5,11 @@
 //! entirely - which servers are entitled to refuse, and some do (Wikimedia answers a header-less
 //! request with 403). A caller reaching for the simple API is still the same client as one using
 //! the scheduler, and should look like it.
+//!
+//! None of the [`Fetcher`](crate::Fetcher)'s policy applies here: no URL hook, HSTS, mixed
+//! content, cookies or DNS policy, so there is no SSRF protection. Redirects are followed up
+//! to 10 hops, across hosts, but never from `https` down to `http`. A `file:` URL reads any
+//! regular file the process can read. Bodies are capped at 10 MiB.
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -27,28 +32,76 @@ use std::time::Duration;
 /// Maximum body size accepted by the simple API (10 MiB).
 const MAX_SIMPLE_BODY: u64 = 10 * 1024 * 1024;
 
+/// Most redirect hops followed.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_SIMPLE_REDIRECTS: usize = 10;
+
+/// Whether a redirect from `previous` (every hop so far) to `next` is followed.
+#[cfg(not(target_arch = "wasm32"))]
+fn allow_redirect(previous: &[Url], next: &Url) -> Result<(), &'static str> {
+    if previous.len() >= MAX_SIMPLE_REDIRECTS {
+        return Err("too many redirects");
+    }
+    match next.scheme() {
+        "https" => Ok(()),
+        "http" if previous.iter().any(|u| u.scheme() == "https") => {
+            Err("redirect from https to http refused")
+        }
+        "http" => Ok(()),
+        _ => Err("redirect to an unsupported scheme"),
+    }
+}
+
+/// The client the simple helpers use.
+#[cfg(not(target_arch = "wasm32"))]
+fn simple_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .user_agent(DEFAULT_USER_AGENT)
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::custom(
+            |attempt| match allow_redirect(attempt.previous(), attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(why) => attempt.error(why),
+            },
+        ))
+        .build()
+}
+
+/// Fail for anything but a regular file: a FIFO or device has no end to read to.
+#[cfg(not(target_arch = "wasm32"))]
+fn require_regular_file(meta: &std::fs::Metadata) -> Result<()> {
+    if meta.is_file() {
+        Ok(())
+    } else {
+        anyhow::bail!("not a regular file")
+    }
+}
+
 /// Perform a simple one-shot GET request and return the body as bytes.
 /// Handles http, https, and file:// URLs.
 /// Use this for standalone callers (renderer, tools) that don't need the full
 /// priority-scheduler Fetcher.
 ///
-/// The body is capped at 10 MiB. No SSRF protection is applied;
-/// callers are responsible for validating the URL before passing it here.
+/// The body is capped at 10 MiB. See the [module docs](self) for what is not checked.
 pub async fn simple_get(url: &Url) -> Result<Bytes> {
     match url.scheme() {
         // wasm32 has no filesystem; file:// URLs fall through to the unsupported-scheme error.
         #[cfg(not(target_arch = "wasm32"))]
         "file" => {
-            use std::io::Read as _;
+            use tokio::io::AsyncReadExt as _;
             let path = url
                 .to_file_path()
                 .map_err(|_| anyhow::anyhow!("invalid file URL: {url}"))?;
-            // Open and read in one step with a hard byte cap to eliminate the TOCTOU
-            // window that a separate metadata() + read() would create.
+            // Checked on the opened handle and read with a hard cap, so there is no window
+            // between the check and the read.
+            let file = tokio::fs::File::open(&path).await?;
+            require_regular_file(&file.metadata().await?)?;
             let mut body = Vec::new();
-            std::fs::File::open(&path)?
-                .take(MAX_SIMPLE_BODY + 1)
-                .read_to_end(&mut body)?;
+            file.take(MAX_SIMPLE_BODY + 1)
+                .read_to_end(&mut body)
+                .await?;
             if body.len() as u64 > MAX_SIMPLE_BODY {
                 anyhow::bail!("file too large (exceeds {} bytes)", MAX_SIMPLE_BODY);
             }
@@ -56,12 +109,7 @@ pub async fn simple_get(url: &Url) -> Result<Bytes> {
         }
         "http" | "https" => {
             #[cfg(not(target_arch = "wasm32"))]
-            let client = reqwest::Client::builder()
-                .use_rustls_tls()
-                .user_agent(DEFAULT_USER_AGENT)
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(30))
-                .build()?;
+            let client = simple_client()?;
             // The browser's fetch() owns TLS and timeouts; no builder knobs on wasm32.
             #[cfg(target_arch = "wasm32")]
             let client = reqwest::Client::new();
@@ -140,10 +188,11 @@ fn do_sync_fetch(url: Url) -> Result<Response> {
         let path = url
             .to_file_path()
             .map_err(|_| anyhow::anyhow!("invalid file URL: {}", url))?;
+        // Blocking is fine: this runs on its own thread.
+        let file = std::fs::File::open(&path)?;
+        require_regular_file(&file.metadata()?)?;
         let mut body = Vec::new();
-        std::fs::File::open(&path)?
-            .take(MAX_BODY + 1)
-            .read_to_end(&mut body)?;
+        file.take(MAX_BODY + 1).read_to_end(&mut body)?;
         if body.len() as u64 > MAX_BODY {
             anyhow::bail!("File too large (> {} bytes)", MAX_BODY);
         }
@@ -156,12 +205,7 @@ fn do_sync_fetch(url: Url) -> Result<Response> {
         .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
 
     rt.block_on(async move {
-        let client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .user_agent(DEFAULT_USER_AGENT)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        let client = simple_client()?;
         let resp = client.get(url.as_str()).send().await?;
 
         let status = resp.status().as_u16();
@@ -230,6 +274,31 @@ fn do_sync_fetch(url: Url) -> Result<Response> {
 mod tests {
     use super::*;
     use url::Url;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn redirects_are_limited_and_never_downgrade() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        assert!(allow_redirect(&[u("http://a.test/")], &u("http://b.test/")).is_ok());
+        assert!(allow_redirect(&[u("http://a.test/")], &u("https://b.test/")).is_ok());
+        assert!(allow_redirect(&[u("https://a.test/")], &u("http://b.test/")).is_err());
+        assert!(allow_redirect(
+            &[u("https://a.test/"), u("http://b.test/")],
+            &u("http://c.test/")
+        )
+        .is_err());
+        assert!(allow_redirect(&[u("http://a.test/")], &u("ftp://b.test/")).is_err());
+        let ten = vec![u("http://a.test/"); MAX_SIMPLE_REDIRECTS];
+        assert!(allow_redirect(&ten, &u("http://b.test/")).is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn simple_get_refuses_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = Url::from_directory_path(dir.path()).unwrap();
+        assert!(simple_get(&url).await.is_err());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn simple_get_reads_file_url() {
