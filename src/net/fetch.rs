@@ -10,6 +10,8 @@ use crate::net::cache::{CacheEntry, CacheMode, CacheOutcome};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::cors::CorsPreflightCache;
 use crate::net::cors::{self, CorsError, ResponseTainting};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::dns::DnsResolver;
 use crate::net::events::NetEvent;
 use crate::net::fetch_metadata::{self, RequestDestination, RequestMode, SecFetchSite};
 use crate::net::fetcher_context::FetcherContext;
@@ -79,6 +81,16 @@ fn without_credentials(mut url: Url, observer: &Arc<dyn NetObserver + Send + Syn
         message: "credentials embedded in the URL were dropped".into(),
     });
     url
+}
+
+/// The host of `url` when it is an IP literal, without brackets.
+#[cfg(not(target_arch = "wasm32"))]
+fn ip_literal(url: &Url) -> Option<String> {
+    match url.host()? {
+        url::Host::Ipv4(a) => Some(a.to_string()),
+        url::Host::Ipv6(a) => Some(a.to_string()),
+        url::Host::Domain(_) => None,
+    }
 }
 
 /// What [`hop_checks`] decided about one hop.
@@ -222,6 +234,11 @@ pub struct NetPolicy {
     /// is. `None` (default): no hop is proxied. Set via [`NetPolicy::with_proxy_for`].
     #[cfg(not(target_arch = "wasm32"))]
     pub proxy_for: Option<ProxyForFn>,
+    /// The resolver a hop with an IP-literal host is checked against; see
+    /// [`dns`](mod@crate::net::dns). `None` skips the check. Set via
+    /// [`NetPolicy::with_dns_resolver`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub dns_resolver: Option<Arc<dyn DnsResolver>>,
 }
 
 impl Default for NetPolicy {
@@ -245,6 +262,7 @@ impl Default for NetPolicy {
             proxy_authorization: None,
             #[cfg(not(target_arch = "wasm32"))]
             proxy_for: None,
+            dns_resolver: None,
         }
     }
 }
@@ -277,6 +295,7 @@ impl NetPolicy {
             proxy_authorization: None,
             #[cfg(not(target_arch = "wasm32"))]
             proxy_for: None,
+            dns_resolver: None,
         }
     }
 
@@ -301,6 +320,13 @@ impl NetPolicy {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_proxy_for(mut self, f: ProxyForFn) -> Self {
         self.proxy_for = Some(f);
+        self
+    }
+
+    /// Attaches the resolver for [`NetPolicy::dns_resolver`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_dns_resolver(mut self, resolver: Option<Arc<dyn DnsResolver>>) -> Self {
+        self.dns_resolver = resolver;
         self
     }
 
@@ -1504,6 +1530,26 @@ async fn get_with_redirects(
                     });
                     url = target;
                 }
+            }
+        }
+
+        // The client connects to an IP literal without asking the resolver, so a policy in
+        // it would never see e.g. 169.254.169.254. Ask it here with the literal as the name;
+        // an Err refuses the hop like a refused name would. The returned addresses are unused.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(resolver), Some(literal)) = (policy.dns_resolver.as_ref(), ip_literal(&url)) {
+            let refused = tokio::select! {
+                _ = cancel.cancelled() => {
+                    observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled net.get_with_redirects" });
+                    return Err(NetError::Cancelled("cancelled net.get_with_redirects".into()));
+                }
+                r = resolver.resolve(&literal) => r.err(),
+            };
+            if let Some(e) = refused {
+                return Err(NetError::Transport(TransportError {
+                    kind: crate::net::transport::TransportErrorKind::Connect,
+                    message: format!("dns error: {e}"),
+                }));
             }
         }
 
