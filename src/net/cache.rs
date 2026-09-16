@@ -683,23 +683,70 @@ const DEFAULT_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// Default per-entry ceiling of an [`InMemoryHttpCache`].
 const DEFAULT_MAX_ENTRY_BYTES: usize = 2 * 1024 * 1024;
 
-/// One stored variant, plus when it was last touched.
+/// One stored variant and what it is charged against the budget.
 struct Stored {
     entry: Arc<CacheEntry>,
+    charged: usize,
+}
+
+/// The variants under one key, plus when the key was last touched.
+struct Keyed {
+    variants: Vec<Stored>,
     last_used: u64,
 }
 
 /// Contents of an [`InMemoryHttpCache`], behind one lock.
 #[derive(Default)]
 struct Contents {
-    variants: HashMap<CacheKey, Vec<Stored>>,
+    keys: HashMap<CacheKey, Keyed>,
+    /// Keys by `last_used`, oldest first; clocks are unique so a key has one slot.
+    lru: std::collections::BTreeMap<u64, CacheKey>,
     bytes: usize,
     clock: u64,
 }
 
+impl Contents {
+    /// Mark `key` as used now, moving it to the young end of the LRU order.
+    fn touch(&mut self, key: &CacheKey) {
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some(keyed) = self.keys.get_mut(key) {
+            self.lru.remove(&keyed.last_used);
+            keyed.last_used = clock;
+            self.lru.insert(clock, key.clone());
+        }
+    }
+
+    /// Remove `key` with every variant, returning what they were charged.
+    fn remove(&mut self, key: &CacheKey) -> usize {
+        let Some(keyed) = self.keys.remove(key) else {
+            return 0;
+        };
+        self.lru.remove(&keyed.last_used);
+        let freed: usize = keyed.variants.iter().map(|s| s.charged).sum();
+        self.bytes = self.bytes.saturating_sub(freed);
+        freed
+    }
+}
+
+/// Estimated overhead of one stored variant beyond its bytes: the map slots, the `Arc`, the
+/// header map's own allocation.
+const STORED_OVERHEAD: usize = 256;
+
+/// What a variant costs against the budget: the response plus the key and `Vary` list it is
+/// found by, so a flood of tiny bodies under long URLs cannot sit outside the accounting.
+fn charge(key: &CacheKey, entry: &CacheEntry) -> usize {
+    let vary: usize = entry
+        .vary
+        .iter()
+        .map(|(name, value)| name.len() + value.as_ref().map_or(0, String::len))
+        .sum();
+    entry.size() + key.url.as_str().len() + vary + STORED_OVERHEAD
+}
+
 /// [`HttpCache`] holding entries in memory, bounded by a byte budget.
 ///
-/// When a `put` pushes the total over the budget, the least recently used entries are dropped
+/// When a `put` pushes the total over the budget, the least recently used keys are dropped
 /// until it fits. Nothing is persisted: a new fetcher starts with an empty cache.
 pub struct InMemoryHttpCache {
     contents: parking_lot::Mutex<Contents>,
@@ -730,7 +777,12 @@ impl InMemoryHttpCache {
 
     /// Number of stored variants.
     pub fn len(&self) -> usize {
-        self.contents.lock().variants.values().map(Vec::len).sum()
+        self.contents
+            .lock()
+            .keys
+            .values()
+            .map(|k| k.variants.len())
+            .sum()
     }
 
     /// True when nothing is stored.
@@ -743,30 +795,17 @@ impl InMemoryHttpCache {
         self.contents.lock().bytes
     }
 
-    /// Drop the least recently used variants until the total is within budget.
+    /// Drop the least recently used keys until the total is within budget.
     fn evict(contents: &mut Contents, max_bytes: usize) {
         while contents.bytes > max_bytes {
-            let oldest = contents
-                .variants
-                .iter()
-                .flat_map(|(key, stored)| {
-                    stored
-                        .iter()
-                        .enumerate()
-                        .map(move |(index, s)| (s.last_used, key.clone(), index))
-                })
-                .min_by_key(|(last_used, _, _)| *last_used);
-            let Some((_, key, index)) = oldest else {
-                // Nothing left to drop; the budget is smaller than a single entry.
+            let Some((_, key)) = contents.lru.pop_first() else {
                 contents.bytes = 0;
                 return;
             };
-            if let Some(stored) = contents.variants.get_mut(&key) {
-                let dropped = stored.remove(index);
-                contents.bytes = contents.bytes.saturating_sub(dropped.entry.size());
-                if stored.is_empty() {
-                    contents.variants.remove(&key);
-                }
+            // `remove` would look the slot up again; it is gone already.
+            if let Some(keyed) = contents.keys.remove(&key) {
+                let freed: usize = keyed.variants.iter().map(|s| s.charged).sum();
+                contents.bytes = contents.bytes.saturating_sub(freed);
             }
         }
     }
@@ -775,68 +814,56 @@ impl InMemoryHttpCache {
 impl HttpCache for InMemoryHttpCache {
     fn get(&self, key: &CacheKey) -> Vec<Arc<CacheEntry>> {
         let mut contents = self.contents.lock();
-        contents.clock += 1;
-        let clock = contents.clock;
-        match contents.variants.get_mut(key) {
-            Some(stored) => stored
-                .iter_mut()
-                .map(|s| {
-                    s.last_used = clock;
-                    s.entry.clone()
-                })
-                .collect(),
+        contents.touch(key);
+        match contents.keys.get(key) {
+            Some(keyed) => keyed.variants.iter().map(|s| s.entry.clone()).collect(),
             None => Vec::new(),
         }
     }
 
     fn put(&self, key: CacheKey, entry: Arc<CacheEntry>) {
-        let size = entry.size();
-        if size > self.max_entry_bytes {
+        if entry.size() > self.max_entry_bytes {
             return;
         }
+        let charged = charge(&key, &entry);
         let mut contents = self.contents.lock();
         contents.clock += 1;
         let clock = contents.clock;
-        let stored = contents.variants.entry(key).or_default();
+        if contents.keys.contains_key(&key) {
+            contents.touch(&key);
+        } else {
+            contents.lru.insert(clock, key.clone());
+        }
+        let keyed = contents.keys.entry(key).or_insert_with(|| Keyed {
+            variants: Vec::new(),
+            last_used: clock,
+        });
         // One variant per set of selecting request headers, so a new response for the same
         // headers replaces the old one instead of being stored beside it.
-        let replaced = stored
+        let replaced = keyed
+            .variants
             .iter()
             .position(|s| s.entry.vary == entry.vary && s.entry.decoded == entry.decoded);
+        let stored = Stored { entry, charged };
         let freed = match replaced {
-            Some(index) => {
-                let old = std::mem::replace(
-                    &mut stored[index],
-                    Stored {
-                        entry,
-                        last_used: clock,
-                    },
-                );
-                old.entry.size()
-            }
+            Some(index) => std::mem::replace(&mut keyed.variants[index], stored).charged,
             None => {
-                stored.push(Stored {
-                    entry,
-                    last_used: clock,
-                });
+                keyed.variants.push(stored);
                 0
             }
         };
-        contents.bytes = contents.bytes.saturating_sub(freed) + size;
+        contents.bytes = contents.bytes.saturating_sub(freed) + charged;
         Self::evict(&mut contents, self.max_bytes);
     }
 
     fn invalidate(&self, key: &CacheKey) {
-        let mut contents = self.contents.lock();
-        if let Some(stored) = contents.variants.remove(key) {
-            let freed: usize = stored.iter().map(|s| s.entry.size()).sum();
-            contents.bytes = contents.bytes.saturating_sub(freed);
-        }
+        self.contents.lock().remove(key);
     }
 
     fn clear(&self) {
         let mut contents = self.contents.lock();
-        contents.variants.clear();
+        contents.keys.clear();
+        contents.lru.clear();
         contents.bytes = 0;
     }
 
@@ -1549,9 +1576,6 @@ mod tests {
     #[test]
     fn the_in_memory_cache_evicts_the_least_recently_used_entry() {
         let one = entry(&[("cache-control", "max-age=60")]);
-        // Budget for two entries and a bit.
-        let cache = InMemoryHttpCache::with_limits(one.size() * 2 + 8, 1024);
-
         let keys: Vec<CacheKey> = ["a", "b", "c"]
             .iter()
             .map(|p| {
@@ -1561,6 +1585,8 @@ mod tests {
                 )
             })
             .collect();
+        // Budget for two entries and a bit.
+        let cache = InMemoryHttpCache::with_limits(charge(&keys[0], &one) * 2 + 8, 1024);
 
         cache.put(keys[0].clone(), one.clone());
         cache.put(keys[1].clone(), one.clone());
@@ -1577,7 +1603,40 @@ mod tests {
             "least recently used, dropped"
         );
         assert!(!cache.get(&keys[2]).is_empty());
-        assert!(cache.byte_len() <= one.size() * 2 + 8);
+        assert!(cache.byte_len() <= charge(&keys[0], &one) * 2 + 8);
+    }
+
+    /// Tiny bodies under long URLs are charged for the URL, so they cannot pile up past the
+    /// budget in real memory.
+    #[test]
+    fn the_key_counts_against_the_budget() {
+        let cache = InMemoryHttpCache::with_limits(64 * 1024, 1024);
+        let one = entry(&[("cache-control", "max-age=60")]);
+        for i in 0..1000 {
+            let url = format!("https://example.com/{}?{}", i, "x".repeat(8 * 1024));
+            cache.put(
+                CacheKey::new(&Method::GET, &Url::parse(&url).unwrap()),
+                one.clone(),
+            );
+        }
+        assert!(cache.len() <= 8, "{} entries", cache.len());
+        assert!(cache.byte_len() <= 64 * 1024);
+    }
+
+    #[test]
+    fn invalidate_and_replace_keep_the_accounting_straight() {
+        let cache = InMemoryHttpCache::with_limits(1024 * 1024, 64 * 1024);
+        let k = key();
+        let one = entry(&[("cache-control", "max-age=60")]);
+        cache.put(k.clone(), one.clone());
+        let charged = cache.byte_len();
+        assert_eq!(charged, charge(&k, &one));
+        // replacing the same variant does not double count
+        cache.put(k.clone(), one.clone());
+        assert_eq!(cache.byte_len(), charged);
+        cache.invalidate(&k);
+        assert_eq!(cache.byte_len(), 0);
+        assert!(cache.is_empty());
     }
 
     #[test]

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `InMemoryHttpCache` eviction scanned every entry, cloning each key, for every entry it
+  dropped, so a full cache turned each store into a stall under the lock; it now keeps keys
+  in LRU order and evicts in O(log n). Entries are charged for their URL and `Vary` list as
+  well as the response, so many tiny bodies under long URLs no longer sit outside the budget.
+  Eviction is per key: all variants of a URL go together
+
+
 ### Added
 
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect
