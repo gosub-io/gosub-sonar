@@ -3,6 +3,8 @@
 [![Crates.io](https://img.shields.io/crates/v/gosub-sonar.svg)](https://crates.io/crates/gosub-sonar)
 [![Documentation](https://docs.rs/gosub-sonar/badge.svg)](https://docs.rs/gosub-sonar)
 [![CI](https://github.com/gosub-io/gosub-sonar/actions/workflows/ci.yml/badge.svg)](https://github.com/gosub-io/gosub-sonar/actions/workflows/ci.yml)
+[![Security audit](https://github.com/gosub-io/gosub-sonar/actions/workflows/security.yml/badge.svg)](https://github.com/gosub-io/gosub-sonar/actions/workflows/security.yml)
+[![MSRV](https://img.shields.io/crates/msrv/gosub-sonar.svg)](https://github.com/gosub-io/gosub-sonar/blob/main/Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/gosub-io/gosub-sonar/blob/main/LICENSE)
 
 Browser-agnostic priority-scheduled HTTP/HTTPS fetching library.
