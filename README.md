@@ -106,8 +106,9 @@ over the reply channel use `fetcher.submit(req, cancel, reply_tx)`.
 
 The timeouts in `FetcherConfig` apply to every request, and a request can override them for
 itself: `with_req_timeout` (a hop, headers and body), `with_read_idle_timeout` (silence
-between body chunks), and `with_total_body_timeout` (the whole body). A large download that must
-not be cut off by the fetcher-wide body deadline uses `without_total_body_timeout()`.
+between body chunks), `with_total_body_timeout` (the whole body), and `with_redirect_timeout`
+(following redirects, counted from the first redirect). A large download that must not be cut
+off by the fetcher-wide body deadline uses `without_total_body_timeout()`.
 
 Transient failures (connect errors, broken transfers, 502/503/504) are retried for idempotent
 requests, twice with backoff by default. `FetcherConfig::retry` holds the `RetryPolicy` (`None`

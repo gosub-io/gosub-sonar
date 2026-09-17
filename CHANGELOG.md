@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Per-request timeout overrides on `FetchRequest`: `req_timeout`, `read_idle_timeout`, and
+  `total_body_timeout` each override the same-named `FetcherConfig` setting for one request and
+  inherit it when unset. The builder gains `with_req_timeout`, `with_read_idle_timeout`,
+  `with_total_body_timeout`, and `without_total_body_timeout`, the last for a large download
+  that must not be cut off by the fetcher-wide body deadline. The overrides do not take part in
+  the coalescing key: a request that joins an identical in-flight one runs under the timeouts
+  of the request that started it. `connect_timeout` stays fetcher-wide, as the client applies
+  it per connection rather than per request (#10)
+- `FetchRequestBuilder::with_user_agent`, a shorthand for setting the `User-Agent` header on one
+  request over the fetcher's `user_agent`
+- `RequestInit::timeout` (and `with_timeout`) for callers of the `net::fetch` functions directly:
+  bounds each hop's wait for response headers in place of the client's own request timeout
+- `FetcherConfig::header_order`, overridable per request with `FetchRequest::header_order`
+  (`with_header_order` on the builder): the order in which request headers are sent. Named
+  headers go first, in that order; the rest follow in insertion order. `host` and `user-agent`
+  can be named too; the fetcher now inserts them itself instead of leaving them for the client
+  to append last. No `host` is sent to an origin known to speak HTTP/2. Unset, headers are
+  sent in insertion order as before. Native only (#115)
+- `NetPolicy::speaks_h2` (`with_protocol_hint`): whether a URL's origin is known to speak
+  HTTP/2 or HTTP/3. The fetcher wires it to its per-origin protocol table
+- `RequestInit::header_order` (`with_header_order`) for direct users of `net::fetch`
 - `FetcherConfig::retry` with `RetryPolicy` (`net::retry`): transient failures (connect
   errors, broken transfers, 502/503/504) are retried for idempotent requests, by default twice
   with exponential backoff and jitter (250 ms, capped at 5 s). `Retry-After` is honoured; a
@@ -16,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attempt emits its own events; `NetEvent::Retrying` is emitted before each wait. `None`
   disables. Per-request override via `FetchRequest::retry` (`with_retry` / `without_retry`)
   (#11)
+- `FetcherConfig::redirect_timeout` (default 30 s): a wall-clock budget for following
+  redirects, counted from the first redirect response up to the final response headers.
+  Until now only the hop count was capped, so a chain of slow hops could take up to
+  `MAX_REDIRECTS` times the request timeout. A request that is not redirected is unaffected.
+  `None` disables the budget. Overridable per request with `FetchRequest::redirect_timeout`
+  (`with_redirect_timeout` / `without_redirect_timeout` on the builder), and available to
+  direct users of `net::fetch` as `RequestInit::redirect_timeout` (`with_redirect_timeout`),
+  where it defaults to no limit as before (#16)
 
 ### Changed
 
