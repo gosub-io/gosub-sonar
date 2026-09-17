@@ -78,6 +78,23 @@ docs.rs builds with `all-features` (see `[package.metadata.docs.rs]`), so a brok
 in feature-gated code only shows up after the publish, when that version can no longer be fixed.
 That is what `cargo doc` here is for.
 
+### Coverage
+
+CI runs it on every PR (the `Coverage` job) and fails under 90% of lines; the report table is
+on the run's summary page and the lcov file is an artifact. Locally it needs
+`cargo install cargo-llvm-cov` and `rustup component add llvm-tools-preview`.
+
+```sh
+cargo llvm-cov --all-features --html          # report in target/llvm-cov/html/index.html
+cargo llvm-cov report --show-missing-lines    # per-file table plus uncovered line numbers
+```
+
+Inline `#[cfg(test)]` modules count as covered lines, so the total reads a few points high;
+the per-file "missed" columns are the useful part. 2026-09-17: 95.9% of lines, 1623 of 1687
+functions. What is left uncovered is mostly `Display`/`Debug` impls, the platform-specific arms
+of the TLS error mapping, the file-writing side of `pump`, and the `simple` helpers' error
+paths.
+
 CI also runs the test job on macOS and Windows, which is what the PR is for.
 
 ## 5. Dry-run the publish

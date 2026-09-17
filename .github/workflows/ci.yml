@@ -111,3 +111,48 @@ jobs:
 
       - name: cargo test
         run: cargo test --features test-support
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      # Separate cache key: instrumented artefacts are not the test job's.
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          key: coverage
+
+      # Prebuilt binary; `cargo install` would take minutes per run.
+      - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
+        with:
+          tool: cargo-llvm-cov
+
+      # all-features so the test-support server and the e2e tests count. The floor is a
+      # fair way under where the crate sits, so only a real drop fails the PR.
+      - name: cargo llvm-cov
+        run: cargo llvm-cov --all-features --lcov --output-path lcov.info --fail-under-lines 90
+
+      - name: coverage summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage'
+            echo
+            echo '```'
+            cargo llvm-cov report
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: lcov
+          path: lcov.info
+          retention-days: 14
