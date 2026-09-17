@@ -25,7 +25,7 @@ async fn fetch(url: &str) -> Result<String, Error> {
 
 This, in theory, should be enough to fetch a resource over the network. But there are a few problems with this approach:
 
-1. **Blocking**: The above function is asynchronous, but it still blocks the current thread until the request is 
+1. **Blocking**: The above function is synchronous, but it still blocks the current thread until the request is 
    complete. In a browser, we want to be able to fetch resources without blocking the main thread.
 2. **Memory usage**: The above function reads the entire response body into memory before returning it. This can be a 
    problem for large resources, as it can lead to high memory usage.
