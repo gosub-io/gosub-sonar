@@ -20,7 +20,7 @@ use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::proxy::ProxyConfig;
 use crate::net::retry::{self, RetryPolicy};
-use crate::net::shared_body::{ReaderOptions, SharedBody};
+use crate::net::shared_body::{ReaderOptions, SharedBody, DEFAULT_REPLAY_LIMIT};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::tls::TlsOverrideStore;
 use crate::net::types::{FetchRequest, FetchResult, Initiator, NetError, Priority};
@@ -75,6 +75,13 @@ pub struct FetcherConfig {
     /// caller joined onto a streamed fetch. Default 64 MiB; `None` removes the cap. A
     /// streamed fetch is only capped by the request's own `max_bytes`.
     pub max_body_bytes: Option<usize>,
+    /// How many bytes from the start of a streamed body its [`SharedBody`] keeps for
+    /// subscribers that attach after the body started flowing, such as a second consumer or
+    /// a coalesced caller. Such a subscriber gets the whole body if it fits, and an error if
+    /// not. The first subscriber always gets the whole body, because reading waits for it.
+    /// Default [`DEFAULT_REPLAY_LIMIT`] (4 MiB); `0` keeps nothing. See
+    /// [`SharedBody::with_replay_limit`].
+    pub stream_replay_limit: usize,
     /// Wall-clock budget for following redirects. Starts when the first redirect response
     /// arrives and must cover every later hop up to the final response headers, so a chain
     /// of slow hops cannot take up to `MAX_REDIRECTS` times `req_timeout`. A request that is
@@ -215,6 +222,7 @@ impl Default for FetcherConfig {
             read_idle_timeout: Duration::from_secs(15),
             total_body_timeout: Some(Duration::from_secs(180)),
             max_body_bytes: Some(64 * 1024 * 1024),
+            stream_replay_limit: DEFAULT_REPLAY_LIMIT,
             redirect_timeout: Some(Duration::from_secs(30)),
             pool_max_idle_per_host: 6,
             pool_idle_timeout: Some(Duration::from_secs(90)),
@@ -1117,6 +1125,7 @@ async fn perform_streaming(
         max_size: req
             .max_bytes
             .map(|max| max.saturating_sub(peek_buf.len()) as u64),
+        replay_limit: cfg.stream_replay_limit,
     };
 
     let reader = HoldsSlots {
@@ -1852,6 +1861,75 @@ mod tests {
             other => panic!("expected Stream, got {:?}", other),
         }
         shutdown.cancel();
+    }
+
+    /// One streamed result read by three consumers: one from the start, one that attaches
+    /// mid-stream and one that attaches after the end. Each gets the whole body. With
+    /// `stream_replay_limit` below the body size, the two late ones get an error and the
+    /// first is unaffected.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetcher_stream_late_subscribers_get_the_whole_body_or_an_error() {
+        use futures_util::StreamExt;
+
+        async fn read_all(
+            peek_buf: crate::types::PeekBuf,
+            shared: Arc<crate::net::shared_body::SharedBody>,
+        ) -> std::io::Result<Vec<u8>> {
+            let mut reader = crate::net::shared_body::SharedBody::combined_reader(peek_buf, shared);
+            let mut body = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut body).await?;
+            Ok(body)
+        }
+
+        let srv = start_server().await;
+        for (limit, late_ok) in [(DEFAULT_REPLAY_LIMIT, true), (2 * 1024, false)] {
+            let cfg = FetcherConfig {
+                stream_replay_limit: limit,
+                ..test_config()
+            };
+            let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+            let shutdown = CancellationToken::new();
+            let f = fetcher.clone();
+            let s = shutdown.clone();
+            tokio::spawn(async move { f.run(s).await });
+
+            let (mut req, _) = make_req(srv.url("/dribble-big"), Priority::Normal);
+            req.streaming = true;
+            let result = tokio::time::timeout(Duration::from_secs(5), fetcher.fetch(req))
+                .await
+                .unwrap();
+            let FetchResult::Stream {
+                peek_buf, shared, ..
+            } = result
+            else {
+                panic!("expected Stream");
+            };
+
+            // First consumer: read past the replay limit before the second one attaches.
+            let mut first = shared.subscribe_stream();
+            let mut first_len = 0;
+            while first_len <= 3 * 1024 {
+                first_len += first.next().await.unwrap().unwrap().len();
+            }
+            let second = tokio::spawn(read_all(peek_buf.clone(), shared.clone()));
+            while let Some(chunk) = first.next().await {
+                first_len += chunk.unwrap().len();
+            }
+            assert_eq!(peek_buf.len() + first_len, 12 * 1024);
+
+            let second = second.await.unwrap();
+            let third = read_all(peek_buf.clone(), shared.clone()).await;
+            if late_ok {
+                assert_eq!(second.unwrap(), vec![b'X'; 12 * 1024]);
+                assert_eq!(third.unwrap(), vec![b'X'; 12 * 1024]);
+            } else {
+                for late in [second, third] {
+                    let err = late.unwrap_err();
+                    assert!(err.to_string().contains("replay limit"), "got: {err}");
+                }
+            }
+            shutdown.cancel();
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

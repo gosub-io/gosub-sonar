@@ -247,9 +247,12 @@ The heart of the "one fetch, many consumers" behaviour lives in three pieces:
 - **`Waiter`** (`utils.rs`) — the set of listeners. `register(tx, wants_streaming)` adds a listener;
   `finish(result)` delivers to all of them.
 - **`SharedBody`** (`shared_body.rs`) — a bounded fan-out stream. Each subscriber has its own queue
-  (capacity 32); a subscriber that can't keep up is **dropped** rather than stalling the producer.
-  Subscribers see only *future* chunks (no replay), but the pump doesn't start reading until the
-  first subscriber attaches, so that one always gets the whole body.
+  (capacity 32); a subscriber that can't keep up is **dropped** rather than stalling the producer,
+  and its stream ends with an error. The first `FetcherConfig::stream_replay_limit` bytes (4 MiB by
+  default) are kept, so a subscriber that attaches late, even after the end, gets the chunks it
+  missed and then the live ones. If more than that was pushed before it attached, it gets an error.
+  The pump doesn't start reading until the first subscriber attaches, so that one always gets the
+  whole body. `subscribe_live` gives only the chunks from now on, for progress observers.
 
 **Streaming and buffered requests coalesce in both directions.** The coalescing key does not
 distinguish them, so which mode runs is decided by the subscribers: if any asked for streaming, the
