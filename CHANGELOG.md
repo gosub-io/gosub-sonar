@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-26
+
 ### Added
 
 - Per-request timeout overrides on `FetchRequest`: `req_timeout`, `read_idle_timeout`, and
@@ -48,10 +50,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `FetcherConfig` (`max_body_bytes`, `redirect_timeout`, `header_order`,
+  `retry`), `NetPolicy` (`tls_overrides`, `proxy_for`, `dns_resolver`, `speaks_h2`) and
+  `RequestInit` (`timeout`, `header_order`, `redirect_timeout`) gained public fields. None of
+  them is `#[non_exhaustive]`, so a struct literal that lists every field no longer compiles:
+  end it with `..Default::default()`, or start from `Default::default()` / the `with_*`
+  builders
 - **Breaking:** `AuthChallenge::proxy` (the proxy that sent a 407), a fifth `proxy` argument
   on `parse_challenges`, and `ProtectionSpace::origin` set to the proxy's origin for proxy
-  challenges. `NetPolicy::proxy_for` (native only) for direct users of `net::fetch`; unset, no
-  407 is answered
+  challenges. Callers of `parse_challenges` pass the proxy the response came through, or
+  `None` for a server response; a struct literal of `AuthChallenge` adds `proxy`.
+  `NetPolicy::proxy_for` (native only) for direct users of `net::fetch`; unset, no 407 is
+  answered
+- New defaults change what an unchanged `FetcherConfig::default()` does: transient failures
+  of idempotent requests are retried twice (`retry: None` restores the old behaviour),
+  redirect chains get a 30 s budget (`redirect_timeout: None`), and buffered bodies without
+  their own `max_bytes` are capped at 64 MiB (`max_body_bytes: None`)
 - `NetPolicy::on_cookies` now also receives the final response's `Set-Cookie` values; the
   fetcher no longer reports them separately. Same sink for fetcher users; direct users of
   `net::fetch` with their own `on_cookies` now see every response
@@ -685,7 +699,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.3...v0.7.0
 [0.6.3]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.2...v0.6.3
 [0.6.2]: https://github.com/gosub-io/gosub-sonar/compare/v0.6.1...v0.6.2
