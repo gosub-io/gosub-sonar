@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `FetcherConfig::stream_replay_limit` and `ReaderOptions::replay_limit` (default
+  `DEFAULT_REPLAY_LIMIT`, 4 MiB): how many bytes from the start of a streamed body are kept for
+  subscribers that attach late. `SharedBody::with_replay_limit` sets it for a body built by
+  hand; `0` keeps nothing. Kept chunks are reference-counted, not copied, and are released when
+  the body passes the limit or the last `SharedBody` handle is dropped
+- `SharedBody::subscribe_live`: only the chunks pushed from now on, without replay, for
+  progress observers
+
+### Changed
+
+- **Breaking:** `FetcherConfig` (`stream_replay_limit`) and `ReaderOptions` (`replay_limit`)
+  gained public fields. A struct literal that lists every field no longer compiles: end it
+  with `..Default::default()`
+- **Breaking:** every `SharedBody` subscriber now gets the body from its first byte. Before,
+  only the first subscriber of a fetcher body and coalesced callers (through `reserve`) did.
+  Any other subscriber, such as a second consumer of one `FetchResult::Stream`, got only the
+  chunks pushed after it attached, and one that attached after the end got an empty body. A
+  late subscriber now gets the chunks it missed and then the live ones. If more than the
+  replay limit was pushed before it attached, it gets a `NetError::Read` ("replay limit")
+  instead. The first subscriber of a fetcher body still gets the whole body regardless of the
+  limit, because reading waits for it. Use `subscribe_live` to see only later chunks
+- `SharedBody::reserve` is now a no-op, kept so existing callers compile
+
+### Fixed
+
+- A `SharedBody` subscriber whose queue was full when the body failed never got the error,
+  so it saw a clean end. The body now stores the error, and every subscriber gets it after
+  its queued chunks
+
 ## [0.8.0] - 2026-09-26
 
 ### Added

@@ -180,9 +180,8 @@ impl Waiter {
                     }
                 }
 
-                // Every listener starts from the beginning however late it subscribes.
-                shared.reserve(streaming_ls.len() + usize::from(!buffered_ls.is_empty()));
-
+                // Every listener gets the body from the beginning, however late it subscribes,
+                // up to the SharedBody's replay limit (past it, an error).
                 for tx in streaming_ls {
                     let res = FetchResult::Stream {
                         meta: meta.clone(),
