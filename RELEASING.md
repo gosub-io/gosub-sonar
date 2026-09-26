@@ -68,7 +68,7 @@ cargo doc --no-deps --all-features
 cargo check --target wasm32-unknown-unknown
 cargo test --features test-support
 cargo test --all-features
-cargo +1.88 test --features test-support        # MSRV, matches rust-version in Cargo.toml
+cargo +1.88.0 test --features test-support      # MSRV, matches rust-version in Cargo.toml
 ```
 
 Both test invocations are needed: `test_support` compiles under `cfg(test)` whether or not the
