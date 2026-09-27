@@ -23,7 +23,10 @@ use crate::net::referrer::{self, ReferrerPolicy};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::tls::TlsOverrideStore;
 use crate::net::transport::TransportError;
-use crate::net::types::{BlockReason, FetchResultMeta, NetError, RequestBody, RequestCredentials};
+use crate::net::types::{
+    BlockReason, FetchResultMeta, NetError, RequestBody, RequestChange, RequestCredentials,
+    UpgradeReason,
+};
 use crate::net::utils::BytesAsyncReader;
 use crate::types::PeekBuf;
 use anyhow::anyhow;
@@ -68,21 +71,26 @@ pub(crate) fn blocked(
     NetError::Blocked { reason, url }
 }
 
-/// `url` without its `user:password@`, warning the observer when there was one. The client
-/// would turn embedded credentials into an `Authorization` header, which lets a page or a
-/// redirect send credentials of its choosing along with the user's cookies; browsers do not
-/// send them either. Credentials for a server come from the auth hook, after a challenge.
-fn without_credentials(mut url: Url, observer: &Arc<dyn NetObserver + Send + Sync>) -> Url {
+/// Remove the `user:password@` from `url`. Returns whether there was one, so the caller can
+/// report [`RequestChange::UrlCredentialsRemoved`]. The client would turn embedded credentials
+/// into an `Authorization` header, which lets a page or a redirect send credentials of its
+/// choosing along with the user's cookies. Browsers do not send them either. Credentials for a
+/// server come from the auth hook, after a challenge.
+fn strip_url_credentials(url: &mut Url) -> bool {
     if url.username().is_empty() && url.password().is_none() {
-        return url;
+        return false;
     }
     let _ = url.set_username("");
     let _ = url.set_password(None);
-    observer.on_event(NetEvent::Warning {
+    true
+}
+
+/// Report one [`RequestChange`] for the hop to `url`.
+fn modified(observer: &Arc<dyn NetObserver + Send + Sync>, url: &Url, change: RequestChange) {
+    observer.on_event(NetEvent::RequestModified {
         url: url.clone(),
-        message: "credentials embedded in the URL were dropped".into(),
+        change,
     });
-    url
 }
 
 /// The host of `url` when it is an IP literal, without brackets.
@@ -719,9 +727,18 @@ pub async fn fetch_response_top(
     observer: Arc<dyn NetObserver + Send + Sync>,
     policy: NetPolicy,
 ) -> Result<ResponseTop, NetError> {
-    let url = without_credentials(url, &observer);
-    let result =
-        fetch_response_top_inner(client, url.clone(), init, cancel, observer.clone(), policy).await;
+    let mut url = url;
+    let credentials_removed = strip_url_credentials(&mut url);
+    let result = fetch_response_top_inner(
+        client,
+        url.clone(),
+        init,
+        cancel,
+        observer.clone(),
+        policy,
+        credentials_removed,
+    )
+    .await;
 
     // One terminal event per failed request, whatever went wrong and wherever it went
     // wrong. The events that name a specific cause - `Blocked`, `TlsFailed` - are emitted
@@ -750,9 +767,13 @@ async fn fetch_response_top_inner(
     cancel: CancellationToken,
     observer: Arc<dyn NetObserver + Send + Sync>,
     policy: NetPolicy,
+    url_credentials_removed: bool,
 ) -> Result<ResponseTop, NetError> {
     let started = Instant::now();
     observer.on_event(NetEvent::Started { url: url.clone() });
+    if url_credentials_removed {
+        modified(&observer, &url, RequestChange::UrlCredentialsRemoved);
+    }
 
     // Bind this request's observer for the duration of the HTTP exchange. Work that
     // happens below the request layer - DNS resolution inside the connection pool - has no
@@ -1531,6 +1552,8 @@ fn credentials_for_challenges(
 ///   `init.origin`, `init.destination`, and `init.mode`. `Sec-Fetch-Site` only degrades across
 ///   the chain, and `Origin` collapses to `null` once the chain redirects away from an origin
 ///   the request had already left — see [`fetch_metadata`](mod@crate::net::fetch_metadata).
+/// - Every upgrade to `https` is reported as [`NetEvent::SecurityUpgraded`], and every other
+///   change a policy makes to a hop as [`NetEvent::RequestModified`].
 /// - `policy.url_allowed` and `policy.cookies_for` are called at every hop.
 /// - A `401`/`407` hop is re-sent with credentials from the credential store or
 ///   `policy.on_auth_challenge` (see [`auth`](mod@crate::net::auth)); only a response that is
@@ -1564,6 +1587,10 @@ async fn get_with_redirects(
     // The tainted origin flag (Fetch, HTTP-redirect fetch): once set, `Origin` is sent as the
     // literal `null` for every remaining hop.
     let mut origin_tainted = false;
+    // `RequestChange::OriginTainted` is reported once per chain, on the first `null` it causes.
+    let mut taint_reported = false;
+    // Whether the `Cookie` in `current_headers` came from the jar rather than from the caller.
+    let mut cookie_from_jar = false;
     // Response tainting (Fetch §2.2.5): basic until the chain leaves the initiating origin,
     // then cors/opaque per the request mode — and it stays there even if a detour redirects
     // back home, which is why the CORS check below keys on this and not on the hop's URL.
@@ -1587,7 +1614,13 @@ async fn get_with_redirects(
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ref store) = policy.hsts {
             if hsts::should_upgrade(store.as_ref(), &url, chrono::Utc::now()) {
-                url = hsts::upgrade(&url);
+                let upgraded = hsts::upgrade(&url);
+                observer.on_event(NetEvent::SecurityUpgraded {
+                    from: url.clone(),
+                    to: upgraded.clone(),
+                    reason: UpgradeReason::Hsts,
+                });
+                url = upgraded;
             }
         }
 
@@ -1597,9 +1630,10 @@ async fn get_with_redirects(
             HopCheck::Reject(reason) => return Err(blocked(&observer, url, reason)),
             HopCheck::Proceed(target) => {
                 if target != url {
-                    observer.on_event(NetEvent::Warning {
-                        url: url.clone(),
-                        message: format!("upgraded insecure request to {target}"),
+                    observer.on_event(NetEvent::SecurityUpgraded {
+                        from: url.clone(),
+                        to: target.clone(),
+                        reason: UpgradeReason::MixedContent,
                     });
                     url = target;
                 }
@@ -1669,19 +1703,37 @@ async fn get_with_redirects(
 
         // Recomputed per hop; see the note on this function.
         if let Some(ref source) = init.referrer {
-            match referrer::determine(source, referrer_policy, &url) {
+            let sent = match referrer::determine(source, referrer_policy, &url) {
                 Some(value) => match value.as_str().parse() {
                     Ok(header_value) => {
                         current_headers.insert(header::REFERER, header_value);
+                        Some(value)
                     }
                     // A URL that will not go into a header is not worth failing the request over.
                     Err(_) => {
                         current_headers.remove(header::REFERER);
+                        None
                     }
                 },
                 // Drop any value from an earlier hop: this one is not allowed a referrer.
                 None => {
                     current_headers.remove(header::REFERER);
+                    None
+                }
+            };
+            // Measured against what would go out with no policy. A source that is never sent
+            // (not http or https) has nothing to reduce.
+            if let Some(full) = referrer::strip(source) {
+                if sent.as_ref() != Some(&full) {
+                    modified(
+                        &observer,
+                        &url,
+                        RequestChange::ReferrerReduced {
+                            from: full,
+                            to: sent,
+                            policy: referrer_policy,
+                        },
+                    );
                 }
             }
         }
@@ -1714,11 +1766,34 @@ async fn get_with_redirects(
                 init.mode,
                 referrer_policy,
                 &url,
-            )
-            .and_then(|v| v.parse().ok())
-            {
+            ) {
                 Some(value) => {
-                    current_headers.insert(header::ORIGIN, value);
+                    // `null` for an origin that has a serialisation is a change worth reporting.
+                    // An opaque origin serialises to `null` anyway.
+                    if value == "null" && matches!(o, Origin::Tuple(..)) {
+                        if origin_tainted {
+                            if !taint_reported {
+                                taint_reported = true;
+                                modified(&observer, &url, RequestChange::OriginTainted);
+                            }
+                        } else {
+                            modified(
+                                &observer,
+                                &url,
+                                RequestChange::OriginHidden {
+                                    policy: referrer_policy,
+                                },
+                            );
+                        }
+                    }
+                    match value.parse() {
+                        Ok(value) => {
+                            current_headers.insert(header::ORIGIN, value);
+                        }
+                        Err(_) => {
+                            current_headers.remove(header::ORIGIN);
+                        }
+                    }
                 }
                 None => {
                     current_headers.remove(header::ORIGIN);
@@ -1821,11 +1896,15 @@ async fn get_with_redirects(
                 .as_ref()
                 .is_none_or(|o| !origin_tainted && *o == url.origin()),
         };
+        if !attach_credentials && init.credentials == RequestCredentials::SameOrigin {
+            modified(&observer, &url, RequestChange::CredentialsWithheld);
+        }
         if attach_credentials && !current_headers.contains_key(header::COOKIE) {
             if let Some(cookie_str) = (policy.cookies_for)(&url) {
                 if let Ok(mut val) = cookie_str.parse::<http::HeaderValue>() {
                     val.set_sensitive(true);
                     current_headers.insert(header::COOKIE, val);
+                    cookie_from_jar = true;
                 }
             }
         }
@@ -2285,6 +2364,7 @@ async fn get_with_redirects(
         // makes the next hop re-query the now-updated jar instead of resending a stale value.
         if attach_credentials && report_set_cookie(&policy, &from, hop.headers()) {
             current_headers.remove(header::COOKIE);
+            cookie_from_jar = false;
         }
 
         let loc = hop
@@ -2315,9 +2395,11 @@ async fn get_with_redirects(
                 BlockReason::Cors(CorsError::CredentialedRedirect),
             ));
         }
-        let to = without_credentials(to, &observer);
+        let mut to = to;
+        let location_credentials_removed = strip_url_credentials(&mut to);
 
         // Method and body semantics per RFC 7231 §6.4
+        let method_before = current_method.clone();
         match status {
             // 301/302: browsers always downgrade POST to GET (§6.4.2–3); we follow suit.
             // HEAD stays HEAD (no body involved); all other methods become GET.
@@ -2351,10 +2433,25 @@ async fn get_with_redirects(
 
         // Strip credential headers when redirecting to a different origin (RFC 9110 §15.4).
         // Cookie will be re-applied from the jar at the top of the next loop iteration.
+        let mut stripped = Vec::new();
         if from.origin() != to.origin() {
             for h in SENSITIVE_REDIRECT_HEADERS {
-                current_headers.remove(h);
+                if current_headers.remove(h).is_none() {
+                    continue;
+                }
+                // Only what the caller set and nothing puts back. Jar cookies are fetched again
+                // for the new origin, and a computed `Referer` or `Origin` is recomputed.
+                let reported = match *h {
+                    header::COOKIE => !cookie_from_jar,
+                    header::REFERER => init.referrer.is_none(),
+                    header::ORIGIN => origin.is_none(),
+                    _ => true,
+                };
+                if reported {
+                    stripped.push(h.clone());
+                }
             }
+            cookie_from_jar = false;
         }
 
         // Fetch's redirect-taint, per hop: a redirect to another origin from a hop that was
@@ -2371,6 +2468,28 @@ async fn get_with_redirects(
             to: to.clone(),
             status,
         });
+
+        // After `Redirected`, so the stream first says where the chain goes, then how the hop changed.
+        if location_credentials_removed {
+            modified(&observer, &to, RequestChange::UrlCredentialsRemoved);
+        }
+        if method_before != current_method {
+            modified(
+                &observer,
+                &to,
+                RequestChange::MethodDowngraded {
+                    from: method_before,
+                    to: current_method.clone(),
+                },
+            );
+        }
+        if !stripped.is_empty() {
+            modified(
+                &observer,
+                &to,
+                RequestChange::SensitiveHeadersStripped { headers: stripped },
+            );
+        }
 
         url = to
     }
@@ -3982,7 +4101,7 @@ mod tests {
     ///
     /// Asserting only "did not block" would be worthless here: an `Upgrade` silently degraded to
     /// `Allow` would send plain http to a host that does not resolve and fail identically. The
-    /// emitted warning naming the https URL is the only evidence the rewrite actually happened.
+    /// emitted `SecurityUpgraded` event is the only evidence the rewrite actually happened.
     #[tokio::test(flavor = "current_thread")]
     async fn mixed_content_upgrades_insecure_redirect_target() {
         let srv = TestServer::new()
@@ -4008,8 +4127,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            rec.warnings(),
-            vec!["upgraded insecure request to https://insecure.invalid/a.js"],
+            rec.upgrades(),
+            vec![(
+                "http://insecure.invalid/a.js".to_string(),
+                "https://insecure.invalid/a.js".to_string(),
+                crate::net::types::UpgradeReason::MixedContent
+            )],
             "the hop must be rewritten to https"
         );
         assert!(
@@ -5785,5 +5908,587 @@ mod tests {
         drop(reader);
 
         assert!(cache.is_empty(), "an incomplete body is not a cache entry");
+    }
+
+    /// `NetEvent::SecurityUpgraded` and `NetEvent::RequestModified`: one event per change, in
+    /// the right place in the stream, and nothing when nothing changed.
+    mod security_events {
+        use super::*;
+        use crate::net::types::{RequestChange, UpgradeReason};
+
+        /// Fetch `url` to the end with a recording observer and return it. The result is not
+        /// checked. Some chains here end at a host that does not resolve.
+        async fn recorded(
+            client: Arc<reqwest::Client>,
+            url: Url,
+            init: RequestInit,
+            policy: NetPolicy,
+        ) -> Arc<RecordingObserver> {
+            let rec = Arc::new(RecordingObserver::new());
+            let _ = super::super::fetch_response_complete(
+                client,
+                url,
+                init,
+                CancellationToken::new(),
+                rec.clone(),
+                None,
+                Duration::from_secs(5),
+                None,
+                policy,
+            )
+            .await;
+            rec
+        }
+
+        fn changes(rec: &RecordingObserver) -> Vec<RequestChange> {
+            rec.modifications().into_iter().map(|(_, c)| c).collect()
+        }
+
+        /// The names of the events from `first` on, with the ones no test here is about
+        /// (`DnsResolved`, `Connected`, `BodyPreview`, `Progress`) left out.
+        fn stream(rec: &RecordingObserver) -> Vec<String> {
+            rec.event_names()
+                .into_iter()
+                .filter(|n| {
+                    !matches!(
+                        n.as_str(),
+                        "DnsResolved" | "Connected" | "Progress" | "BodyPreview"
+                    )
+                })
+                .collect()
+        }
+
+        /// A request with every input set that nothing has to change. It has a same-origin
+        /// referrer (its fragment is not a change), a same-origin initiator, same-origin
+        /// credentials and a same-origin 307, which keeps the POST. No event.
+        #[tokio::test(flavor = "current_thread")]
+        async fn nothing_changed_reports_nothing() {
+            let srv = TestServer::new()
+                .route("/hop", RouteConfig::redirect_307("/end"))
+                .route("/end", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let mut referrer = srv.url("/page");
+            referrer.set_fragment(Some("frag"));
+            let mut headers = HeaderMap::new();
+            headers.insert(header::AUTHORIZATION, "Bearer t".parse().unwrap());
+            let init = RequestInit::post(headers, b"x".to_vec())
+                .with_referrer(Some(referrer), ReferrerPolicy::default())
+                .with_mixed_content(Some(srv.base_url().origin()), MixedContentPolicy::Upgrade)
+                .with_credentials(RequestCredentials::SameOrigin);
+            let rec = recorded(client(), srv.url("/hop"), init, NetPolicy::default()).await;
+
+            assert!(rec.upgrades().is_empty(), "{:?}", rec.upgrades());
+            assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
+            assert_eq!(rec.requests_sent().len(), 2);
+        }
+
+        /// A host with a stored HSTS policy is fetched over https, and the upgrade is reported
+        /// before the request goes out.
+        #[tokio::test(flavor = "current_thread")]
+        async fn hsts_upgrade_is_reported_before_the_request() {
+            let (srv, client) = tls_server_and_client(vec![("/", RouteConfig::ok(b"x"))]).await;
+            let store = Arc::new(crate::net::hsts::InMemoryHstsStore::new());
+            crate::net::hsts::HstsStore::store(
+                store.as_ref(),
+                "hsts.test",
+                crate::net::hsts::HstsEntry {
+                    expires_at: chrono::Utc::now() + chrono::TimeDelta::days(1),
+                    include_subdomains: false,
+                },
+            );
+            let secure = srv.url("/");
+            let mut insecure = secure.clone();
+            insecure.set_scheme("http").unwrap();
+
+            let rec = recorded(
+                client,
+                insecure.clone(),
+                RequestInit::get(HeaderMap::new()),
+                NetPolicy::default().with_hsts(Some(store)),
+            )
+            .await;
+
+            assert_eq!(
+                rec.upgrades(),
+                vec![(
+                    insecure.to_string(),
+                    secure.to_string(),
+                    UpgradeReason::Hsts
+                )]
+            );
+            assert_eq!(rec.requests_sent()[0].1, secure);
+            assert_eq!(
+                stream(&rec)[..4],
+                [
+                    "Started",
+                    "SecurityUpgraded",
+                    "RequestSent",
+                    "ResponseHeaders"
+                ]
+            );
+        }
+
+        /// A mixed content upgrade on a redirect hop comes after the `Redirected` for it, and
+        /// is not also reported as a warning any more.
+        #[tokio::test(flavor = "current_thread")]
+        async fn mixed_content_upgrade_follows_the_redirect() {
+            let srv = TestServer::new()
+                .route(
+                    "/hop",
+                    RouteConfig::redirect_absolute("http://insecure.invalid/a.js"),
+                )
+                .start()
+                .await;
+            let init = RequestInit::get(HeaderMap::new()).with_mixed_content(
+                Some(Url::parse("https://example.com").unwrap().origin()),
+                MixedContentPolicy::Upgrade,
+            );
+            let rec = recorded(client(), srv.url("/hop"), init, NetPolicy::default()).await;
+
+            assert_eq!(
+                rec.upgrades(),
+                vec![(
+                    "http://insecure.invalid/a.js".to_string(),
+                    "https://insecure.invalid/a.js".to_string(),
+                    UpgradeReason::MixedContent
+                )]
+            );
+            assert!(rec.warnings().is_empty(), "{:?}", rec.warnings());
+            let names = stream(&rec);
+            let redirected = names.iter().position(|n| n == "Redirected").unwrap();
+            assert_eq!(names[redirected + 1], "SecurityUpgraded", "{names:?}");
+        }
+
+        /// Credentials in the initial URL: reported once, right after `Started`, against the
+        /// URL without them. No warning.
+        #[tokio::test(flavor = "current_thread")]
+        async fn url_credentials_on_the_initial_url() {
+            let srv = TestServer::new()
+                .route("/", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let mut url = srv.url("/");
+            url.set_username("user").unwrap();
+            url.set_password(Some("pw")).unwrap();
+            let rec = recorded(
+                client(),
+                url,
+                RequestInit::get(HeaderMap::new()),
+                NetPolicy::default(),
+            )
+            .await;
+
+            assert_eq!(
+                rec.modifications(),
+                vec![(
+                    srv.url("/").to_string(),
+                    RequestChange::UrlCredentialsRemoved
+                )]
+            );
+            assert!(rec.warnings().is_empty(), "{:?}", rec.warnings());
+            assert_eq!(
+                stream(&rec)[..3],
+                ["Started", "RequestModified", "RequestSent"]
+            );
+        }
+
+        /// Credentials in a same-origin `Location`: reported after the `Redirected`, against
+        /// the target.
+        #[tokio::test(flavor = "current_thread")]
+        async fn url_credentials_on_a_location() {
+            let srv = TestServer::new()
+                .route(
+                    "/hop",
+                    RouteConfig::redirect_to_with_credentials("user:pw", "/end"),
+                )
+                .route("/end", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let rec = recorded(
+                client(),
+                srv.url("/hop"),
+                RequestInit::get(HeaderMap::new()),
+                NetPolicy::default(),
+            )
+            .await;
+
+            assert_eq!(
+                rec.modifications(),
+                vec![(
+                    srv.url("/end").to_string(),
+                    RequestChange::UrlCredentialsRemoved
+                )]
+            );
+            let names = stream(&rec);
+            let redirected = names.iter().position(|n| n == "Redirected").unwrap();
+            assert_eq!(names[redirected + 1], "RequestModified", "{names:?}");
+        }
+
+        /// The default policy sends a cross-origin target the bare origin. Reported for each
+        /// hop, before that hop's request.
+        #[tokio::test(flavor = "current_thread")]
+        async fn referrer_reduced_on_each_hop() {
+            let srv = TestServer::new()
+                .route("/hop", RouteConfig::redirect_to("/end"))
+                .route("/end", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let init = RequestInit::get(HeaderMap::new()).with_referrer(
+                Some(Url::parse("https://example.com/page?q=1#frag").unwrap()),
+                ReferrerPolicy::default(),
+            );
+            let rec = recorded(client(), srv.url("/hop"), init, NetPolicy::default()).await;
+
+            let change = RequestChange::ReferrerReduced {
+                from: Url::parse("https://example.com/page?q=1").unwrap(),
+                to: Some(Url::parse("https://example.com/").unwrap()),
+                policy: ReferrerPolicy::StrictOriginWhenCrossOrigin,
+            };
+            assert_eq!(
+                rec.modifications(),
+                vec![
+                    (srv.url("/hop").to_string(), change.clone()),
+                    (srv.url("/end").to_string(), change)
+                ]
+            );
+            assert_eq!(
+                stream(&rec),
+                [
+                    "Started",
+                    "RequestModified",
+                    "RequestSent",
+                    "ResponseHeaders",
+                    "Redirected",
+                    "RequestModified",
+                    "RequestSent",
+                    "ResponseHeaders",
+                    "Finished"
+                ]
+            );
+        }
+
+        /// `no-referrer` sends nothing, reported as `to: None`.
+        #[tokio::test(flavor = "current_thread")]
+        async fn referrer_suppressed() {
+            let srv = TestServer::new()
+                .route("/", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let referrer = srv.url("/page");
+            let init = RequestInit::get(HeaderMap::new())
+                .with_referrer(Some(referrer.clone()), ReferrerPolicy::NoReferrer);
+            let rec = recorded(client(), srv.url("/"), init, NetPolicy::default()).await;
+
+            assert_eq!(
+                changes(&rec),
+                vec![RequestChange::ReferrerReduced {
+                    from: referrer,
+                    to: None,
+                    policy: ReferrerPolicy::NoReferrer,
+                }]
+            );
+        }
+
+        /// The chain goes home, away, home, home. The second hop taints the chain, and `Origin` is
+        /// `null` from there on. Reported once, on the first hop that sends the `null`.
+        #[tokio::test(flavor = "current_thread")]
+        async fn origin_tainted_once_per_chain() {
+            let home = TestServer::new()
+                .route("/again", RouteConfig::redirect_to("/end"))
+                .route("/end", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let away = TestServer::new()
+                .route(
+                    "/hop",
+                    RouteConfig::redirect_absolute(home.url("/again").as_str()),
+                )
+                .start()
+                .await;
+            let init = RequestInit::get(HeaderMap::new())
+                .with_fetch_metadata(RequestDestination::Empty, RequestMode::Websocket, false)
+                .with_mixed_content(
+                    Some(home.base_url().origin()),
+                    MixedContentPolicy::default(),
+                );
+            let rec = recorded(client(), away.url("/hop"), init, NetPolicy::default()).await;
+
+            assert_eq!(
+                rec.modifications(),
+                vec![(home.url("/again").to_string(), RequestChange::OriginTainted)]
+            );
+            let origins: Vec<_> = rec
+                .requests_sent()
+                .iter()
+                .map(|(_, _, h)| h.get(header::ORIGIN).cloned())
+                .collect();
+            assert_eq!(origins.len(), 3);
+            assert_eq!(origins[1].as_ref().unwrap(), "null");
+            assert_eq!(origins[2].as_ref().unwrap(), "null");
+        }
+
+        /// A POST under `no-referrer` sends `Origin: null`. Reported with the policy.
+        #[tokio::test(flavor = "current_thread")]
+        async fn origin_hidden_by_the_referrer_policy() {
+            let srv = TestServer::new()
+                .route("/", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let init = RequestInit::post(HeaderMap::new(), b"x".to_vec())
+                .with_referrer(None, ReferrerPolicy::NoReferrer)
+                .with_mixed_content(Some(srv.base_url().origin()), MixedContentPolicy::default());
+            let rec = recorded(client(), srv.url("/"), init, NetPolicy::default()).await;
+
+            assert_eq!(
+                changes(&rec),
+                vec![RequestChange::OriginHidden {
+                    policy: ReferrerPolicy::NoReferrer
+                }]
+            );
+        }
+
+        /// An opaque initiator has no serialisation other than `null`. Nothing is hidden.
+        #[tokio::test(flavor = "current_thread")]
+        async fn an_opaque_origin_is_not_reported() {
+            let srv = TestServer::new()
+                .route("/", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let opaque = Url::parse("data:text/html,x").unwrap().origin();
+            let init = RequestInit::post(HeaderMap::new(), b"x".to_vec())
+                .with_mixed_content(Some(opaque), MixedContentPolicy::default());
+            let rec = recorded(client(), srv.url("/"), init, NetPolicy::default()).await;
+            assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
+        }
+
+        /// `same-origin` credentials on a cross-origin hop. The jar is not asked, and the
+        /// hop reports it. `omit` asked for that on every hop and reports nothing.
+        #[tokio::test(flavor = "current_thread")]
+        async fn credentials_withheld_from_a_cross_origin_hop() {
+            let srv = TestServer::new()
+                .route("/", RouteConfig::echo_cookie_header())
+                .start()
+                .await;
+            let jar = || NetPolicy {
+                cookies_for: Box::new(|_| Some("session=1".into())),
+                ..NetPolicy::default()
+            };
+            let other = Some(Url::parse("http://other.example/").unwrap().origin());
+
+            let init = RequestInit::get(HeaderMap::new())
+                .with_mixed_content(other.clone(), MixedContentPolicy::default())
+                .with_credentials(RequestCredentials::SameOrigin);
+            let rec = recorded(client(), srv.url("/"), init, jar()).await;
+            assert_eq!(
+                rec.modifications(),
+                vec![(srv.url("/").to_string(), RequestChange::CredentialsWithheld)]
+            );
+            assert_eq!(rec.requests_sent()[0].2.get(header::COOKIE), None);
+
+            let init = RequestInit::get(HeaderMap::new())
+                .with_mixed_content(other, MixedContentPolicy::default())
+                .with_credentials(RequestCredentials::Omit);
+            let rec = recorded(client(), srv.url("/"), init, jar()).await;
+            assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
+        }
+
+        /// A cross-origin redirect drops the caller's `Authorization`, `Cookie` and `Referer`.
+        /// Reported once, after the `Redirected`, listing only what was there.
+        #[tokio::test(flavor = "current_thread")]
+        async fn sensitive_headers_stripped_on_a_cross_origin_redirect() {
+            let away = TestServer::new()
+                .route("/end", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let home = TestServer::new()
+                .route(
+                    "/cross",
+                    RouteConfig::redirect_absolute(away.url("/end").as_str()),
+                )
+                .route("/same", RouteConfig::redirect_to("/end"))
+                .route("/end", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let headers = || {
+                let mut h = HeaderMap::new();
+                h.insert(header::AUTHORIZATION, "Bearer t".parse().unwrap());
+                h.insert(header::COOKIE, "a=1".parse().unwrap());
+                h.insert(header::REFERER, "http://example.com/".parse().unwrap());
+                h
+            };
+
+            let rec = recorded(
+                client(),
+                home.url("/cross"),
+                RequestInit::get(headers()),
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(
+                rec.modifications(),
+                vec![(
+                    away.url("/end").to_string(),
+                    RequestChange::SensitiveHeadersStripped {
+                        headers: vec![header::AUTHORIZATION, header::COOKIE, header::REFERER],
+                    }
+                )]
+            );
+            let names = stream(&rec);
+            let redirected = names.iter().position(|n| n == "Redirected").unwrap();
+            assert_eq!(names[redirected + 1], "RequestModified", "{names:?}");
+
+            let rec = recorded(
+                client(),
+                home.url("/same"),
+                RequestInit::get(headers()),
+                NetPolicy::default(),
+            )
+            .await;
+            assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
+        }
+
+        /// Cookies from the jar and a computed `Referer` are put back for the next hop, so
+        /// stripping them changes nothing the caller asked for.
+        #[tokio::test(flavor = "current_thread")]
+        async fn recomputed_headers_are_not_reported_as_stripped() {
+            let away = TestServer::new()
+                .route("/end", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let home = TestServer::new()
+                .route(
+                    "/cross",
+                    RouteConfig::redirect_absolute(away.url("/end").as_str()),
+                )
+                .start()
+                .await;
+            let policy = NetPolicy {
+                cookies_for: Box::new(|_| Some("session=1".into())),
+                ..NetPolicy::default()
+            };
+            let init = RequestInit::get(HeaderMap::new())
+                .with_referrer(Some(home.url("/page")), ReferrerPolicy::UnsafeUrl);
+            let rec = recorded(client(), home.url("/cross"), init, policy).await;
+            assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
+            let sent = rec.requests_sent();
+            assert_eq!(sent[1].2.get(header::COOKIE).unwrap(), "session=1");
+        }
+
+        /// A 302 turns a POST into a GET and drops the body. A 307 keeps both.
+        #[tokio::test(flavor = "current_thread")]
+        async fn method_downgraded_by_a_redirect() {
+            let srv = TestServer::new()
+                .route("/302", RouteConfig::redirect_to("/end"))
+                .route("/307", RouteConfig::redirect_307("/end"))
+                .route("/end", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+
+            let rec = recorded(
+                client(),
+                srv.url("/302"),
+                RequestInit::post(HeaderMap::new(), b"a=1".to_vec()),
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(
+                rec.modifications(),
+                vec![(
+                    srv.url("/end").to_string(),
+                    RequestChange::MethodDowngraded {
+                        from: Method::POST,
+                        to: Method::GET,
+                    }
+                )]
+            );
+
+            let rec = recorded(
+                client(),
+                srv.url("/307"),
+                RequestInit::post(HeaderMap::new(), b"a=1".to_vec()),
+                NetPolicy::default(),
+            )
+            .await;
+            assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
+        }
+
+        /// A refused hop is a `Blocked`, not an upgrade or a change.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_blocked_hop_is_not_a_change() {
+            let init = RequestInit::get(HeaderMap::new()).with_mixed_content(
+                Some(Url::parse("https://example.com").unwrap().origin()),
+                MixedContentPolicy::Block,
+            );
+            let rec = recorded(
+                client(),
+                Url::parse("http://insecure.example.com/a.js").unwrap(),
+                init,
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(rec.blocked_reason(), Some(BlockReason::MixedContent));
+            assert!(rec.upgrades().is_empty());
+            assert!(rec.modifications().is_empty());
+        }
+
+        #[test]
+        fn display() {
+            assert_eq!(UpgradeReason::Hsts.to_string(), "HSTS");
+            assert_eq!(UpgradeReason::MixedContent.to_string(), "mixed content");
+            let u = |s: &str| Url::parse(s).unwrap();
+            let cases = [
+                (
+                    RequestChange::UrlCredentialsRemoved,
+                    "removed credentials from the URL",
+                ),
+                (
+                    RequestChange::ReferrerReduced {
+                        from: u("https://a.example/p"),
+                        to: Some(u("https://a.example/")),
+                        policy: ReferrerPolicy::StrictOrigin,
+                    },
+                    "referrer https://a.example/p reduced to https://a.example/ by strict-origin",
+                ),
+                (
+                    RequestChange::ReferrerReduced {
+                        from: u("https://a.example/p"),
+                        to: None,
+                        policy: ReferrerPolicy::NoReferrer,
+                    },
+                    "referrer https://a.example/p suppressed by no-referrer",
+                ),
+                (
+                    RequestChange::OriginTainted,
+                    "origin sent as null after a redirect",
+                ),
+                (
+                    RequestChange::OriginHidden {
+                        policy: ReferrerPolicy::SameOrigin,
+                    },
+                    "origin sent as null by same-origin",
+                ),
+                (
+                    RequestChange::CredentialsWithheld,
+                    "credentials withheld from a cross-origin hop",
+                ),
+                (
+                    RequestChange::SensitiveHeadersStripped {
+                        headers: vec![header::AUTHORIZATION, header::COOKIE],
+                    },
+                    "stripped headers on a cross-origin redirect: authorization cookie",
+                ),
+                (
+                    RequestChange::MethodDowngraded {
+                        from: Method::POST,
+                        to: Method::GET,
+                    },
+                    "method changed from POST to GET by a redirect",
+                ),
+            ];
+            for (change, text) in cases {
+                assert_eq!(change.to_string(), text);
+            }
+        }
     }
 }

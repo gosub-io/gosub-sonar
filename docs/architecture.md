@@ -612,9 +612,21 @@ Two traits decouple the net stack from the host's event system:
 
 `NetObserver::on_event(&self, ev: NetEvent)` receives lifecycle events. `NetEvent` variants:
 `Started`, `RequestSent`, `Redirected`, `ResponseHeaders`, `Progress`, `BodyPreview`,
-`Finished`, `Failed`, `Cancelled`, `Blocked`, `TlsFailed`, `CorsPreflight`,
-`CorsPreflightDone`, `AuthRequired`, `Cache`, `DnsResolved`, `Connected`, `Warning`, `Io`.
-`NullEmitter` is a no-op implementation for callers that don't care.
+`Finished`, `Failed`, `Cancelled`, `Blocked`, `TlsFailed`, `SecurityUpgraded`,
+`RequestModified`, `CorsPreflight`, `CorsPreflightDone`, `AuthRequired`, `Cache`, `DnsResolved`,
+`Connected`, `Warning`, `Io`. `NullEmitter` is a no-op implementation for callers that don't care.
+
+**Security changes.** When a policy changes a hop instead of refusing it, the observer is told.
+`SecurityUpgraded { from, to, reason }` reports an `http` hop sent as `https`, for HSTS or a mixed
+content upgrade. `RequestModified { url, change }` reports every other change, one event per
+change: credentials removed from the URL, a `Referer` trimmed or suppressed by the referrer
+policy, `Origin` sent as `null`, credentials withheld by `same-origin` credentials mode, headers
+stripped on a cross-origin redirect, and a method changed by a redirect. `UpgradeReason` and
+`RequestChange` are `#[non_exhaustive]`. A hop's changes come before its `RequestSent`. Changes
+made while following a redirect come right after its `Redirected`. A hop nothing changed reports
+nothing. A refused hop is `Blocked`, never one of these. The `Sec-Fetch-*` headers are always
+computed rather than changed, so they only show in `RequestSent`. Only the observer of the request
+that leads a coalesced fetch gets events. Followers get its result and no events.
 
 `NetEvent` is `#[non_exhaustive]`: a `match` over it needs a catch-all arm, and new events can
 be added without a breaking release.

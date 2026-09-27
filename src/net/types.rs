@@ -198,6 +198,120 @@ impl Display for BlockReason {
     }
 }
 
+/// Why a hop was rewritten from `http` to `https` before it was sent.
+///
+/// Carried by [`NetEvent::SecurityUpgraded`](crate::net::events::NetEvent::SecurityUpgraded).
+/// The upgraded request is sent. Compare [`BlockReason`], where it is not.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum UpgradeReason {
+    /// The host has a stored HSTS policy (RFC 6797). See [`hsts`](crate::net::hsts).
+    Hsts,
+    /// An insecure subresource of a secure document was upgraded instead of blocked.
+    /// See [`MixedContentPolicy::Upgrade`].
+    MixedContent,
+}
+
+impl Display for UpgradeReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UpgradeReason::Hsts => "HSTS",
+            UpgradeReason::MixedContent => "mixed content",
+        })
+    }
+}
+
+/// One way a hop differs from what the caller asked for, when a policy changed it instead of
+/// refusing it.
+///
+/// Carried by [`NetEvent::RequestModified`](crate::net::events::NetEvent::RequestModified).
+/// The request is still sent. Most of these cannot be seen in the response, so the event is
+/// the only record of them.
+#[derive(Debug, Clone, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RequestChange {
+    /// A `user:password@` in the URL was removed. The client would otherwise turn it into an
+    /// `Authorization` header. Reported for the initial URL and for each `Location`.
+    UrlCredentialsRemoved,
+    /// The referrer policy trimmed or suppressed the `Referer` for this hop. A referrer longer
+    /// than 4096 bytes is also cut to its origin, whatever the policy.
+    ReferrerReduced {
+        /// The referrer as it would go out with no policy. That is the caller's referrer without its
+        /// fragment and credentials.
+        from: Url,
+        /// What is sent instead. `None` when no `Referer` is sent.
+        to: Option<Url>,
+        /// The policy in force for this hop. A redirect can change it.
+        policy: ReferrerPolicy,
+    },
+    /// `Origin` is sent as `null` because the redirect chain left the initiating origin and
+    /// then moved to another one (the Fetch tainted origin flag). Reported once, on the first
+    /// hop it applies to.
+    OriginTainted,
+    /// `Origin` is sent as `null` because the referrer policy hides the origin from this
+    /// target, the same way it hides the `Referer`.
+    OriginHidden {
+        /// The policy in force for this hop.
+        policy: ReferrerPolicy,
+    },
+    /// Cookies and server credentials were not attached to this hop, because it leaves the
+    /// initiating origin and the request's credentials mode is
+    /// [`RequestCredentials::SameOrigin`]. Not reported for
+    /// [`RequestCredentials::Omit`], which withholds them on every hop by request.
+    CredentialsWithheld,
+    /// Headers the caller set were removed because a redirect crossed origins
+    /// (RFC 9110 section 15.4). Only headers that were present and are not recomputed for the
+    /// next hop are listed. Cookies from the jar are fetched again for the new origin and are
+    /// not listed.
+    SensitiveHeadersStripped {
+        /// The removed headers.
+        headers: Vec<HeaderName>,
+    },
+    /// A redirect changed the method, and any request body was dropped with it
+    /// (RFC 9110 section 15.4).
+    MethodDowngraded {
+        /// The method of the hop that answered with the redirect.
+        from: Method,
+        /// The method of the next hop.
+        to: Method,
+    },
+}
+
+impl Display for RequestChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestChange::UrlCredentialsRemoved => f.write_str("removed credentials from the URL"),
+            RequestChange::ReferrerReduced {
+                from,
+                to: Some(to),
+                policy,
+            } => write!(f, "referrer {from} reduced to {to} by {policy}"),
+            RequestChange::ReferrerReduced {
+                from,
+                to: None,
+                policy,
+            } => write!(f, "referrer {from} suppressed by {policy}"),
+            RequestChange::OriginTainted => f.write_str("origin sent as null after a redirect"),
+            RequestChange::OriginHidden { policy } => {
+                write!(f, "origin sent as null by {policy}")
+            }
+            RequestChange::CredentialsWithheld => {
+                f.write_str("credentials withheld from a cross-origin hop")
+            }
+            RequestChange::SensitiveHeadersStripped { headers } => {
+                f.write_str("stripped headers on a cross-origin redirect:")?;
+                for h in headers {
+                    write!(f, " {h}")?;
+                }
+                Ok(())
+            }
+            RequestChange::MethodDowngraded { from, to } => {
+                write!(f, "method changed from {from} to {to} by a redirect")
+            }
+        }
+    }
+}
+
 /// Network-level errors.
 #[derive(Debug, thiserror::Error, Clone)]
 pub enum NetError {

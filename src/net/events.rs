@@ -3,7 +3,7 @@
 use crate::net::auth::{AuthChallenge, AuthTarget};
 use crate::net::cache::CacheOutcome;
 use crate::net::tls::TlsError;
-use crate::net::types::BlockReason;
+use crate::net::types::{BlockReason, RequestChange, UpgradeReason};
 use http::{HeaderMap, Method};
 use std::time::Duration;
 use url::Url;
@@ -236,6 +236,32 @@ pub enum NetEvent {
         url: Url,
         /// Why the request was refused
         reason: BlockReason,
+    },
+    /// A hop was rewritten from `http` to `https` before it was sent.
+    ///
+    /// Emitted per hop, before that hop's [`NetEvent::RequestSent`]. After a redirect it
+    /// follows the [`NetEvent::Redirected`] that led to the hop. The upgraded request is
+    /// sent as usual unless a later check refuses it, which [`NetEvent::Blocked`] reports.
+    /// Without this event the result looks as if the caller had asked for `https`.
+    SecurityUpgraded {
+        /// The URL before the upgrade
+        from: Url,
+        /// The URL that is fetched
+        to: Url,
+        /// What caused the upgrade
+        reason: UpgradeReason,
+    },
+    /// A policy changed a hop instead of refusing it. One event per change.
+    ///
+    /// Changes to a hop are reported before its [`NetEvent::RequestSent`]. Changes made while
+    /// following a redirect come right after the [`NetEvent::Redirected`] for it, and name
+    /// the redirect target. A hop that nothing changed reports nothing. Compare
+    /// [`NetEvent::Blocked`], where the hop is not sent.
+    RequestModified {
+        /// The hop the change applies to
+        url: Url,
+        /// What changed
+        change: RequestChange,
     },
     /// A CORS preflight `OPTIONS` is about to be sent for this hop, because the request's
     /// method or headers need the server's approval and no cached grant covered them.

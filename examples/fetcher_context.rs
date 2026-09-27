@@ -76,6 +76,10 @@ impl NetObserver for Logger {
                 "[{t}] auth      {} challenge(s), retried: {retried}",
                 challenges.len()
             ),
+            NetEvent::SecurityUpgraded { to, reason, .. } => {
+                println!("[{t}] upgraded  to {to} ({reason})")
+            }
+            NetEvent::RequestModified { change, .. } => println!("[{t}] modified  {change}"),
             NetEvent::Warning { message, .. } => println!("[{t}] warning   {message}"),
             NetEvent::Io { message } => println!("[{t}] io        {message}"),
             // `NetEvent` is non-exhaustive; a new event should not break this example.

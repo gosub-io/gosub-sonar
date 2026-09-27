@@ -70,6 +70,26 @@ impl ReferrerPolicy {
     pub fn parse_header(value: &str) -> Option<Self> {
         value.split(',').filter_map(Self::parse_token).next_back()
     }
+
+    /// The policy's token, as written in a `Referrer-Policy` header.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoReferrer => "no-referrer",
+            Self::NoReferrerWhenDowngrade => "no-referrer-when-downgrade",
+            Self::SameOrigin => "same-origin",
+            Self::Origin => "origin",
+            Self::StrictOrigin => "strict-origin",
+            Self::OriginWhenCrossOrigin => "origin-when-cross-origin",
+            Self::StrictOriginWhenCrossOrigin => "strict-origin-when-cross-origin",
+            Self::UnsafeUrl => "unsafe-url",
+        }
+    }
+}
+
+impl std::fmt::Display for ReferrerPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Strip a URL for use as a referrer: drop the fragment and any credentials.
@@ -77,7 +97,7 @@ impl ReferrerPolicy {
 /// Returns `None` for schemes that are never sent as a referrer. A `file:`, `data:`, or
 /// `about:blank` document produces no `Referer` at all, so those are filtered here rather than
 /// leaking a local path to the network.
-fn strip(url: &Url) -> Option<Url> {
+pub(crate) fn strip(url: &Url) -> Option<Url> {
     if !matches!(url.scheme(), "http" | "https") {
         return None;
     }
@@ -463,5 +483,22 @@ mod tests {
             determined(ReferrerPolicy::SameOrigin, "https://example.com:8443/a"),
             None
         );
+    }
+
+    #[test]
+    fn as_str_round_trips_through_parse_token() {
+        for policy in [
+            ReferrerPolicy::NoReferrer,
+            ReferrerPolicy::NoReferrerWhenDowngrade,
+            ReferrerPolicy::SameOrigin,
+            ReferrerPolicy::Origin,
+            ReferrerPolicy::StrictOrigin,
+            ReferrerPolicy::OriginWhenCrossOrigin,
+            ReferrerPolicy::StrictOriginWhenCrossOrigin,
+            ReferrerPolicy::UnsafeUrl,
+        ] {
+            assert_eq!(ReferrerPolicy::parse_token(policy.as_str()), Some(policy));
+            assert_eq!(policy.to_string(), policy.as_str());
+        }
     }
 }

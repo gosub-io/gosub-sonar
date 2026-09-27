@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the body passes the limit or the last `SharedBody` handle is dropped
 - `SharedBody::subscribe_live`: only the chunks pushed from now on, without replay, for
   progress observers
+- `NetEvent::SecurityUpgraded { from, to, reason }`: a hop was sent over `https` instead of
+  `http`. `UpgradeReason` is `Hsts` or `MixedContent`. HSTS upgrades were not reported at all
+  before
+- `NetEvent::RequestModified { url, change }`: a policy changed a hop instead of refusing it.
+  One event per change. `RequestChange` covers credentials removed from the URL, a `Referer`
+  trimmed or suppressed by the referrer policy, `Origin` sent as `null` after a tainting
+  redirect or by the referrer policy, credentials withheld from a cross-origin hop in
+  `same-origin` credentials mode, headers the caller set that a cross-origin redirect stripped,
+  and a method changed by a redirect. Most of these were not reported before. A hop's changes
+  come before its `RequestSent`, and changes made by a redirect right after its `Redirected`.
+  A hop nothing changed reports nothing. `UpgradeReason` and `RequestChange` are
+  `#[non_exhaustive]` and exported from the crate root
+- `ReferrerPolicy::as_str` and a `Display` impl that writes the header token
+- `RecordingObserver::upgrades`, `modifications` and `event_names` in `test-support`
 
 ### Changed
 
@@ -31,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead. The first subscriber of a fetcher body still gets the whole body regardless of the
   limit, because reading waits for it. Use `subscribe_live` to see only later chunks
 - `SharedBody::reserve` is now a no-op, kept so existing callers compile
+- A mixed content upgrade and credentials removed from a URL are reported as
+  `SecurityUpgraded` and `RequestModified` instead of `NetEvent::Warning`. The credentials
+  event now follows `Started` rather than coming before it
 
 ### Fixed
 
