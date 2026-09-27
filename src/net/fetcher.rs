@@ -2713,6 +2713,62 @@ mod tests {
         }
     }
 
+    /// Security events reach the fetcher's observer. Coalesced requests share one fetch, and
+    /// the change is reported once, by the leader. A follower gets the leader's result and
+    /// no events of its own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn request_changes_are_reported_once_through_the_fetcher() {
+        let srv = start_server().await;
+        let log = Arc::new(RecordingObserver::new());
+        let fetcher =
+            Arc::new(Fetcher::new(test_config(), Arc::new(Recording(log.clone()))).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let mut url = srv.url("/coalesce");
+        url.set_username("user").unwrap();
+        url.set_password(Some("pw")).unwrap();
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        fetcher
+            .submit(
+                make_req(url.clone(), Priority::Normal).0,
+                CancellationToken::new(),
+                tx1,
+            )
+            .await;
+        fetcher
+            .submit(
+                make_req(url, Priority::Normal).0,
+                CancellationToken::new(),
+                tx2,
+            )
+            .await;
+        for rx in [rx1, rx2] {
+            let result = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status_of(&result), 200);
+        }
+        shutdown.cancel();
+
+        assert_eq!(
+            srv.hit_count("/coalesce"),
+            1,
+            "the two requests must coalesce"
+        );
+        assert_eq!(
+            log.modifications(),
+            vec![(
+                srv.url("/coalesce").to_string(),
+                crate::net::types::RequestChange::UrlCredentialsRemoved
+            )]
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn retry_recovers_from_transient_5xx() {
         let srv = start_server().await;

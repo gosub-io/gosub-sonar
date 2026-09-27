@@ -1252,6 +1252,52 @@ impl RecordingObserver {
             .collect()
     }
 
+    /// Every [`NetEvent::SecurityUpgraded`] recorded, as `(from, to, reason)`, in order.
+    pub fn upgrades(&self) -> Vec<(String, String, crate::net::types::UpgradeReason)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::SecurityUpgraded { from, to, reason } => {
+                    Some((from.to_string(), to.to_string(), *reason))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every [`NetEvent::RequestModified`] recorded, as `(url, change)`, in order.
+    pub fn modifications(&self) -> Vec<(String, crate::net::types::RequestChange)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::RequestModified { url, change } => {
+                    Some((url.to_string(), change.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The variant name of every event recorded, in order (`"Started"`, `"RequestSent"`, ...),
+    /// for tests about where an event falls in the stream.
+    pub fn event_names(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                format!("{e:?}")
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Every [`NetEvent::Warning`] message recorded, in order.
     pub fn warnings(&self) -> Vec<String> {
         self.events

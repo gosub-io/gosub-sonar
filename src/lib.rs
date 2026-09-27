@@ -46,6 +46,7 @@ pub use net::tls::{
 pub use net::transport::{TransportError, TransportErrorKind};
 pub use net::types::{
     BlockReason, BoxedAsyncRead, FetchRequest, FetchRequestBuilder, FetchResult, FetchResultMeta,
-    Initiator, NetError, Priority, RequestBody, RequestCredentials, ResourceKind,
+    Initiator, NetError, Priority, RequestBody, RequestChange, RequestCredentials, ResourceKind,
+    UpgradeReason,
 };
 pub use types::{PeekBuf, RequestId};
