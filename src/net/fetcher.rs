@@ -18,7 +18,7 @@ use crate::net::hsts::{self, HstsStore, InMemoryHstsStore};
 use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::net::proxy::ProxyConfig;
+use crate::net::proxy::{ProxyConfig, ProxyRoutes};
 use crate::net::retry::{self, RetryPolicy};
 use crate::net::shared_body::{ReaderOptions, SharedBody, DEFAULT_REPLAY_LIMIT};
 #[cfg(not(target_arch = "wasm32"))]
@@ -342,6 +342,27 @@ pub struct Fetcher {
     wake: Notify,
 
     ctx: Arc<dyn FetcherContext>,
+
+    built: Arc<ClientsBuilt>,
+}
+
+/// What the clients were built with that a request's policy has to agree with, taken when
+/// they were built rather than looked up again per request.
+struct ClientsBuilt {
+    /// The proxies the clients route by; see [`ProxyRoutes`].
+    #[cfg(not(target_arch = "wasm32"))]
+    proxy: ProxyRoutes,
+}
+
+impl ClientsBuilt {
+    fn new(cfg: &FetcherConfig) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let _ = cfg;
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            proxy: ProxyRoutes::resolve(&cfg.proxy),
+        }
+    }
 }
 
 impl Fetcher {
@@ -363,6 +384,8 @@ impl Fetcher {
             "FetcherConfig.h2_per_origin must be >= 1"
         );
 
+        // Read the environment's proxies alongside the clients, which read them while building.
+        let built = Arc::new(ClientsBuilt::new(&config));
         let client = build_client(&config, true, &ctx)?;
         let client_raw = build_client(&config, false, &ctx)?;
 
@@ -379,6 +402,7 @@ impl Fetcher {
             inflight_map: Arc::new(DashMap::new()),
             wake: Notify::new(),
             ctx,
+            built,
         })
     }
 
@@ -648,6 +672,7 @@ impl Fetcher {
             };
             let global = self.global_slots.clone();
             let per_origin = self.per_origin.clone();
+            let built = self.built.clone();
             let cfg = self.cfg.clone();
             let inflight = self.inflight_map.clone();
             let key_for_remove = key_str.clone();
@@ -705,6 +730,7 @@ impl Fetcher {
                         cancel_parent.clone(),
                         ctx_clone.clone(),
                         per_origin.clone(),
+                        built.clone(),
                         slot_guards,
                     )
                     .await
@@ -717,6 +743,7 @@ impl Fetcher {
                         cancel_parent.clone(),
                         ctx_clone.clone(),
                         per_origin.clone(),
+                        built.clone(),
                     )
                     .await
                 };
@@ -1036,7 +1063,10 @@ fn build_policy(
     cfg: &FetcherConfig,
     ctx: &Arc<dyn FetcherContext>,
     origins: Arc<OriginTable>,
+    built: &Arc<ClientsBuilt>,
 ) -> NetPolicy {
+    #[cfg(target_arch = "wasm32")]
+    let _ = built;
     let hint_origins = origins.clone();
     let policy = NetPolicy::from_context(ctx)
         .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)))
@@ -1053,10 +1083,12 @@ fn build_policy(
         // while executing the request, and an observer would never see the header its own
         // configuration put there.
         let proxy = cfg.proxy.clone();
-        let proxy_for = cfg.proxy.clone();
+        let proxy_for = built.clone();
+        let proxied = built.clone();
         let policy = policy
             .with_proxy_authorization(Box::new(move |url| proxy.proxy_authorization(url)))
-            .with_proxy_for(Box::new(move |url| proxy_for.plain_http_proxy(url)))
+            .with_proxy_for(Box::new(move |url| proxy_for.proxy.plain_http_proxy(url)))
+            .with_proxied(Box::new(move |url| proxied.proxy.routes_through_proxy(url)))
             .with_dns_resolver(cfg.dns_resolver.clone())
             .with_hsts(cfg.hsts.clone())
             .with_tls_overrides(cfg.tls_overrides.clone())
@@ -1086,6 +1118,7 @@ async fn perform_streaming(
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
     origins: Arc<OriginTable>,
+    built: Arc<ClientsBuilt>,
     slots: SlotGuards,
 ) -> Result<FetchResult, NetError> {
     let client = Arc::new(client.clone());
@@ -1107,7 +1140,7 @@ async fn perform_streaming(
                 make_request_init(req, cfg),
                 cancel.clone(),
                 observer.clone(),
-                build_policy(cfg, &ctx, origins.clone()),
+                build_policy(cfg, &ctx, origins.clone(), &built),
             )
         },
         |top| (top.meta.status, &top.meta.headers),
@@ -1139,6 +1172,7 @@ async fn perform_streaming(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn perform_buffered(
     client: &reqwest::Client,
     observer: Arc<dyn NetObserver + Send + Sync>,
@@ -1147,6 +1181,7 @@ async fn perform_buffered(
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
     origins: Arc<OriginTable>,
+    built: Arc<ClientsBuilt>,
 ) -> Result<FetchResult, NetError> {
     let client = Arc::new(client.clone());
     let (meta, body) = retry::with_retries(
@@ -1165,7 +1200,7 @@ async fn perform_buffered(
                 req.max_bytes.or(cfg.max_body_bytes),
                 effective_read_idle_timeout(req, cfg),
                 effective_total_body_timeout(req, cfg),
-                build_policy(cfg, &ctx, origins.clone()),
+                build_policy(cfg, &ctx, origins.clone(), &built),
             )
         },
         |(meta, _)| (meta.status, &meta.headers),

@@ -379,6 +379,7 @@ mod tests {
             has_body: true,
             from_cache: false,
             tainting: Default::default(),
+            peer_addr: None,
         }
     }
 

@@ -114,6 +114,17 @@ pub struct FetchResultMeta {
     /// Always [`Basic`](ResponseTainting::Basic) on wasm32, where the browser has already
     /// filtered what its `fetch()` exposes.
     pub tainting: ResponseTainting,
+    /// The address the response came from: the peer of the connection the final hop was read
+    /// from, or for a cached response, of the one it was stored (or last confirmed by a `304`)
+    /// from. Unlike a fresh lookup of the host, this cannot be answered differently by a
+    /// rebinding DNS server, so it is what to judge the response's network by - a document
+    /// served from a private address may be allowed to reach its neighbours, one served from
+    /// a public address may not.
+    ///
+    /// `None` when there was no connection (a synthetic result), when the request went through
+    /// a proxy (the peer is then the proxy, which says nothing about the host), or when the
+    /// client does not say (wasm32, where the browser connects).
+    pub peer_addr: Option<std::net::SocketAddr>,
 }
 
 impl FetchResultMeta {
@@ -134,7 +145,8 @@ impl FetchResultMeta {
     /// ```
     ///
     /// Defaults describe a successful, same-origin, non-cached response with no body and
-    /// no headers: status 200 `OK`, [`ResponseTainting::Basic`], `from_cache` false.
+    /// no headers: status 200 `OK`, [`ResponseTainting::Basic`], `from_cache` false, no
+    /// [`peer_addr`](Self::peer_addr).
     #[must_use]
     pub fn synthetic(final_url: Url) -> Self {
         Self {
@@ -147,6 +159,7 @@ impl FetchResultMeta {
             has_body: false,
             from_cache: false,
             tainting: ResponseTainting::default(),
+            peer_addr: None,
         }
     }
 
@@ -1973,6 +1986,7 @@ mod tests {
             has_body: false,
             from_cache: false,
             tainting: ResponseTainting::Basic,
+            peer_addr: None,
         };
 
         let buffered = FetchResult::Buffered {
