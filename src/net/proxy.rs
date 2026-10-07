@@ -311,51 +311,6 @@ impl ProxyConfig {
             .find_map(|rule| rule.non_tunnel_authorization(&dst))
     }
 
-    /// The http(s) proxy a plain-`http` request to `url` goes through, without credentials;
-    /// `None` for https (tunnelled via CONNECT, so no 407 response can come from the proxy),
-    /// direct, or socks. Decides whether a 407 counts as a proxy challenge.
-    /// [`ProxyConfig::System`] is answered from the environment with the client's own matcher.
-    pub(crate) fn plain_http_proxy(&self, url: &Url) -> Option<Url> {
-        if url.scheme() != "http" {
-            return None;
-        }
-        let dst: http::Uri = url.as_str().parse().ok()?;
-        match *self {
-            ProxyConfig::Rules(ref rules) => {
-                rules.iter().find_map(|rule| rule.non_tunnel_proxy(&dst))
-            }
-            ProxyConfig::System => {
-                let intercept = proxy_matcher::Matcher::from_system().intercept(&dst)?;
-                if !matches!(intercept.uri().scheme_str(), Some("http") | Some("https")) {
-                    return None;
-                }
-                let mut proxy = Url::parse(&intercept.uri().to_string()).ok()?;
-                let _ = proxy.set_username("");
-                let _ = proxy.set_password(None);
-                Some(proxy)
-            }
-            ProxyConfig::Disabled => None,
-        }
-    }
-
-    /// Whether a request to `url` goes through a proxy (http, https or socks) rather than
-    /// straight to the host. A URL the matcher cannot take counts as proxied: the answer
-    /// decides whether the connection's peer is the host's address, and "unknown" must not
-    /// pass for "yes". [`ProxyConfig::System`] is answered from the environment with the
-    /// client's own matcher.
-    pub(crate) fn routes_through_proxy(&self, url: &Url) -> bool {
-        let Ok(dst) = url.as_str().parse::<http::Uri>() else {
-            return true;
-        };
-        match *self {
-            ProxyConfig::Rules(ref rules) => rules.iter().any(|rule| rule.routes(&dst)),
-            ProxyConfig::System => proxy_matcher::Matcher::from_system()
-                .intercept(&dst)
-                .is_some(),
-            ProxyConfig::Disabled => false,
-        }
-    }
-
     /// Apply this configuration to a client builder.
     ///
     /// [`ProxyConfig::System`] leaves the builder untouched, since reading the environment is
@@ -381,6 +336,71 @@ impl ProxyConfig {
     }
 }
 
+/// A [`ProxyConfig`] resolved the way a client built from it resolved it. reqwest reads the
+/// environment for [`ProxyConfig::System`] once, while building the client, and routes by that
+/// for the client's lifetime; asking the environment again per request would answer for
+/// settings the client never saw. Take this next to the client it describes.
+pub(crate) enum ProxyRoutes {
+    /// The environment's proxies, as they were when the client was built.
+    System(Box<proxy_matcher::Matcher>),
+    Disabled,
+    Rules(Vec<ProxyRule>),
+}
+
+impl ProxyRoutes {
+    /// Resolve `config`, reading the environment now for [`ProxyConfig::System`].
+    pub(crate) fn resolve(config: &ProxyConfig) -> Self {
+        match config {
+            ProxyConfig::System => {
+                ProxyRoutes::System(Box::new(proxy_matcher::Matcher::from_system()))
+            }
+            ProxyConfig::Disabled => ProxyRoutes::Disabled,
+            ProxyConfig::Rules(rules) => ProxyRoutes::Rules(rules.clone()),
+        }
+    }
+
+    /// The http(s) proxy a plain-`http` request to `url` goes through, without credentials;
+    /// `None` for https (tunnelled via CONNECT, so no 407 response can come from the proxy),
+    /// direct, or socks. Decides whether a 407 counts as a proxy challenge.
+    pub(crate) fn plain_http_proxy(&self, url: &Url) -> Option<Url> {
+        if url.scheme() != "http" {
+            return None;
+        }
+        let dst: http::Uri = url.as_str().parse().ok()?;
+        match *self {
+            ProxyRoutes::Rules(ref rules) => {
+                rules.iter().find_map(|rule| rule.non_tunnel_proxy(&dst))
+            }
+            ProxyRoutes::System(ref matcher) => {
+                let intercept = matcher.intercept(&dst)?;
+                if !matches!(intercept.uri().scheme_str(), Some("http") | Some("https")) {
+                    return None;
+                }
+                let mut proxy = Url::parse(&intercept.uri().to_string()).ok()?;
+                let _ = proxy.set_username("");
+                let _ = proxy.set_password(None);
+                Some(proxy)
+            }
+            ProxyRoutes::Disabled => None,
+        }
+    }
+
+    /// Whether a request to `url` goes through a proxy (http, https or socks) rather than
+    /// straight to the host. A URL the matcher cannot take counts as proxied: the answer
+    /// decides whether the connection's peer is the host's address, and "unknown" must not
+    /// pass for "yes".
+    pub(crate) fn routes_through_proxy(&self, url: &Url) -> bool {
+        let Ok(dst) = url.as_str().parse::<http::Uri>() else {
+            return true;
+        };
+        match *self {
+            ProxyRoutes::Rules(ref rules) => rules.iter().any(|rule| rule.routes(&dst)),
+            ProxyRoutes::System(ref matcher) => matcher.intercept(&dst).is_some(),
+            ProxyRoutes::Disabled => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,19 +410,44 @@ mod tests {
     #[test]
     fn routes_through_proxy_covers_socks_and_honours_the_bypass_list() {
         let url = |s: &str| Url::parse(s).unwrap();
-        let socks = ProxyConfig::Rules(vec![ProxyRule::all("socks5h://127.0.0.1:9050")]);
+        let socks = ProxyRoutes::Rules(vec![ProxyRule::all("socks5h://127.0.0.1:9050")]);
         assert!(socks.routes_through_proxy(&url("https://example.com/")));
         assert!(socks.routes_through_proxy(&url("http://example.com/")));
 
-        let http_only = ProxyConfig::Rules(vec![
+        let http_only = ProxyRoutes::Rules(vec![
             ProxyRule::http("http://127.0.0.1:3128").bypassing("intranet.test")
         ]);
         assert!(http_only.routes_through_proxy(&url("http://example.com/")));
         assert!(!http_only.routes_through_proxy(&url("https://example.com/")));
         assert!(!http_only.routes_through_proxy(&url("http://intranet.test/")));
 
-        assert!(!ProxyConfig::Disabled.routes_through_proxy(&url("http://example.com/")));
-        assert!(!ProxyConfig::Rules(vec![]).routes_through_proxy(&url("http://example.com/")));
+        assert!(!ProxyRoutes::Disabled.routes_through_proxy(&url("http://example.com/")));
+        assert!(!ProxyRoutes::Rules(vec![]).routes_through_proxy(&url("http://example.com/")));
+    }
+
+    /// The system routes answer from the matcher they were resolved with, not from whatever
+    /// the environment says by the time a request is made.
+    #[test]
+    fn system_routes_answer_from_their_snapshot() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        let routes = ProxyRoutes::System(Box::new(
+            proxy_matcher::Matcher::builder()
+                .all("http://127.0.0.1:3128".to_string())
+                .no("intranet.test".to_string())
+                .build(),
+        ));
+        assert!(routes.routes_through_proxy(&url("https://example.com/")));
+        assert!(!routes.routes_through_proxy(&url("http://intranet.test/")));
+        assert_eq!(
+            routes
+                .plain_http_proxy(&url("http://example.com/"))
+                .map(|u| u.to_string()),
+            Some("http://127.0.0.1:3128/".to_string())
+        );
+
+        let direct = ProxyRoutes::System(Box::new(proxy_matcher::Matcher::builder().build()));
+        assert!(!direct.routes_through_proxy(&url("https://example.com/")));
+        assert_eq!(direct.plain_http_proxy(&url("http://example.com/")), None);
     }
 
     #[test]
@@ -605,7 +650,7 @@ mod tests {
 
     #[test]
     fn plain_http_proxy_names_the_proxy_for_http_only() {
-        let cfg = ProxyConfig::Rules(vec![
+        let cfg = ProxyRoutes::Rules(vec![
             ProxyRule::all("http://user:pw@proxy.test:3128").bypassing("internal.test")
         ]);
         let proxy = |u: &str| cfg.plain_http_proxy(&Url::parse(u).unwrap());
@@ -621,13 +666,13 @@ mod tests {
         );
         assert_eq!(proxy("http://internal.test/"), None, "no_proxy is honoured");
 
-        let socks = ProxyConfig::Rules(vec![ProxyRule::all("socks5://proxy.test:1080")]);
+        let socks = ProxyRoutes::Rules(vec![ProxyRule::all("socks5://proxy.test:1080")]);
         assert_eq!(
             socks.plain_http_proxy(&Url::parse("http://example.test/").unwrap()),
             None
         );
         assert_eq!(
-            ProxyConfig::Disabled.plain_http_proxy(&Url::parse("http://example.test/").unwrap()),
+            ProxyRoutes::Disabled.plain_http_proxy(&Url::parse("http://example.test/").unwrap()),
             None
         );
     }
