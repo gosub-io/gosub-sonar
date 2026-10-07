@@ -175,6 +175,10 @@ pub struct CacheEntry {
     pub requested_at: DateTime<Utc>,
     /// When its response arrived.
     pub received_at: DateTime<Utc>,
+    /// The peer of the connection the response was read from, or of the one whose `304` last
+    /// confirmed it; see [`FetchResultMeta::peer_addr`](crate::net::types::FetchResultMeta::peer_addr).
+    /// `None` when the client did not report one.
+    pub peer_addr: Option<std::net::SocketAddr>,
 }
 
 impl CacheEntry {
@@ -511,6 +515,7 @@ pub fn entry_from_response(
         decoded,
         requested_at,
         received_at,
+        peer_addr: None,
     }
 }
 

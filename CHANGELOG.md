@@ -20,6 +20,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and no cookie jar between calls - use `Fetcher` for those
 - `SimpleOptions::max_body` makes the 10 MiB body cap configurable, and applies it to `file:`
   reads and `sync_fetch`, which kept their own copy of the limit
+- `FetchResultMeta::peer_addr`: the address the response came from - the peer of the connection
+  the final hop was read from, or for a cache hit, of the one that stored or last confirmed the
+  entry (`CacheEntry::peer_addr`). An embedder judging a document's network (private or public)
+  by it cannot be fooled by a rebinding DNS server the way a fresh lookup of the host can.
+  `None` for synthetic results, for a response that came through a proxy (http, https or
+  socks: the peer would be the proxy), and on wasm32
+- `NetPolicy::proxied` / `NetPolicy::with_proxied`: whether a request goes through a proxy.
+  The `Fetcher` sets it from `FetcherConfig::proxy`; a hand-built policy without it cannot
+  tell a proxy from the host, so it reports no peer at all
+
+### Changed
+
+- `CacheEntry` gained the public `peer_addr` field, so a `CacheEntry` struct literal outside
+  this crate must set it
 
 ## [0.9.0] - 2026-09-28
 
