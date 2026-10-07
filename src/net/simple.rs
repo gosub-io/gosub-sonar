@@ -79,7 +79,9 @@ pub struct SimpleOptions {
     pub headers: HeaderMap,
 
     /// `User-Agent` for the request. `None` sends [`DEFAULT_USER_AGENT`], as the
-    /// [`Fetcher`](crate::Fetcher) does. On wasm32 `None` leaves it to the browser.
+    /// [`Fetcher`](crate::Fetcher) does. On wasm32 `None` leaves it to the browser. Ignored if
+    /// [`headers`](SimpleOptions::headers) already carries a `User-Agent`, so a hand-written one
+    /// always wins, as with [`cookies`](SimpleOptions::cookies).
     pub user_agent: Option<String>,
 
     /// Cookies to send, in `Cookie` header format: `"name=value; name2=value2"`. Ignored if
@@ -166,10 +168,23 @@ impl SimpleOptions {
         self
     }
 
-    /// The headers actually sent: [`headers`](SimpleOptions::headers) plus a `Cookie` header
-    /// built from [`cookies`](SimpleOptions::cookies), unless one was set by hand.
+    /// The headers actually sent: [`headers`](SimpleOptions::headers) plus a `User-Agent` and a
+    /// `Cookie` header built from [`user_agent`](SimpleOptions::user_agent) and
+    /// [`cookies`](SimpleOptions::cookies), each unless one was set by hand.
     fn effective_headers(&self) -> Result<HeaderMap> {
         let mut headers = self.headers.clone();
+        if !headers.contains_key(header::USER_AGENT) {
+            #[cfg(not(target_arch = "wasm32"))]
+            let user_agent = Some(self.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT));
+            #[cfg(target_arch = "wasm32")]
+            let user_agent = self.user_agent.as_deref();
+            if let Some(user_agent) = user_agent {
+                let value = user_agent
+                    .parse()
+                    .with_context(|| format!("unusable User-Agent header value {user_agent:?}"))?;
+                headers.insert(header::USER_AGENT, value);
+            }
+        }
         if let Some(ref cookies) = self.cookies {
             if !headers.contains_key(header::COOKIE) {
                 let value = cookies
@@ -183,18 +198,14 @@ impl SimpleOptions {
 
     /// The one-shot client for this request.
     fn build_client(&self) -> Result<reqwest::Client> {
+        // The user agent travels in the default headers rather than through
+        // `ClientBuilder::user_agent`, which would overwrite one the caller set in `headers`.
         let b = reqwest::Client::builder().default_headers(self.effective_headers()?);
         // The browser's fetch() owns TLS, timeouts, redirects and proxying; reqwest's wasm
         // backend has headers and nothing else.
-        #[cfg(target_arch = "wasm32")]
-        let b = match self.user_agent {
-            Some(ref ua) => b.user_agent(ua),
-            None => b,
-        };
         #[cfg(not(target_arch = "wasm32"))]
         let b = self.proxy.apply(
             b.use_rustls_tls()
-                .user_agent(self.user_agent.as_deref().unwrap_or(DEFAULT_USER_AGENT))
                 .connect_timeout(self.connect_timeout)
                 .timeout(self.timeout)
                 .redirect(reqwest::redirect::Policy::custom(
@@ -587,6 +598,35 @@ mod tests {
                 .unwrap(),
             "explicit=1"
         );
+    }
+
+    /// A `User-Agent` set by hand is the caller being explicit; neither `user_agent` nor the
+    /// default may replace it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn sync_fetch_keeps_a_hand_written_user_agent() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let srv = rt.block_on(async {
+            TestServer::new()
+                .route("/ua", RouteConfig::echo_request_header("User-Agent"))
+                .start()
+                .await
+        });
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, "Explicit/1.0".parse().unwrap());
+        let resp = sync_fetch_with(
+            &srv.url("/ua"),
+            &SimpleOptions::default().with_headers(headers.clone()),
+        )
+        .unwrap();
+        assert_eq!(&resp.body[..], b"Explicit/1.0");
+
+        let opts = SimpleOptions::default()
+            .with_headers(headers)
+            .with_user_agent("Ignored/2.0");
+        let resp = sync_fetch_with(&srv.url("/ua"), &opts).unwrap();
+        assert_eq!(&resp.body[..], b"Explicit/1.0");
     }
 
     #[test]
