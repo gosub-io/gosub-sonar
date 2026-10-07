@@ -37,9 +37,9 @@ pub use net::referrer::ReferrerPolicy;
 pub use net::request_ref::RequestReference;
 pub use net::retry::RetryPolicy;
 pub use net::shared_body::{SharedBody, DEFAULT_REPLAY_LIMIT};
-pub use net::simple::simple_get;
+pub use net::simple::{simple_get, simple_get_with, SimpleOptions};
 #[cfg(not(target_arch = "wasm32"))]
-pub use net::simple::{sync_fetch, sync_get};
+pub use net::simple::{sync_fetch, sync_fetch_with, sync_get, sync_get_with};
 pub use net::tls::{
     Fingerprint, InMemoryTlsOverrideStore, TlsError, TlsErrorKind, TlsOverrideStore,
 };
