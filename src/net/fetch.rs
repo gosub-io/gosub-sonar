@@ -292,8 +292,9 @@ pub struct NetPolicy {
     pub proxy_for: Option<ProxyForFn>,
     /// Whether a request goes through a proxy (http, https or socks). A proxied response's
     /// connection peer is the proxy, so [`FetchResultMeta::peer_addr`] is `None` for it.
-    /// `None` (default): no request is proxied, which is right only for a client with no
-    /// proxy - the [`Fetcher`](crate::net::fetcher::Fetcher) always sets it. Set via
+    /// `None` (default): unknown, so no response reports a peer either - a client built with
+    /// reqwest's defaults reads proxies from the environment, and its peer may well be one.
+    /// The [`Fetcher`](crate::net::fetcher::Fetcher) always sets it. Set via
     /// [`NetPolicy::with_proxied`].
     #[cfg(not(target_arch = "wasm32"))]
     pub proxied: Option<ProxiedFn>,
@@ -1472,7 +1473,8 @@ impl HopResponse {
 }
 
 /// The peer `resp` was read from, as [`FetchResultMeta::peer_addr`] reports it: `None` when
-/// the request to `url` went through a proxy, whose address says nothing about the host's.
+/// the request to `url` went through a proxy, whose address says nothing about the host's, or
+/// when the policy cannot say whether it did.
 fn origin_peer(
     resp: &reqwest::Response,
     url: &Url,
@@ -1480,10 +1482,10 @@ fn origin_peer(
 ) -> Option<std::net::SocketAddr> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if policy.proxied.as_ref().is_some_and(|proxied| proxied(url)) {
-            return None;
+        match policy.proxied {
+            Some(ref proxied) if !proxied(url) => resp.remote_addr(),
+            _ => None,
         }
-        resp.remote_addr()
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -5451,6 +5453,11 @@ mod tests {
         (NetPolicy::default().with_cache(Some(cache.clone())), cache)
     }
 
+    /// A policy that knows the test client connects straight to the host.
+    fn direct() -> NetPolicy {
+        NetPolicy::default().with_proxied(Box::new(|_| false))
+    }
+
     /// Fetch `path` through the policy, returning the metadata and body.
     async fn cache_fetch(
         srv: &crate::net::test_support::TestServerHandle,
@@ -5627,8 +5634,9 @@ mod tests {
             .start()
             .await;
         let peer = Some(srv.socket_addr());
-        let (policy, cache) = caching_policy();
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
 
+        let policy = direct().with_cache(Some(cache.clone()));
         let (meta, _) =
             cache_fetch(&srv, "/fresh", RequestInit::default(), policy, observer()).await;
         assert!(!meta.from_cache);
@@ -5642,7 +5650,7 @@ mod tests {
 
         // Stored, then confirmed by a 304: the confirming connection's peer.
         for _ in 0..2 {
-            let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+            let policy = direct().with_cache(Some(cache.clone()));
             let (meta, _) =
                 cache_fetch(&srv, "/stale", RequestInit::default(), policy, observer()).await;
             assert_eq!(meta.peer_addr, peer);
@@ -5656,6 +5664,17 @@ mod tests {
         let (meta, _) =
             cache_fetch(&srv, "/fresh", RequestInit::default(), proxied, observer()).await;
         assert!(!meta.from_cache);
+        assert_eq!(meta.peer_addr, None);
+
+        // A policy that cannot say whether the client was proxied reports no address either.
+        let (meta, _) = cache_fetch(
+            &srv,
+            "/fresh",
+            RequestInit::default(),
+            NetPolicy::default(),
+            observer(),
+        )
+        .await;
         assert_eq!(meta.peer_addr, None);
     }
 

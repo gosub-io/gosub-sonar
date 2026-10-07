@@ -26,8 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `None` for synthetic results, for a response that came through a proxy (http, https or
   socks: the peer would be the proxy), and on wasm32
 - `NetPolicy::proxied` / `NetPolicy::with_proxied`: whether a request goes through a proxy.
-  The `Fetcher` sets it from `FetcherConfig::proxy`; a hand-built policy without it reports
-  every peer as the host's
+  The `Fetcher` sets it from `FetcherConfig::proxy`; a hand-built policy without it cannot
+  tell a proxy from the host, so it reports no peer at all
 
 ### Changed
 
