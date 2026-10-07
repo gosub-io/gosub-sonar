@@ -273,7 +273,9 @@ pub async fn simple_get_with(url: &Url, opts: &SimpleOptions) -> Result<Bytes> {
             let file = tokio::fs::File::open(&path).await?;
             require_regular_file(&file.metadata().await?)?;
             let mut body = Vec::new();
-            file.take(max_body + 1).read_to_end(&mut body).await?;
+            file.take(max_body.saturating_add(1))
+                .read_to_end(&mut body)
+                .await?;
             if body.len() as u64 > max_body {
                 anyhow::bail!("file too large (exceeds {} bytes)", max_body);
             }
@@ -381,7 +383,8 @@ fn do_sync_fetch(url: Url, opts: SimpleOptions) -> Result<Response> {
         let file = std::fs::File::open(&path)?;
         require_regular_file(&file.metadata()?)?;
         let mut body = Vec::new();
-        file.take(max_body + 1).read_to_end(&mut body)?;
+        file.take(max_body.saturating_add(1))
+            .read_to_end(&mut body)?;
         if body.len() as u64 > max_body {
             anyhow::bail!("File too large (> {} bytes)", max_body);
         }
@@ -627,6 +630,22 @@ mod tests {
             .with_user_agent("Ignored/2.0");
         let resp = sync_fetch_with(&srv.url("/ua"), &opts).unwrap();
         assert_eq!(&resp.body[..], b"Explicit/1.0");
+    }
+
+    /// `u64::MAX` is how a caller says "no cap"; the read limit must not wrap to zero.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_reads_take_an_unbounded_cap() {
+        use std::io::Write;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"file content").unwrap();
+        let url = Url::from_file_path(f.path()).unwrap();
+        let opts = SimpleOptions::default().with_max_body(u64::MAX);
+
+        let bytes = simple_get_with(&url, &opts).await.unwrap();
+        assert_eq!(&bytes[..], b"file content");
+        let resp = sync_fetch_with(&url, &opts).unwrap();
+        assert_eq!(&resp.body[..], b"file content");
     }
 
     #[test]
