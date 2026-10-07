@@ -227,17 +227,30 @@ impl ProxyRule {
     /// Match `dst` with `hyper_util`'s matcher, as `reqwest::Proxy` does. Socks proxies are
     /// filtered out: they authenticate in their own handshake and send no header.
     fn intercept(&self, proxy_url: Url, dst: &http::Uri) -> Option<proxy_matcher::Intercept> {
+        let intercept = self.intercept_any(proxy_url, dst)?;
+        matches!(intercept.uri().scheme_str(), Some("http") | Some("https")).then_some(intercept)
+    }
+
+    /// Whether this rule sends a request to `dst` through its proxy, of any kind.
+    fn routes(&self, dst: &http::Uri) -> bool {
+        Url::parse(&self.url)
+            .ok()
+            .and_then(|proxy_url| self.intercept_any(proxy_url, dst))
+            .is_some()
+    }
+
+    /// [`intercept`](Self::intercept) without the filter: socks proxies match too.
+    fn intercept_any(&self, proxy_url: Url, dst: &http::Uri) -> Option<proxy_matcher::Intercept> {
         let builder = proxy_matcher::Matcher::builder();
         let builder = match self.scope {
             ProxyScope::Http => builder.http(proxy_url.to_string()),
             ProxyScope::Https => builder.https(proxy_url.to_string()),
             ProxyScope::All => builder.all(proxy_url.to_string()),
         };
-        let intercept = builder
+        builder
             .no(self.no_proxy.clone().unwrap_or_default())
             .build()
-            .intercept(dst)?;
-        matches!(intercept.uri().scheme_str(), Some("http") | Some("https")).then_some(intercept)
+            .intercept(dst)
     }
 }
 
@@ -325,6 +338,24 @@ impl ProxyConfig {
         }
     }
 
+    /// Whether a request to `url` goes through a proxy (http, https or socks) rather than
+    /// straight to the host. A URL the matcher cannot take counts as proxied: the answer
+    /// decides whether the connection's peer is the host's address, and "unknown" must not
+    /// pass for "yes". [`ProxyConfig::System`] is answered from the environment with the
+    /// client's own matcher.
+    pub(crate) fn routes_through_proxy(&self, url: &Url) -> bool {
+        let Ok(dst) = url.as_str().parse::<http::Uri>() else {
+            return true;
+        };
+        match *self {
+            ProxyConfig::Rules(ref rules) => rules.iter().any(|rule| rule.routes(&dst)),
+            ProxyConfig::System => proxy_matcher::Matcher::from_system()
+                .intercept(&dst)
+                .is_some(),
+            ProxyConfig::Disabled => false,
+        }
+    }
+
     /// Apply this configuration to a client builder.
     ///
     /// [`ProxyConfig::System`] leaves the builder untouched, since reading the environment is
@@ -353,6 +384,26 @@ impl ProxyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every kind of proxy counts, socks included (a local Tor is the case that matters: its
+    /// address is loopback whatever the host's is), and a bypassed host does not.
+    #[test]
+    fn routes_through_proxy_covers_socks_and_honours_the_bypass_list() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        let socks = ProxyConfig::Rules(vec![ProxyRule::all("socks5h://127.0.0.1:9050")]);
+        assert!(socks.routes_through_proxy(&url("https://example.com/")));
+        assert!(socks.routes_through_proxy(&url("http://example.com/")));
+
+        let http_only = ProxyConfig::Rules(vec![
+            ProxyRule::http("http://127.0.0.1:3128").bypassing("intranet.test")
+        ]);
+        assert!(http_only.routes_through_proxy(&url("http://example.com/")));
+        assert!(!http_only.routes_through_proxy(&url("https://example.com/")));
+        assert!(!http_only.routes_through_proxy(&url("http://intranet.test/")));
+
+        assert!(!ProxyConfig::Disabled.routes_through_proxy(&url("http://example.com/")));
+        assert!(!ProxyConfig::Rules(vec![]).routes_through_proxy(&url("http://example.com/")));
+    }
 
     #[test]
     fn builders_set_scope_and_extras() {

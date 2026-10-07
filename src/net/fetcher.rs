@@ -1054,9 +1054,11 @@ fn build_policy(
         // configuration put there.
         let proxy = cfg.proxy.clone();
         let proxy_for = cfg.proxy.clone();
+        let proxied = cfg.proxy.clone();
         let policy = policy
             .with_proxy_authorization(Box::new(move |url| proxy.proxy_authorization(url)))
             .with_proxy_for(Box::new(move |url| proxy_for.plain_http_proxy(url)))
+            .with_proxied(Box::new(move |url| proxied.routes_through_proxy(url)))
             .with_dns_resolver(cfg.dns_resolver.clone())
             .with_hsts(cfg.hsts.clone())
             .with_tls_overrides(cfg.tls_overrides.clone())
