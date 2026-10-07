@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Headers, `User-Agent`, and cookies in the simple API: `SimpleOptions` plus `simple_get_with`,
+  `sync_get_with`, and `sync_fetch_with`. It carries `headers`, `user_agent` (`None` still
+  sends `DEFAULT_USER_AGENT`), `cookies` (a `Cookie` header value; a hand-written `Cookie` in
+  `headers` wins), `connect_timeout`, `timeout`, `max_body`, and `proxy`. `simple_get`,
+  `sync_get`, and `sync_fetch` are unchanged and delegate to the `_with` forms with
+  `SimpleOptions::default()`. Redirect limits, the https-to-http refusal and the regular-file
+  check apply to the `_with` forms too. Still one-shot: a client per call, no connection reuse
+  and no cookie jar between calls - use `Fetcher` for those
+- `SimpleOptions::max_body` makes the 10 MiB body cap configurable, and applies it to `file:`
+  reads and `sync_fetch`, which kept their own copy of the limit
+
 ## [0.9.0] - 2026-09-28
 
 ### Added
