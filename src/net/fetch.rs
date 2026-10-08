@@ -204,6 +204,10 @@ pub type ProxyAuthorizationFn = Box<dyn Fn(&Url) -> Option<http::HeaderValue> + 
 #[cfg(not(target_arch = "wasm32"))]
 pub type ProxyForFn = Box<dyn Fn(&Url) -> Option<Url> + Send + Sync>;
 
+/// Callback type saying whether a request goes through a proxy of any kind.
+#[cfg(not(target_arch = "wasm32"))]
+pub type ProxiedFn = Box<dyn Fn(&Url) -> bool + Send + Sync>;
+
 /// Network-level request policies threaded through the fetch stack.
 ///
 /// Bundles the URL allowlist check and the cookie-jar query so both can be applied at
@@ -286,6 +290,14 @@ pub struct NetPolicy {
     /// is. `None` (default): no hop is proxied. Set via [`NetPolicy::with_proxy_for`].
     #[cfg(not(target_arch = "wasm32"))]
     pub proxy_for: Option<ProxyForFn>,
+    /// Whether a request goes through a proxy (http, https or socks). A proxied response's
+    /// connection peer is the proxy, so [`FetchResultMeta::peer_addr`] is `None` for it.
+    /// `None` (default): unknown, so no response reports a peer either - a client built with
+    /// reqwest's defaults reads proxies from the environment, and its peer may well be one.
+    /// The [`Fetcher`](crate::net::fetcher::Fetcher) always sets it. Set via
+    /// [`NetPolicy::with_proxied`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub proxied: Option<ProxiedFn>,
     /// The resolver a hop with an IP-literal host is checked against; see
     /// [`dns`](mod@crate::net::dns). `None` skips the check. Set via
     /// [`NetPolicy::with_dns_resolver`].
@@ -316,6 +328,8 @@ impl Default for NetPolicy {
             proxy_authorization: None,
             #[cfg(not(target_arch = "wasm32"))]
             proxy_for: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            proxied: None,
             #[cfg(not(target_arch = "wasm32"))]
             dns_resolver: None,
         }
@@ -353,6 +367,8 @@ impl NetPolicy {
             #[cfg(not(target_arch = "wasm32"))]
             proxy_for: None,
             #[cfg(not(target_arch = "wasm32"))]
+            proxied: None,
+            #[cfg(not(target_arch = "wasm32"))]
             dns_resolver: None,
         }
     }
@@ -378,6 +394,13 @@ impl NetPolicy {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_proxy_for(mut self, f: ProxyForFn) -> Self {
         self.proxy_for = Some(f);
+        self
+    }
+
+    /// Attaches the callback for [`NetPolicy::proxied`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_proxied(mut self, f: ProxiedFn) -> Self {
+        self.proxied = Some(f);
         self
     }
 
@@ -795,6 +818,7 @@ async fn fetch_response_top_inner(
         response,
         url: final_url,
         tainting,
+        peer_addr,
         #[cfg(not(target_arch = "wasm32"))]
         store,
     } = outcome;
@@ -823,6 +847,7 @@ async fn fetch_response_top_inner(
                     .map(|s| s.to_string()),
                 has_body: !entry.body.is_empty(),
                 from_cache: true,
+                peer_addr,
             };
             let rest = BytesAsyncReader {
                 data: entry.body.slice(peek_len..),
@@ -872,6 +897,7 @@ async fn fetch_response_top_inner(
             .map(|s| s.to_string()),
         has_body: true, // Don't know yet
         from_cache: false,
+        peer_addr,
     };
 
     // Peek the stream up to PEEK_MAX bytes. A body that stops part way is a transport failure,
@@ -1446,6 +1472,28 @@ impl HopResponse {
     }
 }
 
+/// The peer `resp` was read from, as [`FetchResultMeta::peer_addr`] reports it: `None` when
+/// the request to `url` went through a proxy, whose address says nothing about the host's, or
+/// when the policy cannot say whether it did.
+fn origin_peer(
+    resp: &reqwest::Response,
+    url: &Url,
+    policy: &NetPolicy,
+) -> Option<std::net::SocketAddr> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        match policy.proxied {
+            Some(ref proxied) if !proxied(url) => resp.remote_addr(),
+            _ => None,
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (resp, url, policy);
+        None
+    }
+}
+
 /// A storable response whose body has not been read yet.
 ///
 /// `get_with_redirects` decides whether a response may be cached from its headers, but the body
@@ -1462,6 +1510,7 @@ pub(crate) struct PendingStore {
     decoded: bool,
     requested_at: chrono::DateTime<chrono::Utc>,
     received_at: chrono::DateTime<chrono::Utc>,
+    peer_addr: Option<std::net::SocketAddr>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1473,7 +1522,7 @@ impl PendingStore {
 
     /// Write the response to the cache now that its body is complete.
     pub(crate) fn commit(self, body: Bytes, observer: &Arc<dyn NetObserver + Send + Sync>) {
-        let entry = cache::entry_from_response(
+        let mut entry = cache::entry_from_response(
             self.status,
             &self.response_headers,
             &self.request_headers,
@@ -1482,6 +1531,7 @@ impl PendingStore {
             self.requested_at,
             self.received_at,
         );
+        entry.peer_addr = self.peer_addr;
         self.cache.put(self.key, Arc::new(entry));
         observer.on_event(NetEvent::Cache {
             url: self.url,
@@ -1498,6 +1548,8 @@ pub(crate) struct ChainOutcome {
     pub(crate) url: Url,
     /// Response tainting of the chain — see [`cors`](mod@crate::net::cors).
     pub(crate) tainting: ResponseTainting,
+    /// Where that response came from — see [`FetchResultMeta::peer_addr`].
+    pub(crate) peer_addr: Option<std::net::SocketAddr>,
     /// Set when that response may be cached once its body has been read.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) store: Option<PendingStore>,
@@ -2159,11 +2211,11 @@ async fn get_with_redirects(
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ref entry) = revalidating {
                     if resp.status().as_u16() == 304 {
-                        let updated = Arc::new(entry.updated_by_304(
-                            resp.headers(),
-                            requested_at,
-                            received_at,
-                        ));
+                        let mut updated =
+                            entry.updated_by_304(resp.headers(), requested_at, received_at);
+                        // The connection that confirmed the entry is where it now comes from.
+                        updated.peer_addr = origin_peer(&resp, &url, &policy);
+                        let updated = Arc::new(updated);
                         if let Some(ref cache) = policy.cache {
                             cache.put(CacheKey::new(&current_method, &url), updated.clone());
                         }
@@ -2279,6 +2331,11 @@ async fn get_with_redirects(
             }
         }
 
+        let peer_addr = match &hop {
+            HopResponse::Network(resp) => origin_peer(resp, &url, &policy),
+            HopResponse::Cached(entry) => entry.peer_addr,
+        };
+
         // Whether this response may be stored. The body is not here yet: a redirect has none
         // worth keeping and is stored right away, while the final response's write waits for the
         // reader of its body.
@@ -2305,6 +2362,7 @@ async fn get_with_redirects(
                     decoded: init.auto_decode,
                     requested_at,
                     received_at,
+                    peer_addr,
                 })
             }
             _ => None,
@@ -2318,6 +2376,7 @@ async fn get_with_redirects(
                 response: hop,
                 url: url.clone(),
                 tainting,
+                peer_addr,
                 #[cfg(not(target_arch = "wasm32"))]
                 store: pending_store,
             });
@@ -5394,6 +5453,11 @@ mod tests {
         (NetPolicy::default().with_cache(Some(cache.clone())), cache)
     }
 
+    /// A policy that knows the test client connects straight to the host.
+    fn direct() -> NetPolicy {
+        NetPolicy::default().with_proxied(Box::new(|_| false))
+    }
+
     /// Fetch `path` through the policy, returning the metadata and body.
     async fn cache_fetch(
         srv: &crate::net::test_support::TestServerHandle,
@@ -5550,6 +5614,68 @@ mod tests {
         assert!(meta.from_cache);
         assert_eq!(&body[..], b"original");
         assert_eq!(rec.cache_outcomes(), vec![CacheOutcome::Validated]);
+    }
+
+    /// A response reports the peer it was read from, and a cache hit the peer its entry was
+    /// stored from, so the address cannot be answered afresh by DNS when the entry is used.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_peer_address_is_reported_and_kept_with_the_cache_entry() {
+        let srv = TestServer::new()
+            .route(
+                "/fresh",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(60, b"v1".to_vec())),
+            )
+            .route(
+                "/stale",
+                RouteConfig::Cacheable(
+                    CacheRouteOptions::max_age(0, b"original".to_vec()).with_etag("\"v1\""),
+                ),
+            )
+            .start()
+            .await;
+        let peer = Some(srv.socket_addr());
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+
+        let policy = direct().with_cache(Some(cache.clone()));
+        let (meta, _) =
+            cache_fetch(&srv, "/fresh", RequestInit::default(), policy, observer()).await;
+        assert!(!meta.from_cache);
+        assert_eq!(meta.peer_addr, peer);
+
+        let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+        let (meta, _) =
+            cache_fetch(&srv, "/fresh", RequestInit::default(), policy, observer()).await;
+        assert!(meta.from_cache);
+        assert_eq!(meta.peer_addr, peer);
+
+        // Stored, then confirmed by a 304: the confirming connection's peer.
+        for _ in 0..2 {
+            let policy = direct().with_cache(Some(cache.clone()));
+            let (meta, _) =
+                cache_fetch(&srv, "/stale", RequestInit::default(), policy, observer()).await;
+            assert_eq!(meta.peer_addr, peer);
+        }
+        assert_eq!(srv.hit_count("/stale"), 2);
+
+        assert_eq!(FetchResultMeta::synthetic(srv.url("/x")).peer_addr, None);
+
+        // Through a proxy the peer is the proxy, not the host: no address at all.
+        let proxied = NetPolicy::default().with_proxied(Box::new(|_| true));
+        let (meta, _) =
+            cache_fetch(&srv, "/fresh", RequestInit::default(), proxied, observer()).await;
+        assert!(!meta.from_cache);
+        assert_eq!(meta.peer_addr, None);
+
+        // A policy that cannot say whether the client was proxied reports no address either.
+        let (meta, _) = cache_fetch(
+            &srv,
+            "/fresh",
+            RequestInit::default(),
+            NetPolicy::default(),
+            observer(),
+        )
+        .await;
+        assert_eq!(meta.peer_addr, None);
     }
 
     /// A stale entry the server cannot confirm is refetched, and the fresh response takes its
