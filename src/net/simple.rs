@@ -42,9 +42,16 @@ const MAX_SIMPLE_REDIRECTS: usize = 10;
 
 /// Whether a redirect from `previous` (every hop so far) to `next` is followed.
 #[cfg(not(target_arch = "wasm32"))]
-fn allow_redirect(previous: &[Url], next: &Url) -> Result<(), &'static str> {
+fn allow_redirect(
+    previous: &[Url],
+    next: &Url,
+    allowed_bad_ports: &[u16],
+) -> Result<(), &'static str> {
     if previous.len() >= MAX_SIMPLE_REDIRECTS {
         return Err("too many redirects");
+    }
+    if crate::net::port_blocking::should_block(next, allowed_bad_ports) {
+        return Err("redirect to a bad port refused");
     }
     match next.scheme() {
         "https" => Ok(()),
@@ -106,6 +113,11 @@ pub struct SimpleOptions {
     /// Native-only: on wasm32 the browser's `fetch()` uses the user's own proxy settings.
     #[cfg(not(target_arch = "wasm32"))]
     pub proxy: ProxyConfig,
+
+    /// Bad ports to fetch from anyway, as
+    /// [`FetcherConfig::allowed_bad_ports`](crate::net::fetcher::FetcherConfig::allowed_bad_ports).
+    /// Empty by default: every bad port is refused, redirects included.
+    pub allowed_bad_ports: Vec<u16>,
 }
 
 impl Default for SimpleOptions {
@@ -119,6 +131,7 @@ impl Default for SimpleOptions {
             max_body: MAX_SIMPLE_BODY,
             #[cfg(not(target_arch = "wasm32"))]
             proxy: ProxyConfig::default(),
+            allowed_bad_ports: Vec::new(),
         }
     }
 }
@@ -157,6 +170,13 @@ impl SimpleOptions {
     #[must_use]
     pub fn with_max_body(mut self, max_body: u64) -> Self {
         self.max_body = max_body;
+        self
+    }
+
+    /// Fetch from these bad ports anyway - see
+    /// [`allowed_bad_ports`](SimpleOptions::allowed_bad_ports).
+    pub fn with_allowed_bad_ports(mut self, ports: Vec<u16>) -> Self {
+        self.allowed_bad_ports = ports;
         self
     }
 
@@ -204,12 +224,18 @@ impl SimpleOptions {
         // The browser's fetch() owns TLS, timeouts, redirects and proxying; reqwest's wasm
         // backend has headers and nothing else.
         #[cfg(not(target_arch = "wasm32"))]
+        let allowed_bad_ports = self.allowed_bad_ports.clone();
+        #[cfg(not(target_arch = "wasm32"))]
         let b = self.proxy.apply(
             b.use_rustls_tls()
                 .connect_timeout(self.connect_timeout)
                 .timeout(self.timeout)
                 .redirect(reqwest::redirect::Policy::custom(
-                    |attempt| match allow_redirect(attempt.previous(), attempt.url()) {
+                    move |attempt| match allow_redirect(
+                        attempt.previous(),
+                        attempt.url(),
+                        &allowed_bad_ports,
+                    ) {
                         Ok(()) => attempt.follow(),
                         Err(why) => attempt.error(why),
                     },
@@ -217,6 +243,15 @@ impl SimpleOptions {
         )?;
         Ok(b.build()?)
     }
+}
+
+/// Fail for a URL on a bad port; see [`port_blocking`](crate::net::port_blocking). Redirects are
+/// checked by [`allow_redirect`]. On wasm32 the browser's fetch() blocks them itself.
+fn refuse_bad_port(url: &Url, allowed_bad_ports: &[u16]) -> Result<()> {
+    if crate::net::port_blocking::should_block(url, allowed_bad_ports) {
+        anyhow::bail!("refusing to fetch {url}: bad port");
+    }
+    Ok(())
 }
 
 /// Fail for anything but a regular file: a FIFO or device has no end to read to.
@@ -282,6 +317,7 @@ pub async fn simple_get_with(url: &Url, opts: &SimpleOptions) -> Result<Bytes> {
             Ok(Bytes::from(body))
         }
         "http" | "https" => {
+            refuse_bad_port(url, &opts.allowed_bad_ports)?;
             let client = opts.build_client()?;
             let resp = client.get(url.as_str()).send().await?;
             let status = resp.status();
@@ -397,6 +433,7 @@ fn do_sync_fetch(url: Url, opts: SimpleOptions) -> Result<Response> {
         .map_err(|e| anyhow::anyhow!("tokio runtime: {e}"))?;
 
     rt.block_on(async move {
+        refuse_bad_port(&url, &opts.allowed_bad_ports)?;
         let client = opts.build_client()?;
         let resp = client.get(url.as_str()).send().await?;
 
@@ -473,17 +510,23 @@ mod tests {
     #[test]
     fn redirects_are_limited_and_never_downgrade() {
         let u = |s: &str| Url::parse(s).unwrap();
-        assert!(allow_redirect(&[u("http://a.test/")], &u("http://b.test/")).is_ok());
-        assert!(allow_redirect(&[u("http://a.test/")], &u("https://b.test/")).is_ok());
-        assert!(allow_redirect(&[u("https://a.test/")], &u("http://b.test/")).is_err());
+        assert!(allow_redirect(&[u("http://a.test/")], &u("http://b.test/"), &[]).is_ok());
+        assert!(allow_redirect(&[u("http://a.test/")], &u("https://b.test/"), &[]).is_ok());
+        assert!(allow_redirect(&[u("https://a.test/")], &u("http://b.test/"), &[]).is_err());
         assert!(allow_redirect(
             &[u("https://a.test/"), u("http://b.test/")],
-            &u("http://c.test/")
+            &u("http://c.test/"),
+            &[]
         )
         .is_err());
-        assert!(allow_redirect(&[u("http://a.test/")], &u("ftp://b.test/")).is_err());
+        assert!(allow_redirect(&[u("http://a.test/")], &u("ftp://b.test/"), &[]).is_err());
+        assert!(allow_redirect(&[u("http://a.test/")], &u("http://b.test:25/"), &[]).is_err());
+        assert!(refuse_bad_port(&u("http://b.test:6667/"), &[]).is_err());
+        assert!(refuse_bad_port(&u("http://b.test:8080/"), &[]).is_ok());
+        assert!(allow_redirect(&[u("http://a.test/")], &u("http://b.test:25/"), &[25]).is_ok());
+        assert!(refuse_bad_port(&u("http://b.test:6667/"), &[6667]).is_ok());
         let ten = vec![u("http://a.test/"); MAX_SIMPLE_REDIRECTS];
-        assert!(allow_redirect(&ten, &u("http://b.test/")).is_err());
+        assert!(allow_redirect(&ten, &u("http://b.test/"), &[]).is_err());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

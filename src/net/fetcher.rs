@@ -145,6 +145,12 @@ pub struct FetcherConfig {
     /// [`FetchRequest::mixed_content`]. See [`mixed_content`](mod@crate::net::mixed_content).
     pub mixed_content: MixedContentPolicy,
 
+    /// Bad ports (see [`port_blocking`](mod@crate::net::port_blocking)) to fetch from anyway.
+    /// Empty by default: every bad port is refused. For an embedder that lets its user reach
+    /// a named service, as browsers do; a list rather than a switch, so allowing one port
+    /// never opens the rest.
+    pub allowed_bad_ports: Vec<u16>,
+
     /// Cache of CORS preflight grants, consulted before sending a preflight `OPTIONS` and
     /// updated from its response.
     ///
@@ -234,6 +240,7 @@ impl Default for FetcherConfig {
             #[cfg(not(target_arch = "wasm32"))]
             tls_overrides: None,
             mixed_content: MixedContentPolicy::default(),
+            allowed_bad_ports: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             cors_preflight_cache: Some(Arc::new(InMemoryPreflightCache::new())),
             credentials: Some(Arc::new(InMemoryCredentialStore::new())),
@@ -649,6 +656,7 @@ impl Fetcher {
                 &req.url,
                 effective_mixed_content(&req, &self.cfg),
                 req.origin.as_ref(),
+                &self.cfg.allowed_bad_ports,
                 &|u| self.ctx.is_url_allowed(u),
             ) {
                 HopCheck::Reject(reason) => Some(reason),
@@ -1072,6 +1080,7 @@ fn build_policy(
         .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)))
         .with_protocol_hint(Box::new(move |url| hint_origins.speaks_h2(url)))
         .with_credential_store(cfg.credentials.clone())
+        .with_allowed_bad_ports(cfg.allowed_bad_ports.clone())
         // The same user agent `build_client` puts on the client. Passed along only so
         // `NetEvent::RequestSent` can report it: reqwest merges a client default when the
         // request is executed and never exposes it for reading, so without this an observer
@@ -1552,7 +1561,14 @@ mod tests {
         let f = fetcher.clone();
         tokio::spawn(async move { f.run(shutdown.clone()).await });
 
-        let (req, handle) = make_req(Url::parse("http://127.0.0.1:1/").unwrap(), Priority::Normal);
+        let (req, handle) = make_req(
+            Url::parse(&format!(
+                "http://127.0.0.1:{}/",
+                crate::net::test_support::closed_port()
+            ))
+            .unwrap(),
+            Priority::Normal,
+        );
         let (tx, rx) = oneshot::channel();
         fetcher.submit(req, handle, tx).await;
 
@@ -2895,7 +2911,15 @@ mod tests {
         };
         let (result, log) = fetch_recorded_within(
             cfg,
-            make_req(Url::parse("http://127.0.0.1:1/").unwrap(), Priority::Normal).0,
+            make_req(
+                Url::parse(&format!(
+                    "http://127.0.0.1:{}/",
+                    crate::net::test_support::closed_port()
+                ))
+                .unwrap(),
+                Priority::Normal,
+            )
+            .0,
             Duration::from_secs(90),
         )
         .await;
