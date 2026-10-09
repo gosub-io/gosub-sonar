@@ -575,7 +575,7 @@ impl Fetcher {
             // the same coalescing bucket instead of needlessly splitting.
             req.mixed_content = Some(effective_mixed_content(&req, &self.cfg));
 
-            let key_opt = req.generate_request_key();
+            let key_opt = req.request_key(&self.ctx.cookie_jar_key(req.reference));
             let key_str = {
                 let base = match key_opt {
                     Some(k) => k,
@@ -1064,10 +1064,12 @@ impl OriginTable {
 }
 
 /// Build the `NetPolicy` for a fetcher request: context hooks, HSTS, CORS preflight cache and
-/// the protocol sink that updates the per-origin limits. On wasm32 the sink is never called
+/// the protocol sink that updates the per-origin limits. The cookie hooks are asked on behalf of
+/// `req`'s reference. On wasm32 the sink is never called
 /// (reqwest's wasm Response has no version), so origins stay at the h1 limit there; the browser
 /// does the actual connection management anyway.
 fn build_policy(
+    req: &FetchRequest,
     cfg: &FetcherConfig,
     ctx: &Arc<dyn FetcherContext>,
     origins: Arc<OriginTable>,
@@ -1076,7 +1078,7 @@ fn build_policy(
     #[cfg(target_arch = "wasm32")]
     let _ = built;
     let hint_origins = origins.clone();
-    let policy = NetPolicy::from_context(ctx)
+    let policy = NetPolicy::from_context(ctx, req.reference)
         .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)))
         .with_protocol_hint(Box::new(move |url| hint_origins.speaks_h2(url)))
         .with_credential_store(cfg.credentials.clone())
@@ -1149,7 +1151,7 @@ async fn perform_streaming(
                 make_request_init(req, cfg),
                 cancel.clone(),
                 observer.clone(),
-                build_policy(cfg, &ctx, origins.clone(), &built),
+                build_policy(req, cfg, &ctx, origins.clone(), &built),
             )
         },
         |top| (top.meta.status, &top.meta.headers),
@@ -1209,7 +1211,7 @@ async fn perform_buffered(
                 req.max_bytes.or(cfg.max_body_bytes),
                 effective_read_idle_timeout(req, cfg),
                 effective_total_body_timeout(req, cfg),
-                build_policy(cfg, &ctx, origins.clone(), &built),
+                build_policy(req, cfg, &ctx, origins.clone(), &built),
             )
         },
         |(meta, _)| (meta.status, &meta.headers),
@@ -4021,5 +4023,91 @@ mod tests {
             err.to_string().contains("not a url"),
             "error should name the offending proxy URL, got: {err}"
         );
+    }
+
+    /// A jar per reference, the way a browser keeps one per tab or profile.
+    #[derive(Default)]
+    struct JarPerReference {
+        jars: parking_lot::Mutex<std::collections::HashMap<RequestReference, Vec<String>>>,
+    }
+
+    impl FetcherContext for JarPerReference {
+        fn observer_for(
+            &self,
+            _: RequestReference,
+            _: RequestId,
+            _: ResourceKind,
+            _: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            Arc::new(crate::net::null_emitter::NullEmitter)
+        }
+        fn on_ref_active(&self, _: RequestReference) {}
+        fn on_ref_done(&self, _: RequestReference) {}
+        fn cookies_for(&self, reference: RequestReference, _url: &Url) -> Option<String> {
+            let jars = self.jars.lock();
+            let jar = jars.get(&reference).filter(|jar| !jar.is_empty())?;
+            Some(jar.join("; "))
+        }
+        fn on_cookies_received(&self, reference: RequestReference, _url: &Url, values: &[&str]) {
+            let mut jars = self.jars.lock();
+            for v in values {
+                let pair = v.split(';').next().unwrap_or(v).trim().to_string();
+                jars.entry(reference).or_default().push(pair);
+            }
+        }
+    }
+
+    /// The cookie hooks are asked on the request's behalf: a cookie a redirect hop sets lands in
+    /// that request's jar and rides on its next hop, and another reference's request neither
+    /// sees it nor adds to that jar.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cookie_hooks_are_asked_for_the_requests_reference() {
+        let srv = TestServer::new()
+            .route(
+                "/login",
+                RouteConfig::redirect_with_cookie("/echo", "sid=1; Path=/"),
+            )
+            .route("/echo", RouteConfig::echo_cookie_header())
+            .start()
+            .await;
+        let ctx = Arc::new(JarPerReference::default());
+        let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let f = fetcher.clone();
+        let s = shutdown.clone();
+        tokio::spawn(async move { f.run(s).await });
+
+        let body_for = |reference: RequestReference, path: &str| {
+            let req = FetchRequest::builder(Method::GET, srv.url(path))
+                .with_reference(reference)
+                .build();
+            let fetcher = fetcher.clone();
+            async move {
+                match fetcher.fetch(req).await {
+                    FetchResult::Buffered { body, .. } => String::from_utf8(body.to_vec()).unwrap(),
+                    other => panic!("expected Buffered, got {other:?}"),
+                }
+            }
+        };
+
+        let logged_in = RequestReference::Tagged(1);
+        let other = RequestReference::Tagged(2);
+        assert_eq!(
+            body_for(logged_in, "/login").await,
+            "sid=1",
+            "the hop's cookie rides on the next hop"
+        );
+        assert_eq!(
+            body_for(other, "/echo").await,
+            "",
+            "another reference's jar is empty"
+        );
+        assert_eq!(body_for(logged_in, "/echo").await, "sid=1");
+
+        let jars = ctx.jars.lock();
+        assert_eq!(jars.get(&logged_in), Some(&vec!["sid=1".to_string()]));
+        assert_eq!(jars.get(&other), None);
+        drop(jars);
+        shutdown.cancel();
     }
 }

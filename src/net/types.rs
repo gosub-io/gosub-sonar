@@ -803,7 +803,19 @@ impl FetchRequest {
     /// share one response. Covers the method, URL, every header, the body and the size cap,
     /// plus the request fields that change what a hop sends or accepts. `None` for a request
     /// that must not be coalesced: a method other than GET/HEAD, or a streamed body.
+    ///
+    /// While cookies may ride along, requests with different references never share a key:
+    /// the fetcher keys on the context's [`FetcherContext::cookie_jar_key`] instead, which lets
+    /// references that use one jar share again.
+    ///
+    /// [`FetcherContext::cookie_jar_key`]: crate::net::fetcher_context::FetcherContext::cookie_jar_key
     pub fn generate_request_key(&self) -> Option<String> {
+        self.request_key(&self.reference.to_string())
+    }
+
+    /// [`generate_request_key`](Self::generate_request_key) with `jar` naming whose cookies the
+    /// request gets: two requests that may carry cookies share a key only on the same `jar`.
+    pub(crate) fn request_key(&self, jar: &str) -> Option<String> {
         match self.method {
             Method::GET | Method::HEAD => {}
             _ => return None,
@@ -965,10 +977,16 @@ impl FetchRequest {
         // The credentials mode decides whether the jar's cookies are attached on each hop —
         // after the Cookie hash above is computed — so requests that differ on it must not
         // share a response. It also varies the CORS verdict (wildcard vs credentialed rules).
+        // When cookies may ride along, the jar is part of it too: the context's jar is asked on
+        // the reference's behalf, so two references can hold different cookies for the same URL,
+        // and one must not be handed the response the other's cookies bought.
         let credentials = match self.credentials {
-            RequestCredentials::Omit => "omit",
-            RequestCredentials::SameOrigin => "same-origin",
-            RequestCredentials::Include => "include",
+            RequestCredentials::Omit => "omit".to_string(),
+            // Hashed: the context names the jar, and a `;` in its name must not read as a field.
+            RequestCredentials::SameOrigin => {
+                format!("same-origin@{:x}", short_hash(jar.as_bytes()))
+            }
+            RequestCredentials::Include => format!("include@{:x}", short_hash(jar.as_bytes())),
         };
 
         // A reload and a normal fetch of the same URL are not interchangeable: one must reach
@@ -1569,13 +1587,21 @@ mod tests {
                   authorization:Bearer abc\ncookie:a=1; b=2\nrange:bytes=0-99\n"
             )
         );
+        let jar_hash = format!("{:x}", short_hash(b"BG(0)"));
         let expected = format!(
             // MC=n: no secure initiating origin. Ref=n: no referrer set, so none is ever sent.
             // FM: default destination and mode, no initiating origin, no user navigation.
-            // Cred and Cache: the default credentials mode and normal HTTP caching.
+            // Cred and Cache: the default credentials mode, for the default reference, and normal
+            // HTTP caching.
             // H: every header, sorted. B=n: no body. MB=n: no size cap.
-            "M={};U={}:{};R=10:bytes=0-99;A=9:text/html;AL=5:en-US;AE=4:gzip;Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include;Cache=default;H={};B=n;MB=n",
-            fr.method, url_norm.len(), url_norm, auth_hash, cookie_hash, all_headers
+            "M={};U={}:{};R=10:bytes=0-99;A=9:text/html;AL=5:en-US;AE=4:gzip;Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include@{};Cache=default;H={};B=n;MB=n",
+            fr.method,
+            url_norm.len(),
+            url_norm,
+            auth_hash,
+            cookie_hash,
+            jar_hash,
+            all_headers
         );
 
         assert_eq!(key, expected);
@@ -1732,6 +1758,51 @@ mod tests {
                 assert_ne!(a, b, "each policy reaches a different verdict");
             }
         }
+    }
+
+    /// The context's jar is asked per reference, so while cookies ride along two references'
+    /// requests for the same URL must not share a response. Without credentials they may.
+    #[test]
+    fn coalescing_key_separates_references_when_cookies_ride_along() {
+        let url = Url::parse("https://example.org/a").unwrap();
+        let key_for = |reference: RequestReference, credentials: RequestCredentials| {
+            FetchRequest::builder(Method::GET, url.clone())
+                .with_reference(reference)
+                .with_credentials(credentials)
+                .build()
+                .generate_request_key()
+                .unwrap()
+        };
+        let (a, b) = (RequestReference::Tagged(1), RequestReference::Tagged(2));
+
+        for credentials in [RequestCredentials::Include, RequestCredentials::SameOrigin] {
+            assert_ne!(
+                key_for(a, credentials),
+                key_for(b, credentials),
+                "{credentials:?}"
+            );
+            assert_eq!(key_for(a, credentials), key_for(a, credentials));
+        }
+        assert_eq!(
+            key_for(a, RequestCredentials::Omit),
+            key_for(b, RequestCredentials::Omit),
+            "no jar is asked, so the reference changes nothing"
+        );
+
+        // Keyed on the jar the context names, two references that share one share again.
+        let request = |reference: RequestReference| {
+            FetchRequest::builder(Method::GET, url.clone())
+                .with_reference(reference)
+                .build()
+        };
+        assert_eq!(
+            request(a).request_key("zone-1"),
+            request(b).request_key("zone-1")
+        );
+        assert_ne!(
+            request(a).request_key("zone-1"),
+            request(a).request_key("zone-2")
+        );
     }
 
     /// Regression: an `https` target must NOT be treated as "mixed content cannot apply".

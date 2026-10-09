@@ -122,7 +122,7 @@ impl FetcherContext for CookieContext {
     }
     fn on_ref_active(&self, _: RequestReference) {}
     fn on_ref_done(&self, _: RequestReference) {}
-    fn cookies_for(&self, _url: &Url) -> Option<String> {
+    fn cookies_for(&self, _: RequestReference, _url: &Url) -> Option<String> {
         Some("session=e2e".into())
     }
 }

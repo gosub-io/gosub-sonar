@@ -22,6 +22,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `FetcherContext::cookies_for` and `on_cookies_received` take the request's `RequestReference`
+  as their first argument, so a host with a jar per tab, profile or partition can answer each
+  hop from the right one; until now such a host could not use the hooks at all and had to attach
+  `Cookie` itself, which loses every `Set-Cookie` on a redirect hop. An implementation outside
+  this crate must add the parameter. `NetPolicy::from_context` takes the reference too
+- While cookies ride along (credentials `include` or `same-origin`), two requests coalesce only
+  when the new `FetcherContext::cookie_jar_key` names the same jar for both: the jar is asked
+  per reference, so two references can carry different cookies for the same URL. The default
+  is the reference itself, so a context that does not override it no longer coalesces
+  credentialed requests across references; one with a single jar returns a constant to get
+  that back, as `NullContext` does. `credentials: omit` requests coalesce as before
+- The cookie hooks are handed a `Set-Cookie` value that is UTF-8, not only visible ASCII: a
+  non-ASCII cookie value was dropped before it reached the jar
 - `BlockReason` gained `BadPort`, so an exhaustive `match` on it outside this crate must
   handle it
 - `FetcherConfig`, `SimpleOptions` and `NetPolicy` gained the public `allowed_bad_ports`

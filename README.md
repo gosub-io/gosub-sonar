@@ -172,8 +172,8 @@ impl FetcherContext for MyContext {
 
     // All optional; the defaults allow everything, send no cookies and refuse bad certificates.
     fn is_url_allowed(&self, url: &Url) -> bool { url.host_str() != Some("ads.example") }
-    fn cookies_for(&self, _url: &Url) -> Option<String> { None }
-    fn on_cookies_received(&self, _url: &Url, _set_cookie: &[&str]) {}
+    fn cookies_for(&self, _: RequestReference, _url: &Url) -> Option<String> { None }
+    fn on_cookies_received(&self, _: RequestReference, _url: &Url, _set_cookie: &[&str]) {}
     fn tls_override(&self, _error: &TlsError) -> bool { false }
 }
 ```
@@ -181,7 +181,9 @@ impl FetcherContext for MyContext {
 `is_url_allowed`, `cookies_for` and `on_cookies_received` are called for the initial URL and
 for every redirect target, so a blocklist or cookie jar can't be bypassed by a redirect. The two
 cookie hooks follow the request's credentials mode: a `credentials: omit` request neither sends
-nor stores cookies. See
+nor stores cookies. They also get the request's `RequestReference`, so a host with a jar per tab
+can answer from the right one; `cookie_jar_key` tells the fetcher which references share a jar,
+so their requests can share one fetch. See
 `examples/fetcher_context.rs` for a complete one with a cookie jar and an event log.
 
 ### HSTS

@@ -21,6 +21,7 @@ use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
 use crate::net::observer::NetObserver;
 use crate::net::port_blocking;
 use crate::net::referrer::{self, ReferrerPolicy};
+use crate::net::request_ref::RequestReference;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::tls::TlsOverrideStore;
 use crate::net::transport::TransportError;
@@ -105,11 +106,14 @@ fn ip_literal(url: &Url) -> Option<String> {
 }
 
 /// Hand a response's `Set-Cookie` values to the policy's jar. Returns whether there were any.
+/// A value is read as UTF-8, the way browsers read cookies, not as visible ASCII only: a
+/// non-ASCII cookie value is common and valid, and `to_str` would drop it. Bytes that are not
+/// UTF-8 at all are left out.
 fn report_set_cookie(policy: &NetPolicy, url: &Url, headers: &HeaderMap) -> bool {
     let values: Vec<&str> = headers
         .get_all(header::SET_COOKIE)
         .iter()
-        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| std::str::from_utf8(v.as_bytes()).ok())
         .collect();
     if values.is_empty() {
         return false;
@@ -350,16 +354,19 @@ impl Default for NetPolicy {
 }
 
 impl NetPolicy {
-    /// Build a policy that delegates to a [`FetcherContext`] implementation.
-    pub fn from_context(ctx: &Arc<dyn FetcherContext>) -> Self {
+    /// Build a policy that delegates to a [`FetcherContext`] implementation, for the request
+    /// tagged `reference`: the cookie hooks are asked on its behalf.
+    pub fn from_context(ctx: &Arc<dyn FetcherContext>, reference: RequestReference) -> Self {
         let ctx_url = ctx.clone();
         let ctx_cookies = ctx.clone();
         let ctx_sink = ctx.clone();
         let ctx_auth = ctx.clone();
         Self {
             url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
-            cookies_for: Box::new(move |url| ctx_cookies.cookies_for(url)),
-            on_cookies: Box::new(move |url, values| ctx_sink.on_cookies_received(url, values)),
+            cookies_for: Box::new(move |url| ctx_cookies.cookies_for(reference, url)),
+            on_cookies: Box::new(move |url, values| {
+                ctx_sink.on_cookies_received(reference, url, values)
+            }),
             on_protocol: Box::new(|_, _| {}),
             speaks_h2: Box::new(|_| false),
             // Filled in by the fetcher, which is what knows how its client was built.
@@ -4938,6 +4945,40 @@ mod tests {
         assert_eq!(meta.status, 200);
         assert_eq!(meta.content_length, Some(2 * 1024 * 1024));
         assert_eq!(&body[..], pattern(2 * 1024 * 1024).as_slice());
+    }
+
+    /// The jar is handed a UTF-8 cookie value as it is; only bytes that are not UTF-8 at all
+    /// are left out.
+    #[test]
+    fn a_utf8_set_cookie_reaches_the_jar() {
+        let received: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let policy = NetPolicy {
+            on_cookies: Box::new(move |_, values| {
+                sink.lock()
+                    .unwrap()
+                    .extend(values.iter().map(|v| v.to_string()));
+            }),
+            ..NetPolicy::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.append(header::SET_COOKIE, "a=1".parse().unwrap());
+        headers.append(
+            header::SET_COOKIE,
+            http::HeaderValue::from_bytes("b=h\u{e9}llo".as_bytes()).unwrap(),
+        );
+        headers.append(
+            header::SET_COOKIE,
+            http::HeaderValue::from_bytes(b"c=\xff\xfe").unwrap(),
+        );
+
+        let url = Url::parse("https://site.test/").unwrap();
+        assert!(report_set_cookie(&policy, &url, &headers));
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec!["a=1".to_string(), "b=h\u{e9}llo".to_string()]
+        );
     }
 
     /// A cookie set on an intermediate 302 must be reported via `on_cookies` before the next hop,

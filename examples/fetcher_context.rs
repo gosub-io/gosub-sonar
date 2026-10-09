@@ -131,7 +131,9 @@ impl FetcherContext for AppContext {
     }
 
     // Called on every hop; the jar is keyed by host here, a real one would follow RFC 6265.
-    fn cookies_for(&self, url: &Url) -> Option<String> {
+    // One jar for every request, so the reference is not needed; a host with a jar per tab
+    // would pick it by the reference.
+    fn cookies_for(&self, _reference: RequestReference, url: &Url) -> Option<String> {
         let jar = self.cookies.lock();
         let cookies = jar.get(url.host_str()?)?;
         if cookies.is_empty() {
@@ -141,7 +143,7 @@ impl FetcherContext for AppContext {
     }
 
     // Called with the raw Set-Cookie values of a response (redirect hops included).
-    fn on_cookies_received(&self, url: &Url, values: &[&str]) {
+    fn on_cookies_received(&self, _reference: RequestReference, url: &Url, values: &[&str]) {
         let Some(host) = url.host_str() else { return };
         let mut jar = self.cookies.lock();
         let entry = jar.entry(host.to_string()).or_default();

@@ -338,7 +338,8 @@ it to the connection, not the request.
 
 - **`url_allowed`** — consulted for the initial URL *and every redirect target*; the place to
   implement SSRF guards, allow/block lists. Wired to `FetcherContext::is_url_allowed`.
-- **`cookies_for`** — supplies the `Cookie` header per origin from the host's jar.
+- **`cookies_for`** — supplies the `Cookie` header per origin from the host's jar, asked on
+  behalf of the request's `RequestReference`.
 - **`hsts`** — the [HSTS](#hsts) store, consulted to upgrade each hop and updated from each hop's
   response. Set from `FetcherConfig::hsts` rather than `FetcherContext`; `None` disables HSTS.
 - **`cors_preflight`** — the [CORS](#cors) preflight-grant cache, consulted before sending a
@@ -719,9 +720,12 @@ Implemented by the host and passed to `Fetcher::new`. The bridge between schedul
 - `on_ref_active` / `on_ref_done` — fired when a unique fetch becomes active and when its last
   subscriber finishes (outstanding-work tracking).
 - `is_url_allowed(url)` — URL policy hook (default: allow all).
-- `cookies_for(url)` — returns the `Cookie` header value for a request hop (default: none), wired
-  into `NetPolicy::cookies_for`.
-- `on_cookies_received(hop_url, set_cookie_values)` — called for every response carrying
+- `cookies_for(reference, url)` — returns the `Cookie` header value for a request hop (default:
+  none), wired into `NetPolicy::cookies_for`. `reference` is the request's, so a host with a jar
+  per tab or partition answers from the right one.
+- `cookie_jar_key(reference)` — which jar the cookie hooks answer `reference` from; credentialed
+  requests coalesce only on the same key (default: the reference, so none share).
+- `on_cookies_received(reference, hop_url, set_cookie_values)` — called for every response carrying
   `Set-Cookie` headers, redirect hops included, when the request's credentials mode attached
   cookies to that hop; a `credentials: omit` request cannot write the jar.
 - `tls_override(error)` — whether to accept a certificate that failed verification (default:
