@@ -43,8 +43,14 @@ pub trait FetcherContext: Send + Sync {
     /// Called at the start of every request hop (including redirect targets after cross-origin
     /// cookie stripping). Returning `None` sends no cookie header for that hop.
     ///
+    /// `reference` is the request's [`FetchRequest::reference`](crate::net::types::FetchRequest),
+    /// so a host with more than one jar (one per tab, profile or partition) can answer from the
+    /// right one. Requests share a response while cookies ride along only when
+    /// [`cookie_jar_key`](Self::cookie_jar_key) says they use the same jar, so one jar's cookies
+    /// cannot reach another's request through coalescing.
+    ///
     /// The default returns `None` (no cookies injected).
-    fn cookies_for(&self, _url: &Url) -> Option<String> {
+    fn cookies_for(&self, _reference: RequestReference, _url: &Url) -> Option<String> {
         None
     }
 
@@ -52,11 +58,23 @@ pub trait FetcherContext: Send + Sync {
     /// the request's credentials mode attached cookies to that hop. A `credentials: omit`
     /// request never reaches this.
     ///
-    /// `url` is the URL of the hop that sent them. `values` is the slice of raw `Set-Cookie`
-    /// header values from the response — one entry per header line.
+    /// `reference` is the request's, as for [`cookies_for`](Self::cookies_for). `url` is the URL
+    /// of the hop that sent them. `values` is the slice of raw `Set-Cookie` header values from
+    /// the response — one entry per header line.
     ///
     /// The default implementation does nothing.
-    fn on_cookies_received(&self, _url: &Url, _values: &[&str]) {}
+    fn on_cookies_received(&self, _reference: RequestReference, _url: &Url, _values: &[&str]) {}
+
+    /// Which jar the cookie hooks answer `reference` from, as far as sharing a response goes:
+    /// two requests for the same thing that may carry cookies are coalesced into one fetch only
+    /// when this is equal for both. Equal must mean the hooks give both the same answers.
+    ///
+    /// The default is the reference itself, so no two references share: safe for a host with a
+    /// jar per reference that does not override this. A host with one jar, or none, returns a
+    /// constant and gets coalescing across references back.
+    fn cookie_jar_key(&self, reference: RequestReference) -> String {
+        reference.to_string()
+    }
 
     /// Whether to accept a certificate that failed verification.
     ///
@@ -119,4 +137,8 @@ impl FetcherContext for NullContext {
     }
     fn on_ref_active(&self, _: RequestReference) {}
     fn on_ref_done(&self, _: RequestReference) {}
+    // No jar, so every reference gets the same cookies: none.
+    fn cookie_jar_key(&self, _: RequestReference) -> String {
+        String::new()
+    }
 }

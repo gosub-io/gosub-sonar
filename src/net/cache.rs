@@ -129,7 +129,7 @@ pub enum CacheDecision {
     NotCached,
 }
 
-/// The URL and method a cache entry is stored under.
+/// The URL and method a cache entry is stored under, and whose cookies fetched it.
 ///
 /// The URL's fragment is dropped: it never goes on the wire, so it cannot distinguish two
 /// responses. Entries that differ only in the request headers a response declared in `Vary` are
@@ -140,17 +140,31 @@ pub struct CacheKey {
     pub method: Method,
     /// Request URL, without its fragment.
     pub url: Url,
+    /// The cookie jar the response was fetched with, as
+    /// [`FetcherContext::cookie_jar_key`](crate::net::fetcher_context::FetcherContext::cookie_jar_key)
+    /// names it; empty for a request that carried no cookies. A response is what one jar's
+    /// cookies bought, and a server that does not say `Vary: Cookie` (most do not) would
+    /// otherwise have it handed to another jar's request: one cache per jar, as a browser keeps
+    /// one per profile.
+    pub partition: String,
 }
 
 impl CacheKey {
-    /// Key for a request, dropping the URL's fragment.
+    /// Key for a request that carries no cookies, dropping the URL's fragment.
     pub fn new(method: &Method, url: &Url) -> Self {
         let mut url = url.clone();
         url.set_fragment(None);
         Self {
             method: method.clone(),
             url,
+            partition: String::new(),
         }
+    }
+
+    /// The same key in `partition`: for a request that carries that jar's cookies.
+    pub fn in_partition(mut self, partition: &str) -> Self {
+        self.partition = partition.to_string();
+        self
     }
 }
 
@@ -688,7 +702,8 @@ pub trait HttpCache: Send + Sync {
     fn get(&self, key: &CacheKey) -> Vec<Arc<CacheEntry>>;
     /// Store `entry`, replacing the variant selected by the same request headers.
     fn put(&self, key: CacheKey, entry: Arc<CacheEntry>);
-    /// Drop every variant stored for `key`.
+    /// Drop every variant stored for `key`'s method and URL, in every partition: a write that
+    /// makes the resource stale makes every jar's copy stale.
     fn invalidate(&self, key: &CacheKey);
     /// Drop everything.
     fn clear(&self);
@@ -764,7 +779,7 @@ fn charge(key: &CacheKey, entry: &CacheEntry) -> usize {
         .iter()
         .map(|(name, value)| name.len() + value.as_ref().map_or(0, String::len))
         .sum();
-    entry.size() + key.url.as_str().len() + vary + STORED_OVERHEAD
+    entry.size() + key.url.as_str().len() + key.partition.len() + vary + STORED_OVERHEAD
 }
 
 /// [`HttpCache`] holding entries in memory, bounded by a byte budget.
@@ -880,7 +895,16 @@ impl HttpCache for InMemoryHttpCache {
     }
 
     fn invalidate(&self, key: &CacheKey) {
-        self.contents.lock().remove(key);
+        let mut contents = self.contents.lock();
+        let doomed: Vec<CacheKey> = contents
+            .keys
+            .keys()
+            .filter(|k| k.method == key.method && k.url == key.url)
+            .cloned()
+            .collect();
+        for key in doomed {
+            contents.remove(&key);
+        }
     }
 
     fn clear(&self) {
@@ -1699,6 +1723,26 @@ mod tests {
         cache.invalidate(&k);
         assert_eq!(cache.byte_len(), 0);
         assert!(cache.is_empty());
+    }
+
+    /// Partitions do not see each other's entries, and an invalidation reaches all of them.
+    #[test]
+    fn partitions_are_separate_and_invalidated_together() {
+        let cache = InMemoryHttpCache::new();
+        let fresh = entry(&[("cache-control", "max-age=60")]);
+        cache.put(key().in_partition("a"), fresh.clone());
+        assert!(
+            cache.get(&key()).is_empty(),
+            "the shared partition does not see jar a's entry"
+        );
+        assert!(cache.get(&key().in_partition("b")).is_empty());
+        cache.put(key().in_partition("b"), fresh.clone());
+        cache.put(key(), fresh);
+        assert_eq!(cache.len(), 3);
+
+        cache.invalidate(&key());
+        assert!(cache.is_empty(), "a write makes every jar's copy stale");
+        assert_eq!(cache.byte_len(), 0);
     }
 
     #[test]

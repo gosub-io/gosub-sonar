@@ -21,6 +21,7 @@ use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
 use crate::net::observer::NetObserver;
 use crate::net::port_blocking;
 use crate::net::referrer::{self, ReferrerPolicy};
+use crate::net::request_ref::RequestReference;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::tls::TlsOverrideStore;
 use crate::net::transport::TransportError;
@@ -105,11 +106,14 @@ fn ip_literal(url: &Url) -> Option<String> {
 }
 
 /// Hand a response's `Set-Cookie` values to the policy's jar. Returns whether there were any.
+/// A value is read as UTF-8, the way browsers read cookies, not as visible ASCII only: a
+/// non-ASCII cookie value is common and valid, and `to_str` would drop it. Bytes that are not
+/// UTF-8 at all are left out.
 fn report_set_cookie(policy: &NetPolicy, url: &Url, headers: &HeaderMap) -> bool {
     let values: Vec<&str> = headers
         .get_all(header::SET_COOKIE)
         .iter()
-        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| std::str::from_utf8(v.as_bytes()).ok())
         .collect();
     if values.is_empty() {
         return false;
@@ -315,6 +319,12 @@ pub struct NetPolicy {
     /// Empty (default): every bad port is refused. Set via
     /// [`NetPolicy::with_allowed_bad_ports`].
     pub allowed_bad_ports: Vec<u16>,
+    /// The cache partition a hop that carries cookies reads and writes: whose jar
+    /// [`cookies_for`](Self::cookies_for) answers from, so one jar's responses are never
+    /// served to another's requests. A hop without cookies uses the shared, empty partition.
+    /// Set by [`NetPolicy::from_context`] from
+    /// [`FetcherContext::cookie_jar_key`].
+    pub cache_partition: String,
 }
 
 impl Default for NetPolicy {
@@ -345,21 +355,25 @@ impl Default for NetPolicy {
             #[cfg(not(target_arch = "wasm32"))]
             dns_resolver: None,
             allowed_bad_ports: Vec::new(),
+            cache_partition: String::new(),
         }
     }
 }
 
 impl NetPolicy {
-    /// Build a policy that delegates to a [`FetcherContext`] implementation.
-    pub fn from_context(ctx: &Arc<dyn FetcherContext>) -> Self {
+    /// Build a policy that delegates to a [`FetcherContext`] implementation, for the request
+    /// tagged `reference`: the cookie hooks are asked on its behalf.
+    pub fn from_context(ctx: &Arc<dyn FetcherContext>, reference: RequestReference) -> Self {
         let ctx_url = ctx.clone();
         let ctx_cookies = ctx.clone();
         let ctx_sink = ctx.clone();
         let ctx_auth = ctx.clone();
         Self {
             url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
-            cookies_for: Box::new(move |url| ctx_cookies.cookies_for(url)),
-            on_cookies: Box::new(move |url, values| ctx_sink.on_cookies_received(url, values)),
+            cookies_for: Box::new(move |url| ctx_cookies.cookies_for(reference, url)),
+            on_cookies: Box::new(move |url, values| {
+                ctx_sink.on_cookies_received(reference, url, values)
+            }),
             on_protocol: Box::new(|_, _| {}),
             speaks_h2: Box::new(|_| false),
             // Filled in by the fetcher, which is what knows how its client was built.
@@ -384,6 +398,7 @@ impl NetPolicy {
             #[cfg(not(target_arch = "wasm32"))]
             dns_resolver: None,
             allowed_bad_ports: Vec::new(),
+            cache_partition: ctx.cookie_jar_key(reference),
         }
     }
 
@@ -1983,6 +1998,13 @@ async fn get_with_redirects(
         if !attach_credentials && init.credentials == RequestCredentials::SameOrigin {
             modified(&observer, &url, RequestChange::CredentialsWithheld);
         }
+        // A hop that carries a jar's cookies is cached for that jar alone.
+        #[cfg(not(target_arch = "wasm32"))]
+        let cache_partition = if attach_credentials {
+            policy.cache_partition.as_str()
+        } else {
+            ""
+        };
         if attach_credentials && !current_headers.contains_key(header::COOKIE) {
             if let Some(cookie_str) = (policy.cookies_for)(&url) {
                 if let Ok(mut val) = cookie_str.parse::<http::HeaderValue>() {
@@ -2000,7 +2022,7 @@ async fn get_with_redirects(
         #[cfg(not(target_arch = "wasm32"))]
         let (cache_hit, revalidating, conditional) = match policy.cache {
             Some(ref cache) => {
-                let key = CacheKey::new(&current_method, &url);
+                let key = CacheKey::new(&current_method, &url).in_partition(cache_partition);
                 let stored = cache.get(&key);
                 match cache::decide(
                     &stored,
@@ -2249,7 +2271,10 @@ async fn get_with_redirects(
                         updated.peer_addr = origin_peer(&resp, &url, &policy);
                         let updated = Arc::new(updated);
                         if let Some(ref cache) = policy.cache {
-                            cache.put(CacheKey::new(&current_method, &url), updated.clone());
+                            cache.put(
+                                CacheKey::new(&current_method, &url).in_partition(cache_partition),
+                                updated.clone(),
+                            );
                         }
                         observer.on_event(NetEvent::Cache {
                             url: url.clone(),
@@ -2351,7 +2376,8 @@ async fn get_with_redirects(
                     }
                 }
                 for target in targets {
-                    // Entries are keyed by method, so both of the cacheable ones go.
+                    // Entries are keyed by method, so both of the cacheable ones go; in every
+                    // partition (see `HttpCache::invalidate`).
                     for method in [Method::GET, Method::HEAD] {
                         cache.invalidate(&CacheKey::new(&method, &target));
                     }
@@ -2386,7 +2412,7 @@ async fn get_with_redirects(
             {
                 Some(PendingStore {
                     cache: cache.clone(),
-                    key: CacheKey::new(&current_method, &url),
+                    key: CacheKey::new(&current_method, &url).in_partition(cache_partition),
                     url: url.clone(),
                     status: resp.status().as_u16(),
                     response_headers: resp.headers().clone(),
@@ -4940,6 +4966,40 @@ mod tests {
         assert_eq!(&body[..], pattern(2 * 1024 * 1024).as_slice());
     }
 
+    /// The jar is handed a UTF-8 cookie value as it is; only bytes that are not UTF-8 at all
+    /// are left out.
+    #[test]
+    fn a_utf8_set_cookie_reaches_the_jar() {
+        let received: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let policy = NetPolicy {
+            on_cookies: Box::new(move |_, values| {
+                sink.lock()
+                    .unwrap()
+                    .extend(values.iter().map(|v| v.to_string()));
+            }),
+            ..NetPolicy::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.append(header::SET_COOKIE, "a=1".parse().unwrap());
+        headers.append(
+            header::SET_COOKIE,
+            http::HeaderValue::from_bytes("b=h\u{e9}llo".as_bytes()).unwrap(),
+        );
+        headers.append(
+            header::SET_COOKIE,
+            http::HeaderValue::from_bytes(b"c=\xff\xfe").unwrap(),
+        );
+
+        let url = Url::parse("https://site.test/").unwrap();
+        assert!(report_set_cookie(&policy, &url, &headers));
+        assert_eq!(
+            *received.lock().unwrap(),
+            vec!["a=1".to_string(), "b=h\u{e9}llo".to_string()]
+        );
+    }
+
     /// A cookie set on an intermediate 302 must be reported via `on_cookies` before the next hop,
     /// and the next hop must carry the updated jar contents instead of a stale Cookie header.
     #[tokio::test(flavor = "current_thread")]
@@ -5631,6 +5691,45 @@ mod tests {
         assert_eq!(&body[..], b"hit-1", "the stored body, not a second request");
         assert_eq!(srv.hit_count("/fresh"), 1, "the server was not asked again");
         assert_eq!(rec.cache_outcomes(), vec![CacheOutcome::Hit]);
+    }
+
+    /// What one jar's cookies fetched is cached for that jar: another jar's request goes to the
+    /// network, and so does one that carries no cookies at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_jars_cached_response_is_not_served_to_another_jar() {
+        let srv = TestServer::new()
+            .route(
+                "/mine",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(60, b"v1".to_vec()).counting()),
+            )
+            .start()
+            .await;
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let jar = |partition: &str| NetPolicy {
+            cache_partition: partition.to_string(),
+            ..NetPolicy::default().with_cache(Some(cache.clone()))
+        };
+
+        let (_, body) =
+            cache_fetch(&srv, "/mine", RequestInit::default(), jar("a"), observer()).await;
+        assert_eq!(&body[..], b"hit-1");
+        let (meta, body) =
+            cache_fetch(&srv, "/mine", RequestInit::default(), jar("a"), observer()).await;
+        assert!(meta.from_cache, "the same jar is served from its cache");
+        assert_eq!(&body[..], b"hit-1");
+
+        let (meta, body) =
+            cache_fetch(&srv, "/mine", RequestInit::default(), jar("b"), observer()).await;
+        assert!(!meta.from_cache, "another jar's response is not served");
+        assert_eq!(&body[..], b"hit-2");
+
+        let omit = RequestInit::default().with_credentials(RequestCredentials::Omit);
+        let (meta, _) = cache_fetch(&srv, "/mine", omit, jar("a"), observer()).await;
+        assert!(
+            !meta.from_cache,
+            "a request without cookies does not read a jar's entry"
+        );
+        assert_eq!(srv.hit_count("/mine"), 3);
     }
 
     /// A stored response is CORS-checked like a fresh one: an entry stored by a same-origin
