@@ -19,6 +19,7 @@ use crate::net::fetcher_context::FetcherContext;
 use crate::net::hsts::{self, HstsStore};
 use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
 use crate::net::observer::NetObserver;
+use crate::net::port_blocking;
 use crate::net::referrer::{self, ReferrerPolicy};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::tls::TlsOverrideStore;
@@ -148,8 +149,8 @@ pub(crate) enum HopCheck {
     Reject(BlockReason),
 }
 
-/// Apply the pre-dispatch checks to a single hop: scheme allowlist, mixed content, then the
-/// embedder's URL allowlist.
+/// Apply the pre-dispatch checks to a single hop: scheme allowlist, mixed content, bad ports,
+/// then the embedder's URL allowlist.
 ///
 /// Both the scheduler's pre-dispatch check and the per-hop redirect loop call this, so the two
 /// cannot reach different conclusions about the same URL. Order matters: a mixed content upgrade
@@ -159,6 +160,7 @@ pub(crate) fn hop_checks(
     url: &Url,
     mixed_content: MixedContentPolicy,
     origin: Option<&Origin>,
+    allowed_bad_ports: &[u16],
     url_allowed: &dyn Fn(&Url) -> bool,
 ) -> HopCheck {
     if !matches!(url.scheme(), "http" | "https") {
@@ -170,6 +172,11 @@ pub(crate) fn hop_checks(
         MixedContentAction::Upgrade(upgraded) => upgraded,
         MixedContentAction::Block => return HopCheck::Reject(BlockReason::MixedContent),
     };
+
+    // On the URL the upgrade settled, as main fetch orders it.
+    if port_blocking::should_block(&target, allowed_bad_ports) {
+        return HopCheck::Reject(BlockReason::BadPort);
+    }
 
     if !url_allowed(&target) {
         return HopCheck::Reject(BlockReason::UrlPolicy);
@@ -303,6 +310,11 @@ pub struct NetPolicy {
     /// [`NetPolicy::with_dns_resolver`].
     #[cfg(not(target_arch = "wasm32"))]
     pub dns_resolver: Option<Arc<dyn DnsResolver>>,
+    /// Bad ports to fetch from anyway; see
+    /// [`FetcherConfig::allowed_bad_ports`](crate::net::fetcher::FetcherConfig::allowed_bad_ports).
+    /// Empty (default): every bad port is refused. Set via
+    /// [`NetPolicy::with_allowed_bad_ports`].
+    pub allowed_bad_ports: Vec<u16>,
 }
 
 impl Default for NetPolicy {
@@ -332,6 +344,7 @@ impl Default for NetPolicy {
             proxied: None,
             #[cfg(not(target_arch = "wasm32"))]
             dns_resolver: None,
+            allowed_bad_ports: Vec::new(),
         }
     }
 }
@@ -370,6 +383,7 @@ impl NetPolicy {
             proxied: None,
             #[cfg(not(target_arch = "wasm32"))]
             dns_resolver: None,
+            allowed_bad_ports: Vec::new(),
         }
     }
 
@@ -378,6 +392,12 @@ impl NetPolicy {
     /// dropped rather than reported wrongly.
     pub fn with_user_agent(mut self, user_agent: Option<&str>) -> Self {
         self.user_agent = user_agent.and_then(|ua| http::HeaderValue::from_str(ua).ok());
+        self
+    }
+
+    /// Attaches the exceptions for [`NetPolicy::allowed_bad_ports`].
+    pub fn with_allowed_bad_ports(mut self, ports: Vec<u16>) -> Self {
+        self.allowed_bad_ports = ports;
         self
     }
 
@@ -741,7 +761,13 @@ pub struct ResponseTop {
 /// are most likely the headers and the first 5 KB of body. This can be used to determine mime type
 /// of the resource fetched. It will also return a stream reader that is able to read the remainder
 /// of the body (minus the peek buffer).
-pub async fn fetch_response_top(
+///
+/// Crate-private because `client` must not follow redirects itself: reqwest has no per-request
+/// redirect policy, and a client that follows them sends each next hop before
+/// `get_with_redirects` sees it, so the per-hop checks (bad ports, URL policy, mixed content,
+/// HSTS, CORS) never run on it. [`Fetcher`](crate::net::fetcher::Fetcher) builds its clients
+/// with redirects off.
+pub(crate) async fn fetch_response_top(
     client: Arc<reqwest::Client>,
     url: Url,
     // Method, headers, and optional body for this request.
@@ -1314,8 +1340,10 @@ const READ_CHUNK: usize = 16 * 1024;
 /// then `freeze`d into an `Arc`-backed [`Bytes`]. Handing the result to the caller — and the
 /// `Bytes::from`/`freeze` at the boundary — is zero-copy, so the only memcpy of the payload is the
 /// unavoidable assembly into one contiguous buffer.
+///
+/// Crate-private for the reason [`fetch_response_top`] is.
 #[allow(clippy::too_many_arguments)]
-pub async fn fetch_response_complete(
+pub(crate) async fn fetch_response_complete(
     client: Arc<reqwest::Client>,
     url: Url,
     init: RequestInit,
@@ -1676,9 +1704,13 @@ async fn get_with_redirects(
             }
         }
 
-        match hop_checks(&url, init.mixed_content, origin.as_ref(), &|u| {
-            (policy.url_allowed)(u)
-        }) {
+        match hop_checks(
+            &url,
+            init.mixed_content,
+            origin.as_ref(),
+            &policy.allowed_bad_ports,
+            &|u| (policy.url_allowed)(u),
+        ) {
             HopCheck::Reject(reason) => return Err(blocked(&observer, url, reason)),
             HopCheck::Proceed(target) => {
                 if target != url {
@@ -4594,6 +4626,97 @@ mod tests {
 
         assert!(res.is_err());
         assert_eq!(rec.blocked_reason(), Some(BlockReason::UrlPolicy));
+    }
+
+    /// A bad port is refused before anything is sent, on the first hop and on a redirect, and
+    /// the refusal is reported like any other block.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_bad_port_is_blocked_on_every_hop() {
+        let rec = Arc::new(RecordingObserver::new());
+        let res = super::fetch_response_top(
+            client(),
+            Url::parse("http://127.0.0.1:25/").unwrap(),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(rec.blocked_reason(), Some(BlockReason::BadPort));
+
+        let srv = TestServer::new()
+            .route(
+                "/to-smtp",
+                RouteConfig::redirect_absolute("http://127.0.0.1:25/"),
+            )
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+        let res = super::fetch_response_top(
+            client(),
+            srv.url("/to-smtp"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            NetPolicy::default(),
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(rec.blocked_reason(), Some(BlockReason::BadPort));
+        assert_eq!(srv.hit_count("/to-smtp"), 1, "the first hop was fetched");
+    }
+
+    /// A bad port the policy allows is fetched like any other; the block is what an
+    /// allowance lifts, not the request. Uses an unprivileged bad port a test can listen on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_allowed_bad_port_is_fetched() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let unprivileged = [
+            6665u16, 6666, 6667, 6668, 6669, 6679, 6697, 10080, 4190, 6566,
+        ];
+        let mut listener = None;
+        for port in unprivileged {
+            if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                listener = Some((l, port));
+                break;
+            }
+        }
+        let Some((listener, port)) = listener else {
+            eprintln!("skipping: no unprivileged bad port is free");
+            return;
+        };
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .await;
+            }
+        });
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let fetch = |policy: NetPolicy| {
+            super::fetch_response_top(
+                client(),
+                url.clone(),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                Arc::new(RecordingObserver::new()),
+                policy,
+            )
+        };
+
+        assert!(
+            fetch(NetPolicy::default()).await.is_err(),
+            "blocked by default"
+        );
+        let top = fetch(NetPolicy::default().with_allowed_bad_ports(vec![port]))
+            .await
+            .expect("an allowed port is fetched");
+        assert_eq!(top.meta.status, 200);
     }
 
     /// Regression: `url_allowed` must see the post-upgrade URL. An embedder that rejects plain

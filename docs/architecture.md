@@ -43,7 +43,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | Module | File | Responsibility |
 |--------|------|----------------|
 | `net::fetcher` | `src/net/fetcher.rs` | **The scheduler.** Priority queues, coalescing, concurrency limits, task spawning. `Fetcher::{new, run, submit}`. |
-| `net::fetch` | `src/net/fetch.rs` | Low-level fetch primitives: `fetch_response_top`, `fetch_response_complete`, redirect handling, `ProgressReader`, `NetPolicy`. |
+| `net::fetch` | `src/net/fetch.rs` | Low-level fetch primitives: `fetch_response_top`, `fetch_response_complete` (crate-private: they need a client with redirects off, which only `Fetcher` builds), redirect handling, `ProgressReader`, `NetPolicy`. |
 | `net::fetcher_context` | `src/net/fetcher_context.rs` | `FetcherContext` trait — the host's hook into the fetch lifecycle (observers, ref tracking, URL policy, cookies). |
 | `net::cors` | `src/net/cors.rs` | CORS (WHATWG Fetch): safelist predicates, the CORS check, preflight validation, response tainting/filtering. `CorsPreflightCache` / `InMemoryPreflightCache`. Enforcement is native-only. |
 | `net::cache` | `src/net/cache.rs` | HTTP caching (RFC 9111): freshness and age, request/response `Cache-Control`, conditional revalidation, `Vary`, invalidation. `HttpCache` / `InMemoryHttpCache`, `CacheMode`. Native-only. |

@@ -196,6 +196,9 @@ pub enum BlockReason {
     /// The request required a stored response ([`CacheMode::OnlyIfCached`], or
     /// `Cache-Control: only-if-cached`) and the cache had none.
     NotCached,
+    /// The URL's port is one the Fetch standard refuses (SMTP, IRC, FTP, ...).
+    /// See [`port_blocking`](crate::net::port_blocking).
+    BadPort,
 }
 
 impl Display for BlockReason {
@@ -205,6 +208,7 @@ impl Display for BlockReason {
             BlockReason::UrlPolicy => "blocked by URL policy",
             BlockReason::UnsupportedScheme => "unsupported URL scheme",
             BlockReason::NotCached => "not in the cache",
+            BlockReason::BadPort => "bad port",
             BlockReason::Cors(err) => return write!(f, "CORS: {err}"),
         };
         f.write_str(s)

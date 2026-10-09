@@ -298,7 +298,8 @@ mod tests {
         let s = shutdown.clone();
         tokio::spawn(async move { f.run(s).await });
 
-        let url = Url::parse("http://sonar-dead.test:1/x").unwrap();
+        let port = crate::net::test_support::closed_port();
+        let url = Url::parse(&format!("http://sonar-dead.test:{port}/x")).unwrap();
         let result = fetch(&fetcher, url).await;
         assert!(
             result.is_error(),
@@ -399,7 +400,10 @@ mod tests {
         let srv = TestServer::new()
             .route(
                 "/hop",
-                RouteConfig::redirect_absolute("http://127.0.0.1:1/x"),
+                RouteConfig::redirect_absolute(format!(
+                    "http://127.0.0.1:{}/x",
+                    crate::net::test_support::closed_port()
+                )),
             )
             .start()
             .await;

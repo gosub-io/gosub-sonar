@@ -1471,3 +1471,13 @@ impl NetObserver for RecordingObserver {
         Some(usize::MAX / 2)
     }
 }
+
+/// A loopback port nothing listens on: one the OS just handed out and took back. Port 1, the
+/// usual stand-in, is a bad port the fetcher refuses before connecting, so a test of a refused
+/// connection would test the refusal instead.
+pub fn closed_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|addr| addr.port())
+        .expect("bind an ephemeral loopback port")
+}

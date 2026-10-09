@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Port blocking (Fetch, "Port blocking"): a request to an `http`/`https` URL on one of the
+  standard's bad ports (SMTP, IRC, FTP and the rest) is refused before anything is sent, on
+  every hop, redirects included, and through the simple API too. `port_blocking::is_bad_port`
+  exposes the list
+- `FetcherConfig::allowed_bad_ports`, `SimpleOptions::allowed_bad_ports` and
+  `NetPolicy::allowed_bad_ports`: bad ports to fetch from anyway, empty by default. The
+  embedder's equivalent of Chromium's `--explicitly-allowed-ports` and Firefox's
+  `network.security.ports.banned.override`; a list, so allowing one port opens no other
+- `test_support::closed_port`, a loopback port nothing listens on, for tests of a refused
+  connection (port 1 is now refused before connecting)
+
+### Changed
+
+- `BlockReason` gained `BadPort`, so an exhaustive `match` on it outside this crate must
+  handle it
+- `FetcherConfig`, `SimpleOptions` and `NetPolicy` gained the public `allowed_bad_ports`
+  field, so a struct literal of one outside this crate must set it (or use `..Default::default()`)
+- `net::fetch::fetch_response_top` and `fetch_response_complete` are no longer public. They took
+  any `reqwest::Client`, and one that follows redirects itself sends every next hop before
+  sonar's per-hop checks see it, so a redirect could reach a bad port, a private address or an
+  insecure URL. `Fetcher`, whose clients have redirects off, is the way to fetch
+
 ## [0.10.0] - 2026-10-08
 
 ### Added

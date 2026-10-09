@@ -30,6 +30,7 @@ pub mod hsts;
 pub mod mixed_content;
 pub mod null_emitter;
 pub mod observer;
+pub mod port_blocking;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod proxy;
 #[cfg(not(target_arch = "wasm32"))]
