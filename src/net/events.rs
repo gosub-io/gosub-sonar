@@ -107,10 +107,6 @@ pub enum NetEvent {
     /// `keep-alive`, and `te` unless it is `trailers`), so a caller that sets one of those by
     /// hand sees it reported and not sent.
     ///
-    /// Requests made through [`fetch_response_complete`](crate::net::fetch::fetch_response_complete)
-    /// with a caller-provided client keep everything above except the guarantee: that client's
-    /// default headers are its own, and cannot be read back.
-    ///
     /// On `wasm32` the guarantee does not hold at all, and the report is the request this crate
     /// composed rather than the one that went out. The browser's `fetch()` owns the connection
     /// there, and strips every header the Fetch spec forbids a caller from setting --

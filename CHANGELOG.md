@@ -26,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle it
 - `FetcherConfig`, `SimpleOptions` and `NetPolicy` gained the public `allowed_bad_ports`
   field, so a struct literal of one outside this crate must set it (or use `..Default::default()`)
+- `net::fetch::fetch_response_top` and `fetch_response_complete` are no longer public. They took
+  any `reqwest::Client`, and one that follows redirects itself sends every next hop before
+  sonar's per-hop checks see it, so a redirect could reach a bad port, a private address or an
+  insecure URL. `Fetcher`, whose clients have redirects off, is the way to fetch
 
 ## [0.10.0] - 2026-10-08
 

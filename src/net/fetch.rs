@@ -761,7 +761,13 @@ pub struct ResponseTop {
 /// are most likely the headers and the first 5 KB of body. This can be used to determine mime type
 /// of the resource fetched. It will also return a stream reader that is able to read the remainder
 /// of the body (minus the peek buffer).
-pub async fn fetch_response_top(
+///
+/// Crate-private because `client` must not follow redirects itself: reqwest has no per-request
+/// redirect policy, and a client that follows them sends each next hop before
+/// `get_with_redirects` sees it, so the per-hop checks (bad ports, URL policy, mixed content,
+/// HSTS, CORS) never run on it. [`Fetcher`](crate::net::fetcher::Fetcher) builds its clients
+/// with redirects off.
+pub(crate) async fn fetch_response_top(
     client: Arc<reqwest::Client>,
     url: Url,
     // Method, headers, and optional body for this request.
@@ -1334,8 +1340,10 @@ const READ_CHUNK: usize = 16 * 1024;
 /// then `freeze`d into an `Arc`-backed [`Bytes`]. Handing the result to the caller — and the
 /// `Bytes::from`/`freeze` at the boundary — is zero-copy, so the only memcpy of the payload is the
 /// unavoidable assembly into one contiguous buffer.
+///
+/// Crate-private for the reason [`fetch_response_top`] is.
 #[allow(clippy::too_many_arguments)]
-pub async fn fetch_response_complete(
+pub(crate) async fn fetch_response_complete(
     client: Arc<reqwest::Client>,
     url: Url,
     init: RequestInit,
