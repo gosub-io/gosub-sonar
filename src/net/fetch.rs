@@ -323,7 +323,7 @@ pub struct NetPolicy {
     /// [`cookies_for`](Self::cookies_for) answers from, so one jar's responses are never
     /// served to another's requests. A hop without cookies uses the shared, empty partition.
     /// Set by [`NetPolicy::from_context`] from
-    /// [`FetcherContext::cookie_jar_key`](crate::net::fetcher_context::FetcherContext::cookie_jar_key).
+    /// [`FetcherContext::cookie_jar_key`].
     pub cache_partition: String,
 }
 
