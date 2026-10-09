@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that back, as `NullContext` does. `credentials: omit` requests coalesce as before
 - The cookie hooks are handed a `Set-Cookie` value that is UTF-8, not only visible ASCII: a
   non-ASCII cookie value was dropped before it reached the jar
+- The HTTP cache is partitioned by cookie jar: a hop that carries cookies reads and stores
+  under the jar `cookie_jar_key` names, a hop without cookies under a shared partition, so a
+  response one jar's cookies bought is never served from the cache to another jar's request.
+  `CacheKey` gained a public `partition` field (`CacheKey::new` keeps it empty,
+  `CacheKey::in_partition` sets it) and `NetPolicy` a public `cache_partition`, so a struct
+  literal of either outside this crate must set them. `HttpCache::invalidate` now drops the
+  method and URL in every partition, which an implementation outside this crate must honour
 - `BlockReason` gained `BadPort`, so an exhaustive `match` on it outside this crate must
   handle it
 - `FetcherConfig`, `SimpleOptions` and `NetPolicy` gained the public `allowed_bad_ports`
