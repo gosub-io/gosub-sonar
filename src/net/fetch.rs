@@ -14,7 +14,7 @@ use crate::net::cors::{self, CorsError, ResponseTainting};
 use crate::net::dns::DnsResolver;
 use crate::net::events::NetEvent;
 use crate::net::fetch_metadata::{self, RequestDestination, RequestMode, SecFetchSite};
-use crate::net::fetcher_context::FetcherContext;
+use crate::net::fetcher_context::{CookieHop, FetcherContext};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::hsts::{self, HstsStore};
 use crate::net::mixed_content::{self, MixedContentAction, MixedContentPolicy};
@@ -193,7 +193,7 @@ pub(crate) fn hop_checks(
 pub type UrlFilter = Box<dyn Fn(&Url) -> bool + Send + Sync>;
 
 /// Callback type for per-URL cookie jar queries.
-pub type CookieJarFn = Box<dyn Fn(&Url) -> Option<String> + Send + Sync>;
+pub type CookieJarFn = Box<dyn Fn(&CookieHop<'_>) -> Option<String> + Send + Sync>;
 
 /// Callback type for reporting `Set-Cookie` values received on a response.
 pub type CookieSinkFn = Box<dyn Fn(&Url, &[&str]) + Send + Sync>;
@@ -229,9 +229,9 @@ pub type ProxiedFn = Box<dyn Fn(&Url) -> bool + Send + Sync>;
 pub struct NetPolicy {
     /// Return `false` to block a URL. Called for the initial URL and each redirect target.
     pub url_allowed: UrlFilter,
-    /// Return cookies for a request URL in `"name=value; name2=value2"` format, or `None`.
-    /// Called on each hop after cross-origin cookie stripping, so the jar is always consulted
-    /// for the correct origin.
+    /// Return cookies for a hop in `"name=value; name2=value2"` format, or `None`. Called on
+    /// each hop after cross-origin cookie stripping, so the jar is always consulted for the
+    /// correct origin, with the hop's URL, method and the chain before it (see [`CookieHop`]).
     pub cookies_for: CookieJarFn,
     /// Called with the raw `Set-Cookie` values of every response, redirect hops included, so a
     /// cookie set mid-chain (a session cookie on a login 302) reaches the jar before the next
@@ -370,7 +370,7 @@ impl NetPolicy {
         let ctx_auth = ctx.clone();
         Self {
             url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
-            cookies_for: Box::new(move |url| ctx_cookies.cookies_for(reference, url)),
+            cookies_for: Box::new(move |hop| ctx_cookies.cookies_for_hop(reference, hop)),
             on_cookies: Box::new(move |url, values| {
                 ctx_sink.on_cookies_received(reference, url, values)
             }),
@@ -1670,6 +1670,9 @@ async fn get_with_redirects(
 ) -> Result<ChainOutcome, NetError> {
     let mut url = url;
     let mut current_method = init.method;
+    // Where the chain has been: every hop's URL before the current one (Fetch, request's URL
+    // list), for the cookie hook to judge `SameSite` across the chain.
+    let mut url_list: Vec<Url> = Vec::new();
     let mut current_headers = init.headers;
     let mut current_body = init.body;
     let origin = init.origin;
@@ -2006,7 +2009,9 @@ async fn get_with_redirects(
             ""
         };
         if attach_credentials && !current_headers.contains_key(header::COOKIE) {
-            if let Some(cookie_str) = (policy.cookies_for)(&url) {
+            if let Some(cookie_str) =
+                (policy.cookies_for)(&CookieHop::new(&url, &current_method, &url_list))
+            {
                 if let Ok(mut val) = cookie_str.parse::<http::HeaderValue>() {
                     val.set_sensitive(true);
                     current_headers.insert(header::COOKIE, val);
@@ -2608,7 +2613,7 @@ async fn get_with_redirects(
             );
         }
 
-        url = to
+        url_list.push(std::mem::replace(&mut url, to));
     }
 
     Err(NetError::Redirect(Arc::new(anyhow!("too many redirects"))))
@@ -6759,6 +6764,51 @@ mod tests {
             )
             .await;
             assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
+        }
+
+        /// The cookie hook sees each hop's method as the hop sends it, and the chain before it:
+        /// a 307 keeps the POST, the 302 after it turns it into a GET.
+        #[tokio::test(flavor = "current_thread")]
+        async fn the_cookie_hook_sees_each_hops_method_and_chain() {
+            let srv = TestServer::new()
+                .route("/307", RouteConfig::redirect_307("/302"))
+                .route("/302", RouteConfig::redirect_to("/end"))
+                .route("/end", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+
+            type Seen = Vec<(Method, String, Vec<String>)>;
+            let seen: Arc<std::sync::Mutex<Seen>> = Arc::default();
+            let record = seen.clone();
+            let policy = NetPolicy {
+                cookies_for: Box::new(move |hop| {
+                    let paths = hop.url_list.iter().map(|u| u.path().to_string()).collect();
+                    record.lock().unwrap().push((
+                        hop.method.clone(),
+                        hop.url.path().to_string(),
+                        paths,
+                    ));
+                    None
+                }),
+                ..NetPolicy::default()
+            };
+            recorded(
+                client(),
+                srv.url("/307"),
+                RequestInit::post(HeaderMap::new(), b"a=1".to_vec()),
+                policy,
+            )
+            .await;
+
+            let path = |p: &str| p.to_string();
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![
+                    (Method::POST, path("/307"), vec![]),
+                    (Method::POST, path("/302"), vec![path("/307")]),
+                    (Method::GET, path("/end"), vec![path("/307"), path("/302")]),
+                ]
+            );
         }
 
         /// A refused hop is a `Blocked`, not an upgrade or a change.

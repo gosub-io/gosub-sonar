@@ -7,8 +7,34 @@ use crate::net::request_ref::RequestReference;
 use crate::net::tls::TlsError;
 use crate::net::types::{Initiator, ResourceKind};
 use crate::types::RequestId;
+use http::Method;
 use std::sync::Arc;
 use url::Url;
+
+/// One hop of a request, as [`FetcherContext::cookies_for_hop`] sees it: what a jar needs to
+/// decide which `SameSite` cookies the hop may carry.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct CookieHop<'a> {
+    /// The URL this hop goes to.
+    pub url: &'a Url,
+    /// The hop's method. A redirect may have changed it: a `303`, and a `301` or `302` after a
+    /// `POST`, turn it into `GET`; a `307` or `308` keeps it.
+    pub method: &'a Method,
+    /// The URLs the request went to before this hop, oldest first; empty on the first hop.
+    pub url_list: &'a [Url],
+}
+
+impl<'a> CookieHop<'a> {
+    /// A hop to `url` with `method`, after the hops at `url_list`.
+    pub fn new(url: &'a Url, method: &'a Method, url_list: &'a [Url]) -> Self {
+        Self {
+            url,
+            method,
+            url_list,
+        }
+    }
+}
 
 /// Abstracts the engine-side plumbing the Fetcher needs: observer creation and reference lifecycle.
 /// Implement this in the engine to wire up event routing without the net crate depending on
@@ -52,6 +78,20 @@ pub trait FetcherContext: Send + Sync {
     /// The default returns `None` (no cookies injected).
     fn cookies_for(&self, _reference: RequestReference, _url: &Url) -> Option<String> {
         None
+    }
+
+    /// Return the cookies to send with one hop of a request: what the fetcher calls at the
+    /// start of every hop.
+    ///
+    /// Override this rather than [`cookies_for`](Self::cookies_for) to judge `SameSite` the way
+    /// RFC 6265bis does: the hop's [`method`](CookieHop::method) decides whether `Lax` cookies
+    /// ride on a cross-site navigation (only a safe one), and its
+    /// [`url_list`](CookieHop::url_list) is the chain so far, which a redirect through another
+    /// site makes cross-site for the rest of it.
+    ///
+    /// The default asks [`cookies_for`](Self::cookies_for) with the hop's URL.
+    fn cookies_for_hop(&self, reference: RequestReference, hop: &CookieHop<'_>) -> Option<String> {
+        self.cookies_for(reference, hop.url)
     }
 
     /// Called for every response carrying `Set-Cookie` headers, redirect hops included, when

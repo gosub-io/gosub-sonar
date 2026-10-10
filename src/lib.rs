@@ -25,7 +25,7 @@ pub use net::dns::{DnsError, DnsResolver, Resolving};
 pub use net::events::NetEvent;
 pub use net::fetch_metadata::{RequestDestination, RequestMode, SecFetchSite};
 pub use net::fetcher::{Fetcher, FetcherConfig, DEFAULT_USER_AGENT};
-pub use net::fetcher_context::{FetcherContext, NullContext};
+pub use net::fetcher_context::{CookieHop, FetcherContext, NullContext};
 #[cfg(not(target_arch = "wasm32"))]
 pub use net::hsts::{HstsEntry, HstsStore, InMemoryHstsStore};
 pub use net::mixed_content::MixedContentPolicy;
