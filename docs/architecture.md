@@ -123,7 +123,7 @@ flowchart TD
         queues["priority queues<br/>q_high · q_norm · q_low · q_idle"]
         pick["pick_lane<br/>(weighted round-robin)"]
         inflight["inflight_map<br/>coalesce by key → FetchInflightEntry"]
-        slots["concurrency limits<br/>global_slots + per_origin semaphores"]
+        slots["SlotPool<br/>global_slots + per-origin limits,<br/>handed out by priority"]
         queues --> pick --> inflight --> slots
     end
 
@@ -162,8 +162,9 @@ End to end, a fetch through the scheduler goes:
 
 2. **Dequeue.** `Fetcher::run` picks the next item with `pick_lane` — a weighted round-robin over
    the four lanes (≈ High 8 : Normal 4 : Low 2 : Idle 1 across a 15-slot cycle). When the preferred
-   lane is empty it falls through to the next lane in descending priority, so **no lane starves**
-   while slots remain.
+   lane is empty it falls through to the next lane in descending priority. The run loop does not
+   wait for a free slot, so this only orders a backlog it finds; where priority really holds is
+   step 4, where requests wait.
 
 3. **Upgrade & coalesce.** If [HSTS](#hsts) applies to the request URL it is rewritten to `https`
    before anything else, so an `http` and an `https` request for the same armed host share one
@@ -173,10 +174,14 @@ End to end, a fetch through the scheduler goes:
    already exists in `inflight_map`, this caller becomes a **follower**: it just registers a
    listener and returns. Otherwise it becomes the **leader** and creates a `FetchInflightEntry`.
 
-4. **Acquire slots.** The leader spawns a fetch task that first acquires a global concurrency slot
-   (`global_slots`, default 32) and then a per-origin slot (`h1_per_origin` = 6 for HTTP/1,
-   `h2_per_origin` = 16 once we've seen an HTTP/2 or HTTP/3 response from that origin). Both are
-   semaphores; acquisition races against the shutdown token.
+4. **Acquire slots.** The leader joins the line at the `SlotPool` (`slots.rs`) for a global
+   concurrency slot (`global_slots`, default 32) and a slot of its origin (`h1_per_origin` = 6 for
+   HTTP/1, `h2_per_origin` = 16 once we've seen an HTTP/2 or HTTP/3 response from that origin),
+   then spawns the fetch task, which waits for its turn. A freed slot goes to the next waiter by
+   the same weighted round-robin over the lanes, first come first served within a lane, so a High
+   request that arrives while the slots are busy goes before the Low ones already waiting. A
+   waiter whose origin is at its limit is passed over and holds no global slot meanwhile. The wait
+   races against the shutdown token and the cancellation of every subscriber.
 
 5. **Perform.** If **any** coalesced subscriber wants streaming, the task runs `perform_streaming`
    (→ `FetchResult::Stream` backed by a `SharedBody`); otherwise `perform_buffered`
@@ -216,19 +221,24 @@ Defined in `src/net/types.rs` (and `src/types.rs`):
 ## Scheduling & concurrency
 
 The `Fetcher` holds four `VecDeque` lanes behind mutexes (`q_high`, `q_norm`, `q_low`, `q_idle`)
-and two layers of semaphores:
+and a `SlotPool` (`slots.rs`) that counts its connection slots:
 
-- **`global_slots`** — a single `Semaphore` capping total concurrent fetches (default 32).
-- **`per_origin`** — an `OriginTable` (`DashMap<origin, OriginSlots>`), created on first use per
-  origin, capping concurrent fetches to one origin. Starts at the HTTP/1 limit (6) and is grown
+- **`global_slots`** — total concurrent fetches (default 32).
+- **per origin** — concurrent fetches to one origin. Starts at the HTTP/1 limit (6) and is grown
   to the HTTP/2 limit (16) once an HTTP/2 or HTTP/3 response has been seen from that origin
   (reported per hop via `NetPolicy::on_protocol`; native only, wasm32 stays at the HTTP/1 limit).
+
+Fetches waiting for slots sit in the pool in the same four lanes, and a freed slot goes to the
+first waiter, by the 8:4:2:1 round-robin, that can use it: one whose origin is below its limit.
+Priority is applied here rather than only at dequeue because this is where fetches wait. Each
+fetch holds its two slots in a `Slots` guard that gives them back when dropped, so a cancelled
+or failed fetch cannot leak one.
 
 `FetcherConfig` (in `fetcher.rs`) also carries `connect_timeout` (5s), `req_timeout` (60s),
 `read_idle_timeout` (15s), `total_body_timeout` (180s), a `user_agent` (defaults to
 `gosub-sonar/<crate version>`), an optional `header_order` (applied per hop by
 `order_hop_headers` in `fetch.rs`, which also inserts `host` and `user-agent` so they can be
-placed; `host` is skipped for origins the `OriginTable` has seen on HTTP/2, via
+placed; `host` is skipped for origins the `SlotPool` has seen on HTTP/2, via
 `NetPolicy::speaks_h2`), and a `proxy`
 (`proxy.rs`) that defaults to reading `HTTP_PROXY` and friends from the environment. The fetcher
 builds **two** `reqwest` clients: one with automatic gzip/brotli/deflate decoding (`auto_decode:
@@ -309,8 +319,8 @@ Cancellation is layered with `tokio_util::sync::CancellationToken`:
   shared fetch.
 - The `FetchInflightEntry::parent_cancel` fires only when the *last* subscriber cancels, aborting
   the shared fetch.
-- A `shutdown` token passed to `Fetcher::run` stops the whole scheduler and unblocks pending
-  semaphore acquisitions.
+- A `shutdown` token passed to `Fetcher::run` stops the whole scheduler and ends every wait for
+  a slot.
 
 Retries (`retry.rs`): `perform_buffered` and `perform_streaming` wrap each attempt in
 `with_retries`, which re-sends after a backoff on a retryable error or status, idempotent methods
