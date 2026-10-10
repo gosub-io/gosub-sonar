@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncReadExt, ReadBuf};
 use tokio::sync::oneshot;
@@ -106,6 +107,8 @@ impl tokio::io::AsyncRead for BytesAsyncReader {
 
 /// An entry in the waiter, representing a listener and whether it wants streaming or buffered response.
 struct WaiterEntry {
+    /// Names the entry, so one listener can be taken out again (see [`Waiter::cancel`]).
+    id: u64,
     /// Listener for this entry.
     tx: oneshot::Sender<FetchResult>,
     /// Whether the listener wants a streaming response (true) or buffered (false).
@@ -121,12 +124,15 @@ pub struct Waiter {
     /// List of listeners (oneshot senders) waiting for the result.
     /// Uses a non-async mutex so register() is synchronous and never needs to be awaited.
     listeners: Mutex<Vec<WaiterEntry>>,
+    /// The id the next registration gets.
+    next_id: AtomicU64,
 }
 
 impl Waiter {
     pub fn new() -> Self {
         Self {
             listeners: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
         }
     }
 
@@ -136,13 +142,36 @@ impl Waiter {
     }
 
     /// Register a consumer for this waiter. We need to know if the consumer is streaming or not.
+    /// Returns the listener's id, for [`cancel`](Self::cancel).
     ///
     /// This is a plain (non-async) call — the lock is held only for the duration of the push.
-    pub fn register(&self, tx: oneshot::Sender<FetchResult>, wants_streaming: bool) {
+    pub fn register(&self, tx: oneshot::Sender<FetchResult>, wants_streaming: bool) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.listeners.lock().push(WaiterEntry {
+            id,
             tx,
             wants_streaming,
         });
+        id
+    }
+
+    /// Takes one listener out and answers it with `err` at once, so a caller that gives up
+    /// stops waiting even while others still wait for the same fetch.
+    ///
+    /// Does nothing when the listener is no longer registered: [`finish`](Self::finish) already
+    /// took it, and it gets (or has) the result. Returns whether the listener was taken out.
+    pub fn cancel(&self, id: u64, err: NetError) -> bool {
+        let entry = {
+            let mut ls = self.listeners.lock();
+            ls.iter().position(|e| e.id == id).map(|at| ls.remove(at))
+        };
+        match entry {
+            Some(entry) => {
+                let _ = entry.tx.send(FetchResult::Error(err));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Process the fetch result with the listeners.
@@ -381,6 +410,52 @@ mod tests {
             tainting: Default::default(),
             peer_addr: None,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiter_cancel_answers_one_listener_and_keeps_the_rest() {
+        let waiter = Waiter::new_arc();
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let first = waiter.register(tx1, false);
+        waiter.register(tx2, false);
+
+        assert!(waiter.cancel(first, NetError::Cancelled("gave up".into())));
+        // The cancelled listener hears now, before any result exists.
+        assert!(matches!(
+            rx1.await.unwrap(),
+            FetchResult::Error(NetError::Cancelled(_))
+        ));
+
+        waiter
+            .finish(
+                FetchResult::Buffered {
+                    meta: dummy_meta(),
+                    body: Bytes::from_static(b"BODY"),
+                },
+                None,
+            )
+            .await;
+        assert!(matches!(rx2.await.unwrap(), FetchResult::Buffered { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiter_cancel_after_finish_leaves_the_result() {
+        let waiter = Waiter::new_arc();
+        let (tx, rx) = oneshot::channel();
+        let id = waiter.register(tx, false);
+        waiter
+            .finish(
+                FetchResult::Buffered {
+                    meta: dummy_meta(),
+                    body: Bytes::from_static(b"BODY"),
+                },
+                None,
+            )
+            .await;
+
+        assert!(!waiter.cancel(id, NetError::Cancelled("too late".into())));
+        assert!(matches!(rx.await.unwrap(), FetchResult::Buffered { .. }));
     }
 
     #[tokio::test(flavor = "current_thread")]

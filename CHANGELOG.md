@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to the next waiter by the same 8:4:2:1 round-robin as the lanes, first come first served
   within a lane. A waiter whose origin is at its limit is passed over instead of holding up
   the ones behind it, and holds no global slot while it waits
+- A caller that cancelled while other callers still wanted the same fetch was not released:
+  cancelling its token only counted it out, its listener stayed registered, and
+  `fetch_with_cancel` went on waiting and returned the full result when the shared fetch ended.
+  It now returns at once with `NetError::Cancelled`, as `fetch_with_cancel` and the
+  architecture doc describe; a caller whose token fires after the result was handed to it keeps
+  the result
+- The error and the `NetEvent::Cancelled` reason when every caller has cancelled read
+  `cancelled net.get_with_redirects`, the name of an internal function; they now say
+  `all callers cancelled`
 
 ## [0.12.0] - 2026-10-10
 
