@@ -266,10 +266,11 @@ impl Default for FetcherConfig {
 /// 1. **Leader** — the first request for a key creates the entry and starts the real HTTP fetch.
 /// 2. **Followers** — subsequent requests with the same key join via `waiter.register()` without
 ///    starting a second fetch.  They receive the same result when the leader finishes.
-/// 3. **Cancellation** — each subscriber gets a child `CancellationToken` derived from
-///    `parent_cancel`.  When a subscriber cancels, `dec_sub_and_maybe_cancel` decrements `subs`.
-///    If the count reaches zero (all subscribers cancelled), `parent_cancel` is fired, which
-///    in turn cancels the in-progress HTTP request.
+/// 3. **Cancellation** — each subscriber brings its own `CancellationToken`.  When one fires,
+///    the subscriber's listener is taken out of the waiter and answered with
+///    `NetError::Cancelled` at once (`Waiter::cancel`), and `dec_sub_and_maybe_cancel`
+///    decrements `subs`.  If the count reaches zero (all subscribers cancelled),
+///    `parent_cancel` is fired, which in turn cancels the in-progress HTTP request.
 /// 4. **Completion** — the leader removes the entry from the map (so new requests start a fresh
 ///    fetch instead of joining a waiter that is about to be drained), then calls
 ///    `waiter.finish(result)`, which fans the result out to all registered receivers.  `done` is
@@ -467,7 +468,8 @@ impl Fetcher {
     }
 
     /// Like [`fetch`](Self::fetch), with a caller-supplied cancellation token for this
-    /// subscriber. Cancelling the token abandons this caller's interest in the result; the
+    /// subscriber. Cancelling the token makes this call return at once with
+    /// [`NetError::Cancelled`], unless the result had already been handed to it; the
     /// underlying HTTP request is aborted once all subscribers have cancelled.
     pub async fn fetch_with_cancel(
         &self,
@@ -596,27 +598,28 @@ impl Fetcher {
             // guaranteed to register before the drain; otherwise it finds the map vacant and
             // becomes the leader of a fresh fetch. Registering after releasing the guard would
             // leave a window where the result is lost and the subscriber gets a RecvError.
-            let (inflight_entry, is_leader) = match self.inflight_map.entry(key_str.clone()) {
-                Entry::Occupied(entry) => {
-                    let arc = entry.get().clone();
-                    arc.waiter.register(reply_tx, req.streaming);
-                    arc.inc_sub();
-                    (arc, false)
-                }
-                Entry::Vacant(v) => {
-                    let arc = Arc::new(FetchInflightEntry {
-                        parent_cancel: CancellationToken::new(),
-                        waiter: Arc::new(Waiter::new()),
-                        wants_streaming: AtomicBool::new(req.streaming),
-                        done: CancellationToken::new(),
-                        subs: AtomicUsize::new(0),
-                    });
-                    arc.waiter.register(reply_tx, req.streaming);
-                    arc.inc_sub();
-                    v.insert(arc.clone());
-                    (arc, true)
-                }
-            };
+            let (inflight_entry, is_leader, listener) =
+                match self.inflight_map.entry(key_str.clone()) {
+                    Entry::Occupied(entry) => {
+                        let arc = entry.get().clone();
+                        let listener = arc.waiter.register(reply_tx, req.streaming);
+                        arc.inc_sub();
+                        (arc, false, listener)
+                    }
+                    Entry::Vacant(v) => {
+                        let arc = Arc::new(FetchInflightEntry {
+                            parent_cancel: CancellationToken::new(),
+                            waiter: Arc::new(Waiter::new()),
+                            wants_streaming: AtomicBool::new(req.streaming),
+                            done: CancellationToken::new(),
+                            subs: AtomicUsize::new(0),
+                        });
+                        let listener = arc.waiter.register(reply_tx, req.streaming);
+                        arc.inc_sub();
+                        v.insert(arc.clone());
+                        (arc, true, listener)
+                    }
+                };
 
             if is_leader {
                 self.ctx.on_ref_active(req.reference);
@@ -627,7 +630,15 @@ impl Fetcher {
             let done = entry_for_cancel.done.clone();
             tokio::spawn(async move {
                 tokio::select! {
-                    _ = child_cancel.cancelled() => entry_for_cancel.dec_sub_and_maybe_cancel(),
+                    _ = child_cancel.cancelled() => {
+                        // This caller stops waiting now, even while others still want the
+                        // result; unless the result was already handed to it, which it keeps.
+                        entry_for_cancel.waiter.cancel(
+                            listener,
+                            NetError::Cancelled("cancelled by the caller".into()),
+                        );
+                        entry_for_cancel.dec_sub_and_maybe_cancel();
+                    }
                     _ = done.cancelled() => {}
                 }
             });
@@ -1737,6 +1748,61 @@ mod tests {
         t.observe(&url, http::Version::HTTP_2);
         assert!(slots.sem.try_acquire().is_ok());
         drop(held);
+    }
+
+    /// A caller that cancels stops waiting at once, even while other callers keep the shared
+    /// fetch alive; the others still get the result, and the server is asked once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetcher_a_caller_that_cancels_alone_is_released_at_once() {
+        let srv = TestServer::new()
+            .route(
+                "/slow",
+                RouteConfig::delay(Duration::from_millis(800), b"body".to_vec()),
+            )
+            .start()
+            .await;
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+
+        let quitter = CancellationToken::new();
+        let quitting = tokio::spawn({
+            let (f, url, token) = (fetcher.clone(), srv.url("/slow"), quitter.clone());
+            async move {
+                let started = std::time::Instant::now();
+                let result = f
+                    .fetch_with_cancel(FetchRequest::builder(Method::GET, url).build(), token)
+                    .await;
+                (result, started.elapsed())
+            }
+        });
+        let staying = tokio::spawn({
+            let (f, url) = (fetcher.clone(), srv.url("/slow"));
+            async move {
+                f.fetch(FetchRequest::builder(Method::GET, url).build())
+                    .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        quitter.cancel();
+
+        let (result, waited) = quitting.await.unwrap();
+        assert!(
+            matches!(result, FetchResult::Error(NetError::Cancelled(_))),
+            "{result:?}"
+        );
+        assert!(
+            waited < Duration::from_millis(500),
+            "released after {waited:?}"
+        );
+        assert!(matches!(
+            staying.await.unwrap(),
+            FetchResult::Buffered { .. }
+        ));
+        assert_eq!(srv.hit_count("/slow"), 1);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]

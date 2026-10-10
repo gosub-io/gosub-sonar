@@ -305,8 +305,10 @@ file on disk — writing to a temp file and atomically renaming on success (see 
 Cancellation is layered with `tokio_util::sync::CancellationToken`:
 
 - Each subscriber passes its own `CancellationToken` to `submit`; when a caller cancels, its
-  listener is removed and the subscriber count drops. Cancelling one caller does not cancel the
-  shared fetch.
+  listener is removed, it is answered at once with `NetError::Cancelled`, and the subscriber
+  count drops. Cancelling one caller does not cancel the shared fetch, and does not keep that
+  caller waiting for it either. A caller whose token fires after the result was handed to it
+  keeps the result.
 - The `FetchInflightEntry::parent_cancel` fires only when the *last* subscriber cancels, aborting
   the shared fetch.
 - A `shutdown` token passed to `Fetcher::run` stops the whole scheduler and unblocks pending

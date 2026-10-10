@@ -1749,8 +1749,8 @@ async fn get_with_redirects(
         if let (Some(resolver), Some(literal)) = (policy.dns_resolver.as_ref(), ip_literal(&url)) {
             let refused = tokio::select! {
                 _ = cancel.cancelled() => {
-                    observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled net.get_with_redirects" });
-                    return Err(NetError::Cancelled("cancelled net.get_with_redirects".into()));
+                    observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "all callers cancelled" });
+                    return Err(NetError::Cancelled("all callers cancelled".into()));
                 }
                 r = resolver.resolve(&literal) => r.err(),
             };
@@ -2208,8 +2208,8 @@ async fn get_with_redirects(
 
                 let resp = tokio::select! {
                     _ = cancel.cancelled() => {
-                        observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled net.get_with_redirects" });
-                        return Err(NetError::Cancelled("cancelled net.get_with_redirects".into()));
+                        observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "all callers cancelled" });
+                        return Err(NetError::Cancelled("all callers cancelled".into()));
                     }
                     _ = &mut deadline => {
                         return Err(NetError::Timeout(format!(
