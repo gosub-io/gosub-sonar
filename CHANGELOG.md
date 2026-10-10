@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-10
+
 ### Added
 
 - `FetcherContext::cookies_for_hop` and `CookieHop`: the cookie hook for one hop with its method
@@ -846,7 +848,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.8.0...v0.9.0
