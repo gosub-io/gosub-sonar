@@ -339,7 +339,8 @@ it to the connection, not the request.
 - **`url_allowed`** — consulted for the initial URL *and every redirect target*; the place to
   implement SSRF guards, allow/block lists. Wired to `FetcherContext::is_url_allowed`.
 - **`cookies_for`** — supplies the `Cookie` header per origin from the host's jar, asked on
-  behalf of the request's `RequestReference`.
+  behalf of the request's `RequestReference` with a `CookieHop`: the hop's URL, its method, and
+  the URLs before it.
 - **`hsts`** — the [HSTS](#hsts) store, consulted to upgrade each hop and updated from each hop's
   response. Set from `FetcherConfig::hsts` rather than `FetcherContext`; `None` disables HSTS.
 - **`cors_preflight`** — the [CORS](#cors) preflight-grant cache, consulted before sending a
@@ -723,6 +724,10 @@ Implemented by the host and passed to `Fetcher::new`. The bridge between schedul
 - `cookies_for(reference, url)` — returns the `Cookie` header value for a request hop (default:
   none), wired into `NetPolicy::cookies_for`. `reference` is the request's, so a host with a jar
   per tab or partition answers from the right one.
+- `cookies_for_hop(reference, hop)` — the same for one `CookieHop`, which also carries the hop's
+  method and the request's URL list so far: a host judging `SameSite` needs both (`Lax` only on a
+  safe cross-site navigation; a detour through another site taints the rest of the chain).
+  Defaults to `cookies_for(reference, hop.url)`; this is what `NetPolicy::cookies_for` calls.
 - `cookie_jar_key(reference)` — which jar the cookie hooks answer `reference` from; credentialed
   requests coalesce only on the same key (default: the reference, so none share).
 - `on_cookies_received(reference, hop_url, set_cookie_values)` — called for every response carrying

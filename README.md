@@ -179,7 +179,8 @@ impl FetcherContext for MyContext {
 ```
 
 `is_url_allowed`, `cookies_for` and `on_cookies_received` are called for the initial URL and
-for every redirect target, so a blocklist or cookie jar can't be bypassed by a redirect. The two
+for every redirect target (`cookies_for_hop`, which defaults to `cookies_for`, also gets the
+hop's method and the chain before it, for `SameSite`), so a blocklist or cookie jar can't be bypassed by a redirect. The two
 cookie hooks follow the request's credentials mode: a `credentials: omit` request neither sends
 nor stores cookies. They also get the request's `RequestReference`, so a host with a jar per tab
 can answer from the right one; `cookie_jar_key` tells the fetcher which references share a jar,

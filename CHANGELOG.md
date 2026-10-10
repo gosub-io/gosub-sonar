@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `FetcherContext::cookies_for_hop` and `CookieHop`: the cookie hook for one hop with its method
+  and the URLs the request went to before it, which is what `SameSite` needs. `Lax` cookies ride
+  on a cross-site navigation only when its method is safe, so a `307` that keeps a `POST` must
+  not carry them; and a chain that passed through another site is cross-site from then on. The
+  default asks `cookies_for` with the hop's URL, so an existing context is unchanged
+
+### Changed
+
+- `NetPolicy::cookies_for` (`CookieJarFn`) takes a `&CookieHop` instead of the hop's `&Url`; a
+  closure written as `|url| ...` reads `hop.url` instead. `NetPolicy::from_context` calls
+  `cookies_for_hop`
+
 ## [0.11.0] - 2026-10-10
 
 ### Added
