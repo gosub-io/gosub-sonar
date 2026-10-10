@@ -40,6 +40,7 @@ pub mod request_ref;
 pub mod retry;
 pub mod shared_body;
 pub mod simple;
+pub(crate) mod slots;
 pub mod tls;
 pub mod transport;
 pub mod types;

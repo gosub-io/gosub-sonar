@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued
+  by priority but spawned every request straight away, and the spawned tasks then waited on
+  the global and per-origin semaphores in whatever order they happened to reach them: a `High`
+  request that arrived while the slots were busy went out after every `Low` one already
+  waiting, and even a queued backlog went out in an order that varied from run to run.
+  Fetches now wait for slots in a priority-aware pool (`net::slots`) that hands a freed slot
+  to the next waiter by the same 8:4:2:1 round-robin as the lanes, first come first served
+  within a lane. A waiter whose origin is at its limit is passed over instead of holding up
+  the ones behind it, and holds no global slot while it waits
+
 ## [0.12.0] - 2026-10-10
 
 ### Added

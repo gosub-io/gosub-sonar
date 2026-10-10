@@ -21,6 +21,7 @@ use crate::net::observer::NetObserver;
 use crate::net::proxy::{ProxyConfig, ProxyRoutes};
 use crate::net::retry::{self, RetryPolicy};
 use crate::net::shared_body::{ReaderOptions, SharedBody, DEFAULT_REPLAY_LIMIT};
+use crate::net::slots::{SlotPool, Slots};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::tls::TlsOverrideStore;
 use crate::net::types::{FetchRequest, FetchResult, Initiator, NetError, Priority};
@@ -29,9 +30,8 @@ use dashmap::{DashMap, Entry};
 use http::{header, HeaderName};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{collections::VecDeque, sync::Arc, time::Duration};
-use tokio::sync::{oneshot, Notify, Semaphore};
+use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
-use url::Url;
 
 const SHARED_MAX_CAPACITY: usize = 32;
 
@@ -335,9 +335,9 @@ pub struct Fetcher {
     client_raw: reqwest::Client,
     cfg: FetcherConfig,
 
-    global_slots: Arc<Semaphore>,
-    // Wrapped in Arc so spawned tasks share the same map rather than each getting a clone.
-    per_origin: Arc<OriginTable>,
+    // The global and per-origin connection slots, handed out by priority. Shared with the
+    // spawned fetch tasks, which wait on it and give slots back to it.
+    slots: Arc<SlotPool>,
 
     q_high: tokio::sync::Mutex<VecDeque<QueueItem>>,
     q_norm: tokio::sync::Mutex<VecDeque<QueueItem>>,
@@ -400,8 +400,7 @@ impl Fetcher {
             client,
             client_raw,
             cfg: config.clone(),
-            global_slots: Arc::new(Semaphore::new(config.global_slots)),
-            per_origin: Arc::new(OriginTable::new(&config)),
+            slots: SlotPool::new(&config),
             q_high: tokio::sync::Mutex::new(VecDeque::new()),
             q_norm: tokio::sync::Mutex::new(VecDeque::new()),
             q_low: tokio::sync::Mutex::new(VecDeque::new()),
@@ -413,14 +412,11 @@ impl Fetcher {
         })
     }
 
-    fn origin_key(url: &Url) -> String {
-        url.origin().ascii_serialization()
-    }
-
     // Weighted round-robin dequeue across the four priority lanes.
     // The 15-slot cycle gives approximate weights: High=8, Normal=4, Low=2, Idle=1.
     // When the preferred lane is empty the next non-empty lane is tried in
-    // descending priority order, so no request starves as long as slots remain.
+    // descending priority order. This only orders a backlog the run loop finds: requests then
+    // wait for slots in the `SlotPool`, which applies the same weights where the waiting is.
     fn pick_lane<'a>(
         &'a self,
         high: &'a mut VecDeque<QueueItem>,
@@ -527,7 +523,9 @@ impl Fetcher {
     /// Runs the scheduler loop until `shutdown` is cancelled.
     ///
     /// Dequeues requests via weighted round-robin across the four priority lanes and
-    /// spawns fetch tasks subject to the global and per-origin concurrency limits.
+    /// spawns fetch tasks subject to the global and per-origin concurrency limits. A task
+    /// waiting for its slots keeps its priority: a freed slot goes to the highest lane that
+    /// can use it, first come first served within a lane.
     /// Spawn this on a Tokio runtime before calling [`fetch`](Self::fetch).
     pub async fn run(&self, shutdown: CancellationToken) {
         let mut lane_counter: u8 = 0;
@@ -678,8 +676,10 @@ impl Fetcher {
             } else {
                 self.client_raw.clone()
             };
-            let global = self.global_slots.clone();
-            let per_origin = self.per_origin.clone();
+            let pool = self.slots.clone();
+            // Join the line for slots here, in dequeue order, rather than in the spawned task:
+            // tasks start in no particular order, which would shuffle requests of one lane.
+            let ticket = self.slots.enqueue(&req.url, req.priority);
             let built = self.built.clone();
             let cfg = self.cfg.clone();
             let inflight = self.inflight_map.clone();
@@ -692,29 +692,17 @@ impl Fetcher {
 
             let title = format!("Fetcher: {}", short_url(&req.url, 80));
             spawn_named(&title, async move {
-                let slots = per_origin.slots_for(&req.url);
-
-                // Waiting for slots ends early on shutdown, or once every subscriber has
-                // cancelled. Either way the entry below is still cleaned up like a finished
-                // fetch, so nothing stays in the in-flight map and every listener hears.
+                // Priority is applied here, where fetches wait: the pool hands a freed slot to
+                // the highest lane that can use it (see `slots`). Waiting ends early on
+                // shutdown, or once every subscriber has cancelled. Either way the entry below
+                // is still cleaned up like a finished fetch, so nothing stays in the in-flight
+                // map and every listener hears.
                 let acquire = async {
-                    let global_permit = tokio::select! {
-                        p = global.acquire_owned() => p.ok()?,
-                        _ = shutdown_child.cancelled() => return None,
-                        _ = cancel_parent.cancelled() => return None,
-                    };
-                    let origin_permit = tokio::select! {
-                        p = slots.sem.acquire() => {
-                            p.ok()?.forget();
-                            OriginPermit(slots.clone())
-                        }
-                        _ = shutdown_child.cancelled() => return None,
-                        _ = cancel_parent.cancelled() => return None,
-                    };
-                    Some(SlotGuards {
-                        _global: global_permit,
-                        _origin: origin_permit,
-                    })
+                    tokio::select! {
+                        s = ticket.wait() => s,
+                        _ = shutdown_child.cancelled() => None,
+                        _ = cancel_parent.cancelled() => None,
+                    }
                 };
                 // Held here until the task ends, or by the body of a streamed fetch.
                 let mut held = acquire.await;
@@ -737,7 +725,7 @@ impl Fetcher {
                         &cfg,
                         cancel_parent.clone(),
                         ctx_clone.clone(),
-                        per_origin.clone(),
+                        pool.clone(),
                         built.clone(),
                         slot_guards,
                     )
@@ -750,7 +738,7 @@ impl Fetcher {
                         &cfg,
                         cancel_parent.clone(),
                         ctx_clone.clone(),
-                        per_origin.clone(),
+                        pool.clone(),
                         built.clone(),
                     )
                     .await
@@ -963,37 +951,10 @@ fn build_client(
     }
 }
 
-/// Connection semaphore for one origin.
-///
-/// Starts at the h1 limit, since we only know whether an origin speaks HTTP/2 after ALPN.
-/// Once an HTTP/2 (or HTTP/3) response comes in from the origin, the semaphore is grown to the
-/// h2 limit. It is never shrunk again.
-struct OriginSlots {
-    sem: Semaphore,
-    h2: AtomicBool,
-}
-
-/// A slot taken from one origin's semaphore, given back on drop.
-struct OriginPermit(Arc<OriginSlots>);
-
-impl Drop for OriginPermit {
-    fn drop(&mut self) {
-        self.0.sem.add_permits(1);
-    }
-}
-
-/// The connection slots a fetch holds: one global, one for its origin. A buffered fetch
-/// keeps them until it has delivered; a streamed one hands them to its body, so the
-/// connection stays counted until the body ends.
-struct SlotGuards {
-    _global: tokio::sync::OwnedSemaphorePermit,
-    _origin: OriginPermit,
-}
-
 /// A body reader that keeps the fetch's slots until it is dropped.
 struct HoldsSlots<R> {
     inner: R,
-    _slots: SlotGuards,
+    _slots: Slots,
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HoldsSlots<R> {
@@ -1006,63 +967,6 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HoldsSlots<R> {
     }
 }
 
-/// Per-origin connection semaphores, keyed by serialized origin.
-struct OriginTable {
-    cfg: FetcherConfig,
-    slots: DashMap<String, Arc<OriginSlots>>,
-}
-
-impl OriginTable {
-    fn new(cfg: &FetcherConfig) -> Self {
-        Self {
-            cfg: cfg.clone(),
-            slots: DashMap::new(),
-        }
-    }
-
-    fn slots_for(&self, url: &Url) -> Arc<OriginSlots> {
-        self.slots
-            .entry(Fetcher::origin_key(url))
-            .or_insert_with(|| {
-                Arc::new(OriginSlots {
-                    sem: Semaphore::new(self.cfg.h1_per_origin),
-                    h2: AtomicBool::new(false),
-                })
-            })
-            .clone()
-    }
-
-    /// Called with the HTTP version of every response; grows the origin's semaphore the first
-    /// time it turns out to speak h2.
-    fn observe(&self, url: &Url, version: http::Version) {
-        if !matches!(version, http::Version::HTTP_2 | http::Version::HTTP_3) {
-            return;
-        }
-        let slots = self.slots_for(url);
-        if !slots.h2.swap(true, Ordering::AcqRel) {
-            let extra = self
-                .cfg
-                .h2_per_origin
-                .saturating_sub(self.cfg.h1_per_origin);
-            slots.sem.add_permits(extra);
-        }
-    }
-
-    /// True once a response from this origin came in over HTTP/2 or HTTP/3.
-    fn speaks_h2(&self, url: &Url) -> bool {
-        self.slots_for(url).h2.load(Ordering::Acquire)
-    }
-
-    #[cfg(test)]
-    fn limit_for(&self, url: &Url) -> usize {
-        if self.speaks_h2(url) {
-            self.cfg.h2_per_origin
-        } else {
-            self.cfg.h1_per_origin
-        }
-    }
-}
-
 /// Build the `NetPolicy` for a fetcher request: context hooks, HSTS, CORS preflight cache and
 /// the protocol sink that updates the per-origin limits. The cookie hooks are asked on behalf of
 /// `req`'s reference. On wasm32 the sink is never called
@@ -1072,7 +976,7 @@ fn build_policy(
     req: &FetchRequest,
     cfg: &FetcherConfig,
     ctx: &Arc<dyn FetcherContext>,
-    origins: Arc<OriginTable>,
+    origins: Arc<SlotPool>,
     built: &Arc<ClientsBuilt>,
 ) -> NetPolicy {
     #[cfg(target_arch = "wasm32")]
@@ -1128,9 +1032,9 @@ async fn perform_streaming(
     cfg: &FetcherConfig,
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
-    origins: Arc<OriginTable>,
+    origins: Arc<SlotPool>,
     built: Arc<ClientsBuilt>,
-    slots: SlotGuards,
+    slots: Slots,
 ) -> Result<FetchResult, NetError> {
     let client = Arc::new(client.clone());
     // Only the header phase is retried; the body goes straight to the caller.
@@ -1191,7 +1095,7 @@ async fn perform_buffered(
     cfg: &FetcherConfig,
     cancel: CancellationToken,
     ctx: Arc<dyn FetcherContext>,
-    origins: Arc<OriginTable>,
+    origins: Arc<SlotPool>,
     built: Arc<ClientsBuilt>,
 ) -> Result<FetchResult, NetError> {
     let client = Arc::new(client.clone());
@@ -1678,65 +1582,77 @@ mod tests {
         shutdown.cancel();
     }
 
-    fn origin_table() -> OriginTable {
-        OriginTable::new(&FetcherConfig {
-            h1_per_origin: 3,
-            h2_per_origin: 8,
-            ..FetcherConfig::default()
-        })
-    }
-
-    #[test]
-    fn origin_table_starts_at_h1_limit_for_all_schemes() {
-        let t = origin_table();
-        for u in [
-            "http://example.com/",
-            "https://example.com/",
-            "ftp://example.com/",
-        ] {
-            let url = Url::parse(u).unwrap();
-            assert_eq!(t.limit_for(&url), 3, "{u}");
-            assert_eq!(t.slots_for(&url).sem.available_permits(), 3, "{u}");
-        }
-    }
-
-    #[test]
-    fn origin_table_grows_to_h2_limit_after_h2_response() {
-        let t = origin_table();
-        let a = Url::parse("https://a.example/x").unwrap();
-        let b = Url::parse("https://b.example/x").unwrap();
-        // different port = different origin
-        let a_alt = Url::parse("https://a.example:8443/x").unwrap();
-
-        t.observe(&a, http::Version::HTTP_2);
-        assert_eq!(t.limit_for(&a), 8);
-        assert_eq!(t.slots_for(&a).sem.available_permits(), 8);
-        assert_eq!(t.limit_for(&b), 3);
-        assert_eq!(t.limit_for(&a_alt), 3);
-
-        // more h2 responses (or an h1 one) don't change anything
-        t.observe(&a, http::Version::HTTP_2);
-        t.observe(
-            &Url::parse("https://a.example/other").unwrap(),
-            http::Version::HTTP_3,
+    /// Priority has to hold where fetches actually wait: for a slot. The run loop hands every
+    /// request on as soon as it has coalesced it, so here all six are already waiting for the
+    /// one slot when it frees, and they must get it by lane, first come first served within one. On a multi-threaded runtime the
+    /// tasks reach the slots in no particular order, which is what a lane order applied only
+    /// at dequeue used to lose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetcher_waiting_requests_get_the_slot_by_priority() {
+        let mut srv = TestServer::new().route(
+            "/blocker",
+            RouteConfig::delay(Duration::from_millis(300), b"b".to_vec()),
         );
-        t.observe(&a, http::Version::HTTP_11);
-        assert_eq!(t.slots_for(&a).sem.available_permits(), 8);
-    }
+        let labels = ["low1", "low2", "normal1", "normal2", "high1", "high2"];
+        for label in labels {
+            srv = srv.route(
+                &format!("/{label}"),
+                RouteConfig::delay(Duration::from_millis(20), label.as_bytes().to_vec()),
+            );
+        }
+        let srv = srv.start().await;
+        let fetcher = Arc::new(
+            Fetcher::new(
+                FetcherConfig {
+                    global_slots: 1,
+                    cache: None,
+                    ..test_config()
+                },
+                Arc::new(NullContext),
+            )
+            .unwrap(),
+        );
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
 
-    /// The extra permits must land on the semaphore that requests are already waiting on.
-    #[test]
-    fn origin_table_growth_reaches_blocked_acquirers() {
-        let t = origin_table();
-        let url = Url::parse("https://a.example/x").unwrap();
-        let slots = t.slots_for(&url);
+        // The slot is taken before anything else arrives.
+        let (req, handle) = make_req(srv.url("/blocker"), Priority::Low);
+        let (tx, blocker) = oneshot::channel();
+        fetcher.submit(req, handle, tx).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let held: Vec<_> = (0..3).map(|_| slots.sem.try_acquire().unwrap()).collect();
-        assert!(slots.sem.try_acquire().is_err());
+        let order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let mut joins = Vec::new();
+        for (label, prio) in [
+            ("low1", Priority::Low),
+            ("low2", Priority::Low),
+            ("normal1", Priority::Normal),
+            ("normal2", Priority::Normal),
+            ("high1", Priority::High),
+            ("high2", Priority::High),
+        ] {
+            let (req, handle) = make_req(srv.url(&format!("/{label}")), prio);
+            let (tx, rx) = oneshot::channel();
+            fetcher.submit(req, handle, tx).await;
+            let order = order.clone();
+            joins.push(tokio::spawn(async move {
+                let _ = rx.await;
+                order.lock().unwrap().push(label);
+            }));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
 
-        t.observe(&url, http::Version::HTTP_2);
-        assert!(slots.sem.try_acquire().is_ok());
-        drop(held);
+        let _ = tokio::time::timeout(Duration::from_secs(5), blocker).await;
+        for j in joins {
+            let _ = tokio::time::timeout(Duration::from_secs(5), j).await;
+        }
+        // By lane, and within a lane in the order they arrived.
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["high1", "high2", "normal1", "normal2", "low1", "low2"]
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]

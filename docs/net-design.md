@@ -129,8 +129,10 @@ Each unique non-coalesced request will be represented by a `FetchInflightEntry`.
 the list of listeners, and the state of the job. This system will also take care of streamable vs buffered requests,
 and can serve both types of requests from the same inflight job.
 
-If the request wasn't coalescable, we can fetch the actual request. This is done by spawning a new task. The 
-first thing it does is to acquire a slot from a global semaphore, and then a per-origin slot. Both limits come from 
+If the request wasn't coalescable, we can fetch the actual request. This is done by spawning a new task, which first 
+needs a global slot and a per-origin slot. It waits for them in a `SlotPool`, again in the four priority lanes: the run 
+loop hands requests on as soon as it has dequeued them, so this is where they actually wait, and where priority has to 
+hold. A freed slot goes to the highest-priority waiter whose origin has room. Both limits come from 
 `FetcherConfig`: by default there can be 32 requests running in total (`global_slots`), and per single origin 6 for 
 HTTP/1 (`h1_per_origin`) or 16 for HTTP/2 (`h2_per_origin`). This is to avoid overloading the server, and to avoid 
 running into issues with browsers that limit the number of connections to a single origin.
