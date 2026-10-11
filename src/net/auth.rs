@@ -238,8 +238,14 @@ impl Credentials {
         let mut value = match self {
             Self::Basic { username, password } => {
                 // RFC 7617 §2: the user-id is everything before the first colon, so a colon in
-                // the name would move the password boundary.
-                if username.contains(':') {
+                // the name would move the password boundary; and neither part may contain a
+                // control character.
+                if username.contains(':')
+                    || username
+                        .chars()
+                        .chain(password.chars())
+                        .any(char::is_control)
+                {
                     return None;
                 }
                 let encoded = base64_encode(format!("{username}:{password}").as_bytes());
@@ -760,6 +766,20 @@ mod tests {
     fn credentials_that_cannot_be_a_header_value_are_dropped() {
         // A colon in the user-id would move the password boundary.
         assert!(Credentials::basic("a:b", "pw").header_value().is_none());
+        // RFC 7617 §2: "The user-id and password MUST NOT contain any control characters".
+        for (user, password) in [
+            ("a\tb", "pw"),
+            ("ab", "p\0w"),
+            ("ab", "p\u{7f}"),
+            ("a\u{85}", "pw"),
+        ] {
+            assert!(
+                Credentials::basic(user, password).header_value().is_none(),
+                "{user:?} {password:?}"
+            );
+        }
+        // A colon in the password is fine.
+        assert!(Credentials::basic("ab", "p:w").header_value().is_some());
         assert!(Credentials::Raw("Bearer bad\nvalue".into())
             .header_value()
             .is_none());

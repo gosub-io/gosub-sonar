@@ -94,6 +94,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Auth: a challenge whose realm had a byte above 0x7F (`realm="Café"`) was dropped whole,
   so no login was possible on that server. Such bytes are opaque data in a quoted-string
   (RFC 9110 §5.5); the challenge is parsed, with the realm read as UTF-8
+- Auth: Basic credentials with a control character in the user-id or password (a tab, NUL,
+  DEL) were encoded and sent, though RFC 7617 §2 says they MUST NOT contain any. Such
+  credentials give no header now, like a colon in the user-id already did
 
 ## [0.12.0] - 2026-10-10
 
