@@ -68,6 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache: a `max-age` that was not a number of seconds (`max-age=abc`) was ignored, and the
   response was then fresh by its `Expires` or the `Last-Modified` heuristic. It counts as
   `max-age=0` now, as RFC 9111 §4.2.1 encourages and browsers do
+- Cache: headers named in a response's `Connection` (`Connection: close, X-Hop-Info`) were
+  stored with it and replayed on every hit. They describe that connection, like the fixed
+  hop-by-hop headers, and are dropped before storing and from a `304` now (RFC 9110 §7.6.1)
 
 ## [0.12.0] - 2026-10-10
 

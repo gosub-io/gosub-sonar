@@ -72,6 +72,19 @@ const HOP_BY_HOP: &[HeaderName] = &[
 /// `Proxy-Authentication-Info` (RFC 9110 §11.7.3), never stored either; see [`HOP_BY_HOP`].
 const PROXY_AUTHENTICATION_INFO: &str = "proxy-authentication-info";
 
+/// The headers a response's `Connection` names (RFC 9110 §7.6.1): they describe that connection
+/// like the fixed hop-by-hop ones do, so they are not stored either (RFC 9111 §3.1 allows the
+/// removal at storage time).
+fn connection_listed(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|name| HeaderName::try_from(name.trim()).ok())
+        .collect()
+}
+
 /// How a request uses the cache, mirroring the Fetch standard's request cache mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CacheMode {
@@ -312,6 +325,7 @@ impl CacheEntry {
         received_at: DateTime<Utc>,
     ) -> Self {
         let mut updated = self.clone();
+        let connection = connection_listed(headers);
         for name in headers.keys() {
             // Content-Length describes the stored body, which the 304 did not carry. A decoded
             // body was stored without its Content-Encoding, and the 304's would put back a
@@ -319,6 +333,7 @@ impl CacheEntry {
             // response depends on are not updated).
             if HOP_BY_HOP.contains(name)
                 || name == PROXY_AUTHENTICATION_INFO
+                || connection.contains(name)
                 || name == header::CONTENT_LENGTH
                 || name == header::SET_COOKIE
                 || (self.decoded && name == header::CONTENT_ENCODING)
@@ -540,6 +555,9 @@ pub fn entry_from_response(
     received_at: DateTime<Utc>,
 ) -> CacheEntry {
     let mut headers = response.clone();
+    for name in connection_listed(response) {
+        headers.remove(name);
+    }
     for name in HOP_BY_HOP {
         headers.remove(name);
     }
@@ -1688,6 +1706,31 @@ mod tests {
         ]);
         assert!(!stored.headers.contains_key(header::PROXY_AUTHENTICATE));
         assert!(!stored.headers.contains_key("proxy-authentication-info"));
+        // Nor what `Connection` names: it describes that connection, not the response.
+        let stored = entry(&[
+            ("cache-control", "max-age=60"),
+            ("connection", "close, X-Hop-Info"),
+            ("x-hop-info", "1"),
+            ("x-kept", "1"),
+        ]);
+        assert!(!stored.headers.contains_key("x-hop-info"));
+        assert!(stored.headers.contains_key("x-kept"));
+        let updated = stored.updated_by_304(
+            &headers(&[
+                ("connection", "x-hop-304"),
+                ("x-hop-304", "1"),
+                ("x-new", "1"),
+            ]),
+            at(1),
+            at(1),
+        );
+        assert!(!updated.headers.contains_key("x-hop-304"));
+        assert!(updated.headers.contains_key("x-new"));
+        let stored = entry(&[
+            ("cache-control", "max-age=60"),
+            ("proxy-authentication-info", "nextnonce=\"n\""),
+        ]);
+
         // Nor does a 304 bring one in.
         let updated = stored.updated_by_304(
             &headers(&[("proxy-authentication-info", "nextnonce=\"m\"")]),
