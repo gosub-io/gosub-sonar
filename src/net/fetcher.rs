@@ -7,6 +7,7 @@ use crate::net::cache::{HttpCache, InMemoryHttpCache};
 use crate::net::cors::{CorsPreflightCache, InMemoryPreflightCache};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::dns::DnsResolver;
+use crate::net::events::NetEvent;
 use crate::net::fetch::{
     blocked, fetch_response_complete, fetch_response_top, hop_checks, HopCheck, NetPolicy,
     RequestInit, ResponseTop,
@@ -740,7 +741,14 @@ impl Fetcher {
             };
 
             if let Some(reason) = reject {
-                let err = FetchResult::Error(blocked(&observer, req.url.clone(), reason));
+                // `Blocked` names the cause; `Failed` ends the request, as on any other path
+                // (see `NetEvent::Blocked`).
+                let error = blocked(&observer, req.url.clone(), reason);
+                observer.on_event(NetEvent::Failed {
+                    url: req.url.clone(),
+                    error: anyhow::Error::new(error.clone()),
+                });
+                let err = FetchResult::Error(error);
                 // Remove before finish — see the registration comment above for the ordering.
                 self.inflight_map
                     .remove_if(&key_str, |_, e| Arc::ptr_eq(e, &inflight_entry));
@@ -3196,6 +3204,19 @@ mod tests {
             matches!(late, FetchResult::Error(NetError::Cancelled(_))),
             "{late:?}"
         );
+    }
+
+    /// `NetEvent::Blocked`: "A request hop was refused by policy and never sent.
+    /// `NetEvent::Failed` follows as the terminal event." Also when the scheduler refuses the
+    /// request before it is sent at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_blocked_before_sending_ends_with_failed() {
+        // Port 25 is on the bad-port list: refused by the scheduler's pre-flight check.
+        let req =
+            FetchRequest::builder(Method::GET, Url::parse("http://127.0.0.1:25/").unwrap()).build();
+        let (result, log) = fetch_recorded(test_config(), req).await;
+        assert!(result.is_error(), "{result:?}");
+        assert_eq!(log.event_names(), vec!["Blocked", "Failed"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
