@@ -371,7 +371,9 @@ impl ResponseDirectives {
             match name.as_str() {
                 "no-store" => out.no_store = true,
                 "no-cache" => out.no_cache = true,
-                "must-revalidate" | "proxy-revalidate" => out.must_revalidate = true,
+                // `proxy-revalidate` is `must-revalidate` for shared caches only (RFC 9111
+                // §5.2.2.8); this one is private.
+                "must-revalidate" => out.must_revalidate = true,
                 "immutable" => out.immutable = true,
                 "private" => out.private = true,
                 "public" => out.public = true,
@@ -1315,6 +1317,32 @@ mod tests {
         ));
         assert!(matches!(
             decision(&[("pragma", "foo")]),
+            CacheDecision::Use(_)
+        ));
+    }
+
+    /// RFC 9111 §5.2.2.8: `proxy-revalidate` binds shared caches only. This cache is private,
+    /// so a stale response with it may be served when the request accepts stale ones, unlike
+    /// one with `must-revalidate`.
+    #[test]
+    fn proxy_revalidate_does_not_bind_a_private_cache() {
+        let stale = [entry(&[
+            ("cache-control", "max-age=10, proxy-revalidate"),
+            ("etag", "\"v1\""),
+        ])];
+        let asked = headers(&[("cache-control", "max-stale=60")]);
+        assert!(matches!(
+            decide(&stale, &asked, false, CacheMode::Default, at(40)),
+            CacheDecision::Use(_)
+        ));
+        assert!(matches!(
+            decide(
+                &stale,
+                &HeaderMap::new(),
+                false,
+                CacheMode::ForceCache,
+                at(40)
+            ),
             CacheDecision::Use(_)
         ));
     }

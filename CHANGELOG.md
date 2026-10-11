@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through
 - Cache: `Pragma: no-cache` on a request without `Cache-Control` was ignored, so a fresh
   stored response was used where RFC 9111 §5.4 says to revalidate it
+- Cache: `proxy-revalidate` was treated as `must-revalidate`, so a request's `max-stale` and
+  `CacheMode::ForceCache` could not use a stale response that carried it. It binds shared caches
+  only (RFC 9111 §5.2.2.8), and this cache is private
 
 ## [0.12.0] - 2026-10-10
 
