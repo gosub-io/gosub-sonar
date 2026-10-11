@@ -1969,6 +1969,11 @@ async fn get_with_redirects(
                         if let Ok(v) = serialized.parse() {
                             pf_headers.insert(header::ORIGIN, v);
                         }
+                        // The preflight has the request's referrer (Fetch §4.8 step 1), as this
+                        // hop computed it above.
+                        if let Some(referer) = current_headers.get(header::REFERER) {
+                            pf_headers.insert(header::REFERER, referer.clone());
+                        }
                         fetch_metadata::apply_sec_fetch_headers(
                             &mut pf_headers,
                             &url,

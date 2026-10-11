@@ -100,6 +100,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A same-origin WebSocket handshake (`RequestMode::Websocket`) was sent without `Origin`,
   though the mode's documentation says it always carries one. WebSocket servers check `Origin`
   to refuse handshakes from other sites. It is sent on every handshake now (Fetch §3.1)
+- CORS: the `OPTIONS` preflight was sent without `Referer`, though it has the request's
+  referrer (Fetch §4.8 step 1). It carries the same `Referer` as the request now
 
 ## [0.12.0] - 2026-10-10
 

@@ -503,6 +503,61 @@ async fn a_failed_request_drops_its_preflight_grant() {
     shutdown.cancel();
 }
 
+/// Fetch §4.8 step 1: the preflight's referrer is the request's, so the `OPTIONS` carries the
+/// same `Referer` as the request it asks about.
+#[tokio::test]
+async fn the_preflight_carries_the_referer() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let home = TestServer::new().start().await;
+    let origin = home.base_url().origin().ascii_serialization();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(bool, Option<String>)>();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let referer = head.lines().find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.eq_ignore_ascii_case("referer")
+                    .then(|| value.trim().to_string())
+            });
+            let preflight = head.starts_with("OPTIONS ");
+            let _ = tx.send((preflight, referer));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: {origin}\r\n\
+                 Access-Control-Allow-Methods: PUT\r\nContent-Length: 2\r\n\
+                 Connection: close\r\n\r\nok"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+    let doc = home.url("/page");
+    let req = FetchRequest::builder(
+        Method::PUT,
+        Url::parse(&format!("http://127.0.0.1:{port}/data")).unwrap(),
+    )
+    .with_origin(home.base_url().origin())
+    .with_referrer(doc)
+    .with_mode(RequestMode::Cors)
+    .with_credentials(RequestCredentials::Omit)
+    .with_body(RequestBody::text("payload"))
+    .build();
+    let result = fetcher.fetch(req).await;
+    assert!(!result.is_error(), "{result:?}");
+
+    let (preflight, preflight_referer) = rx.recv().await.unwrap();
+    let (actual, actual_referer) = rx.recv().await.unwrap();
+    assert!(preflight && !actual);
+    assert!(actual_referer.is_some());
+    assert_eq!(preflight_referer, actual_referer);
+    shutdown.cancel();
+}
+
 /// Hands the same recording observer to every request, so a test can assert on the events
 /// the fetch stack emitted.
 struct RecordingCtx(Arc<RecordingObserver>);
