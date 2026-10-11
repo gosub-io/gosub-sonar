@@ -236,9 +236,8 @@ impl CacheEntry {
         self.vary.iter().all(|(name, stored)| {
             let current = HeaderName::try_from(name.as_str())
                 .ok()
-                .and_then(|n| request.get(&n).and_then(|v| v.to_str().ok()))
-                .map(str::to_string);
-            current.as_deref() == stored.as_deref()
+                .and_then(|n| vary_value(request, &n));
+            current.as_deref() == stored.as_deref().map(normalize_list).as_deref()
         })
     }
 
@@ -573,11 +572,7 @@ pub fn entry_from_response(
         .into_iter()
         .filter_map(|name| {
             let header_name = HeaderName::try_from(name.as_str()).ok()?;
-            let value = request
-                .get(&header_name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            Some((name, value))
+            Some((name, vary_value(request, &header_name)))
         })
         .collect();
 
@@ -591,6 +586,33 @@ pub fn entry_from_response(
         received_at,
         peer_addr: None,
     }
+}
+
+/// A request header's value as `Vary` compares it (RFC 9111 §4.1): every field line of it
+/// combined into one list, with the whitespace around the list's elements normalized, so
+/// `en, nl`, `en,nl` and the two lines `en` and `nl` are the same value. `None` when the request
+/// carries no such header.
+fn vary_value(request: &HeaderMap, name: &HeaderName) -> Option<String> {
+    let lines: Vec<&str> = request
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(normalize_list(&lines.join(",")))
+}
+
+/// A comma-separated list with each element trimmed and empty ones dropped, joined by `, `.
+/// Commas inside quoted strings are part of their element.
+fn normalize_list(value: &str) -> String {
+    split_outside_quotes(value)
+        .into_iter()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The header names a response's `Vary` lists, lowercased.
@@ -1466,6 +1488,40 @@ mod tests {
             ]);
             assert!(!e.is_fresh(at(10)), "{max_age}");
         }
+    }
+
+    /// RFC 9111 §4.1: a varied header is compared after combining its field lines and
+    /// normalizing the whitespace in the list. Split over two lines or written without spaces, a
+    /// value matches; a request that carries more than the stored one does not.
+    #[test]
+    fn vary_compares_the_whole_header_however_it_is_written() {
+        let stored = [entry_with_request(
+            &[("cache-control", "max-age=60"), ("vary", "accept-language")],
+            &[("accept-language", "en, nl")],
+        )];
+        let decision = |asked: &[(&str, &str)]| {
+            decide(&stored, &headers(asked), false, CacheMode::Default, at(1))
+        };
+        for same in [
+            &[("accept-language", "en, nl")][..],
+            &[("accept-language", "en,nl")],
+            &[("accept-language", " en ,  nl ")],
+            &[("accept-language", "en"), ("accept-language", "nl")],
+        ] {
+            assert!(matches!(decision(same), CacheDecision::Use(_)), "{same:?}");
+        }
+
+        // Stored for `en` alone: a request for `en` and `nl` is another variant, even though its
+        // first line says `en`.
+        let only_en = [entry_with_request(
+            &[("cache-control", "max-age=60"), ("vary", "accept-language")],
+            &[("accept-language", "en")],
+        )];
+        let asked = headers(&[("accept-language", "en"), ("accept-language", "nl")]);
+        assert!(matches!(
+            decide(&only_en, &asked, false, CacheMode::Default, at(1)),
+            CacheDecision::Send
+        ));
     }
 
     #[test]

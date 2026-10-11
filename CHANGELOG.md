@@ -71,6 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache: headers named in a response's `Connection` (`Connection: close, X-Hop-Info`) were
   stored with it and replayed on every hit. They describe that connection, like the fixed
   hop-by-hop headers, and are dropped before storing and from a `304` now (RFC 9110 §7.6.1)
+- Cache: `Vary` compared only the first line of a request header, as written. A request
+  that sent `Accept-Language` as two lines (`en`, then `nl`) could be answered with the
+  variant stored for `en` alone, and `en,nl` missed one stored for `en, nl`. A varied header is
+  now compared with all its lines combined and the list's whitespace normalized
+  (RFC 9111 §4.1)
 
 ## [0.12.0] - 2026-10-10
 
