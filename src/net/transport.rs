@@ -220,13 +220,23 @@ mod tests {
     /// A deadline that expires before anything connects is a timeout, not a connect failure.
     #[tokio::test]
     async fn an_expired_deadline_outranks_the_connect_failure_underneath_it() {
-        // 203.0.113.0/24 is TEST-NET-3: reserved for documentation, so it routes nowhere and
-        // the connect attempt hangs until the timeout fires rather than being refused.
+        // A resolver that never answers keeps the connect pending until the deadline fires; the
+        // client's connect timeout covers resolution too. A real unroutable address would do the
+        // same only where a route exists - on a host with no network at all the connect fails at
+        // once with "network unreachable", which is a connect failure.
+        struct NeverResolves;
+        impl reqwest::dns::Resolve for NeverResolves {
+            fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                Box::pin(std::future::pending())
+            }
+        }
+
         let e = reqwest::Client::builder()
             .connect_timeout(Duration::from_millis(50))
+            .dns_resolver(std::sync::Arc::new(NeverResolves))
             .build()
             .unwrap()
-            .get("http://203.0.113.1/")
+            .get("http://unresolvable.invalid/")
             .send()
             .await
             .unwrap_err();
