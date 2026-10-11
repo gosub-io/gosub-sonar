@@ -100,6 +100,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Auth: an unknown scheme was keyed as spelled, so credentials stored for `Newauth` were not
   found when the server wrote `NEWAUTH`, and the user was asked again. Scheme names are
   case-insensitive (RFC 9110 §11.1); the protection space keys them in lowercase
+- Auth: a hop through an authenticating proxy to a protected server could not succeed. The
+  answer to the server's 401 replaced the proxy's `Proxy-Authorization` instead of joining it,
+  the two challenges then alternated until the attempts ran out, and the proxy password the
+  proxy had just accepted was forgotten from the store. The proxy and the server now each have
+  their own credentials, attempts and store handling on a hop (RFC 9110 §11.6-11.7)
 
 ## [0.12.0] - 2026-10-10
 

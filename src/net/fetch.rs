@@ -189,6 +189,33 @@ pub(crate) fn hop_checks(
     HopCheck::Proceed(target)
 }
 
+/// What one party (the origin server or the proxy) has been sent for a hop's authentication.
+#[derive(Default)]
+struct AuthSlot {
+    /// The `Authorization` or `Proxy-Authorization` value to send.
+    header: Option<header::HeaderValue>,
+    /// How many times this party was answered on this hop.
+    attempt: u32,
+    /// Credentials sent but not yet accepted: stored once the party lets the request through,
+    /// forgotten when it challenges again.
+    unproven: Option<(ProtectionSpace, Credentials)>,
+}
+
+impl AuthSlot {
+    /// The party let the request through: remember the password it accepted. Only a password:
+    /// a `Raw` answer was computed for the challenge it answered (a Digest nonce, a Negotiate
+    /// token), and replaying it would only draw another challenge.
+    fn accepted(&mut self, policy: &NetPolicy) {
+        if let (Some(store), Some((space, credentials))) =
+            (policy.credentials.as_ref(), self.unproven.take())
+        {
+            if matches!(credentials, Credentials::Basic { .. }) {
+                store.store(space, credentials);
+            }
+        }
+    }
+}
+
 /// Callback type for the URL allowlist check.
 pub type UrlFilter = Box<dyn Fn(&Url) -> bool + Send + Sync>;
 
@@ -2064,14 +2091,16 @@ async fn get_with_redirects(
             (None, HeaderMap::new());
 
         // Authentication (RFC 9110 §11): a 401 or 407 is re-sent with credentials whenever they
-        // can be found for one of its challenges, at most `MAX_AUTH_ATTEMPTS` times. Only a
+        // can be found for one of its challenges, at most `MAX_AUTH_ATTEMPTS` times each. Only a
         // response that is not a challenge leaves this loop. See
         // [`auth`](mod@crate::net::auth).
-        let mut auth_header: Option<(header::HeaderName, header::HeaderValue)> = None;
-        let mut auth_attempt = 0u32;
-        // Credentials the server has not accepted yet. Stored once a response arrives that is
-        // not another challenge, dropped when it is.
-        let mut unproven: Option<(ProtectionSpace, Credentials)> = None;
+        //
+        // The proxy and the origin server are asked separately, and a hop through an
+        // authenticating proxy to a protected server needs both answers at once
+        // (`Proxy-Authorization` and `Authorization`, RFC 9110 §11.6-11.7): each has its own
+        // header, attempt count and unaccepted credentials.
+        let mut server_auth = AuthSlot::default();
+        let mut proxy_auth = AuthSlot::default();
 
         // Timestamps of the exchange that produced the response below, for the age of a cache
         // entry made from it (RFC 9111 §4.2.3). A retried hop overwrites them, so they always
@@ -2109,8 +2138,13 @@ async fn get_with_redirects(
                 // The credentials and conditional headers are added for the send only, so a redirect
                 // from this hop starts from the caller's headers again.
                 let mut hop_headers = current_headers.clone();
-                if let Some((ref name, ref value)) = auth_header {
-                    hop_headers.insert(name.clone(), value.clone());
+                for (target, slot) in [
+                    (AuthTarget::Server, &server_auth),
+                    (AuthTarget::Proxy, &proxy_auth),
+                ] {
+                    if let Some(ref value) = slot.header {
+                        hop_headers.insert(target.credentials_header(), value.clone());
+                    }
                 }
                 for (name, value) in conditional.iter() {
                     hop_headers.insert(name.clone(), value.clone());
@@ -2342,17 +2376,20 @@ async fn get_with_redirects(
                 // After the checks above: a response CORS refuses is blocked even when it asks for
                 // credentials.
                 let Some(target) = AuthTarget::for_status(resp.status().as_u16()) else {
-                    // Only a password is remembered. A `Raw` answer was computed for the challenge
-                    // it answered (a Digest nonce, a Negotiate token), and replaying it would only
-                    // draw another challenge.
-                    if let (Some(store), Some((space, credentials))) =
-                        (policy.credentials.as_ref(), unproven.take())
-                    {
-                        if matches!(credentials, Credentials::Basic { .. }) {
-                            store.store(space, credentials);
-                        }
-                    }
+                    // Neither the proxy nor the server objected: whatever each was sent is
+                    // accepted.
+                    server_auth.accepted(&policy);
+                    proxy_auth.accepted(&policy);
                     break HopResponse::Network(resp);
+                };
+                // A server challenge means the proxy let the request through, so the proxy
+                // credentials sent with it are accepted.
+                if target == AuthTarget::Server {
+                    proxy_auth.accepted(&policy);
+                }
+                let slot = match target {
+                    AuthTarget::Server => &mut server_auth,
+                    AuthTarget::Proxy => &mut proxy_auth,
                 };
 
                 // Only the proxy carrying a plain-http hop can send a 407 we see: over https
@@ -2380,14 +2417,14 @@ async fn get_with_redirects(
                     resp.headers(),
                     target,
                     &url,
-                    auth_attempt,
+                    slot.attempt,
                     proxy.as_ref(),
                 );
-                let answer = if may_answer && auth_attempt < MAX_AUTH_ATTEMPTS {
-                    // What was sent last time has just been rejected: drop it so the store stops
-                    // handing back a password the server no longer takes.
+                let answer = if may_answer && slot.attempt < MAX_AUTH_ATTEMPTS {
+                    // What was sent to this party last time has just been rejected: drop it so
+                    // the store stops handing back a password it no longer takes.
                     if let (Some(store), Some((space, _))) =
-                        (policy.credentials.as_ref(), unproven.take())
+                        (policy.credentials.as_ref(), slot.unproven.take())
                     {
                         store.forget(&space);
                     }
@@ -2406,9 +2443,9 @@ async fn get_with_redirects(
                 let Some((space, credentials, value)) = answer else {
                     break HopResponse::Network(resp);
                 };
-                auth_header = Some((target.credentials_header(), value));
-                unproven = Some((space, credentials));
-                auth_attempt += 1;
+                slot.header = Some(value);
+                slot.unproven = Some((space, credentials));
+                slot.attempt += 1;
             },
         };
 
@@ -5363,6 +5400,93 @@ mod tests {
             Some(credentials.clone())
         }));
         (policy, seen)
+    }
+
+    /// RFC 9110 §11.6-11.7: a hop through an authenticating proxy to a protected server needs
+    /// `Proxy-Authorization` and `Authorization` on one send. Answering the server's 401 keeps
+    /// the proxy's credentials on the request, each party gets its own attempts, and the proxy
+    /// password, accepted when the 401 came through the proxy, stays in the store.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_proxy_and_a_server_challenge_are_answered_together() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        let sends = Arc::new(Mutex::new(Vec::<(bool, bool)>::new()));
+        let log = sends.clone();
+        // Plays both parts: a proxy wanting `Proxy-Authorization`, and behind it a server
+        // wanting `Authorization`. The hook answers both with user:pass.
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let carries = |name: &str| {
+                    head.lines().any(|l| {
+                        l.split_once(':').is_some_and(|(n, v)| {
+                            n.eq_ignore_ascii_case(name) && v.trim() == GOOD_AUTH
+                        })
+                    })
+                };
+                let (proxy_ok, server_ok) =
+                    (carries("proxy-authorization"), carries("authorization"));
+                log.lock().unwrap().push((proxy_ok, server_ok));
+                let response = if !proxy_ok {
+                    "HTTP/1.1 407 Proxy Authentication Required\r\n\
+                     Proxy-Authenticate: Basic realm=\"corp\"\r\nContent-Length: 0\r\n\
+                     Connection: close\r\n\r\n"
+                } else if !server_ok {
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"site\"\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let store = Arc::new(InMemoryCredentialStore::new());
+        let (policy, _) = answering_policy(Credentials::basic("user", "pass"));
+        let proxy = base.clone();
+        let policy = policy
+            .with_credential_store(Some(store.clone()))
+            .with_proxy_for(Box::new(move |_| Some(proxy.clone())));
+
+        let (meta, _) = super::fetch_response_complete(
+            client(),
+            base.join("x").unwrap(),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(
+            *sends.lock().unwrap(),
+            vec![(false, false), (true, false), (true, true)],
+            "(proxy credentials, server credentials) per send"
+        );
+        let space = |target, realm: &str| ProtectionSpace {
+            target,
+            scheme: AuthScheme::Basic,
+            origin: Some(base.origin().ascii_serialization()),
+            realm: realm.into(),
+        };
+        assert!(store
+            .credentials_for(&space(AuthTarget::Proxy, "corp"))
+            .is_some());
+        assert!(store
+            .credentials_for(&space(AuthTarget::Server, "site"))
+            .is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]
