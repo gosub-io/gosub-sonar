@@ -2919,6 +2919,33 @@ mod tests {
         assert_eq!(srv.hit_count("/flaky"), 3);
     }
 
+    /// The `retry` module docs: a stream is retried while its peek is read, since nothing has
+    /// reached the caller then, with a `Retrying` between the attempts; a stream that breaks
+    /// after the peek is the caller's and is not re-sent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stream_is_retried_until_its_peek_is_in() {
+        let srv = TestServer::new()
+            .route("/early", RouteConfig::drop_mid_body(100, 10_000))
+            .route("/late", RouteConfig::drop_mid_body(8_000, 10_000))
+            .start()
+            .await;
+        let stream = |path| {
+            FetchRequest::builder(Method::GET, srv.url(path))
+                .with_streaming(true)
+                .build()
+        };
+
+        let (result, log) = fetch_recorded(retrying_config(), stream("/early")).await;
+        assert!(result.is_error(), "{result:?}");
+        assert_eq!(srv.hit_count("/early"), 3);
+        assert_eq!(log.retries().len(), 2, "{:?}", log.retries());
+
+        let (result, log) = fetch_recorded(retrying_config(), stream("/late")).await;
+        assert!(matches!(result, FetchResult::Stream { .. }), "{result:?}");
+        assert_eq!(srv.hit_count("/late"), 1);
+        assert!(log.retries().is_empty());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn retry_gives_up_after_max_retries() {
         let srv = start_server().await;

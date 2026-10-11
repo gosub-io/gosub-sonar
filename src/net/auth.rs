@@ -166,10 +166,18 @@ impl AuthChallenge {
 
     /// The protection space this challenge belongs to, i.e. the key credentials for it are
     /// stored under.
+    ///
+    /// Scheme names are case-insensitive (RFC 9110 §11.1), so an unknown scheme is keyed in
+    /// lowercase: `Newauth` and `NEWAUTH` are one space. The challenge keeps the server's
+    /// spelling for the header.
     pub fn protection_space(&self) -> ProtectionSpace {
+        let scheme = match &self.scheme {
+            AuthScheme::Other(name) => AuthScheme::Other(name.to_ascii_lowercase()),
+            known => known.clone(),
+        };
         ProtectionSpace {
             target: self.target,
-            scheme: self.scheme.clone(),
+            scheme,
             origin: match self.target {
                 AuthTarget::Server => Some(self.url.origin().ascii_serialization()),
                 AuthTarget::Proxy => self
@@ -225,6 +233,12 @@ pub enum Credentials {
 
 impl Credentials {
     /// [`Credentials::Basic`] from anything string-shaped.
+    ///
+    /// The user-id and password are sent as given, as UTF-8. A server whose challenge says
+    /// `charset="UTF-8"` expects them in Unicode normalization form C (RFC 7617 §2.1), so a
+    /// password typed as `e` plus a combining accent may not match one stored as `é`. Normalizing
+    /// is left to whoever collects the password, where it covers every use of it, not just this
+    /// one.
     pub fn basic(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self::Basic {
             username: username.into(),
@@ -238,8 +252,14 @@ impl Credentials {
         let mut value = match self {
             Self::Basic { username, password } => {
                 // RFC 7617 §2: the user-id is everything before the first colon, so a colon in
-                // the name would move the password boundary.
-                if username.contains(':') {
+                // the name would move the password boundary; and neither part may contain a
+                // control character.
+                if username.contains(':')
+                    || username
+                        .chars()
+                        .chain(password.chars())
+                        .any(char::is_control)
+                {
                     return None;
                 }
                 let encoded = base64_encode(format!("{username}:{password}").as_bytes());
@@ -284,17 +304,56 @@ pub trait CredentialStore: Send + Sync {
     ///
     /// [`FetcherContext::on_auth_challenge`]: crate::net::fetcher_context::FetcherContext::on_auth_challenge
     fn forget(&self, space: &ProtectionSpace);
+
+    /// Note that the credentials stored for `space` were accepted for a request to `url`, right
+    /// after [`store`](Self::store). What [`upfront_for`](Self::upfront_for) answers from. The
+    /// default remembers nothing.
+    fn accepted_at(&self, _space: &ProtectionSpace, _url: &Url) {}
+
+    /// Credentials to send with a request to `url` before any challenge, as a browser does for a
+    /// site it has logged in to (Fetch's authentication entry). The realm is not known before the
+    /// server answers, so this goes by where credentials were accepted. The default sends nothing
+    /// upfront, and every protected request first draws a `401`.
+    fn upfront_for(&self, _url: &Url) -> Option<(ProtectionSpace, Credentials)> {
+        None
+    }
 }
+
+/// The directory of `url`'s path, up to and including its last `/`: the part of the path a
+/// protection space is assumed to cover (RFC 7617 §2.2, "all paths at or deeper than the depth
+/// of the last symbolic element in the path field").
+fn directory_of(url: &Url) -> &str {
+    let path = url.path();
+    path.rfind('/').map_or("/", |end| &path[..=end])
+}
+
+/// Most directories an [`InMemoryCredentialStore`] remembers per protection space for sending
+/// credentials upfront.
+const MAX_UPFRONT_DIRECTORIES: usize = 8;
 
 /// Most protection spaces an [`InMemoryCredentialStore`] remembers.
 pub const MAX_CREDENTIAL_ENTRIES: usize = 256;
 
 /// In-memory [`CredentialStore`]. Past [`MAX_CREDENTIAL_ENTRIES`] the space stored longest
 /// ago is forgotten.
+///
+/// Sends `Basic` server credentials upfront ([`CredentialStore::upfront_for`]) to the origin
+/// they were accepted on, for paths at or below a directory where they were accepted (RFC 7617
+/// §2.2). Nothing else is sent before a challenge: not to another origin, not to a proxy, and
+/// no other scheme, since only a `Basic` value does not depend on the challenge.
 #[derive(Default)]
 pub struct InMemoryCredentialStore {
-    entries: parking_lot::Mutex<std::collections::HashMap<ProtectionSpace, (Credentials, u64)>>,
+    entries: parking_lot::Mutex<std::collections::HashMap<ProtectionSpace, StoredCredentials>>,
     clock: std::sync::atomic::AtomicU64,
+}
+
+/// What an [`InMemoryCredentialStore`] keeps for one protection space.
+struct StoredCredentials {
+    credentials: Credentials,
+    /// When it was stored, for evicting the oldest.
+    stamp: u64,
+    /// Directories they were accepted in, none covering another.
+    directories: Vec<String>,
 }
 
 impl InMemoryCredentialStore {
@@ -321,7 +380,10 @@ impl InMemoryCredentialStore {
 
 impl CredentialStore for InMemoryCredentialStore {
     fn credentials_for(&self, space: &ProtectionSpace) -> Option<Credentials> {
-        self.entries.lock().get(space).map(|(c, _)| c.clone())
+        self.entries
+            .lock()
+            .get(space)
+            .map(|stored| stored.credentials.clone())
     }
 
     fn store(&self, space: ProtectionSpace, credentials: Credentials) {
@@ -332,17 +394,82 @@ impl CredentialStore for InMemoryCredentialStore {
         if entries.len() >= MAX_CREDENTIAL_ENTRIES && !entries.contains_key(&space) {
             if let Some(oldest) = entries
                 .iter()
-                .min_by_key(|(_, (_, at))| *at)
+                .min_by_key(|(_, stored)| stored.stamp)
                 .map(|(k, _)| k.clone())
             {
                 entries.remove(&oldest);
             }
         }
-        entries.insert(space, (credentials, stamp));
+        // New credentials for a space keep the directories the old ones were accepted in only
+        // if they are the same credentials.
+        let directories = entries
+            .remove(&space)
+            .filter(|old| old.credentials == credentials)
+            .map(|old| old.directories)
+            .unwrap_or_default();
+        entries.insert(
+            space,
+            StoredCredentials {
+                credentials,
+                stamp,
+                directories,
+            },
+        );
     }
 
     fn forget(&self, space: &ProtectionSpace) {
         self.entries.lock().remove(space);
+    }
+
+    fn accepted_at(&self, space: &ProtectionSpace, url: &Url) {
+        if space.target != AuthTarget::Server || space.scheme != AuthScheme::Basic {
+            return;
+        }
+        let directory = directory_of(url);
+        let mut entries = self.entries.lock();
+        let Some(stored) = entries.get_mut(space) else {
+            return;
+        };
+        if stored
+            .directories
+            .iter()
+            .any(|known| directory.starts_with(known.as_str()))
+        {
+            return;
+        }
+        stored
+            .directories
+            .retain(|known| !known.starts_with(directory));
+        if stored.directories.len() >= MAX_UPFRONT_DIRECTORIES {
+            stored.directories.remove(0);
+        }
+        stored.directories.push(directory.to_string());
+    }
+
+    fn upfront_for(&self, url: &Url) -> Option<(ProtectionSpace, Credentials)> {
+        let origin = url.origin().ascii_serialization();
+        let path = url.path();
+        let entries = self.entries.lock();
+        // The deepest directory that covers the path: the most specific space wins.
+        entries
+            .iter()
+            .filter(|(space, stored)| {
+                space.target == AuthTarget::Server
+                    && space.scheme == AuthScheme::Basic
+                    && space.origin.as_deref() == Some(origin.as_str())
+                    && matches!(stored.credentials, Credentials::Basic { .. })
+            })
+            .filter_map(|(space, stored)| {
+                stored
+                    .directories
+                    .iter()
+                    .filter(|directory| path.starts_with(directory.as_str()))
+                    .map(String::len)
+                    .max()
+                    .map(|depth| (depth, space, &stored.credentials))
+            })
+            .max_by_key(|(depth, _, _)| *depth)
+            .map(|(_, space, credentials)| (space.clone(), credentials.clone()))
     }
 }
 
@@ -361,8 +488,10 @@ pub fn parse_challenges(
     headers
         .get_all(target.challenge_header())
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(parse_challenge_list)
+        // A realm may carry bytes above 0x7F (RFC 9110 §5.5: obs-text, "opaque data"), which
+        // the strict `to_str` refuses; that would drop the whole challenge and make logging in
+        // impossible. UTF-8 is what servers mean by them in practice.
+        .flat_map(|v| parse_challenge_list(&String::from_utf8_lossy(v.as_bytes())))
         .map(|raw| AuthChallenge {
             url: url.clone(),
             target,
@@ -627,6 +756,36 @@ mod tests {
         assert_eq!(c[0].scheme.as_str(), "Mutual-v1");
     }
 
+    /// RFC 9110 §5.5: obs-text in a quoted-string is opaque data, not a reason to drop the field.
+    /// A realm in UTF-8 still makes a challenge, with the realm as written.
+    #[test]
+    fn a_realm_with_bytes_above_0x7f_is_still_a_challenge() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_bytes("Basic realm=\"Café\"".as_bytes()).unwrap(),
+        );
+        let c = parse_challenges(&headers, AuthTarget::Server, &url(), 0, None);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].scheme, AuthScheme::Basic);
+        assert_eq!(c[0].realm.as_deref(), Some("Café"));
+    }
+
+    /// RFC 9110 §11.1: "It uses a case-insensitive token to identify the authentication scheme".
+    /// One unknown scheme in two spellings is one protection space; the challenge keeps the
+    /// spelling the server sent.
+    #[test]
+    fn an_unknown_scheme_is_one_protection_space_in_any_case() {
+        let lower = challenges(r#"Newauth realm="x""#);
+        let upper = challenges(r#"NEWAUTH realm="x""#);
+        assert_eq!(lower[0].protection_space(), upper[0].protection_space());
+        assert_eq!(upper[0].scheme.as_str(), "NEWAUTH");
+        assert_ne!(
+            lower[0].protection_space(),
+            challenges(r#"Otherauth realm="x""#)[0].protection_space()
+        );
+    }
+
     #[test]
     fn challenges_from_separate_field_lines_are_all_returned() {
         let mut headers = HeaderMap::new();
@@ -743,6 +902,20 @@ mod tests {
     fn credentials_that_cannot_be_a_header_value_are_dropped() {
         // A colon in the user-id would move the password boundary.
         assert!(Credentials::basic("a:b", "pw").header_value().is_none());
+        // RFC 7617 §2: "The user-id and password MUST NOT contain any control characters".
+        for (user, password) in [
+            ("a\tb", "pw"),
+            ("ab", "p\0w"),
+            ("ab", "p\u{7f}"),
+            ("a\u{85}", "pw"),
+        ] {
+            assert!(
+                Credentials::basic(user, password).header_value().is_none(),
+                "{user:?} {password:?}"
+            );
+        }
+        // A colon in the password is fine.
+        assert!(Credentials::basic("ab", "p:w").header_value().is_some());
         assert!(Credentials::Raw("Bearer bad\nvalue".into())
             .header_value()
             .is_none());
@@ -781,5 +954,69 @@ mod tests {
         store.store(space, Credentials::basic("u", "p"));
         store.clear();
         assert!(store.is_empty());
+    }
+
+    /// RFC 7617 §2.2: a client may assume that all paths at or deeper than the last symbolic
+    /// element of an accepted request's path are in the same protection space. Basic server
+    /// credentials accepted at `/area/page` go upfront to the same origin under `/area/`, and
+    /// nowhere else.
+    #[test]
+    fn basic_credentials_go_upfront_below_where_they_were_accepted() {
+        let store = InMemoryCredentialStore::new();
+        let at = |s: &str| Url::parse(s).unwrap();
+        let space = challenges(r#"Basic realm="x""#)[0].protection_space();
+        store.store(space.clone(), Credentials::basic("u", "p"));
+        assert!(store
+            .upfront_for(&at("https://example.com/area/x"))
+            .is_none());
+
+        store.accepted_at(&space, &at("https://example.com/area/page?q=1"));
+        for covered in [
+            "https://example.com/area/",
+            "https://example.com/area/other",
+            "https://example.com/area/deeper/page",
+        ] {
+            assert_eq!(
+                store.upfront_for(&at(covered)),
+                Some((space.clone(), Credentials::basic("u", "p"))),
+                "{covered}"
+            );
+        }
+        for outside in [
+            "https://example.com/areas",
+            "https://example.com/other/area/",
+            "https://example.com/",
+            "http://example.com/area/x",
+            "https://other.example/area/x",
+        ] {
+            assert!(store.upfront_for(&at(outside)).is_none(), "{outside}");
+        }
+
+        // Forgotten credentials go nowhere; replaced ones start over.
+        store.store(space.clone(), Credentials::basic("u", "new"));
+        assert!(store
+            .upfront_for(&at("https://example.com/area/x"))
+            .is_none());
+        store.accepted_at(&space, &at("https://example.com/area/page"));
+        store.forget(&space);
+        assert!(store
+            .upfront_for(&at("https://example.com/area/x"))
+            .is_none());
+    }
+
+    /// Only a `Basic` server password goes upfront: not a proxy's, and not a value computed for
+    /// one challenge.
+    #[test]
+    fn nothing_else_goes_upfront() {
+        let store = InMemoryCredentialStore::new();
+        let url = Url::parse("https://example.com/area/page").unwrap();
+        let digest = challenges(r#"Digest realm="x", nonce="n""#)[0].protection_space();
+        store.store(digest.clone(), Credentials::Raw("Digest x".into()));
+        store.accepted_at(&digest, &url);
+        let mut proxy = challenges(r#"Basic realm="x""#)[0].protection_space();
+        proxy.target = AuthTarget::Proxy;
+        store.store(proxy.clone(), Credentials::basic("u", "p"));
+        store.accepted_at(&proxy, &url);
+        assert!(store.upfront_for(&url).is_none());
     }
 }
