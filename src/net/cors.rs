@@ -310,8 +310,13 @@ pub(crate) fn cors_check(
     if !credentials_include {
         return Ok(());
     }
-    match response.get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS) {
-        Some(v) if v.as_bytes() == b"true" => Ok(()),
+    // Fetch gets the header as one combined value, so a duplicate reads `true, true`, which is
+    // not `true`: only a single line saying exactly `true` grants credentials.
+    let mut values = response
+        .get_all(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+        .iter();
+    match (values.next(), values.next()) {
+        (Some(v), None) if v.as_bytes() == b"true" => Ok(()),
         _ => Err(CorsError::CredentialsNotAllowed),
     }
 }
@@ -925,6 +930,20 @@ mod tests {
             cors_check(&o, false, true, &bad_case),
             Err(CorsError::CredentialsNotAllowed)
         );
+        // Fetch §4.10, CORS check: the header is *got*, so two lines read `true, true`, which
+        // is not `true`; nor is `true` followed by `false`.
+        for second in ["true", "false"] {
+            let twice = headers(&[
+                ("access-control-allow-origin", "https://a.example"),
+                ("access-control-allow-credentials", "true"),
+                ("access-control-allow-credentials", second),
+            ]);
+            assert_eq!(
+                cors_check(&o, false, true, &twice),
+                Err(CorsError::CredentialsNotAllowed),
+                "true, {second}"
+            );
+        }
     }
 
     #[test]

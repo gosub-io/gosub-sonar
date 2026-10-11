@@ -102,6 +102,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to refuse handshakes from other sites. It is sent on every handshake now (Fetch §3.1)
 - CORS: the `OPTIONS` preflight was sent without `Referer`, though it has the request's
   referrer (Fetch §4.8 step 1). It carries the same `Referer` as the request now
+- CORS: a response with `Access-Control-Allow-Credentials` twice passed the check on its first
+  line, even `true` followed by `false`. Fetch reads the header as one combined value, which is
+  then not `true`: only a single `true` grants credentials now (Fetch §4.10)
 
 ## [0.12.0] - 2026-10-10
 
