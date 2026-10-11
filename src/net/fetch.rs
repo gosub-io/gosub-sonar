@@ -1642,9 +1642,12 @@ fn credentials_for_challenges(
 ///   header. A cross-origin or cors-mode `Location` with credentials is refused outright.
 /// - Insecure hops requested by a secure `init.origin` are blocked or upgraded per
 ///   `init.mixed_content`, re-evaluated at every hop so a redirect cannot escape the check.
-/// - `Referer` is recomputed from `init.referrer` and `init.referrer_policy` at every hop, since
-///   the same-origin and downgrade determinations change as the chain moves. A `Referrer-Policy`
-///   header on a 3xx response replaces the policy for the remaining hops.
+/// - `Referer` is recomputed at every hop, since the same-origin and downgrade determinations
+///   change as the chain moves, from the referrer the previous hop sent (Fetch, main fetch step
+///   9): `init.referrer` on the first hop, and what was left of it after that. A referrer once
+///   reduced to its origin, or withheld, stays so for the rest of the chain. A
+///   `Referrer-Policy` header on a 3xx response replaces the policy for the remaining hops, but
+///   cannot bring back what an earlier hop already cut.
 /// - `Origin` and the `Sec-Fetch-*` headers are likewise recomputed at every hop from
 ///   `init.origin`, `init.destination`, and `init.mode`. `Sec-Fetch-Site` only degrades across
 ///   the chain, and `Origin` collapses to `null` once the chain redirects away from an origin
@@ -1680,6 +1683,11 @@ async fn get_with_redirects(
     let origin = init.origin;
     // A redirect may replace this for the remaining hops (Fetch, HTTP-redirect fetch).
     let mut referrer_policy = init.referrer_policy;
+    // The request's referrer as the chain has left it (Fetch, main fetch step 9): each hop
+    // determines its `Referer` from what the hop before it sent, not from the document URL, so
+    // a referrer once cut down to its origin stays cut down, and one once withheld stays
+    // withheld, however the chain moves or what policy a redirect announces.
+    let mut chain_referrer = init.referrer.clone();
     // `Sec-Fetch-Site` describes the whole chain, not the current hop: it starts at same-origin
     // and can only degrade, so a detour through a foreign site is still visible when the chain
     // lands back home.
@@ -1807,9 +1815,12 @@ async fn get_with_redirects(
             }
         }
 
-        // Recomputed per hop; see the note on this function.
+        // Recomputed per hop from what the last hop sent; see `chain_referrer`.
         if let Some(ref source) = init.referrer {
-            let sent = match referrer::determine(source, referrer_policy, &url) {
+            let determined = chain_referrer
+                .as_ref()
+                .and_then(|current| referrer::determine(current, referrer_policy, &url));
+            let sent = match determined {
                 Some(value) => match value.as_str().parse() {
                     Ok(header_value) => {
                         current_headers.insert(header::REFERER, header_value);
@@ -1827,6 +1838,7 @@ async fn get_with_redirects(
                     None
                 }
             };
+            chain_referrer = sent.clone();
             // Measured against what would go out with no policy. A source that is never sent
             // (not http or https) has nothing to reduce.
             if let Some(full) = referrer::strip(source) {
@@ -4445,14 +4457,13 @@ mod tests {
         );
     }
 
-    /// The header is recomputed per hop: leaving the referrer's origin reveals only that origin,
-    /// then a redirect landing back home may reveal the full path.
+    /// Fetch, main fetch step 9: each hop determines its referrer from the one the previous hop
+    /// sent. Leaving the referrer's origin reveals only that origin, and a redirect landing back
+    /// home does not bring the path back: the request's referrer is the origin by then.
     ///
-    /// Two servers are required. One server cannot express "cross-origin then same-origin", so
-    /// both hops would compute the same value and the test would pass even if the header were
-    /// computed once up front.
+    /// Two servers are required. One server cannot express "cross-origin then same-origin".
     #[tokio::test(flavor = "current_thread")]
-    async fn referer_is_recomputed_after_a_redirect() {
+    async fn a_reduced_referrer_stays_reduced_after_a_redirect() {
         let home = TestServer::new()
             .route("/echo", RouteConfig::echo_referer_header())
             .start()
@@ -4476,11 +4487,61 @@ mod tests {
             home.base_url().as_str()
         );
 
-        // Redirected back home it is same-origin, so the full path is revealed. Computing the
-        // header once up front would still be sending the bare origin here.
+        // Redirected back home: same-origin again, but the request's referrer is the bare
+        // origin now, and that is all that comes back.
         assert_eq!(
             referer_seen_by_server(&away, "/hop", Some(&doc), policy).await,
-            doc
+            home.base_url().as_str()
+        );
+    }
+
+    /// Fetch, main fetch step 9, and Referrer Policy §8.2: a redirect may change the policy for
+    /// the hops after it, but the policy applies to the referrer as the chain has left it. A
+    /// server answering with `Referrer-Policy: unsafe-url` cannot recover the full URL an
+    /// origin-only policy cut away.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redirect_policy_cannot_widen_the_referrer_again() {
+        let srv = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_with_referrer_policy("/echo", "unsafe-url"),
+            )
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+        let doc = "https://example.com/secret?tok=1";
+        for policy in [
+            ReferrerPolicy::Origin,
+            ReferrerPolicy::StrictOriginWhenCrossOrigin,
+        ] {
+            assert_eq!(
+                referer_seen_by_server(&srv, "/hop", Some(doc), policy).await,
+                "https://example.com/",
+                "{policy}"
+            );
+        }
+    }
+
+    /// Fetch, main fetch step 9: once a hop determines no referrer, the request's referrer is
+    /// `no-referrer`, and the hops after it send none either, even back on the document's own
+    /// origin under `same-origin`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_withheld_referrer_stays_withheld_after_a_redirect() {
+        let home = TestServer::new()
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+        let away = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute(home.url("/echo").as_str()),
+            )
+            .start()
+            .await;
+        let doc = format!("{}page?q=1", home.base_url());
+        assert_eq!(
+            referer_seen_by_server(&away, "/hop", Some(&doc), ReferrerPolicy::SameOrigin).await,
+            "<absent>"
         );
     }
 

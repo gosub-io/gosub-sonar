@@ -84,6 +84,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `Default` mode. Fetch handles it as `NoStore`, so it now also carries
   `Pragma: no-cache` and `Cache-Control: no-cache`, and a cache between sonar and the server
   does not answer the condition in the server's place
+- Referrer: every redirect hop computed its `Referer` from the document URL again, so a
+  referrer an earlier hop had cut down to its origin, or withheld, came back in full later in
+  the chain. A cross-origin server could recover the full document URL, query string included,
+  by redirecting to itself with `Referrer-Policy: unsafe-url`. Each hop now starts from what
+  the hop before it sent (Fetch, main fetch step 9)
 
 ## [0.12.0] - 2026-10-10
 
