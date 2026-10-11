@@ -548,8 +548,11 @@ pub fn is_storable(
     let has_validator =
         response.contains_key(header::ETAG) || response.contains_key(header::LAST_MODIFIED);
     if !has_freshness && !has_validator {
-        // Nothing to decide freshness by and nothing to revalidate with, so the entry could
-        // never be used and storing it would only cost memory.
+        // Nothing to decide freshness by and nothing to revalidate with: stale on arrival, so a
+        // normal request never uses it. Only a request that accepts stale responses could
+        // (`CacheMode::ForceCache`, `OnlyIfCached`, `max-stale`), as a browser's back/forward
+        // does. Until something here navigates history that way, storing these would only
+        // push out entries that are used.
         return false;
     }
     // A status the caching rules do not cover is only storable when the response says so itself.
