@@ -230,18 +230,39 @@ pub fn is_forbidden_request_header(name: &HeaderName) -> bool {
         )
 }
 
+/// Most bytes the CORS-safelisted header values of one request may add up to before they need a
+/// preflight after all ([Fetch] §2.2.2, CORS-unsafe request-header names).
+///
+/// [Fetch]: https://fetch.spec.whatwg.org/#cors-unsafe-request-header-names
+const MAX_SAFELISTED_VALUE_BYTES: usize = 1024;
+
 /// The caller-set header names that a preflight must get approved: not forbidden (the fetcher
 /// owns those) and not CORS-safelisted for the value they carry. Lowercase, sorted, deduplicated
 /// — the exact list sent in `Access-Control-Request-Headers`.
+///
+/// Each safelisted value is at most 128 bytes, but a request may repeat them: when all of them
+/// together come to more than [`MAX_SAFELISTED_VALUE_BYTES`], every safelisted name needs
+/// approval too, as Fetch has it. Without that, a page could send a cross-origin server any
+/// amount of data in "safe" headers without its consent. The no-cors check uses the same list,
+/// which makes it a little stricter than Fetch's per-name rule for no-cors, never looser.
 pub(crate) fn unsafe_request_header_names(headers: &HeaderMap) -> Vec<String> {
-    let mut names: Vec<String> = headers
-        .iter()
-        .filter(|(name, value)| {
-            !is_forbidden_request_header(name)
-                && !is_cors_safelisted_request_header(name, value.as_bytes())
-        })
-        .map(|(name, _)| name.as_str().to_string())
-        .collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut safelisted: Vec<String> = Vec::new();
+    let mut safelisted_bytes = 0usize;
+    for (name, value) in headers {
+        if is_forbidden_request_header(name) {
+            continue;
+        }
+        if is_cors_safelisted_request_header(name, value.as_bytes()) {
+            safelisted.push(name.as_str().to_string());
+            safelisted_bytes += value.len();
+        } else {
+            names.push(name.as_str().to_string());
+        }
+    }
+    if safelisted_bytes > MAX_SAFELISTED_VALUE_BYTES {
+        names.extend(safelisted);
+    }
     names.sort_unstable();
     names.dedup();
     names
@@ -764,6 +785,43 @@ mod tests {
             &Method::POST,
             &headers(&[("content-type", "application/json")])
         ));
+    }
+
+    /// Fetch §2.2.2, CORS-unsafe request-header names: "If safelistValueSize is greater than
+    /// 1024, then for each name of potentiallyUnsafeNames, append name to unsafeNames." Exactly
+    /// 1024 bytes of safelisted values is fine; one more needs a preflight, for every name.
+    #[test]
+    fn safelisted_values_over_1024_bytes_need_a_preflight() {
+        let value = |n: usize| "a".repeat(n);
+        let at_limit = headers(&[
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept-language", &value(128)),
+        ]);
+        assert!(unsafe_request_header_names(&at_limit).is_empty());
+        assert!(!preflight_needed(&Method::GET, &at_limit));
+
+        let mut over = at_limit.clone();
+        over.append("content-language", "a".parse().unwrap());
+        assert_eq!(
+            unsafe_request_header_names(&over),
+            vec!["accept", "accept-language", "content-language"]
+        );
+        assert!(preflight_needed(&Method::GET, &over));
+
+        // Forbidden headers are the fetcher's and do not count toward the total.
+        let mut with_forbidden = at_limit.clone();
+        with_forbidden.append("user-agent", "a".repeat(2000).parse().unwrap());
+        with_forbidden.append("referer", "a".repeat(2000).parse().unwrap());
+        assert_eq!(
+            unsafe_request_header_names(&with_forbidden),
+            vec!["user-agent"]
+        );
     }
 
     // --- CORS check ---

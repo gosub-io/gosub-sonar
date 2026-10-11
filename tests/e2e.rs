@@ -424,6 +424,35 @@ async fn a_cache_mode_does_not_cost_a_preflight() {
     shutdown.cancel();
 }
 
+/// Fetch §2.2.2: safelisted headers totalling more than 1024 bytes need a preflight like any
+/// other. Nine `Accept` values of 128 bytes each go to a cross-origin server only after it was
+/// asked; the server here grants nothing, so the request itself never goes out.
+#[tokio::test]
+async fn oversized_safelisted_headers_are_preflighted() {
+    let home = TestServer::new().start().await;
+    let away = TestServer::new()
+        .route("/data", RouteConfig::cors(CorsRouteOptions::default()))
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+
+    let mut headers = http::HeaderMap::new();
+    for _ in 0..9 {
+        headers.append("accept", "a".repeat(128).parse().unwrap());
+    }
+    let req = FetchRequest::builder(Method::GET, away.url("/data"))
+        .with_origin(home.base_url().origin())
+        .with_mode(RequestMode::Cors)
+        .with_credentials(RequestCredentials::Omit)
+        .with_headers(headers)
+        .build();
+    let result = fetcher.fetch(req).await;
+    assert!(result.is_error(), "{result:?}");
+    assert_eq!(away.hit_count("OPTIONS /data"), 1);
+    assert_eq!(away.hit_count("/data"), 0);
+    shutdown.cancel();
+}
+
 /// Hands the same recording observer to every request, so a test can assert on the events
 /// the fetch stack emitted.
 struct RecordingCtx(Arc<RecordingObserver>);

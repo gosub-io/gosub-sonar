@@ -84,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `Default` mode. Fetch handles it as `NoStore`, so it now also carries
   `Pragma: no-cache` and `Cache-Control: no-cache`, and a cache between sonar and the server
   does not answer the condition in the server's place
+- CORS: CORS-safelisted header values were checked one by one but never added up, so a
+  request could carry any amount of data to a cross-origin server in `Accept`,
+  `Accept-Language` and the like without a preflight. Values totalling more than 1024 bytes now
+  need one, for every safelisted name (Fetch §2.2.2, CORS-unsafe request-header names)
 
 ## [0.12.0] - 2026-10-10
 
