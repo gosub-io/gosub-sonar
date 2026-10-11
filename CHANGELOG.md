@@ -88,6 +88,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   forms, which RFC 9110 §5.6.7 says a recipient MUST accept, were ignored, and a server asking
   to be left alone for an hour was retried after the normal backoff. All three HTTP-date
   formats are read now
+- Retry: `Retry-After: +5` was read as five seconds, and a number of seconds too large for a
+  u64 was dropped, so the request was retried after the normal backoff instead of hardly at
+  all. delay-seconds is digits only, and a huge one saturates (RFC 9110 §10.2.3)
 
 ## [0.12.0] - 2026-10-10
 

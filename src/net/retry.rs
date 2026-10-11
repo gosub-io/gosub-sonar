@@ -97,7 +97,10 @@ fn random_unit() -> f64 {
 /// accepted too.
 pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
-    if let Ok(secs) = value.parse::<u64>() {
+    // delay-seconds is `1*DIGIT` (RFC 9110 §10.2.3): no sign, no bound. A number too large to
+    // hold is still a long wait, so it saturates rather than being dropped and retried early.
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        let secs = value.parse::<u64>().unwrap_or(u64::MAX);
         return Some(Duration::from_secs(secs));
     }
     let at = crate::net::cache::parse_http_date(value).or_else(|| {
@@ -255,6 +258,28 @@ mod tests {
             "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
         );
         assert_eq!(retry_after(&h), Some(Duration::ZERO));
+    }
+
+    /// RFC 9110 §10.2.3: `delay-seconds = 1*DIGIT`. A sign is not part of it; a number past
+    /// what a u64 holds still asks for a very long wait.
+    #[test]
+    fn retry_after_seconds_are_digits_only() {
+        let parsed = |value: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::RETRY_AFTER, value.parse().unwrap());
+            retry_after(&h)
+        };
+        assert_eq!(parsed("+5"), None);
+        assert_eq!(parsed("-5"), None);
+        assert_eq!(parsed("5.5"), None);
+        assert_eq!(parsed(" 5 "), Some(Duration::from_secs(5)));
+        assert_eq!(
+            parsed("184467440737095516160"),
+            Some(Duration::from_secs(u64::MAX))
+        );
+        // Past `max_backoff`, so the policy gives up rather than retrying soon.
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.backoff(1, parsed("184467440737095516160")), None);
     }
 
     /// RFC 9110 §5.6.7: "A recipient that parses a timestamp value in an HTTP field MUST accept
