@@ -7,11 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- test-support: `CacheRouteOptions::with_etag_on_304` (and the `etag_on_304` field), a route
-  whose `304` names another `ETag` than its own
-
 ### Fixed
 
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued

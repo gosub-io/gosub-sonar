@@ -5888,33 +5888,57 @@ mod tests {
     /// without conditions, and that response is the one used and stored.
     #[tokio::test(flavor = "current_thread")]
     async fn a_304_naming_another_version_refetches() {
-        let srv = TestServer::new()
-            .route(
-                "/flip",
-                RouteConfig::Cacheable(
-                    CacheRouteOptions::max_age(0, b"x".to_vec())
-                        .with_etag("\"v1\"")
-                        .with_etag_on_304("\"v2\"")
-                        .counting(),
-                ),
-            )
-            .start()
-            .await;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A server that contradicts itself: its responses carry `"v1"`, but a matching
+        // `If-None-Match` is answered with a `304` that names `"v2"`. Bodies count requests.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let hit = served.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let response = if request.contains("\r\nif-none-match: \"v1\"") {
+                    "HTTP/1.1 304 Not Modified\r\nETag: \"v2\"\r\nCache-Control: max-age=0\r\n\
+                     Connection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    let body = format!("hit-{hit}");
+                    format!(
+                        "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nCache-Control: max-age=0\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/flip")).unwrap();
         let (_, cache) = caching_policy();
         let fetch = || {
-            cache_fetch(
-                &srv,
-                "/flip",
+            super::fetch_response_complete(
+                client(),
+                url.clone(),
                 RequestInit::default(),
-                NetPolicy::default().with_cache(Some(cache.clone())),
+                CancellationToken::new(),
                 observer(),
+                None,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(10)),
+                NetPolicy::default().with_cache(Some(cache.clone())),
             )
         };
 
-        let (_, body) = fetch().await;
+        let (_, body) = fetch().await.unwrap();
         assert_eq!(&body[..], b"hit-1");
         // Stale at once: revalidated, answered 304 with "v2", asked again without conditions.
-        let (meta, body) = fetch().await;
+        let (meta, body) = fetch().await.unwrap();
         assert_eq!(meta.status, 200);
         assert!(!meta.from_cache);
         assert_eq!(
@@ -5922,7 +5946,7 @@ mod tests {
             b"hit-3",
             "the refetched body, not the stored one"
         );
-        assert_eq!(srv.hit_count("/flip"), 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
         assert_eq!(cache.len(), 1, "the refetched response replaced the entry");
     }
 
