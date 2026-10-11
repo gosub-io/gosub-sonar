@@ -2028,8 +2028,13 @@ async fn get_with_redirects(
         // send, so `Vary` selects on the cookies and the negotiation headers as sent. A fresh
         // stored response ends the hop without a request; a stale one that can be revalidated
         // adds its conditional headers to the send below. See [`cache`](mod@crate::net::cache).
+        //
+        // The mode as Fetch handles it: a caller's own condition turns `Default` into `NoStore`.
+        // Read here from the caller's headers, before any conditional header of the cache's own.
         #[cfg(not(target_arch = "wasm32"))]
-        let (cache_hit, revalidating, conditional) = match policy.cache {
+        let cache_mode = cache::effective_mode(init.cache_mode, &current_headers);
+        #[cfg(not(target_arch = "wasm32"))]
+        let (cache_hit, mut revalidating, mut conditional) = match policy.cache {
             Some(ref cache) => {
                 let key = CacheKey::new(&current_method, &url).in_partition(cache_partition);
                 let stored = cache.get(&key);
@@ -2037,7 +2042,7 @@ async fn get_with_redirects(
                     &stored,
                     &current_headers,
                     init.auto_decode,
-                    init.cache_mode,
+                    cache_mode,
                     chrono::Utc::now(),
                 ) {
                     CacheDecision::Use(entry) => (Some(entry), None, HeaderMap::new()),
@@ -2109,6 +2114,35 @@ async fn get_with_redirects(
                 }
                 for (name, value) in conditional.iter() {
                     hop_headers.insert(name.clone(), value.clone());
+                }
+                // What the cache mode asks of every cache on the way, not just this one (Fetch,
+                // HTTP-network-or-cache fetch): a forced revalidation says `max-age=0`, a reload
+                // or a no-store request `no-cache`. Each only when the caller set none. Added for
+                // the send, after the CORS decision, as Fetch does: neither header is
+                // CORS-safelisted, and the mode alone must not cost a preflight.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let cache_control = match cache_mode {
+                        CacheMode::NoCache => Some("max-age=0"),
+                        CacheMode::NoStore | CacheMode::Reload => {
+                            if !hop_headers.contains_key(header::PRAGMA) {
+                                hop_headers.insert(
+                                    header::PRAGMA,
+                                    header::HeaderValue::from_static("no-cache"),
+                                );
+                            }
+                            Some("no-cache")
+                        }
+                        _ => None,
+                    };
+                    if let Some(value) = cache_control {
+                        if !hop_headers.contains_key(header::CACHE_CONTROL) {
+                            hop_headers.insert(
+                                header::CACHE_CONTROL,
+                                header::HeaderValue::from_static(value),
+                            );
+                        }
+                    }
                 }
                 // Written here rather than left to the client, which would add it while
                 // executing the request -- after this hop was reported. Only when nothing has
@@ -2273,6 +2307,18 @@ async fn get_with_redirects(
                 // response carried written over the stored ones (RFC 9111 §4.3.4).
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ref entry) = revalidating {
+                    // A `304` that names another version than the stored one confirms nothing
+                    // (RFC 9111 §4.3.4): updating from it would pin the old body under the new
+                    // tag, and every later revalidation would confirm it again. The entry goes,
+                    // and the hop is asked again without conditions, once.
+                    if resp.status().as_u16() == 304 && entry.contradicted_by(resp.headers()) {
+                        if let Some(ref cache) = policy.cache {
+                            cache.invalidate(&CacheKey::new(&current_method, &url));
+                        }
+                        revalidating = None;
+                        conditional = HeaderMap::new();
+                        continue;
+                    }
                     if resp.status().as_u16() == 304 {
                         let mut updated =
                             entry.updated_by_304(resp.headers(), requested_at, received_at);
@@ -2411,7 +2457,7 @@ async fn get_with_redirects(
             // `no-store` is both directions: the lookup above skipped the cache, and nothing
             // about this exchange is written to it either.
             (HopResponse::Network(resp), Some(cache))
-                if init.cache_mode != CacheMode::NoStore
+                if cache_mode != CacheMode::NoStore
                     && cache::is_storable(
                         &current_method,
                         &current_headers,
@@ -5731,6 +5777,177 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// A `304` sonar did not ask for (no revalidation of its own) goes to the caller and is not
+    /// stored, even with freshness: the next fetch asks the server again instead of being
+    /// answered with an empty `304` from the cache.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unsolicited_304_is_not_stored() {
+        let srv = TestServer::new()
+            .route(
+                "/not-modified",
+                RouteConfig::StatusThenOk {
+                    code: 304,
+                    headers: vec![("Cache-Control".into(), "max-age=60".into())],
+                    failures: usize::MAX,
+                    body: Vec::new(),
+                },
+            )
+            .start()
+            .await;
+        let (_, cache) = caching_policy();
+        for round in 1..=2 {
+            let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+            let (meta, _) = cache_fetch(
+                &srv,
+                "/not-modified",
+                RequestInit::default(),
+                policy,
+                observer(),
+            )
+            .await;
+            assert_eq!(meta.status, 304);
+            assert!(!meta.from_cache, "round {round}");
+        }
+        assert!(cache.is_empty());
+        assert_eq!(srv.hit_count("/not-modified"), 2);
+    }
+
+    /// Fetch, HTTP-network-or-cache fetch: the cache mode tells the caches on the way too.
+    /// `no-cache` sends `Cache-Control: max-age=0`; `reload` and `no-store` send
+    /// `Pragma: no-cache` and `Cache-Control: no-cache`; each only when the caller set none.
+    /// With or without a cache of sonar's own, since a proxy's cache is the one this is for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_cache_mode_is_sent_for_the_caches_on_the_way() {
+        let srv = TestServer::new()
+            .route("/echo", RouteConfig::echo_request_headers())
+            .start()
+            .await;
+        let sent = |mode: CacheMode, own: Option<(&'static str, &'static str)>| {
+            let srv = &srv;
+            async move {
+                let mut headers = HeaderMap::new();
+                if let Some((name, value)) = own {
+                    headers.insert(name, header::HeaderValue::from_static(value));
+                }
+                let init = RequestInit::get(headers).with_cache(mode, true);
+                let (_, body) =
+                    cache_fetch(srv, "/echo", init, NetPolicy::default(), observer()).await;
+                let lines = String::from_utf8(body.to_vec()).unwrap();
+                let get = |name: &str| {
+                    lines.lines().find_map(|l| {
+                        let (n, v) = l.split_once(':')?;
+                        n.trim()
+                            .eq_ignore_ascii_case(name)
+                            .then(|| v.trim().to_string())
+                    })
+                };
+                (get("cache-control"), get("pragma"))
+            }
+        };
+        let some = |v: &str| Some(v.to_string());
+
+        assert_eq!(sent(CacheMode::Default, None).await, (None, None));
+        assert_eq!(sent(CacheMode::ForceCache, None).await, (None, None));
+        assert_eq!(
+            sent(CacheMode::NoCache, None).await,
+            (some("max-age=0"), None)
+        );
+        assert_eq!(
+            sent(CacheMode::Reload, None).await,
+            (some("no-cache"), some("no-cache"))
+        );
+        assert_eq!(
+            sent(CacheMode::NoStore, None).await,
+            (some("no-cache"), some("no-cache"))
+        );
+        // The caller's own value stands.
+        assert_eq!(
+            sent(CacheMode::Reload, Some(("cache-control", "max-age=5"))).await,
+            (some("max-age=5"), some("no-cache"))
+        );
+        assert_eq!(
+            sent(CacheMode::NoCache, Some(("cache-control", "no-cache"))).await,
+            (some("no-cache"), None)
+        );
+        // A caller's own condition makes a default request a no-store one, which says so too.
+        assert_eq!(
+            sent(CacheMode::Default, Some(("if-none-match", "\"v1\""))).await,
+            (some("no-cache"), some("no-cache"))
+        );
+        // A range is not a condition.
+        assert_eq!(
+            sent(CacheMode::Default, Some(("range", "bytes=0-9"))).await,
+            (None, None)
+        );
+    }
+
+    /// RFC 9111 §4.3.4: a `304` naming another strong `ETag` than the stored one does not
+    /// confirm it. The stored body is not served under the new tag; the hop is asked again
+    /// without conditions, and that response is the one used and stored.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_304_naming_another_version_refetches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A server that contradicts itself: its responses carry `"v1"`, but a matching
+        // `If-None-Match` is answered with a `304` that names `"v2"`. Bodies count requests.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let hit = served.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                let response = if request.contains("\r\nif-none-match: \"v1\"") {
+                    "HTTP/1.1 304 Not Modified\r\nETag: \"v2\"\r\nCache-Control: max-age=0\r\n\
+                     Connection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    let body = format!("hit-{hit}");
+                    format!(
+                        "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nCache-Control: max-age=0\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/flip")).unwrap();
+        let (_, cache) = caching_policy();
+        let fetch = || {
+            super::fetch_response_complete(
+                client(),
+                url.clone(),
+                RequestInit::default(),
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(10)),
+                NetPolicy::default().with_cache(Some(cache.clone())),
+            )
+        };
+
+        let (_, body) = fetch().await.unwrap();
+        assert_eq!(&body[..], b"hit-1");
+        // Stale at once: revalidated, answered 304 with "v2", asked again without conditions.
+        let (meta, body) = fetch().await.unwrap();
+        assert_eq!(meta.status, 200);
+        assert!(!meta.from_cache);
+        assert_eq!(
+            &body[..],
+            b"hit-3",
+            "the refetched body, not the stored one"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(cache.len(), 1, "the refetched response replaced the entry");
     }
 
     /// A fresh stored response answers the next fetch without a request going out.

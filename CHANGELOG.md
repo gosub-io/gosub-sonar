@@ -40,6 +40,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The simple API (`simple_get`, `sync_get`, `sync_fetch`) had the same off-by-one: it followed
   9 redirects, not the 10 `MAX_SIMPLE_REDIRECTS` allows, because reqwest's list of earlier URLs
   starts with the one first asked for
+- Cache: a request's `max-stale` also overrode its own `max-age` and `min-fresh`, so
+  `Cache-Control: max-age=10, max-stale` was answered with a stored response of any age. Each
+  is now a condition of its own (RFC 9111 §5.2.1): `max-stale` only lets a stale response
+  through
+- Cache: `Pragma: no-cache` on a request without `Cache-Control` was ignored, so a fresh
+  stored response was used where RFC 9111 §5.4 says to revalidate it
+- Cache: `proxy-revalidate` was treated as `must-revalidate`, so a request's `max-stale` and
+  `CacheMode::ForceCache` could not use a stale response that carried it. It binds shared caches
+  only (RFC 9111 §5.2.2.8), and this cache is private
+- Cache: a response that gave `max-age` twice was fresh for the last value, so
+  `max-age=0, max-age=600` was stored as fresh for ten minutes. The first one counts now
+  (RFC 9111 §4.2.1)
+- Cache: a `304` that sonar had not asked for was stored when it carried freshness, and
+  answered later requests from the cache as an empty `304`. A `304` is never stored; sonar's
+  own revalidations still use theirs to freshen the stored response
+- Cache: a `304` that repeated `Content-Encoding` put it back on a stored body that had
+  been decoded, so later hits claimed an encoding their bytes did not have. A decoded entry keeps
+  its encoding headers off (RFC 9111 §3.2)
+- Cache: `Proxy-Authentication-Info` was stored with a response, though RFC 9111 §3.1 says the
+  headers of the proxy a request went through must not be
+- Cache modes were not sent: `CacheMode::NoCache`, `Reload` and `NoStore` only changed
+  what sonar's own cache did, so a proxy or CDN on the way still answered from its cache. They
+  now add what Fetch adds (HTTP-network-or-cache fetch): `Cache-Control: max-age=0` for
+  `NoCache`, `Pragma: no-cache` and `Cache-Control: no-cache` for the other two, unless the
+  caller set those headers. Neither triggers a CORS preflight
+- Cache: a `max-age` that was not a number of seconds (`max-age=abc`) was ignored, and the
+  response was then fresh by its `Expires` or the `Last-Modified` heuristic. It counts as
+  `max-age=0` now, as RFC 9111 §4.2.1 encourages and browsers do
+- Cache: headers named in a response's `Connection` (`Connection: close, X-Hop-Info`) were
+  stored with it and replayed on every hit. They describe that connection, like the fixed
+  hop-by-hop headers, and are dropped before storing and from a `304` now (RFC 9110 §7.6.1)
+- Cache: `Vary` compared only the first line of a request header, as written. A request
+  that sent `Accept-Language` as two lines (`en`, then `nl`) could be answered with the
+  variant stored for `en` alone, and `en,nl` missed one stored for `en, nl`. A varied header is
+  now compared with all its lines combined and the list's whitespace normalized
+  (RFC 9111 §4.1)
+- Cache: a `304` naming another strong `ETag` than the stored response was taken as a
+  confirmation. The old body was served under the new tag, and every later revalidation, now
+  sending the new tag, confirmed it again, so the stale body stayed until eviction. Such a `304`
+  now drops the entry and the request is sent once more without conditions (RFC 9111 §4.3.4)
+- Cache: a request with a condition of the caller's own (`If-None-Match` and the like) kept
+  the `Default` mode. Fetch handles it as `NoStore`, so it now also carries
+  `Pragma: no-cache` and `Cache-Control: no-cache`, and a cache between sonar and the server
+  does not answer the condition in the server's place
 
 ## [0.12.0] - 2026-10-10
 

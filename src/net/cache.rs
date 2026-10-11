@@ -15,7 +15,8 @@
 //! - freshness from `Cache-Control: max-age`, `Expires`/`Date`, or the `Last-Modified` heuristic
 //!   (§4.2), with the age of the stored response corrected for `Age` and request latency (§4.2.3)
 //! - request directives `no-store`, `no-cache`, `max-age`, `max-stale`, `min-fresh` and
-//!   `only-if-cached` (§5.2.1)
+//!   `only-if-cached` (§5.2.1), and `Pragma: no-cache` from a request without `Cache-Control`
+//!   (§5.4)
 //! - conditional revalidation of a stale entry with `If-None-Match` / `If-Modified-Since`, and a
 //!   `304` that updates the stored headers and reuses the stored body (§4.3)
 //! - `Vary`: one entry per combination of the request headers the response varies on (§4.1)
@@ -54,8 +55,10 @@ const HEURISTIC_MAX_SECS: i64 = 24 * 60 * 60;
 /// "heuristically cacheable"). `206` is absent: partial responses need range support.
 const DEFAULT_CACHEABLE: &[u16] = &[200, 203, 204, 300, 301, 308, 404, 405, 410, 414, 501];
 
-/// Headers that describe the connection rather than the response, and are never stored
-/// (RFC 9110 §7.6.1).
+/// Headers that describe the connection rather than the response (RFC 9110 §7.6.1), or the proxy
+/// the request went through, and are never stored. RFC 9111 §3.1 names the proxy ones:
+/// `Proxy-Authenticate`, `Proxy-Authorization`, and [`PROXY_AUTHENTICATION_INFO`], which has no
+/// constant in `http` and so is checked by name.
 const HOP_BY_HOP: &[HeaderName] = &[
     header::CONNECTION,
     header::PROXY_AUTHENTICATE,
@@ -65,6 +68,22 @@ const HOP_BY_HOP: &[HeaderName] = &[
     header::TRANSFER_ENCODING,
     header::UPGRADE,
 ];
+
+/// `Proxy-Authentication-Info` (RFC 9110 §11.7.3), never stored either; see [`HOP_BY_HOP`].
+const PROXY_AUTHENTICATION_INFO: &str = "proxy-authentication-info";
+
+/// The headers a response's `Connection` names (RFC 9110 §7.6.1): they describe that connection
+/// like the fixed hop-by-hop ones do, so they are not stored either (RFC 9111 §3.1 allows the
+/// removal at storage time).
+fn connection_listed(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|name| HeaderName::try_from(name.trim()).ok())
+        .collect()
+}
 
 /// How a request uses the cache, mirroring the Fetch standard's request cache mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -217,9 +236,8 @@ impl CacheEntry {
         self.vary.iter().all(|(name, stored)| {
             let current = HeaderName::try_from(name.as_str())
                 .ok()
-                .and_then(|n| request.get(&n).and_then(|v| v.to_str().ok()))
-                .map(str::to_string);
-            current.as_deref() == stored.as_deref()
+                .and_then(|n| vary_value(request, &n));
+            current.as_deref() == stored.as_deref().map(normalize_list).as_deref()
         })
     }
 
@@ -292,6 +310,22 @@ impl CacheEntry {
         out
     }
 
+    /// Whether a `304` names another version than the stored one: both carry a strong `ETag`,
+    /// and they differ. Such a `304` confirms nothing about this entry, and RFC 9111 §4.3.4
+    /// forbids updating it from one. A `304` without an `ETag`, or with a weak one, is not taken
+    /// as a contradiction.
+    pub fn contradicted_by(&self, response: &HeaderMap) -> bool {
+        let strong = |headers: &HeaderMap| {
+            headers
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|tag| !tag.starts_with("W/"))
+                .map(str::to_string)
+        };
+        matches!((strong(&self.headers), strong(response)), (Some(stored), Some(sent)) if stored != sent)
+    }
+
     /// Whether the entry carries a validator, i.e. whether a `304` can ever come back for it.
     pub fn is_revalidatable(&self) -> bool {
         self.headers.contains_key(header::ETAG) || self.headers.contains_key(header::LAST_MODIFIED)
@@ -306,11 +340,18 @@ impl CacheEntry {
         received_at: DateTime<Utc>,
     ) -> Self {
         let mut updated = self.clone();
+        let connection = connection_listed(headers);
         for name in headers.keys() {
-            // Content-Length describes the stored body, which the 304 did not carry.
+            // Content-Length describes the stored body, which the 304 did not carry. A decoded
+            // body was stored without its Content-Encoding, and the 304's would put back a
+            // claim the stored bytes no longer meet (RFC 9111 §3.2: the fields the stored
+            // response depends on are not updated).
             if HOP_BY_HOP.contains(name)
+                || name == PROXY_AUTHENTICATION_INFO
+                || connection.contains(name)
                 || name == header::CONTENT_LENGTH
                 || name == header::SET_COOKIE
+                || (self.decoded && name == header::CONTENT_ENCODING)
             {
                 continue;
             }
@@ -364,17 +405,29 @@ pub struct ResponseDirectives {
 
 impl ResponseDirectives {
     /// Parse the `Cache-Control` field lines of a response.
+    ///
+    /// A `max-age` given more than once counts the first time only (RFC 9111 §4.2.1), so a
+    /// later `max-age=31536000` cannot extend an earlier `max-age=0`. One that is not a number of
+    /// seconds (`max-age=abc`, `max-age=-1`, a bare `max-age`) counts as `max-age=0`: the server
+    /// meant to say something about freshness, and §4.2.1 encourages taking that as stale
+    /// rather than falling back to `Expires` or a guess.
     pub fn parse(headers: &HeaderMap) -> Self {
         let mut out = Self::default();
+        let mut max_age_seen = false;
         for (name, value) in directives(headers) {
             match name.as_str() {
                 "no-store" => out.no_store = true,
                 "no-cache" => out.no_cache = true,
-                "must-revalidate" | "proxy-revalidate" => out.must_revalidate = true,
+                // `proxy-revalidate` is `must-revalidate` for shared caches only (RFC 9111
+                // §5.2.2.8); this one is private.
+                "must-revalidate" => out.must_revalidate = true,
                 "immutable" => out.immutable = true,
                 "private" => out.private = true,
                 "public" => out.public = true,
-                "max-age" => out.max_age = value.and_then(|v| delta_seconds(&v)),
+                "max-age" if !max_age_seen => {
+                    max_age_seen = true;
+                    out.max_age = Some(value.and_then(|v| delta_seconds(&v)).unwrap_or(0));
+                }
                 _ => {}
             }
         }
@@ -402,8 +455,19 @@ pub struct RequestDirectives {
 
 impl RequestDirectives {
     /// Parse the `Cache-Control` field lines of a request.
+    ///
+    /// A request without `Cache-Control` that says `Pragma: no-cache` asks for `no-cache`: HTTP/1.0
+    /// clients and caches still send it that way, and RFC 9111 §5.4 has it count as one.
     pub fn parse(headers: &HeaderMap) -> Self {
         let mut out = Self::default();
+        if !headers.contains_key(header::CACHE_CONTROL) {
+            out.no_cache = headers
+                .get_all(header::PRAGMA)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .any(|d| d.trim().eq_ignore_ascii_case("no-cache"));
+        }
         for (name, value) in directives(headers) {
             match name.as_str() {
                 "no-store" => out.no_store = true,
@@ -456,6 +520,13 @@ pub fn is_storable(
     if *method != Method::GET && *method != Method::HEAD {
         return false;
     }
+    // A `304` is not a response to keep: it confirms one the client already has, and carries no
+    // body of its own (RFC 9110 §15.4.5). Stored, it would answer later requests with an empty
+    // `304` that nobody asked for. Sonar's own revalidations never reach this point: their
+    // `304` freshens the stored entry instead.
+    if status == 304 {
+        return false;
+    }
     if RequestDirectives::parse(request).no_store || bypasses_cache(request) {
         return false;
     }
@@ -477,8 +548,11 @@ pub fn is_storable(
     let has_validator =
         response.contains_key(header::ETAG) || response.contains_key(header::LAST_MODIFIED);
     if !has_freshness && !has_validator {
-        // Nothing to decide freshness by and nothing to revalidate with, so the entry could
-        // never be used and storing it would only cost memory.
+        // Nothing to decide freshness by and nothing to revalidate with: stale on arrival, so a
+        // normal request never uses it. Only a request that accepts stale responses could
+        // (`CacheMode::ForceCache`, `OnlyIfCached`, `max-stale`), as a browser's back/forward
+        // does. Until something here navigates history that way, storing these would only
+        // push out entries that are used.
         return false;
     }
     // A status the caching rules do not cover is only storable when the response says so itself.
@@ -499,9 +573,13 @@ pub fn entry_from_response(
     received_at: DateTime<Utc>,
 ) -> CacheEntry {
     let mut headers = response.clone();
+    for name in connection_listed(response) {
+        headers.remove(name);
+    }
     for name in HOP_BY_HOP {
         headers.remove(name);
     }
+    headers.remove(PROXY_AUTHENTICATION_INFO);
     // A cache hit must not re-apply a cookie the jar has long since stored or dropped.
     headers.remove(header::SET_COOKIE);
     if decoded {
@@ -513,11 +591,7 @@ pub fn entry_from_response(
         .into_iter()
         .filter_map(|name| {
             let header_name = HeaderName::try_from(name.as_str()).ok()?;
-            let value = request
-                .get(&header_name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            Some((name, value))
+            Some((name, vary_value(request, &header_name)))
         })
         .collect();
 
@@ -531,6 +605,33 @@ pub fn entry_from_response(
         received_at,
         peer_addr: None,
     }
+}
+
+/// A request header's value as `Vary` compares it (RFC 9111 §4.1): every field line of it
+/// combined into one list, with the whitespace around the list's elements normalized, so
+/// `en, nl`, `en,nl` and the two lines `en` and `nl` are the same value. `None` when the request
+/// carries no such header.
+fn vary_value(request: &HeaderMap, name: &HeaderName) -> Option<String> {
+    let lines: Vec<&str> = request
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(normalize_list(&lines.join(",")))
+}
+
+/// A comma-separated list with each element trimmed and empty ones dropped, joined by `, `.
+/// Commas inside quoted strings are part of their element.
+fn normalize_list(value: &str) -> String {
+    split_outside_quotes(value)
+        .into_iter()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The header names a response's `Vary` lists, lowercased.
@@ -609,14 +710,12 @@ pub fn decide(
 
     let age = entry.current_age(now);
     let lifetime = entry.freshness_lifetime().unwrap_or_else(TimeDelta::zero);
-    let mut usable = age < lifetime;
 
-    if let Some(max_age) = asked.max_age {
-        usable &= age <= TimeDelta::seconds(max_age);
-    }
-    if let Some(min_fresh) = asked.min_fresh {
-        usable &= lifetime - age >= TimeDelta::seconds(min_fresh);
-    }
+    // Fresh, or stale by no more than the request's `max-stale` allows. `max-stale` relaxes only
+    // this: the request's `max-age` and `min-fresh` below are conditions of their own
+    // (RFC 9111 §5.2.1), so a caller that wants nothing older than ten seconds does not get a
+    // minute-old response because it also accepts stale ones.
+    let mut usable = age < lifetime;
     if !usable && !stored.must_revalidate {
         if let Some(max_stale) = asked.max_stale {
             let staleness = age - lifetime;
@@ -627,11 +726,39 @@ pub fn decide(
             };
         }
     }
+    if let Some(max_age) = asked.max_age {
+        usable &= age <= TimeDelta::seconds(max_age);
+    }
+    if let Some(min_fresh) = asked.min_fresh {
+        usable &= lifetime - age >= TimeDelta::seconds(min_fresh);
+    }
 
     if usable {
         CacheDecision::Use(entry.clone())
     } else {
         revalidate(entry)
+    }
+}
+
+/// The cache mode a request is handled with (Fetch, HTTP-network-or-cache fetch): `Default`
+/// becomes `NoStore` when the caller sent a condition of its own (`If-None-Match`,
+/// `If-Modified-Since`, `If-Match`, `If-Unmodified-Since`, `If-Range`). The caller is asking
+/// the server, so the caches on the way are told not to answer for it either; sonar's own
+/// cache already stays out of such a request (see [`bypasses_cache`]).
+pub fn effective_mode(mode: CacheMode, request: &HeaderMap) -> CacheMode {
+    let conditional = [
+        header::IF_NONE_MATCH,
+        header::IF_MODIFIED_SINCE,
+        header::IF_MATCH,
+        header::IF_UNMODIFIED_SINCE,
+        header::IF_RANGE,
+    ]
+    .iter()
+    .any(|name| request.contains_key(name));
+    if mode == CacheMode::Default && conditional {
+        CacheMode::NoStore
+    } else {
+        mode
     }
 }
 
@@ -1239,6 +1366,253 @@ mod tests {
         ));
     }
 
+    /// RFC 9111 §5.2.1: `max-stale` lets a stale response through, but the request's `max-age`
+    /// and `min-fresh` still hold. A response 50 s into a 100 s lifetime is too old for
+    /// `max-age=10` and not fresh enough for `min-fresh=60`, whatever `max-stale` says.
+    #[test]
+    fn max_stale_does_not_lift_max_age_or_min_fresh() {
+        let fresh = [entry(&[
+            ("cache-control", "max-age=100"),
+            ("etag", "\"v1\""),
+        ])];
+        for asked in [
+            "max-age=10, max-stale",
+            "max-age=10, max-stale=3600",
+            "min-fresh=60, max-stale",
+        ] {
+            let asked = headers(&[("cache-control", asked)]);
+            assert!(
+                matches!(
+                    decide(&fresh, &asked, false, CacheMode::Default, at(50)),
+                    CacheDecision::Revalidate(..)
+                ),
+                "{asked:?}"
+            );
+        }
+        // A stale response young enough for the request's max-age is still let through.
+        let stale = [entry(&[
+            ("cache-control", "max-age=10"),
+            ("etag", "\"v1\""),
+        ])];
+        let asked = headers(&[("cache-control", "max-age=60, max-stale")]);
+        assert!(matches!(
+            decide(&stale, &asked, false, CacheMode::Default, at(30)),
+            CacheDecision::Use(_)
+        ));
+    }
+
+    /// RFC 9111 §5.4: a request with `Pragma: no-cache` and no `Cache-Control` is treated as if
+    /// it carried `Cache-Control: no-cache`. With a `Cache-Control` present, `Pragma` is ignored.
+    #[test]
+    fn pragma_no_cache_counts_when_there_is_no_cache_control() {
+        let fresh = [entry(&[
+            ("cache-control", "max-age=100"),
+            ("etag", "\"v1\""),
+        ])];
+        let decision = |asked: &[(&str, &str)]| {
+            decide(&fresh, &headers(asked), false, CacheMode::Default, at(1))
+        };
+        assert!(matches!(
+            decision(&[("pragma", "no-cache")]),
+            CacheDecision::Revalidate(..)
+        ));
+        assert!(matches!(
+            decision(&[("pragma", "foo, No-Cache")]),
+            CacheDecision::Revalidate(..)
+        ));
+        assert!(matches!(
+            decision(&[("pragma", "no-cache"), ("cache-control", "max-stale")]),
+            CacheDecision::Use(_)
+        ));
+        assert!(matches!(
+            decision(&[("pragma", "foo")]),
+            CacheDecision::Use(_)
+        ));
+    }
+
+    /// RFC 9111 §5.2.2.8: `proxy-revalidate` binds shared caches only. This cache is private,
+    /// so a stale response with it may be served when the request accepts stale ones, unlike
+    /// one with `must-revalidate`.
+    #[test]
+    fn proxy_revalidate_does_not_bind_a_private_cache() {
+        let stale = [entry(&[
+            ("cache-control", "max-age=10, proxy-revalidate"),
+            ("etag", "\"v1\""),
+        ])];
+        let asked = headers(&[("cache-control", "max-stale=60")]);
+        assert!(matches!(
+            decide(&stale, &asked, false, CacheMode::Default, at(40)),
+            CacheDecision::Use(_)
+        ));
+        assert!(matches!(
+            decide(
+                &stale,
+                &HeaderMap::new(),
+                false,
+                CacheMode::ForceCache,
+                at(40)
+            ),
+            CacheDecision::Use(_)
+        ));
+    }
+
+    /// RFC 9111 §4.2.1: with more than one `max-age`, the first is used (or the response is
+    /// taken as stale), never a later, longer one. Across field lines too.
+    #[test]
+    fn the_first_max_age_counts() {
+        let one_line = entry(&[("cache-control", "max-age=0, max-age=600")]);
+        assert!(!one_line.is_fresh(at(10)));
+        let two_lines = entry(&[
+            ("cache-control", "max-age=0"),
+            ("cache-control", "max-age=600"),
+        ]);
+        assert!(!two_lines.is_fresh(at(10)));
+        let longer_first = entry(&[("cache-control", "max-age=600, max-age=0")]);
+        assert!(longer_first.is_fresh(at(10)));
+    }
+
+    /// RFC 9111 §3 and RFC 9110 §15.4.5: a `304` is not a representation, whatever freshness
+    /// it carries, so it is never stored as one.
+    #[test]
+    fn a_304_is_never_stored() {
+        for response in [
+            headers(&[("cache-control", "max-age=60")]),
+            headers(&[("cache-control", "public, max-age=60"), ("etag", "\"v1\"")]),
+        ] {
+            assert!(!is_storable(
+                &Method::GET,
+                &HeaderMap::new(),
+                304,
+                &response
+            ));
+        }
+    }
+
+    /// RFC 9111 §3.2: a `304` does not update the fields the stored response depends on. A body
+    /// stored decoded keeps having no `Content-Encoding` when the `304` that confirms it repeats
+    /// the encoding; a body stored as it came keeps the one it has.
+    #[test]
+    fn a_304_does_not_put_an_encoding_back_on_a_decoded_body() {
+        let stored = |decoded| {
+            entry_from_response(
+                200,
+                &headers(&[
+                    ("cache-control", "max-age=10"),
+                    ("etag", "\"v1\""),
+                    ("content-encoding", "gzip"),
+                ]),
+                &HeaderMap::new(),
+                Bytes::from_static(b"body"),
+                decoded,
+                at(0),
+                at(0),
+            )
+        };
+        let confirmation = headers(&[("etag", "\"v1\""), ("content-encoding", "gzip")]);
+
+        let decoded = stored(true).updated_by_304(&confirmation, at(100), at(100));
+        assert!(!decoded.headers.contains_key(header::CONTENT_ENCODING));
+        let raw = stored(false).updated_by_304(&confirmation, at(100), at(100));
+        assert_eq!(raw.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
+    }
+
+    /// RFC 9111 §4.2.1: a response with invalid freshness information is taken as stale. An
+    /// unparsable `max-age` does not fall through to `Expires` or the `Last-Modified` heuristic.
+    #[test]
+    fn an_invalid_max_age_is_stale() {
+        for max_age in ["max-age=abc", "max-age=-1", "max-age=1.5", "max-age"] {
+            let e = entry(&[
+                ("cache-control", max_age),
+                ("date", &http_date(at(0))),
+                ("expires", &http_date(at(600))),
+                ("last-modified", &http_date(at(-365 * 24 * 3600))),
+            ]);
+            assert!(!e.is_fresh(at(10)), "{max_age}");
+        }
+    }
+
+    /// RFC 9111 §4.1: a varied header is compared after combining its field lines and
+    /// normalizing the whitespace in the list. Split over two lines or written without spaces, a
+    /// value matches; a request that carries more than the stored one does not.
+    #[test]
+    fn vary_compares_the_whole_header_however_it_is_written() {
+        let stored = [entry_with_request(
+            &[("cache-control", "max-age=60"), ("vary", "accept-language")],
+            &[("accept-language", "en, nl")],
+        )];
+        let decision = |asked: &[(&str, &str)]| {
+            decide(&stored, &headers(asked), false, CacheMode::Default, at(1))
+        };
+        for same in [
+            &[("accept-language", "en, nl")][..],
+            &[("accept-language", "en,nl")],
+            &[("accept-language", " en ,  nl ")],
+            &[("accept-language", "en"), ("accept-language", "nl")],
+        ] {
+            assert!(matches!(decision(same), CacheDecision::Use(_)), "{same:?}");
+        }
+
+        // Stored for `en` alone: a request for `en` and `nl` is another variant, even though its
+        // first line says `en`.
+        let only_en = [entry_with_request(
+            &[("cache-control", "max-age=60"), ("vary", "accept-language")],
+            &[("accept-language", "en")],
+        )];
+        let asked = headers(&[("accept-language", "en"), ("accept-language", "nl")]);
+        assert!(matches!(
+            decide(&only_en, &asked, false, CacheMode::Default, at(1)),
+            CacheDecision::Send
+        ));
+    }
+
+    /// RFC 9111 §4.3.4: a `304` whose strong `ETag` is not the stored one does not confirm the
+    /// stored response. Weak or absent tags on either side are no contradiction.
+    #[test]
+    fn a_304_with_another_strong_etag_contradicts_the_entry() {
+        let stored = entry(&[("cache-control", "max-age=10"), ("etag", "\"v1\"")]);
+        let with = |etag: &str| headers(&[("etag", etag)]);
+        assert!(stored.contradicted_by(&with("\"v2\"")));
+        assert!(!stored.contradicted_by(&with("\"v1\"")));
+        assert!(!stored.contradicted_by(&with("W/\"v2\"")));
+        assert!(!stored.contradicted_by(&HeaderMap::new()));
+        let weak = entry(&[("cache-control", "max-age=10"), ("etag", "W/\"v1\"")]);
+        assert!(!weak.contradicted_by(&with("\"v2\"")));
+    }
+
+    /// Fetch, HTTP-network-or-cache fetch: a `default` request with a condition of the caller's
+    /// own is a `no-store` one. A range alone is not a condition, and an explicit mode stays.
+    #[test]
+    fn a_callers_condition_makes_a_default_request_no_store() {
+        for name in [
+            "if-none-match",
+            "if-modified-since",
+            "if-match",
+            "if-unmodified-since",
+            "if-range",
+        ] {
+            let asked = headers(&[(name, "\"v1\"")]);
+            assert_eq!(
+                effective_mode(CacheMode::Default, &asked),
+                CacheMode::NoStore,
+                "{name}"
+            );
+            assert_eq!(
+                effective_mode(CacheMode::Reload, &asked),
+                CacheMode::Reload,
+                "{name}"
+            );
+        }
+        let range = headers(&[("range", "bytes=0-9")]);
+        assert_eq!(
+            effective_mode(CacheMode::Default, &range),
+            CacheMode::Default
+        );
+        assert_eq!(
+            effective_mode(CacheMode::Default, &HeaderMap::new()),
+            CacheMode::Default
+        );
+    }
+
     #[test]
     fn cache_modes_pick_their_own_behaviour() {
         let fresh = [entry(&[
@@ -1468,6 +1842,47 @@ mod tests {
             stored.headers.get(header::CONTENT_TYPE).unwrap(),
             "text/html"
         );
+
+        // RFC 9111 §3.1: the headers of the proxy a request went through are not stored either.
+        let stored = entry(&[
+            ("cache-control", "max-age=60"),
+            ("proxy-authenticate", "Basic realm=\"p\""),
+            ("proxy-authentication-info", "nextnonce=\"n\""),
+        ]);
+        assert!(!stored.headers.contains_key(header::PROXY_AUTHENTICATE));
+        assert!(!stored.headers.contains_key("proxy-authentication-info"));
+        // Nor what `Connection` names: it describes that connection, not the response.
+        let stored = entry(&[
+            ("cache-control", "max-age=60"),
+            ("connection", "close, X-Hop-Info"),
+            ("x-hop-info", "1"),
+            ("x-kept", "1"),
+        ]);
+        assert!(!stored.headers.contains_key("x-hop-info"));
+        assert!(stored.headers.contains_key("x-kept"));
+        let updated = stored.updated_by_304(
+            &headers(&[
+                ("connection", "x-hop-304"),
+                ("x-hop-304", "1"),
+                ("x-new", "1"),
+            ]),
+            at(1),
+            at(1),
+        );
+        assert!(!updated.headers.contains_key("x-hop-304"));
+        assert!(updated.headers.contains_key("x-new"));
+        let stored = entry(&[
+            ("cache-control", "max-age=60"),
+            ("proxy-authentication-info", "nextnonce=\"n\""),
+        ]);
+
+        // Nor does a 304 bring one in.
+        let updated = stored.updated_by_304(
+            &headers(&[("proxy-authentication-info", "nextnonce=\"m\"")]),
+            at(1),
+            at(1),
+        );
+        assert!(!updated.headers.contains_key("proxy-authentication-info"));
     }
 
     #[test]

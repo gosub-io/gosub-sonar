@@ -395,6 +395,35 @@ async fn preflight_runs_once_then_is_cached() {
     shutdown.cancel();
 }
 
+/// The `Cache-Control` and `Pragma` a cache mode adds are not the caller's headers: a simple
+/// cors-mode `GET` with `reload` goes out without a preflight, as in Fetch, where they are added
+/// after the CORS decision.
+#[tokio::test]
+async fn a_cache_mode_does_not_cost_a_preflight() {
+    let home = TestServer::new().start().await;
+    let away = TestServer::new()
+        .route("/data", RouteConfig::cors(CorsRouteOptions::default()))
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+
+    for mode in [CacheMode::Reload, CacheMode::NoStore, CacheMode::NoCache] {
+        let req = FetchRequest::builder(Method::GET, away.url("/data"))
+            .with_origin(home.base_url().origin())
+            .with_mode(RequestMode::Cors)
+            .with_credentials(RequestCredentials::Omit)
+            .with_cache_mode(mode)
+            .build();
+        match fetcher.fetch(req).await {
+            FetchResult::Buffered { .. } => {}
+            other => panic!("{mode:?}: expected Buffered, got {other:?}"),
+        }
+    }
+    assert_eq!(away.hit_count("OPTIONS /data"), 0);
+    assert_eq!(away.hit_count("/data"), 3);
+    shutdown.cancel();
+}
+
 /// Hands the same recording observer to every request, so a test can assert on the events
 /// the fetch stack emitted.
 struct RecordingCtx(Arc<RecordingObserver>);
