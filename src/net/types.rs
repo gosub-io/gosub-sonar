@@ -822,14 +822,16 @@ impl FetchRequest {
         }
         // The named headers above are the common ones, kept readable; the rest of the map
         // varies the response just as much (an API key, a conditional header), so all of it
-        // is hashed, in a fixed order so insertion order does not matter.
+        // is hashed, in a fixed order so insertion order does not matter. Sorted by name only,
+        // and stably: the values of one name go out in the order they were added, which is
+        // part of the request.
         let all_headers = {
             let mut pairs: Vec<(&str, &[u8])> = self
                 .headers
                 .iter()
                 .map(|(n, v)| (n.as_str(), v.as_bytes()))
                 .collect();
-            pairs.sort_unstable();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
             let mut buf = Vec::new();
             for (n, v) in pairs {
                 buf.extend_from_slice(n.as_bytes());
@@ -1644,6 +1646,11 @@ mod tests {
             with(&[("x-a", "1"), ("x-b", "2")]),
             with(&[("x-b", "2"), ("x-a", "1")]),
             "insertion order does not"
+        );
+        assert_ne!(
+            with(&[("x-pref", "nl"), ("x-pref", "en")]),
+            with(&[("x-pref", "en"), ("x-pref", "nl")]),
+            "the order of one name's values does: it is what goes out"
         );
 
         let key_for = |b: FetchRequestBuilder| b.build().generate_request_key();

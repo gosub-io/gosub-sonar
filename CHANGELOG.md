@@ -170,6 +170,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Coalescing: two GET requests whose bodies had the same bytes but a different
   `Content-Type` (`RequestBody::json` and `RequestBody::form`) shared one fetch, though they
   send different requests. The body's content type is part of the key now
+- Coalescing: the key sorted header values as well as names, so `X-Pref: nl` then `en` and
+  `en` then `nl` shared one fetch, though they go out differently. Values of one name keep
+  their order in the key now
 
 ## [0.12.0] - 2026-10-10
 
