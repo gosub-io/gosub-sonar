@@ -361,8 +361,10 @@ pub fn parse_challenges(
     headers
         .get_all(target.challenge_header())
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(parse_challenge_list)
+        // A realm may carry bytes above 0x7F (RFC 9110 §5.5: obs-text, "opaque data"), which
+        // the strict `to_str` refuses; that would drop the whole challenge and make logging in
+        // impossible. UTF-8 is what servers mean by them in practice.
+        .flat_map(|v| parse_challenge_list(&String::from_utf8_lossy(v.as_bytes())))
         .map(|raw| AuthChallenge {
             url: url.clone(),
             target,
@@ -625,6 +627,21 @@ mod tests {
         let c = challenges("Mutual-v1 sid=1");
         assert_eq!(c[0].scheme, AuthScheme::Other("Mutual-v1".into()));
         assert_eq!(c[0].scheme.as_str(), "Mutual-v1");
+    }
+
+    /// RFC 9110 §5.5: obs-text in a quoted-string is opaque data, not a reason to drop the field.
+    /// A realm in UTF-8 still makes a challenge, with the realm as written.
+    #[test]
+    fn a_realm_with_bytes_above_0x7f_is_still_a_challenge() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_bytes("Basic realm=\"Café\"".as_bytes()).unwrap(),
+        );
+        let c = parse_challenges(&headers, AuthTarget::Server, &url(), 0, None);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].scheme, AuthScheme::Basic);
+        assert_eq!(c[0].realm.as_deref(), Some("Café"));
     }
 
     #[test]

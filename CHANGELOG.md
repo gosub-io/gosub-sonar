@@ -91,6 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retry: `Retry-After: +5` was read as five seconds, and a number of seconds too large for a
   u64 was dropped, so the request was retried after the normal backoff instead of hardly at
   all. delay-seconds is digits only, and a huge one saturates (RFC 9110 §10.2.3)
+- Auth: a challenge whose realm had a byte above 0x7F (`realm="Café"`) was dropped whole,
+  so no login was possible on that server. Such bytes are opaque data in a quoted-string
+  (RFC 9110 §5.5); the challenge is parsed, with the realm read as UTF-8
 
 ## [0.12.0] - 2026-10-10
 
