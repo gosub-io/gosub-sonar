@@ -160,9 +160,9 @@ pub fn is_cors_safelisted_request_header(name: &HeaderName, value: &[u8]) -> boo
             if value.iter().copied().any(is_cors_unsafe_header_byte) {
                 return false;
             }
-            let Ok(s) = std::str::from_utf8(value) else {
-                return false;
-            };
+            // Isomorphic decode, one byte to one char, as Fetch has it: a parameter may carry
+            // bytes 0x80-0xFF, which are not UTF-8 but leave the MIME type's essence alone.
+            let s: String = value.iter().map(|&b| char::from(b)).collect();
             let essence = s
                 .split(';')
                 .next()
@@ -187,12 +187,23 @@ pub fn is_cors_safelisted_request_header(name: &HeaderName, value: &[u8]) -> boo
                     !start.is_empty()
                         && start.bytes().all(|b| b.is_ascii_digit())
                         && end.bytes().all(|b| b.is_ascii_digit())
+                        // A start past the end is no range at all (Fetch, parse a single range
+                        // header value).
+                        && (end.is_empty() || !decimal_greater(start, end))
                 }
                 None => false,
             }
         }
         _ => false,
     }
+}
+
+/// Whether the decimal number `a` is greater than `b`, both strings of ASCII digits of any
+/// length, as Fetch reads a range's bounds.
+fn decimal_greater(a: &str, b: &str) -> bool {
+    let a = a.trim_start_matches('0');
+    let b = b.trim_start_matches('0');
+    (a.len(), a) > (b.len(), b)
 }
 
 /// Forbidden request header ([Fetch] §2.2.2): controlled by the user agent — here, by the
@@ -230,18 +241,39 @@ pub fn is_forbidden_request_header(name: &HeaderName) -> bool {
         )
 }
 
+/// Most bytes the CORS-safelisted header values of one request may add up to before they need a
+/// preflight after all ([Fetch] §2.2.2, CORS-unsafe request-header names).
+///
+/// [Fetch]: https://fetch.spec.whatwg.org/#cors-unsafe-request-header-names
+const MAX_SAFELISTED_VALUE_BYTES: usize = 1024;
+
 /// The caller-set header names that a preflight must get approved: not forbidden (the fetcher
 /// owns those) and not CORS-safelisted for the value they carry. Lowercase, sorted, deduplicated
 /// — the exact list sent in `Access-Control-Request-Headers`.
+///
+/// Each safelisted value is at most 128 bytes, but a request may repeat them: when all of them
+/// together come to more than [`MAX_SAFELISTED_VALUE_BYTES`], every safelisted name needs
+/// approval too, as Fetch has it. Without that, a page could send a cross-origin server any
+/// amount of data in "safe" headers without its consent. The no-cors check uses the same list,
+/// which makes it a little stricter than Fetch's per-name rule for no-cors, never looser.
 pub(crate) fn unsafe_request_header_names(headers: &HeaderMap) -> Vec<String> {
-    let mut names: Vec<String> = headers
-        .iter()
-        .filter(|(name, value)| {
-            !is_forbidden_request_header(name)
-                && !is_cors_safelisted_request_header(name, value.as_bytes())
-        })
-        .map(|(name, _)| name.as_str().to_string())
-        .collect();
+    let mut names: Vec<String> = Vec::new();
+    let mut safelisted: Vec<String> = Vec::new();
+    let mut safelisted_bytes = 0usize;
+    for (name, value) in headers {
+        if is_forbidden_request_header(name) {
+            continue;
+        }
+        if is_cors_safelisted_request_header(name, value.as_bytes()) {
+            safelisted.push(name.as_str().to_string());
+            safelisted_bytes += value.len();
+        } else {
+            names.push(name.as_str().to_string());
+        }
+    }
+    if safelisted_bytes > MAX_SAFELISTED_VALUE_BYTES {
+        names.extend(safelisted);
+    }
     names.sort_unstable();
     names.dedup();
     names
@@ -289,8 +321,13 @@ pub(crate) fn cors_check(
     if !credentials_include {
         return Ok(());
     }
-    match response.get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS) {
-        Some(v) if v.as_bytes() == b"true" => Ok(()),
+    // Fetch gets the header as one combined value, so a duplicate reads `true, true`, which is
+    // not `true`: only a single line saying exactly `true` grants credentials.
+    let mut values = response
+        .get_all(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+        .iter();
+    match (values.next(), values.next()) {
+        (Some(v), None) if v.as_bytes() == b"true" => Ok(()),
         _ => Err(CorsError::CredentialsNotAllowed),
     }
 }
@@ -426,12 +463,7 @@ pub(crate) fn validate_preflight_response(
         parse_token_list(response, header::ACCESS_CONTROL_ALLOW_METHODS, false)?;
     let (headers, headers_wildcard) =
         parse_token_list(response, header::ACCESS_CONTROL_ALLOW_HEADERS, true)?;
-    let max_age = response
-        .get(header::ACCESS_CONTROL_MAX_AGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map_or(DEFAULT_PREFLIGHT_MAX_AGE, Duration::from_secs)
-        .min(MAX_PREFLIGHT_MAX_AGE);
+    let max_age = preflight_max_age(response).min(MAX_PREFLIGHT_MAX_AGE);
     Ok(PreflightAllows {
         methods,
         methods_wildcard,
@@ -439,6 +471,26 @@ pub(crate) fn validate_preflight_response(
         headers_wildcard,
         max_age,
     })
+}
+
+/// The `Access-Control-Max-Age` of a preflight response ([Fetch] §4.8 step 7.8): one value of
+/// ASCII digits (`delta-seconds`). A duplicated header, a sign, a fraction or anything else is
+/// a failure and gives the default of five seconds. A number too large to hold saturates.
+#[cfg(not(target_arch = "wasm32"))]
+fn preflight_max_age(response: &HeaderMap) -> Duration {
+    let mut values = response.get_all(header::ACCESS_CONTROL_MAX_AGE).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return DEFAULT_PREFLIGHT_MAX_AGE;
+    };
+    let digits = value.as_bytes().trim_ascii();
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return DEFAULT_PREFLIGHT_MAX_AGE;
+    }
+    let seconds = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|d| d.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    Duration::from_secs(seconds)
 }
 
 /// The request headers a preflight `OPTIONS` carries ([Fetch] §4.9 steps 1–2). The fetcher
@@ -550,6 +602,15 @@ pub trait CorsPreflightCache: Send + Sync {
         allows: PreflightAllows,
         now: DateTime<Utc>,
     );
+
+    /// Drop the grants for `origin` and `url`, with and without credentials ([Fetch] §4.9,
+    /// "clear cache entries"). Called when a request that relied on a grant ended in a network
+    /// error, so the server is asked again next time rather than trusted for up to the grant's
+    /// `max-age` after it may have changed its mind. The default does nothing, for a cache
+    /// that cannot remove entries.
+    ///
+    /// [Fetch]: https://fetch.spec.whatwg.org/#concept-cache-clear
+    fn clear(&self, _origin: &str, _url: &Url) {}
 }
 
 /// In-process [`CorsPreflightCache`] with no persistence; expired entries are pruned on
@@ -626,6 +687,13 @@ impl CorsPreflightCache for InMemoryPreflightCache {
         }
         entries.insert(key, (allows, expires));
     }
+
+    fn clear(&self, origin: &str, url: &Url) {
+        let mut entries = self.entries.write();
+        for credentials in [false, true] {
+            entries.remove(&Self::key(origin, url, credentials));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -655,6 +723,34 @@ mod tests {
         let first = Url::parse("https://api.test/0").unwrap();
         assert!(cache.get("https://a.test", &first, false, now).is_none());
         assert!(cache.get("https://a.test", &extra, false, now).is_some());
+    }
+
+    /// Fetch §4.9, clear cache entries: both grants for the origin and URL go, with and without
+    /// credentials; others stay.
+    #[test]
+    fn clear_drops_the_grants_for_one_origin_and_url() {
+        let cache = InMemoryPreflightCache::new();
+        let now = Utc::now();
+        let allows = PreflightAllows {
+            methods: Vec::new(),
+            methods_wildcard: false,
+            headers: Vec::new(),
+            headers_wildcard: false,
+            max_age: Duration::from_secs(600),
+        };
+        let url = Url::parse("https://api.test/x").unwrap();
+        let other = Url::parse("https://api.test/y").unwrap();
+        for credentials in [false, true] {
+            cache.put("https://a.test", &url, credentials, allows.clone(), now);
+        }
+        cache.put("https://a.test", &other, false, allows.clone(), now);
+        cache.put("https://b.test", &url, false, allows, now);
+
+        cache.clear("https://a.test", &url);
+        assert!(cache.get("https://a.test", &url, false, now).is_none());
+        assert!(cache.get("https://a.test", &url, true, now).is_none());
+        assert!(cache.get("https://a.test", &other, false, now).is_some());
+        assert!(cache.get("https://b.test", &url, false, now).is_some());
     }
 
     fn origin(s: &str) -> url::Origin {
@@ -727,6 +823,41 @@ mod tests {
             &n("range"),
             b"bytes=0-50,100-150"
         ));
+        // Fetch §2.2.2: `Content-Type` is isomorphic decoded, so a byte above 0x7F in a
+        // parameter leaves `text/plain` safelisted.
+        assert!(is_cors_safelisted_request_header(
+            &n("content-type"),
+            b"text/plain;charset=\xE9"
+        ));
+        assert!(!is_cors_safelisted_request_header(
+            &n("content-type"),
+            b"text/pl\xE9in"
+        ));
+        // Fetch, parse a single range header value: a start past the end is failure. Compared
+        // as numbers, of any length, not as text.
+        for invalid in [
+            &b"bytes=5-1"[..],
+            b"bytes=10-9",
+            b"bytes=100000000000000000000-1",
+        ] {
+            assert!(
+                !is_cors_safelisted_request_header(&n("range"), invalid),
+                "{}",
+                String::from_utf8_lossy(invalid)
+            );
+        }
+        for valid in [
+            &b"bytes=5-5"[..],
+            b"bytes=9-10",
+            b"bytes=007-10",
+            b"bytes=1-100000000000000000000",
+        ] {
+            assert!(
+                is_cors_safelisted_request_header(&n("range"), valid),
+                "{}",
+                String::from_utf8_lossy(valid)
+            );
+        }
         assert!(!is_cors_safelisted_request_header(&n("x-custom"), b"1"));
         // Over the 128-byte value cap.
         let long = vec![b'a'; 129];
@@ -764,6 +895,43 @@ mod tests {
             &Method::POST,
             &headers(&[("content-type", "application/json")])
         ));
+    }
+
+    /// Fetch §2.2.2, CORS-unsafe request-header names: "If safelistValueSize is greater than
+    /// 1024, then for each name of potentiallyUnsafeNames, append name to unsafeNames." Exactly
+    /// 1024 bytes of safelisted values is fine; one more needs a preflight, for every name.
+    #[test]
+    fn safelisted_values_over_1024_bytes_need_a_preflight() {
+        let value = |n: usize| "a".repeat(n);
+        let at_limit = headers(&[
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept", &value(128)),
+            ("accept-language", &value(128)),
+        ]);
+        assert!(unsafe_request_header_names(&at_limit).is_empty());
+        assert!(!preflight_needed(&Method::GET, &at_limit));
+
+        let mut over = at_limit.clone();
+        over.append("content-language", "a".parse().unwrap());
+        assert_eq!(
+            unsafe_request_header_names(&over),
+            vec!["accept", "accept-language", "content-language"]
+        );
+        assert!(preflight_needed(&Method::GET, &over));
+
+        // Forbidden headers are the fetcher's and do not count toward the total.
+        let mut with_forbidden = at_limit.clone();
+        with_forbidden.append("user-agent", "a".repeat(2000).parse().unwrap());
+        with_forbidden.append("referer", "a".repeat(2000).parse().unwrap());
+        assert_eq!(
+            unsafe_request_header_names(&with_forbidden),
+            vec!["user-agent"]
+        );
     }
 
     // --- CORS check ---
@@ -823,6 +991,20 @@ mod tests {
             cors_check(&o, false, true, &bad_case),
             Err(CorsError::CredentialsNotAllowed)
         );
+        // Fetch §4.10, CORS check: the header is *got*, so two lines read `true, true`, which
+        // is not `true`; nor is `true` followed by `false`.
+        for second in ["true", "false"] {
+            let twice = headers(&[
+                ("access-control-allow-origin", "https://a.example"),
+                ("access-control-allow-credentials", "true"),
+                ("access-control-allow-credentials", second),
+            ]);
+            assert_eq!(
+                cors_check(&o, false, true, &twice),
+                Err(CorsError::CredentialsNotAllowed),
+                "true, {second}"
+            );
+        }
     }
 
     #[test]
@@ -946,6 +1128,30 @@ mod tests {
         let resp = ok_preflight(&[("access-control-max-age", "999999999")]);
         let allows = validate_preflight_response(200, &resp, &o, false, false).unwrap();
         assert_eq!(allows.max_age, MAX_PREFLIGHT_MAX_AGE);
+
+        // Fetch §4.8 step 7.8: anything but one `delta-seconds` is a failure, and gives 5 s.
+        let max_age = |values: &[&str]| {
+            let pairs: Vec<(&str, &str)> = values
+                .iter()
+                .map(|v| ("access-control-max-age", *v))
+                .collect();
+            validate_preflight_response(200, &ok_preflight(&pairs), &o, false, false)
+                .unwrap()
+                .max_age
+        };
+        for failure in [
+            &["+600"][..],
+            &["-1"],
+            &["1.5"],
+            &["600", "600"],
+            &["ten"],
+            &[""],
+        ] {
+            assert_eq!(max_age(failure), DEFAULT_PREFLIGHT_MAX_AGE, "{failure:?}");
+        }
+        assert_eq!(max_age(&[" 600 "]), Duration::from_secs(600));
+        // Too large for a u64 is still a number of seconds: capped, not defaulted.
+        assert_eq!(max_age(&["99999999999999999999999"]), MAX_PREFLIGHT_MAX_AGE);
     }
 
     #[test]

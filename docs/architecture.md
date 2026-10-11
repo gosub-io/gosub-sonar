@@ -443,11 +443,13 @@ the origin when leaving it, nothing on an https → http downgrade. A `Referrer-
 3xx response replaces the policy for the rest of the chain.
 
 **Mixed content** (`net::mixed_content`). A request from a secure origin to an insecure URL is
-blocked (`BlockReason::MixedContent`) or upgraded to https, per `FetcherConfig::mixed_content`
-(default `Block`) or the per-request `FetchRequest::mixed_content`. Sonar only does the per-hop
-check, which the caller can't do itself: a check before `fetch()` never sees an `https://a` →
-`http://b` redirect. Whether an image counts as optionally-blockable and may go through with
-`MixedContentPolicy::Allow` is up to the embedder.
+handled per `FetcherConfig::mixed_content` or the per-request `FetchRequest::mixed_content`, and
+checked again at every hop, which the caller can't do itself: a check before `fetch()` never sees
+an `https://a` → `http://b` redirect. The default, `Block`, is Mixed Content Level 2 by the
+request's destination: images, audio and video are upgraded to https (except on an IP host), a
+top-level navigation (`document`) goes through, and everything else is blocked
+(`BlockReason::MixedContent`). `Upgrade` upgrades every request, as `upgrade-insecure-requests`
+does; `Allow` sends them as they are.
 
 **Fetch metadata** (`net::fetch_metadata`). `Sec-Fetch-Dest`, `-Mode`, `-Site` and `-User` are
 set from `FetchRequest::destination`, `::mode` and `Initiator::User`; `Origin` is sent on

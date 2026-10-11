@@ -9,12 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mixed_content::evaluate_for`: the mixed content check for a request with a known
+  destination. `evaluate` keeps its signature and judges a request of no particular kind
+- `CorsPreflightCache::clear`, which drops the grants for one origin and URL. It has a default
+  that does nothing, so existing implementations keep compiling
 - `CredentialStore::accepted_at` and `CredentialStore::upfront_for`, for sending credentials
   before a challenge. Both have defaults that do nothing, so existing stores keep compiling and
   keep the challenge-first behaviour
 
 ### Changed
 
+- Mixed content: the default `MixedContentPolicy::Block` follows Mixed Content Level 2. An
+  `http` image, audio or video request from a secure document is fetched over `https` instead
+  of being blocked, unless its host is an IP address; everything else is still blocked. Before,
+  every such request was blocked and an embedder had to classify images itself, which
+  `ResourceKind` could not
+- CORS: a preflight grant made with credentials also covers the same request without them, as
+  Fetch's preflight cache matches, so a page mixing both is not asked twice. It is judged by
+  the credentialed rules it was made under, where `*` is not a wildcard
 - Auth: `InMemoryCredentialStore` sends a `Basic` server password upfront, to the origin it was
   accepted on, for paths at or below the directory where it was accepted (RFC 7617 §2.2), as
   browsers do. A protected site no longer costs a `401` round trip on every request, nor a
@@ -97,6 +109,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `Default` mode. Fetch handles it as `NoStore`, so it now also carries
   `Pragma: no-cache` and `Cache-Control: no-cache`, and a cache between sonar and the server
   does not answer the condition in the server's place
+- Referrer: every redirect hop computed its `Referer` from the document URL again, so a
+  referrer an earlier hop had cut down to its origin, or withheld, came back in full later in
+  the chain. A cross-origin server could recover the full document URL, query string included,
+  by redirecting to itself with `Referrer-Policy: unsafe-url`. Each hop now starts from what
+  the hop before it sent (Fetch, main fetch step 9)
+- Referrer: an `https` document requesting `http://` on an HSTS host was judged against the
+  upgraded `https` URL, so `strict-origin-when-cross-origin` sent the origin where browsers
+  send nothing. The referrer is decided before the HSTS rewrite now, as Fetch orders it (main
+  fetch steps 9 and 11)
+- `localhost.` and `*.localhost.`, the fully qualified forms with a trailing dot, were not
+  potentially trustworthy, so a secure page's request to them was blocked as mixed content and
+  a referrer from them was not treated as leaving a secure origin (secure contexts §3.1)
+- Mixed content: a top-level navigation from an `https` document to an `http` URL was
+  blocked when the request carried the document's origin, so following a plain link or an
+  `https` page's redirect to `http` failed. A request with destination `document` is not mixed
+  content (Mixed Content §4.4); `iframe` and `frame` still are
+- CORS: CORS-safelisted header values were checked one by one but never added up, so a
+  request could carry any amount of data to a cross-origin server in `Accept`,
+  `Accept-Language` and the like without a preflight. Values totalling more than 1024 bytes now
+  need one, for every safelisted name (Fetch §2.2.2, CORS-unsafe request-header names)
+- CORS: a preflight grant outlived a request that then failed. A server that granted a
+  method for ten minutes and then refused the actual request was not asked again until the
+  grant expired. A request that relied on a grant and ends in a network error now clears it
+  (Fetch §4.4, main fetch)
+- A same-origin WebSocket handshake (`RequestMode::Websocket`) was sent without `Origin`,
+  though the mode's documentation says it always carries one. WebSocket servers check `Origin`
+  to refuse handshakes from other sites. It is sent on every handshake now (Fetch §3.1)
+- CORS: the `OPTIONS` preflight was sent without `Referer`, though it has the request's
+  referrer (Fetch §4.8 step 1). It carries the same `Referer` as the request now
+- CORS: a response with `Access-Control-Allow-Credentials` twice passed the check on its first
+  line, even `true` followed by `false`. Fetch reads the header as one combined value, which is
+  then not `true`: only a single `true` grants credentials now (Fetch §4.10)
+- CORS: `Access-Control-Max-Age` accepted `+600` and took the first of two values, caching
+  a grant for as long as either said. Anything but a single number of seconds now falls back
+  to the five-second default (Fetch §4.8)
+- CORS: `Range: bytes=5-1`, a start past the end, counted as CORS-safelisted and went to a
+  cross-origin server without a preflight. It is not a range at all (Fetch, parse a single range
+  header value)
+- CORS: a `Content-Type` with a byte above 0x7F in a parameter (`text/plain;charset=\xE9`)
+  was not CORS-safelisted, because it was read as UTF-8, and cost an unneeded preflight. It is
+  read byte for byte now, as Fetch's isomorphic decode does
+- `Sec-Fetch-User` keyed on `RequestMode::Navigate`, while Fetch Metadata keys it on a navigation
+  request, which is a matter of destination (`document`, `embed`, `frame`, `iframe`, `object`).
+  A user-activated `embed` or `object` load went without it, and a navigate-mode request of
+  another destination got it
 - Retry: `Retry-After` dates were only read in RFC 2822 form, so the RFC 850 and asctime
   forms, which RFC 9110 §5.6.7 says a recipient MUST accept, were ignored, and a server asking
   to be left alone for an hour was retried after the normal backoff. All three HTTP-date
