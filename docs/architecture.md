@@ -162,7 +162,8 @@ End to end, a fetch through the scheduler goes:
 
 2. **Dequeue.** `Fetcher::run` picks the next item with `pick_lane` — a weighted round-robin over
    the four lanes (≈ High 8 : Normal 4 : Low 2 : Idle 1 across a 15-slot cycle). When the preferred
-   lane is empty it falls through to the next lane in descending priority. The run loop does not
+   lane is empty it falls through to the nearest lane, then outward (on a Low turn: Normal, then
+   High, then Idle), so a turn goes to the priority closest to the one it was for. The run loop does not
    wait for a free slot, so this only orders a backlog it finds; where priority really holds is
    step 4, where requests wait.
 
@@ -183,9 +184,10 @@ End to end, a fetch through the scheduler goes:
    waiter whose origin is at its limit is passed over and holds no global slot meanwhile. The wait
    races against the shutdown token and the cancellation of every subscriber.
 
-5. **Perform.** If **any** coalesced subscriber wants streaming, the task runs `perform_streaming`
-   (→ `FetchResult::Stream` backed by a `SharedBody`); otherwise `perform_buffered`
-   (→ `FetchResult::Buffered`). Both handle redirects, cookies, timeouts, and the URL policy.
+5. **Perform.** If **any** subscriber that has joined by the time the fetch starts wants
+   streaming, the task runs `perform_streaming` (→ `FetchResult::Stream` backed by a
+   `SharedBody`); otherwise `perform_buffered` (→ `FetchResult::Buffered`). A streaming caller that
+   joins a buffered fetch already under way gets the buffered result. Both handle redirects, cookies, timeouts, and the URL policy.
 
 6. **Fan-out.** The result is handed to the entry's `Waiter::finish`, which delivers it to every
    listener — cloning streams for streaming listeners and draining the `SharedBody` into a single

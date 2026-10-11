@@ -441,8 +441,8 @@ impl Fetcher {
 
     // Weighted round-robin dequeue across the four priority lanes.
     // The 15-slot cycle gives approximate weights: High=8, Normal=4, Low=2, Idle=1.
-    // When the preferred lane is empty the next non-empty lane is tried in
-    // descending priority order. This only orders a backlog the run loop finds: requests then
+    // When the preferred lane is empty the nearest non-empty lane is tried, then outward
+    // (on a Low turn: Normal, High, Idle). This only orders a backlog the run loop finds: requests then
     // wait for slots in the `SlotPool`, which applies the same weights where the waiting is.
     fn pick_lane<'a>(
         &'a self,
