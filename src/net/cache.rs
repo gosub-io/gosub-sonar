@@ -365,8 +365,12 @@ pub struct ResponseDirectives {
 
 impl ResponseDirectives {
     /// Parse the `Cache-Control` field lines of a response.
+    ///
+    /// A `max-age` given more than once counts the first time only (RFC 9111 §4.2.1), so a
+    /// later `max-age=31536000` cannot extend an earlier `max-age=0`.
     pub fn parse(headers: &HeaderMap) -> Self {
         let mut out = Self::default();
+        let mut max_age_seen = false;
         for (name, value) in directives(headers) {
             match name.as_str() {
                 "no-store" => out.no_store = true,
@@ -377,7 +381,10 @@ impl ResponseDirectives {
                 "immutable" => out.immutable = true,
                 "private" => out.private = true,
                 "public" => out.public = true,
-                "max-age" => out.max_age = value.and_then(|v| delta_seconds(&v)),
+                "max-age" if !max_age_seen => {
+                    max_age_seen = true;
+                    out.max_age = value.and_then(|v| delta_seconds(&v));
+                }
                 _ => {}
             }
         }
@@ -1345,6 +1352,21 @@ mod tests {
             ),
             CacheDecision::Use(_)
         ));
+    }
+
+    /// RFC 9111 §4.2.1: with more than one `max-age`, the first is used (or the response is
+    /// taken as stale), never a later, longer one. Across field lines too.
+    #[test]
+    fn the_first_max_age_counts() {
+        let one_line = entry(&[("cache-control", "max-age=0, max-age=600")]);
+        assert!(!one_line.is_fresh(at(10)));
+        let two_lines = entry(&[
+            ("cache-control", "max-age=0"),
+            ("cache-control", "max-age=600"),
+        ]);
+        assert!(!two_lines.is_fresh(at(10)));
+        let longer_first = entry(&[("cache-control", "max-age=600, max-age=0")]);
+        assert!(longer_first.is_fresh(at(10)));
     }
 
     #[test]

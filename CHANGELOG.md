@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache: `proxy-revalidate` was treated as `must-revalidate`, so a request's `max-stale` and
   `CacheMode::ForceCache` could not use a stale response that carried it. It binds shared caches
   only (RFC 9111 §5.2.2.8), and this cache is private
+- Cache: a response that gave `max-age` twice was fresh for the last value, so
+  `max-age=0, max-age=600` was stored as fresh for ten minutes. The first one counts now
+  (RFC 9111 §4.2.1)
 
 ## [0.12.0] - 2026-10-10
 
