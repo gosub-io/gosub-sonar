@@ -93,6 +93,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upgraded `https` URL, so `strict-origin-when-cross-origin` sent the origin where browsers
   send nothing. The referrer is decided before the HSTS rewrite now, as Fetch orders it (main
   fetch steps 9 and 11)
+- `localhost.` and `*.localhost.`, the fully qualified forms with a trailing dot, were not
+  potentially trustworthy, so a secure page's request to them was blocked as mixed content and
+  a referrer from them was not treated as leaving a secure origin (secure contexts §3.1)
 
 ## [0.12.0] - 2026-10-10
 

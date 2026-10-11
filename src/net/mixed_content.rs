@@ -65,9 +65,11 @@ pub enum MixedContentAction {
 /// [spec]: https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy
 fn is_loopback_host<S: AsRef<str>>(host: &Host<S>) -> bool {
     match host {
-        // `Url` lowercases domains during parsing, so an ASCII comparison is enough.
+        // `Url` lowercases domains during parsing, so an ASCII comparison is enough. The fully
+        // qualified forms, with one trailing dot, count too (secure contexts §3.1 step 5).
         Host::Domain(d) => {
             let d = d.as_ref();
+            let d = d.strip_suffix('.').unwrap_or(d);
             d == "localhost" || d.ends_with(".localhost")
         }
         // The whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
@@ -241,6 +243,9 @@ mod tests {
         for target in [
             "http://localhost:3000/a.js",
             "http://dev.localhost/a.js",
+            // Secure contexts §3.1 step 5: "localhost." and ".localhost." count as well.
+            "http://localhost./a.js",
+            "http://dev.localhost./a.js",
             "http://127.0.0.1/a.js",
             "http://127.9.9.9/a.js",
             "http://[::1]:8080/a.js",
@@ -299,6 +304,7 @@ mod tests {
         for target in [
             "http://notlocalhost/a.js",
             "http://localhost.evil.com/a.js",
+            "http://localhost../a.js",
             "http://128.0.0.1/a.js",
             "http://[::2]/a.js",
         ] {
