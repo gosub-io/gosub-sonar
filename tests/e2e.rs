@@ -424,6 +424,224 @@ async fn a_cache_mode_does_not_cost_a_preflight() {
     shutdown.cancel();
 }
 
+/// Fetch §2.2.2: safelisted headers totalling more than 1024 bytes need a preflight like any
+/// other. Nine `Accept` values of 128 bytes each go to a cross-origin server only after it was
+/// asked; the server here grants nothing, so the request itself never goes out.
+#[tokio::test]
+async fn oversized_safelisted_headers_are_preflighted() {
+    let home = TestServer::new().start().await;
+    let away = TestServer::new()
+        .route("/data", RouteConfig::cors(CorsRouteOptions::default()))
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+
+    let mut headers = http::HeaderMap::new();
+    for _ in 0..9 {
+        headers.append("accept", "a".repeat(128).parse().unwrap());
+    }
+    let req = FetchRequest::builder(Method::GET, away.url("/data"))
+        .with_origin(home.base_url().origin())
+        .with_mode(RequestMode::Cors)
+        .with_credentials(RequestCredentials::Omit)
+        .with_headers(headers)
+        .build();
+    let result = fetcher.fetch(req).await;
+    assert!(result.is_error(), "{result:?}");
+    assert_eq!(away.hit_count("OPTIONS /data"), 1);
+    assert_eq!(away.hit_count("/data"), 0);
+    shutdown.cancel();
+}
+
+/// Fetch §4.4, main fetch: "If corsWithPreflightResponse is a network error, then clear cache
+/// entries using request." A server grants `PUT` for ten minutes, then fails the actual request
+/// its CORS check; the next `PUT` asks it again instead of trusting the cached grant.
+#[tokio::test]
+async fn a_failed_request_drops_its_preflight_grant() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let home = TestServer::new().start().await;
+    let origin = home.base_url().origin().ascii_serialization();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let preflights = Arc::new(AtomicUsize::new(0));
+    let seen = preflights.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let response = if buf[..n].starts_with(b"OPTIONS ") {
+                seen.fetch_add(1, Ordering::SeqCst);
+                format!(
+                    "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: {origin}\r\n\
+                     Access-Control-Allow-Methods: PUT\r\nAccess-Control-Max-Age: 600\r\n\
+                     Connection: close\r\n\r\n"
+                )
+            } else {
+                // No Access-Control-Allow-Origin: the CORS check fails.
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+            };
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/data")).unwrap();
+
+    for _ in 0..2 {
+        let req = FetchRequest::builder(Method::PUT, url.clone())
+            .with_origin(home.base_url().origin())
+            .with_mode(RequestMode::Cors)
+            .with_credentials(RequestCredentials::Omit)
+            .with_body(RequestBody::text("payload"))
+            .build();
+        let result = fetcher.fetch(req).await;
+        assert!(result.is_error(), "{result:?}");
+    }
+    assert_eq!(preflights.load(Ordering::SeqCst), 2);
+    shutdown.cancel();
+}
+
+/// Fetch §4.8 step 1: the preflight's referrer is the request's, so the `OPTIONS` carries the
+/// same `Referer` as the request it asks about.
+#[tokio::test]
+async fn the_preflight_carries_the_referer() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let home = TestServer::new().start().await;
+    let origin = home.base_url().origin().ascii_serialization();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(bool, Option<String>)>();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]).to_string();
+            let referer = head.lines().find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                name.eq_ignore_ascii_case("referer")
+                    .then(|| value.trim().to_string())
+            });
+            let preflight = head.starts_with("OPTIONS ");
+            let _ = tx.send((preflight, referer));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: {origin}\r\n\
+                 Access-Control-Allow-Methods: PUT\r\nContent-Length: 2\r\n\
+                 Connection: close\r\n\r\nok"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+    let doc = home.url("/page");
+    let req = FetchRequest::builder(
+        Method::PUT,
+        Url::parse(&format!("http://127.0.0.1:{port}/data")).unwrap(),
+    )
+    .with_origin(home.base_url().origin())
+    .with_referrer(doc)
+    .with_mode(RequestMode::Cors)
+    .with_credentials(RequestCredentials::Omit)
+    .with_body(RequestBody::text("payload"))
+    .build();
+    let result = fetcher.fetch(req).await;
+    assert!(!result.is_error(), "{result:?}");
+
+    let (preflight, preflight_referer) = rx.recv().await.unwrap();
+    let (actual, actual_referer) = rx.recv().await.unwrap();
+    assert!(preflight && !actual);
+    assert!(actual_referer.is_some());
+    assert_eq!(preflight_referer, actual_referer);
+    shutdown.cancel();
+}
+
+/// Fetch, CORS-preflight cache: a grant made with credentials also covers the same request
+/// without them, so it is not asked again. Judged by the credentialed rules, though: there a
+/// `*` method is a literal, so a credentialed grant that listed `*` (made for a GET with a
+/// custom header) does not cover an uncredentialed DELETE.
+#[tokio::test]
+async fn a_credentialed_grant_covers_the_request_without_credentials() {
+    let home = TestServer::new().start().await;
+    let origin = home.base_url().origin().ascii_serialization();
+    let away = TestServer::new()
+        .route(
+            "/put",
+            RouteConfig::cors(CorsRouteOptions {
+                allow_origin: origin.clone(),
+                allow_methods: Some("PUT".into()),
+                allow_credentials: true,
+                max_age: Some(600),
+                ..Default::default()
+            }),
+        )
+        .route(
+            "/any",
+            RouteConfig::cors(CorsRouteOptions {
+                allow_origin: origin,
+                allow_methods: Some("*".into()),
+                allow_headers: Some("x-custom".into()),
+                allow_credentials: true,
+                max_age: Some(600),
+                ..Default::default()
+            }),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+    let request = |method: Method, path: &str, credentials| {
+        FetchRequest::builder(method, away.url(path))
+            .with_origin(home.base_url().origin())
+            .with_mode(RequestMode::Cors)
+            .with_credentials(credentials)
+            .with_body(RequestBody::text("payload"))
+            .build()
+    };
+
+    assert!(!fetcher
+        .fetch(request(Method::PUT, "/put", RequestCredentials::Include))
+        .await
+        .is_error());
+    assert!(!fetcher
+        .fetch(request(Method::PUT, "/put", RequestCredentials::Omit))
+        .await
+        .is_error());
+    assert_eq!(
+        away.hit_count("OPTIONS /put"),
+        1,
+        "the credentialed grant was used"
+    );
+
+    // A credentialed GET with a custom header is granted and cached, listing `*` as a method.
+    let mut custom = http::HeaderMap::new();
+    custom.insert("x-custom", "1".parse().unwrap());
+    let get = FetchRequest::builder(Method::GET, away.url("/any"))
+        .with_origin(home.base_url().origin())
+        .with_mode(RequestMode::Cors)
+        .with_credentials(RequestCredentials::Include)
+        .with_headers(custom.clone())
+        .build();
+    assert!(!fetcher.fetch(get).await.is_error());
+    assert_eq!(away.hit_count("OPTIONS /any"), 1);
+    // Under credentials that `*` is the method named `*`, so it granted no DELETE: an
+    // uncredentialed DELETE asks for itself rather than reading it as a wildcard.
+    let delete = FetchRequest::builder(Method::DELETE, away.url("/any"))
+        .with_origin(home.base_url().origin())
+        .with_mode(RequestMode::Cors)
+        .with_credentials(RequestCredentials::Omit)
+        .with_headers(custom)
+        .build();
+    let _ = fetcher.fetch(delete).await;
+    assert_eq!(
+        away.hit_count("OPTIONS /any"),
+        2,
+        "asked again without credentials"
+    );
+    shutdown.cancel();
+}
+
 /// Hands the same recording observer to every request, so a test can assert on the events
 /// the fetch stack emitted.
 struct RecordingCtx(Arc<RecordingObserver>);

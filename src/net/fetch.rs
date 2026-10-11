@@ -190,6 +190,35 @@ pub(crate) fn hop_checks(
     HopCheck::Proceed(target)
 }
 
+/// A preflight grant a hop is relying on, dropped from the cache unless the hop's response
+/// passes its CORS check (Fetch §4.4, main fetch: "If corsWithPreflightResponse is a network
+/// error, then clear cache entries using request"). Every way a hop can fail after its grant
+/// returns early, so the drop is what catches them all.
+#[cfg(not(target_arch = "wasm32"))]
+struct PreflightGrant {
+    cache: Arc<dyn CorsPreflightCache>,
+    origin: String,
+    url: Url,
+    kept: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PreflightGrant {
+    /// The hop's response passed: the grant stays cached.
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PreflightGrant {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.cache.clear(&self.origin, &self.url);
+        }
+    }
+}
+
 /// Callback type for the URL allowlist check.
 pub type UrlFilter = Box<dyn Fn(&Url) -> bool + Send + Sync>;
 
@@ -1955,26 +1984,39 @@ async fn get_with_redirects(
         // Native-only: on wasm32 the browser preflights itself and does not surface the
         // `Access-Control-*` response headers this validation would need.
         #[cfg(not(target_arch = "wasm32"))]
+        let mut preflight_grant: Option<PreflightGrant> = None;
+        #[cfg(not(target_arch = "wasm32"))]
         if init.mode == RequestMode::Cors && tainting == ResponseTainting::Cors {
             if let Some(ref o) = origin {
                 let unsafe_names = cors::unsafe_request_header_names(&current_headers);
                 if !cors::is_cors_safelisted_method(&current_method) || !unsafe_names.is_empty() {
                     let serialized = cors::serialize_origin(o, origin_tainted);
                     let now = chrono::Utc::now();
-                    let granted = policy
-                        .cors_preflight
-                        .as_ref()
-                        .and_then(|c| c.get(&serialized, &url, credentials_include, now))
-                        .is_some_and(|allows| {
-                            allows
-                                .permits(&current_method, &unsafe_names, credentials_include)
-                                .is_ok()
-                        });
+                    // A grant made with credentials also covers the request without them
+                    // (Fetch, "method cache entry match"). It is judged by the credentialed
+                    // rules it was made under, where a `*` is a literal, not a wildcard.
+                    let granted = policy.cors_preflight.as_ref().is_some_and(|cache| {
+                        let fits = |credentialed: bool| {
+                            cache
+                                .get(&serialized, &url, credentialed, now)
+                                .is_some_and(|allows| {
+                                    allows
+                                        .permits(&current_method, &unsafe_names, credentialed)
+                                        .is_ok()
+                                })
+                        };
+                        fits(credentials_include) || (!credentials_include && fits(true))
+                    });
                     if !granted {
                         let mut pf_headers =
                             cors::preflight_request_headers(&current_method, &unsafe_names);
                         if let Ok(v) = serialized.parse() {
                             pf_headers.insert(header::ORIGIN, v);
+                        }
+                        // The preflight has the request's referrer (Fetch §4.8 step 1), as this
+                        // hop computed it above.
+                        if let Some(referer) = current_headers.get(header::REFERER) {
+                            pf_headers.insert(header::REFERER, referer.clone());
                         }
                         fetch_metadata::apply_sec_fetch_headers(
                             &mut pf_headers,
@@ -2022,6 +2064,12 @@ async fn get_with_redirects(
                             cache.put(&serialized, &url, credentials_include, allows, now);
                         }
                     }
+                    preflight_grant = policy.cors_preflight.as_ref().map(|cache| PreflightGrant {
+                        cache: cache.clone(),
+                        origin: serialized,
+                        url: url.clone(),
+                        kept: false,
+                    });
                 }
             }
         }
@@ -2136,6 +2184,10 @@ async fn get_with_redirects(
                             return Err(blocked(&observer, url, BlockReason::Cors(e)));
                         }
                     }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(grant) = preflight_grant.take() {
+                    grant.keep();
                 }
                 observer.on_event(NetEvent::Cache {
                     url: url.clone(),
@@ -2339,6 +2391,10 @@ async fn get_with_redirects(
                             return Err(blocked(&observer, url, BlockReason::Cors(e)));
                         }
                     }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(grant) = preflight_grant.take() {
+                    grant.keep();
                 }
 
                 // A `304` answers a revalidation: the stored body stands, with the headers the
@@ -2594,8 +2650,15 @@ async fn get_with_redirects(
         })?;
 
         // A `Location` with embedded `user:password` is refused for a cors-mode request, and
-        // for any request when it points at another origin (Fetch §4.4 steps 9–10): following
+        // for any request when it points at another origin than the hop it came from: following
         // it would replay attacker-chosen credentials against the new target.
+        //
+        // Deliberately stricter than Fetch §4.5 steps 9-10, which only refuse a cors-mode
+        // request whose Location's origin differs from the *request's* origin, or a chain whose
+        // response tainting is already cors, and otherwise follow with the credentials kept.
+        // Credentials in a redirect target are an attack pattern rather than something a site
+        // relies on, and sonar strips them from what it follows anyway, so refusing more only
+        // costs a redirect browsers would follow.
         if (!to.username().is_empty() || to.password().is_some())
             && (init.mode == RequestMode::Cors || from.origin() != to.origin())
         {
@@ -4826,8 +4889,8 @@ mod tests {
         );
     }
 
-    /// `Sec-Fetch-User: ?1` is only sent on user-activated navigations; everything else
-    /// omits the header.
+    /// `Sec-Fetch-User: ?1` is only sent on user-activated navigation requests, which Fetch
+    /// defines by destination; everything else omits the header.
     #[tokio::test(flavor = "current_thread")]
     async fn sec_fetch_user_marks_user_navigations() {
         let srv = TestServer::new()
@@ -4836,20 +4899,36 @@ mod tests {
             .await;
 
         let cases = [
-            (RequestMode::Navigate, true, "?1"),
-            (RequestMode::Navigate, false, "<absent>"),
-            (RequestMode::NoCors, true, "<absent>"),
-        ];
-        for (mode, activated, expected) in cases {
-            let init = RequestInit::get(HeaderMap::new()).with_fetch_metadata(
+            (
                 RequestDestination::Document,
+                RequestMode::Navigate,
+                true,
+                "?1",
+            ),
+            (
+                RequestDestination::Document,
+                RequestMode::Navigate,
+                false,
+                "<absent>",
+            ),
+            (RequestDestination::Embed, RequestMode::NoCors, true, "?1"),
+            (
+                RequestDestination::Image,
+                RequestMode::NoCors,
+                true,
+                "<absent>",
+            ),
+        ];
+        for (destination, mode, activated, expected) in cases {
+            let init = RequestInit::get(HeaderMap::new()).with_fetch_metadata(
+                destination,
                 mode,
                 activated,
             );
             assert_eq!(
                 header_seen_by_server(&srv, "/user", init).await,
                 expected,
-                "{mode:?} activated={activated}"
+                "{destination:?} {mode:?} activated={activated}"
             );
         }
     }

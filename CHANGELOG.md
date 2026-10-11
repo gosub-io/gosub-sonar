@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `mixed_content::evaluate_for`: the mixed content check for a request with a known
   destination. `evaluate` keeps its signature and judges a request of no particular kind
+- `CorsPreflightCache::clear`, which drops the grants for one origin and URL. It has a default
+  that does nothing, so existing implementations keep compiling
 
 ### Changed
 
@@ -19,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of being blocked, unless its host is an IP address; everything else is still blocked. Before,
   every such request was blocked and an embedder had to classify images itself, which
   `ResourceKind` could not
+- CORS: a preflight grant made with credentials also covers the same request without them, as
+  Fetch's preflight cache matches, so a page mixing both is not asked twice. It is judged by
+  the credentialed rules it was made under, where `*` is not a wildcard
 
 ### Fixed
 
@@ -113,6 +118,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocked when the request carried the document's origin, so following a plain link or an
   `https` page's redirect to `http` failed. A request with destination `document` is not mixed
   content (Mixed Content §4.4); `iframe` and `frame` still are
+- CORS: CORS-safelisted header values were checked one by one but never added up, so a
+  request could carry any amount of data to a cross-origin server in `Accept`,
+  `Accept-Language` and the like without a preflight. Values totalling more than 1024 bytes now
+  need one, for every safelisted name (Fetch §2.2.2, CORS-unsafe request-header names)
+- CORS: a preflight grant outlived a request that then failed. A server that granted a
+  method for ten minutes and then refused the actual request was not asked again until the
+  grant expired. A request that relied on a grant and ends in a network error now clears it
+  (Fetch §4.4, main fetch)
+- A same-origin WebSocket handshake (`RequestMode::Websocket`) was sent without `Origin`,
+  though the mode's documentation says it always carries one. WebSocket servers check `Origin`
+  to refuse handshakes from other sites. It is sent on every handshake now (Fetch §3.1)
+- CORS: the `OPTIONS` preflight was sent without `Referer`, though it has the request's
+  referrer (Fetch §4.8 step 1). It carries the same `Referer` as the request now
+- CORS: a response with `Access-Control-Allow-Credentials` twice passed the check on its first
+  line, even `true` followed by `false`. Fetch reads the header as one combined value, which is
+  then not `true`: only a single `true` grants credentials now (Fetch §4.10)
+- CORS: `Access-Control-Max-Age` accepted `+600` and took the first of two values, caching
+  a grant for as long as either said. Anything but a single number of seconds now falls back
+  to the five-second default (Fetch §4.8)
+- CORS: `Range: bytes=5-1`, a start past the end, counted as CORS-safelisted and went to a
+  cross-origin server without a preflight. It is not a range at all (Fetch, parse a single range
+  header value)
+- CORS: a `Content-Type` with a byte above 0x7F in a parameter (`text/plain;charset=\xE9`)
+  was not CORS-safelisted, because it was read as UTF-8, and cost an unneeded preflight. It is
+  read byte for byte now, as Fetch's isomorphic decode does
+- `Sec-Fetch-User` keyed on `RequestMode::Navigate`, while Fetch Metadata keys it on a navigation
+  request, which is a matter of destination (`document`, `embed`, `frame`, `iframe`, `object`).
+  A user-activated `embed` or `object` load went without it, and a navigate-mode request of
+  another destination got it
 
 ## [0.12.0] - 2026-10-10
 
