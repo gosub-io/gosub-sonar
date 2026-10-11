@@ -60,6 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its encoding headers off (RFC 9111 §3.2)
 - Cache: `Proxy-Authentication-Info` was stored with a response, though RFC 9111 §3.1 says the
   headers of the proxy a request went through must not be
+- Cache modes were not sent: `CacheMode::NoCache`, `Reload` and `NoStore` only changed
+  what sonar's own cache did, so a proxy or CDN on the way still answered from its cache. They
+  now add what Fetch adds (HTTP-network-or-cache fetch): `Cache-Control: max-age=0` for
+  `NoCache`, `Pragma: no-cache` and `Cache-Control: no-cache` for the other two, unless the
+  caller set those headers. Neither triggers a CORS preflight
 
 ## [0.12.0] - 2026-10-10
 

@@ -2110,6 +2110,35 @@ async fn get_with_redirects(
                 for (name, value) in conditional.iter() {
                     hop_headers.insert(name.clone(), value.clone());
                 }
+                // What the cache mode asks of every cache on the way, not just this one (Fetch,
+                // HTTP-network-or-cache fetch): a forced revalidation says `max-age=0`, a reload
+                // or a no-store request `no-cache`. Each only when the caller set none. Added for
+                // the send, after the CORS decision, as Fetch does: neither header is
+                // CORS-safelisted, and the mode alone must not cost a preflight.
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let cache_control = match init.cache_mode {
+                        CacheMode::NoCache => Some("max-age=0"),
+                        CacheMode::NoStore | CacheMode::Reload => {
+                            if !hop_headers.contains_key(header::PRAGMA) {
+                                hop_headers.insert(
+                                    header::PRAGMA,
+                                    header::HeaderValue::from_static("no-cache"),
+                                );
+                            }
+                            Some("no-cache")
+                        }
+                        _ => None,
+                    };
+                    if let Some(value) = cache_control {
+                        if !hop_headers.contains_key(header::CACHE_CONTROL) {
+                            hop_headers.insert(
+                                header::CACHE_CONTROL,
+                                header::HeaderValue::from_static(value),
+                            );
+                        }
+                    }
+                }
                 // Written here rather than left to the client, which would add it while
                 // executing the request -- after this hop was reported. Only when nothing has
                 // already answered a `407` for this hop, which is both the credential that was
@@ -5766,6 +5795,65 @@ mod tests {
         }
         assert!(cache.is_empty());
         assert_eq!(srv.hit_count("/not-modified"), 2);
+    }
+
+    /// Fetch, HTTP-network-or-cache fetch: the cache mode tells the caches on the way too.
+    /// `no-cache` sends `Cache-Control: max-age=0`; `reload` and `no-store` send
+    /// `Pragma: no-cache` and `Cache-Control: no-cache`; each only when the caller set none.
+    /// With or without a cache of sonar's own, since a proxy's cache is the one this is for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_cache_mode_is_sent_for_the_caches_on_the_way() {
+        let srv = TestServer::new()
+            .route("/echo", RouteConfig::echo_request_headers())
+            .start()
+            .await;
+        let sent = |mode: CacheMode, own: Option<(&'static str, &'static str)>| {
+            let srv = &srv;
+            async move {
+                let mut headers = HeaderMap::new();
+                if let Some((name, value)) = own {
+                    headers.insert(name, header::HeaderValue::from_static(value));
+                }
+                let init = RequestInit::get(headers).with_cache(mode, true);
+                let (_, body) =
+                    cache_fetch(srv, "/echo", init, NetPolicy::default(), observer()).await;
+                let lines = String::from_utf8(body.to_vec()).unwrap();
+                let get = |name: &str| {
+                    lines.lines().find_map(|l| {
+                        let (n, v) = l.split_once(':')?;
+                        n.trim()
+                            .eq_ignore_ascii_case(name)
+                            .then(|| v.trim().to_string())
+                    })
+                };
+                (get("cache-control"), get("pragma"))
+            }
+        };
+        let some = |v: &str| Some(v.to_string());
+
+        assert_eq!(sent(CacheMode::Default, None).await, (None, None));
+        assert_eq!(sent(CacheMode::ForceCache, None).await, (None, None));
+        assert_eq!(
+            sent(CacheMode::NoCache, None).await,
+            (some("max-age=0"), None)
+        );
+        assert_eq!(
+            sent(CacheMode::Reload, None).await,
+            (some("no-cache"), some("no-cache"))
+        );
+        assert_eq!(
+            sent(CacheMode::NoStore, None).await,
+            (some("no-cache"), some("no-cache"))
+        );
+        // The caller's own value stands.
+        assert_eq!(
+            sent(CacheMode::Reload, Some(("cache-control", "max-age=5"))).await,
+            (some("max-age=5"), some("no-cache"))
+        );
+        assert_eq!(
+            sent(CacheMode::NoCache, Some(("cache-control", "no-cache"))).await,
+            (some("no-cache"), None)
+        );
     }
 
     /// A fresh stored response answers the next fetch without a request going out.
