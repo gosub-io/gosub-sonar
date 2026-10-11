@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CORS: a preflight grant made with credentials also covers the same request without them, as
   Fetch's preflight cache matches, so a page mixing both is not asked twice. It is judged by
   the credentialed rules it was made under, where `*` is not a wildcard
+- `FetcherContext::on_ref_done` for a streamed fetch fires when the stream ends (read to its
+  end, failed, or given up), not when its headers arrive. It tracks outstanding work, and a
+  download still under way is that: before, a loading indicator driven by it cleared while the
+  body was still coming
 
 ### Fixed
 

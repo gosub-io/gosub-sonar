@@ -20,6 +20,7 @@ use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::proxy::{ProxyConfig, ProxyRoutes};
+use crate::net::request_ref::RequestReference;
 use crate::net::retry::{self, RetryPolicy};
 use crate::net::shared_body::{ReaderOptions, SharedBody, DEFAULT_REPLAY_LIMIT};
 use crate::net::slots::{SlotPool, Slots};
@@ -793,6 +794,12 @@ impl Fetcher {
                 };
                 // Held here until the task ends, or by the body of a streamed fetch.
                 let mut held = acquire.await;
+                // Likewise the reference's outstanding work: a stream is still work until its
+                // body ends, so it takes this along; otherwise it ends with the task.
+                let mut ref_done = Some(RefDone {
+                    ctx: ctx_clone.clone(),
+                    reference: req.reference,
+                });
 
                 let should_stream =
                     req.streaming || inflight_entry2.wants_streaming.load(Ordering::Relaxed);
@@ -820,6 +827,7 @@ impl Fetcher {
                         pool.clone(),
                         built.clone(),
                         slot_guards,
+                        &mut ref_done,
                     )
                     .await
                 } else {
@@ -852,7 +860,7 @@ impl Fetcher {
 
                 inflight_entry2.done.cancel();
 
-                ctx_clone.on_ref_done(req.reference);
+                drop(ref_done);
                 drop(held);
             });
         }
@@ -1045,10 +1053,25 @@ fn build_client(
     }
 }
 
-/// A body reader that keeps the fetch's slots until it is dropped.
+/// A body reader that keeps the fetch's slots, and its reference's outstanding work, until it
+/// is dropped: when the stream has been read to its end, failed, or been given up.
 struct HoldsSlots<R> {
     inner: R,
     _slots: Slots,
+    _done: Option<RefDone>,
+}
+
+/// Calls [`FetcherContext::on_ref_done`] for a reference when dropped, so the call is made once,
+/// wherever the fetch's work actually ends.
+struct RefDone {
+    ctx: Arc<dyn FetcherContext>,
+    reference: RequestReference,
+}
+
+impl Drop for RefDone {
+    fn drop(&mut self) {
+        self.ctx.on_ref_done(self.reference);
+    }
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HoldsSlots<R> {
@@ -1129,6 +1152,7 @@ async fn perform_streaming(
     origins: Arc<SlotPool>,
     built: Arc<ClientsBuilt>,
     slots: Slots,
+    ref_done: &mut Option<RefDone>,
 ) -> Result<FetchResult, NetError> {
     let client = Arc::new(client.clone());
     // Only the header phase is retried; the body goes straight to the caller.
@@ -1173,6 +1197,7 @@ async fn perform_streaming(
     let reader = HoldsSlots {
         inner: reader,
         _slots: slots,
+        _done: ref_done.take(),
     };
     Ok(FetchResult::Stream {
         meta,
@@ -3266,6 +3291,59 @@ mod tests {
             ended.contains(&"fetcher shut down before the request was sent"),
             "{ended:?}"
         );
+    }
+
+    /// `FetcherContext::on_ref_done`: "Called once when all subscribers for a fetch are done",
+    /// the outstanding-work signal. A stream is outstanding work until its body ends: not when
+    /// its headers arrive, which is when the caller gets it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_ref_done_waits_for_a_stream_to_end() {
+        use tokio::io::AsyncReadExt;
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl FetcherContext for Counting {
+            fn observer_for(
+                &self,
+                _: RequestReference,
+                _: RequestId,
+                _: ResourceKind,
+                _: Initiator,
+            ) -> Arc<dyn NetObserver + Send + Sync> {
+                Arc::new(crate::net::null_emitter::NullEmitter)
+            }
+            fn on_ref_active(&self, _: RequestReference) {}
+            fn on_ref_done(&self, _: RequestReference) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let srv = start_server().await;
+        let ctx = Arc::new(Counting(Default::default()));
+        let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+
+        // 12 KiB dribbled over ~360 ms: headers at once, the body still coming.
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_streaming(true)
+            .build();
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = fetcher.fetch(req).await
+        else {
+            panic!("expected a stream");
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ctx.0.load(Ordering::SeqCst), 0, "the body is still coming");
+
+        let mut body = Vec::new();
+        crate::net::shared_body::SharedBody::combined_reader(peek_buf, shared)
+            .read_to_end(&mut body)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 12 * 1024);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ctx.0.load(Ordering::SeqCst), 1, "once, when the body ended");
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
