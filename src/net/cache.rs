@@ -310,6 +310,22 @@ impl CacheEntry {
         out
     }
 
+    /// Whether a `304` names another version than the stored one: both carry a strong `ETag`,
+    /// and they differ. Such a `304` confirms nothing about this entry, and RFC 9111 §4.3.4
+    /// forbids updating it from one. A `304` without an `ETag`, or with a weak one, is not taken
+    /// as a contradiction.
+    pub fn contradicted_by(&self, response: &HeaderMap) -> bool {
+        let strong = |headers: &HeaderMap| {
+            headers
+                .get(header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|tag| !tag.starts_with("W/"))
+                .map(str::to_string)
+        };
+        matches!((strong(&self.headers), strong(response)), (Some(stored), Some(sent)) if stored != sent)
+    }
+
     /// Whether the entry carries a validator, i.e. whether a `304` can ever come back for it.
     pub fn is_revalidatable(&self) -> bool {
         self.headers.contains_key(header::ETAG) || self.headers.contains_key(header::LAST_MODIFIED)
@@ -1522,6 +1538,20 @@ mod tests {
             decide(&only_en, &asked, false, CacheMode::Default, at(1)),
             CacheDecision::Send
         ));
+    }
+
+    /// RFC 9111 §4.3.4: a `304` whose strong `ETag` is not the stored one does not confirm the
+    /// stored response. Weak or absent tags on either side are no contradiction.
+    #[test]
+    fn a_304_with_another_strong_etag_contradicts_the_entry() {
+        let stored = entry(&[("cache-control", "max-age=10"), ("etag", "\"v1\"")]);
+        let with = |etag: &str| headers(&[("etag", etag)]);
+        assert!(stored.contradicted_by(&with("\"v2\"")));
+        assert!(!stored.contradicted_by(&with("\"v1\"")));
+        assert!(!stored.contradicted_by(&with("W/\"v2\"")));
+        assert!(!stored.contradicted_by(&HeaderMap::new()));
+        let weak = entry(&[("cache-control", "max-age=10"), ("etag", "W/\"v1\"")]);
+        assert!(!weak.contradicted_by(&with("\"v2\"")));
     }
 
     #[test]

@@ -2029,7 +2029,7 @@ async fn get_with_redirects(
         // stored response ends the hop without a request; a stale one that can be revalidated
         // adds its conditional headers to the send below. See [`cache`](mod@crate::net::cache).
         #[cfg(not(target_arch = "wasm32"))]
-        let (cache_hit, revalidating, conditional) = match policy.cache {
+        let (cache_hit, mut revalidating, mut conditional) = match policy.cache {
             Some(ref cache) => {
                 let key = CacheKey::new(&current_method, &url).in_partition(cache_partition);
                 let stored = cache.get(&key);
@@ -2302,6 +2302,18 @@ async fn get_with_redirects(
                 // response carried written over the stored ones (RFC 9111 §4.3.4).
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(ref entry) = revalidating {
+                    // A `304` that names another version than the stored one confirms nothing
+                    // (RFC 9111 §4.3.4): updating from it would pin the old body under the new
+                    // tag, and every later revalidation would confirm it again. The entry goes,
+                    // and the hop is asked again without conditions, once.
+                    if resp.status().as_u16() == 304 && entry.contradicted_by(resp.headers()) {
+                        if let Some(ref cache) = policy.cache {
+                            cache.invalidate(&CacheKey::new(&current_method, &url));
+                        }
+                        revalidating = None;
+                        conditional = HeaderMap::new();
+                        continue;
+                    }
                     if resp.status().as_u16() == 304 {
                         let mut updated =
                             entry.updated_by_304(resp.headers(), requested_at, received_at);
@@ -5854,6 +5866,49 @@ mod tests {
             sent(CacheMode::NoCache, Some(("cache-control", "no-cache"))).await,
             (some("no-cache"), None)
         );
+    }
+
+    /// RFC 9111 §4.3.4: a `304` naming another strong `ETag` than the stored one does not
+    /// confirm it. The stored body is not served under the new tag; the hop is asked again
+    /// without conditions, and that response is the one used and stored.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_304_naming_another_version_refetches() {
+        let srv = TestServer::new()
+            .route(
+                "/flip",
+                RouteConfig::Cacheable(
+                    CacheRouteOptions::max_age(0, b"x".to_vec())
+                        .with_etag("\"v1\"")
+                        .with_etag_on_304("\"v2\"")
+                        .counting(),
+                ),
+            )
+            .start()
+            .await;
+        let (_, cache) = caching_policy();
+        let fetch = || {
+            cache_fetch(
+                &srv,
+                "/flip",
+                RequestInit::default(),
+                NetPolicy::default().with_cache(Some(cache.clone())),
+                observer(),
+            )
+        };
+
+        let (_, body) = fetch().await;
+        assert_eq!(&body[..], b"hit-1");
+        // Stale at once: revalidated, answered 304 with "v2", asked again without conditions.
+        let (meta, body) = fetch().await;
+        assert_eq!(meta.status, 200);
+        assert!(!meta.from_cache);
+        assert_eq!(
+            &body[..],
+            b"hit-3",
+            "the refetched body, not the stored one"
+        );
+        assert_eq!(srv.hit_count("/flip"), 3);
+        assert_eq!(cache.len(), 1, "the refetched response replaced the entry");
     }
 
     /// A fresh stored response answers the next fetch without a request going out.

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- test-support: `CacheRouteOptions::with_etag_on_304` (and the `etag_on_304` field), a route
+  whose `304` names another `ETag` than its own
+
 ### Fixed
 
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued
@@ -76,6 +81,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variant stored for `en` alone, and `en,nl` missed one stored for `en, nl`. A varied header is
   now compared with all its lines combined and the list's whitespace normalized
   (RFC 9111 §4.1)
+- Cache: a `304` naming another strong `ETag` than the stored response was taken as a
+  confirmation. The old body was served under the new tag, and every later revalidation, now
+  sending the new tag, confirmed it again, so the stale body stayed until eviction. Such a `304`
+  now drops the entry and the request is sent once more without conditions (RFC 9111 §4.3.4)
 
 ## [0.12.0] - 2026-10-10
 

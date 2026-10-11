@@ -221,6 +221,9 @@ pub struct CacheRouteOptions {
     /// Replace `body` with `hit-<n>`, `n` counting this route's requests from 1. Use to tell
     /// which response a caller ended up with.
     pub counting_body: bool,
+    /// The `ETag` a `304` carries instead of [`etag`](Self::etag): a server that confirms one
+    /// version while naming another.
+    pub etag_on_304: Option<String>,
 }
 
 impl CacheRouteOptions {
@@ -266,6 +269,14 @@ impl CacheRouteOptions {
     #[must_use]
     pub fn counting(mut self) -> Self {
         self.counting_body = true;
+        self
+    }
+
+    /// Answer a matching conditional request with a `304` that carries this `ETag` instead of
+    /// the route's own.
+    #[must_use]
+    pub fn with_etag_on_304(mut self, etag: impl Into<String>) -> Self {
+        self.etag_on_304 = Some(etag.into());
         self
     }
 }
@@ -746,7 +757,10 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             if matches_etag || matches_date {
                 let extra: String = response_headers
                     .iter()
-                    .map(|(k, v)| format!("{k}: {v}\r\n"))
+                    .map(|(k, v)| match (k.as_str(), &options.etag_on_304) {
+                        ("ETag", Some(other)) => format!("{k}: {other}\r\n"),
+                        _ => format!("{k}: {v}\r\n"),
+                    })
                     .collect();
                 let hdr = format!("HTTP/1.1 304 Not Modified\r\n{extra}Connection: close\r\n\r\n");
                 let _ = stream.write_all(hdr.as_bytes()).await;
