@@ -85,6 +85,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   confirmation. The old body was served under the new tag, and every later revalidation, now
   sending the new tag, confirmed it again, so the stale body stayed until eviction. Such a `304`
   now drops the entry and the request is sent once more without conditions (RFC 9111 §4.3.4)
+- Cache: a request with a condition of the caller's own (`If-None-Match` and the like) kept
+  the `Default` mode. Fetch handles it as `NoStore`, so it now also carries
+  `Pragma: no-cache` and `Cache-Control: no-cache`, and a cache between sonar and the server
+  does not answer the condition in the server's place
 
 ## [0.12.0] - 2026-10-10
 

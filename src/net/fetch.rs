@@ -2028,6 +2028,11 @@ async fn get_with_redirects(
         // send, so `Vary` selects on the cookies and the negotiation headers as sent. A fresh
         // stored response ends the hop without a request; a stale one that can be revalidated
         // adds its conditional headers to the send below. See [`cache`](mod@crate::net::cache).
+        //
+        // The mode as Fetch handles it: a caller's own condition turns `Default` into `NoStore`.
+        // Read here from the caller's headers, before any conditional header of the cache's own.
+        #[cfg(not(target_arch = "wasm32"))]
+        let cache_mode = cache::effective_mode(init.cache_mode, &current_headers);
         #[cfg(not(target_arch = "wasm32"))]
         let (cache_hit, mut revalidating, mut conditional) = match policy.cache {
             Some(ref cache) => {
@@ -2037,7 +2042,7 @@ async fn get_with_redirects(
                     &stored,
                     &current_headers,
                     init.auto_decode,
-                    init.cache_mode,
+                    cache_mode,
                     chrono::Utc::now(),
                 ) {
                     CacheDecision::Use(entry) => (Some(entry), None, HeaderMap::new()),
@@ -2117,7 +2122,7 @@ async fn get_with_redirects(
                 // CORS-safelisted, and the mode alone must not cost a preflight.
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    let cache_control = match init.cache_mode {
+                    let cache_control = match cache_mode {
                         CacheMode::NoCache => Some("max-age=0"),
                         CacheMode::NoStore | CacheMode::Reload => {
                             if !hop_headers.contains_key(header::PRAGMA) {
@@ -2452,7 +2457,7 @@ async fn get_with_redirects(
             // `no-store` is both directions: the lookup above skipped the cache, and nothing
             // about this exchange is written to it either.
             (HopResponse::Network(resp), Some(cache))
-                if init.cache_mode != CacheMode::NoStore
+                if cache_mode != CacheMode::NoStore
                     && cache::is_storable(
                         &current_method,
                         &current_headers,
@@ -5865,6 +5870,16 @@ mod tests {
         assert_eq!(
             sent(CacheMode::NoCache, Some(("cache-control", "no-cache"))).await,
             (some("no-cache"), None)
+        );
+        // A caller's own condition makes a default request a no-store one, which says so too.
+        assert_eq!(
+            sent(CacheMode::Default, Some(("if-none-match", "\"v1\""))).await,
+            (some("no-cache"), some("no-cache"))
+        );
+        // A range is not a condition.
+        assert_eq!(
+            sent(CacheMode::Default, Some(("range", "bytes=0-9"))).await,
+            (None, None)
         );
     }
 

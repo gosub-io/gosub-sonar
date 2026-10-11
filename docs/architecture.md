@@ -570,7 +570,10 @@ buffered and the streaming path in one place: a fetch that is cancelled, fails, 
 The cache mode also tells the caches on the way, as Fetch does: `NoCache` sends
 `Cache-Control: max-age=0`, `Reload` and `NoStore` send `Pragma: no-cache` and
 `Cache-Control: no-cache`, each only when the caller set none. They are added to the send after
-the CORS decision, so the mode alone never costs a preflight.
+the CORS decision, so the mode alone never costs a preflight. A `Default` request that carries a
+condition of the caller's own (`If-None-Match`, `If-Modified-Since`, `If-Match`,
+`If-Unmodified-Since`, `If-Range`) is handled as `NoStore`, as Fetch does: the caller is asking
+the server, so neither sonar's cache nor one on the way answers for it.
 
 `Set-Cookie` is removed before a response is stored, so a cache hit cannot re-apply a cookie, and
 so are the hop-by-hop headers. A body the HTTP client decompressed is stored

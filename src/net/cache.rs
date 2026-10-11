@@ -740,6 +740,28 @@ pub fn decide(
     }
 }
 
+/// The cache mode a request is handled with (Fetch, HTTP-network-or-cache fetch): `Default`
+/// becomes `NoStore` when the caller sent a condition of its own (`If-None-Match`,
+/// `If-Modified-Since`, `If-Match`, `If-Unmodified-Since`, `If-Range`). The caller is asking
+/// the server, so the caches on the way are told not to answer for it either; sonar's own
+/// cache already stays out of such a request (see [`bypasses_cache`]).
+pub fn effective_mode(mode: CacheMode, request: &HeaderMap) -> CacheMode {
+    let conditional = [
+        header::IF_NONE_MATCH,
+        header::IF_MODIFIED_SINCE,
+        header::IF_MATCH,
+        header::IF_UNMODIFIED_SINCE,
+        header::IF_RANGE,
+    ]
+    .iter()
+    .any(|name| request.contains_key(name));
+    if mode == CacheMode::Default && conditional {
+        CacheMode::NoStore
+    } else {
+        mode
+    }
+}
+
 /// Whether the request asks for something a whole stored response cannot answer: a byte range,
 /// or a condition of the caller's own.
 ///
@@ -1555,6 +1577,40 @@ mod tests {
         assert!(!stored.contradicted_by(&HeaderMap::new()));
         let weak = entry(&[("cache-control", "max-age=10"), ("etag", "W/\"v1\"")]);
         assert!(!weak.contradicted_by(&with("\"v2\"")));
+    }
+
+    /// Fetch, HTTP-network-or-cache fetch: a `default` request with a condition of the caller's
+    /// own is a `no-store` one. A range alone is not a condition, and an explicit mode stays.
+    #[test]
+    fn a_callers_condition_makes_a_default_request_no_store() {
+        for name in [
+            "if-none-match",
+            "if-modified-since",
+            "if-match",
+            "if-unmodified-since",
+            "if-range",
+        ] {
+            let asked = headers(&[(name, "\"v1\"")]);
+            assert_eq!(
+                effective_mode(CacheMode::Default, &asked),
+                CacheMode::NoStore,
+                "{name}"
+            );
+            assert_eq!(
+                effective_mode(CacheMode::Reload, &asked),
+                CacheMode::Reload,
+                "{name}"
+            );
+        }
+        let range = headers(&[("range", "bytes=0-9")]);
+        assert_eq!(
+            effective_mode(CacheMode::Default, &range),
+            CacheMode::Default
+        );
+        assert_eq!(
+            effective_mode(CacheMode::Default, &HeaderMap::new()),
+            CacheMode::Default
+        );
     }
 
     #[test]
