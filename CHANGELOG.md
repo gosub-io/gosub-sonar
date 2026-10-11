@@ -173,6 +173,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Coalescing: the key sorted header values as well as names, so `X-Pref: nl` then `en` and
   `en` then `nl` shared one fetch, though they go out differently. Values of one name keep
   their order in the key now
+- Coalescing: a request that may not share a fetch (a POST, a streamed body) was kept apart
+  from the others only by a nanosecond timestamp in its key. On a coarse clock two identical
+  POSTs could share a key, and the second body was never sent. Each gets a number of its own
+  now
 
 ## [0.12.0] - 2026-10-10
 

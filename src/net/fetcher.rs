@@ -370,6 +370,9 @@ pub struct Fetcher {
     /// submitted after that is answered at once instead of waiting for a loop that is gone.
     stopped: std::sync::atomic::AtomicBool,
 
+    /// Numbers the requests that may not be coalesced, so each gets a key of its own.
+    unshared: std::sync::atomic::AtomicU64,
+
     ctx: Arc<dyn FetcherContext>,
 
     built: Arc<ClientsBuilt>,
@@ -430,6 +433,7 @@ impl Fetcher {
             inflight_map: Arc::new(DashMap::new()),
             wake: Notify::new(),
             stopped: std::sync::atomic::AtomicBool::new(false),
+            unshared: std::sync::atomic::AtomicU64::new(0),
             ctx,
             built,
         })
@@ -635,11 +639,16 @@ impl Fetcher {
             let key_str = {
                 let base = match key_opt {
                     Some(k) => k,
+                    // A request that may not share a fetch (a POST, a streamed body) gets a key
+                    // no other request has. A counter, not the clock: two identical POSTs on
+                    // one clock tick would otherwise share a key, and the second body would
+                    // never be sent.
                     None => format!(
-                        "{} {} @{}",
+                        "{} {} #{}",
                         req.method,
                         req.url,
-                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                        self.unshared
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     ),
                 };
                 format!("{};D={}", base, req.auto_decode as u8)
@@ -3401,6 +3410,34 @@ mod tests {
             &body_with(format!("127.0.0.1:{}", port.wrapping_add(1))).await[..],
             b"served by the proxy"
         );
+    }
+
+    /// Identical POSTs are never coalesced: each is sent, however close together they come.
+    #[tokio::test(flavor = "current_thread")]
+    async fn identical_posts_are_each_sent() {
+        let srv = TestServer::new()
+            .route("/submit", RouteConfig::echo_body())
+            .start()
+            .await;
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+        // Queued before the loop runs, so they are dequeued back to back.
+        let mut replies = Vec::new();
+        for _ in 0..8 {
+            let req = FetchRequest::builder(Method::POST, srv.url("/submit"))
+                .with_body(crate::net::types::RequestBody::text("same"))
+                .build();
+            let (tx, rx) = oneshot::channel();
+            fetcher.submit(req, CancellationToken::new(), tx).await;
+            replies.push(rx);
+        }
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+        for rx in replies {
+            assert!(!rx.await.unwrap().is_error());
+        }
+        assert_eq!(srv.hit_count("/submit"), 8);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "current_thread")]
