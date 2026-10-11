@@ -628,6 +628,13 @@ Credentials do not survive a hop: the header is added to the send, not to the re
 redirect starts from the caller's headers again (and `Authorization` is in
 `SENSITIVE_REDIRECT_HEADERS` for a hand-set one).
 
+A site already logged in to gets its `Basic` credentials with the first send instead of after a
+`401` every time, as browsers do. The store says what to send (`CredentialStore::upfront_for`):
+`InMemoryCredentialStore` sends a `Basic` server password to the origin it was accepted on, for
+paths at or below the directory where it was accepted (RFC 7617 §2.2), and nothing else. The
+same conditions apply as for answering a challenge, per hop, so a redirect to another origin
+finds nothing to send. A store that does not implement it keeps the challenge-first behaviour.
+
 ---
 
 ## Observability

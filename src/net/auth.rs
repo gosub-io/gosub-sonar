@@ -298,17 +298,56 @@ pub trait CredentialStore: Send + Sync {
     ///
     /// [`FetcherContext::on_auth_challenge`]: crate::net::fetcher_context::FetcherContext::on_auth_challenge
     fn forget(&self, space: &ProtectionSpace);
+
+    /// Note that the credentials stored for `space` were accepted for a request to `url`, right
+    /// after [`store`](Self::store). What [`upfront_for`](Self::upfront_for) answers from. The
+    /// default remembers nothing.
+    fn accepted_at(&self, _space: &ProtectionSpace, _url: &Url) {}
+
+    /// Credentials to send with a request to `url` before any challenge, as a browser does for a
+    /// site it has logged in to (Fetch's authentication entry). The realm is not known before the
+    /// server answers, so this goes by where credentials were accepted. The default sends nothing
+    /// upfront, and every protected request first draws a `401`.
+    fn upfront_for(&self, _url: &Url) -> Option<(ProtectionSpace, Credentials)> {
+        None
+    }
 }
+
+/// The directory of `url`'s path, up to and including its last `/`: the part of the path a
+/// protection space is assumed to cover (RFC 7617 §2.2, "all paths at or deeper than the depth
+/// of the last symbolic element in the path field").
+fn directory_of(url: &Url) -> &str {
+    let path = url.path();
+    path.rfind('/').map_or("/", |end| &path[..=end])
+}
+
+/// Most directories an [`InMemoryCredentialStore`] remembers per protection space for sending
+/// credentials upfront.
+const MAX_UPFRONT_DIRECTORIES: usize = 8;
 
 /// Most protection spaces an [`InMemoryCredentialStore`] remembers.
 pub const MAX_CREDENTIAL_ENTRIES: usize = 256;
 
 /// In-memory [`CredentialStore`]. Past [`MAX_CREDENTIAL_ENTRIES`] the space stored longest
 /// ago is forgotten.
+///
+/// Sends `Basic` server credentials upfront ([`CredentialStore::upfront_for`]) to the origin
+/// they were accepted on, for paths at or below a directory where they were accepted (RFC 7617
+/// §2.2). Nothing else is sent before a challenge: not to another origin, not to a proxy, and
+/// no other scheme, since only a `Basic` value does not depend on the challenge.
 #[derive(Default)]
 pub struct InMemoryCredentialStore {
-    entries: parking_lot::Mutex<std::collections::HashMap<ProtectionSpace, (Credentials, u64)>>,
+    entries: parking_lot::Mutex<std::collections::HashMap<ProtectionSpace, StoredCredentials>>,
     clock: std::sync::atomic::AtomicU64,
+}
+
+/// What an [`InMemoryCredentialStore`] keeps for one protection space.
+struct StoredCredentials {
+    credentials: Credentials,
+    /// When it was stored, for evicting the oldest.
+    stamp: u64,
+    /// Directories they were accepted in, none covering another.
+    directories: Vec<String>,
 }
 
 impl InMemoryCredentialStore {
@@ -335,7 +374,10 @@ impl InMemoryCredentialStore {
 
 impl CredentialStore for InMemoryCredentialStore {
     fn credentials_for(&self, space: &ProtectionSpace) -> Option<Credentials> {
-        self.entries.lock().get(space).map(|(c, _)| c.clone())
+        self.entries
+            .lock()
+            .get(space)
+            .map(|stored| stored.credentials.clone())
     }
 
     fn store(&self, space: ProtectionSpace, credentials: Credentials) {
@@ -346,17 +388,82 @@ impl CredentialStore for InMemoryCredentialStore {
         if entries.len() >= MAX_CREDENTIAL_ENTRIES && !entries.contains_key(&space) {
             if let Some(oldest) = entries
                 .iter()
-                .min_by_key(|(_, (_, at))| *at)
+                .min_by_key(|(_, stored)| stored.stamp)
                 .map(|(k, _)| k.clone())
             {
                 entries.remove(&oldest);
             }
         }
-        entries.insert(space, (credentials, stamp));
+        // New credentials for a space keep the directories the old ones were accepted in only
+        // if they are the same credentials.
+        let directories = entries
+            .remove(&space)
+            .filter(|old| old.credentials == credentials)
+            .map(|old| old.directories)
+            .unwrap_or_default();
+        entries.insert(
+            space,
+            StoredCredentials {
+                credentials,
+                stamp,
+                directories,
+            },
+        );
     }
 
     fn forget(&self, space: &ProtectionSpace) {
         self.entries.lock().remove(space);
+    }
+
+    fn accepted_at(&self, space: &ProtectionSpace, url: &Url) {
+        if space.target != AuthTarget::Server || space.scheme != AuthScheme::Basic {
+            return;
+        }
+        let directory = directory_of(url);
+        let mut entries = self.entries.lock();
+        let Some(stored) = entries.get_mut(space) else {
+            return;
+        };
+        if stored
+            .directories
+            .iter()
+            .any(|known| directory.starts_with(known.as_str()))
+        {
+            return;
+        }
+        stored
+            .directories
+            .retain(|known| !known.starts_with(directory));
+        if stored.directories.len() >= MAX_UPFRONT_DIRECTORIES {
+            stored.directories.remove(0);
+        }
+        stored.directories.push(directory.to_string());
+    }
+
+    fn upfront_for(&self, url: &Url) -> Option<(ProtectionSpace, Credentials)> {
+        let origin = url.origin().ascii_serialization();
+        let path = url.path();
+        let entries = self.entries.lock();
+        // The deepest directory that covers the path: the most specific space wins.
+        entries
+            .iter()
+            .filter(|(space, stored)| {
+                space.target == AuthTarget::Server
+                    && space.scheme == AuthScheme::Basic
+                    && space.origin.as_deref() == Some(origin.as_str())
+                    && matches!(stored.credentials, Credentials::Basic { .. })
+            })
+            .filter_map(|(space, stored)| {
+                stored
+                    .directories
+                    .iter()
+                    .filter(|directory| path.starts_with(directory.as_str()))
+                    .map(String::len)
+                    .max()
+                    .map(|depth| (depth, space, &stored.credentials))
+            })
+            .max_by_key(|(depth, _, _)| *depth)
+            .map(|(_, space, credentials)| (space.clone(), credentials.clone()))
     }
 }
 
@@ -841,5 +948,69 @@ mod tests {
         store.store(space, Credentials::basic("u", "p"));
         store.clear();
         assert!(store.is_empty());
+    }
+
+    /// RFC 7617 §2.2: a client may assume that all paths at or deeper than the last symbolic
+    /// element of an accepted request's path are in the same protection space. Basic server
+    /// credentials accepted at `/area/page` go upfront to the same origin under `/area/`, and
+    /// nowhere else.
+    #[test]
+    fn basic_credentials_go_upfront_below_where_they_were_accepted() {
+        let store = InMemoryCredentialStore::new();
+        let at = |s: &str| Url::parse(s).unwrap();
+        let space = challenges(r#"Basic realm="x""#)[0].protection_space();
+        store.store(space.clone(), Credentials::basic("u", "p"));
+        assert!(store
+            .upfront_for(&at("https://example.com/area/x"))
+            .is_none());
+
+        store.accepted_at(&space, &at("https://example.com/area/page?q=1"));
+        for covered in [
+            "https://example.com/area/",
+            "https://example.com/area/other",
+            "https://example.com/area/deeper/page",
+        ] {
+            assert_eq!(
+                store.upfront_for(&at(covered)),
+                Some((space.clone(), Credentials::basic("u", "p"))),
+                "{covered}"
+            );
+        }
+        for outside in [
+            "https://example.com/areas",
+            "https://example.com/other/area/",
+            "https://example.com/",
+            "http://example.com/area/x",
+            "https://other.example/area/x",
+        ] {
+            assert!(store.upfront_for(&at(outside)).is_none(), "{outside}");
+        }
+
+        // Forgotten credentials go nowhere; replaced ones start over.
+        store.store(space.clone(), Credentials::basic("u", "new"));
+        assert!(store
+            .upfront_for(&at("https://example.com/area/x"))
+            .is_none());
+        store.accepted_at(&space, &at("https://example.com/area/page"));
+        store.forget(&space);
+        assert!(store
+            .upfront_for(&at("https://example.com/area/x"))
+            .is_none());
+    }
+
+    /// Only a `Basic` server password goes upfront: not a proxy's, and not a value computed for
+    /// one challenge.
+    #[test]
+    fn nothing_else_goes_upfront() {
+        let store = InMemoryCredentialStore::new();
+        let url = Url::parse("https://example.com/area/page").unwrap();
+        let digest = challenges(r#"Digest realm="x", nonce="n""#)[0].protection_space();
+        store.store(digest.clone(), Credentials::Raw("Digest x".into()));
+        store.accepted_at(&digest, &url);
+        let mut proxy = challenges(r#"Basic realm="x""#)[0].protection_space();
+        proxy.target = AuthTarget::Proxy;
+        store.store(proxy.clone(), Credentials::basic("u", "p"));
+        store.accepted_at(&proxy, &url);
+        assert!(store.upfront_for(&url).is_none());
     }
 }

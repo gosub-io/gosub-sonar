@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `CredentialStore::accepted_at` and `CredentialStore::upfront_for`, for sending credentials
+  before a challenge. Both have defaults that do nothing, so existing stores keep compiling and
+  keep the challenge-first behaviour
+
+### Changed
+
+- Auth: `InMemoryCredentialStore` sends a `Basic` server password upfront, to the origin it was
+  accepted on, for paths at or below the directory where it was accepted (RFC 7617 §2.2), as
+  browsers do. A protected site no longer costs a `401` round trip on every request, nor a
+  request body sent twice
+
 ### Fixed
 
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued

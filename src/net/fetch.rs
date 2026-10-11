@@ -202,15 +202,16 @@ struct AuthSlot {
 }
 
 impl AuthSlot {
-    /// The party let the request through: remember the password it accepted. Only a password:
-    /// a `Raw` answer was computed for the challenge it answered (a Digest nonce, a Negotiate
-    /// token), and replaying it would only draw another challenge.
-    fn accepted(&mut self, policy: &NetPolicy) {
+    /// The party let the request to `url` through: remember the password it accepted, and
+    /// where. Only a password: a `Raw` answer was computed for the challenge it answered (a
+    /// Digest nonce, a Negotiate token), and replaying it would only draw another challenge.
+    fn accepted(&mut self, policy: &NetPolicy, url: &Url) {
         if let (Some(store), Some((space, credentials))) =
             (policy.credentials.as_ref(), self.unproven.take())
         {
             if matches!(credentials, Credentials::Basic { .. }) {
-                store.store(space, credentials);
+                store.store(space.clone(), credentials);
+                store.accepted_at(&space, url);
             }
         }
     }
@@ -2101,6 +2102,23 @@ async fn get_with_redirects(
         // header, attempt count and unaccepted credentials.
         let mut server_auth = AuthSlot::default();
         let mut proxy_auth = AuthSlot::default();
+        // A site already logged in to gets its `Basic` credentials with the first send, as a
+        // browser does, instead of after a `401` every time (RFC 7617 §2.2; Fetch's
+        // authentication entry). Under the same conditions as answering a challenge, for this
+        // hop's own URL: a redirect elsewhere is looked up for where it goes, and finds nothing
+        // on another origin.
+        if attach_credentials
+            && tainting == ResponseTainting::Basic
+            && !current_headers.contains_key(header::AUTHORIZATION)
+        {
+            if let Some((_, credentials)) = policy
+                .credentials
+                .as_ref()
+                .and_then(|store| store.upfront_for(&url))
+            {
+                server_auth.header = credentials.header_value();
+            }
+        }
 
         // Timestamps of the exchange that produced the response below, for the age of a cache
         // entry made from it (RFC 9111 §4.2.3). A retried hop overwrites them, so they always
@@ -2378,14 +2396,14 @@ async fn get_with_redirects(
                 let Some(target) = AuthTarget::for_status(resp.status().as_u16()) else {
                     // Neither the proxy nor the server objected: whatever each was sent is
                     // accepted.
-                    server_auth.accepted(&policy);
-                    proxy_auth.accepted(&policy);
+                    server_auth.accepted(&policy, &url);
+                    proxy_auth.accepted(&policy, &url);
                     break HopResponse::Network(resp);
                 };
                 // A server challenge means the proxy let the request through, so the proxy
                 // credentials sent with it are accepted.
                 if target == AuthTarget::Server {
-                    proxy_auth.accepted(&policy);
+                    proxy_auth.accepted(&policy, &url);
                 }
                 let slot = match target {
                     AuthTarget::Server => &mut server_auth,
@@ -5487,6 +5505,70 @@ mod tests {
         assert!(store
             .credentials_for(&space(AuthTarget::Server, "site"))
             .is_some());
+    }
+
+    /// RFC 7617 §2.2 and Fetch's authentication entry: once a `Basic` password was accepted at
+    /// `/area/page`, a request below `/area/` sends it with the first send, so it costs one
+    /// request instead of two. A path outside that directory still has to be challenged first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stored_basic_credentials_are_sent_upfront() {
+        let protected = |body: &'static [u8]| {
+            RouteConfig::require_auth(r#"Basic realm="Secure Area""#, GOOD_AUTH, body.to_vec())
+        };
+        let srv = TestServer::new()
+            .route("/area/page", protected(b"page"))
+            .route("/area/other", protected(b"other"))
+            .route("/outside", protected(b"outside"))
+            .start()
+            .await;
+        let store = Arc::new(InMemoryCredentialStore::new());
+        let (policy, _) = answering_policy(Credentials::basic("user", "pass"));
+        let policy = policy.with_credential_store(Some(store.clone()));
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/area/page",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(srv.hit_count("/area/page"), 2, "challenged, then answered");
+
+        // No hook this time: only the store can answer.
+        let stored = || NetPolicy::default().with_credential_store(Some(store.clone()));
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/area/other",
+            RequestInit::get(HeaderMap::new()),
+            stored(),
+            observer(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(srv.hit_count("/area/other"), 1, "sent upfront");
+
+        // Outside `/area/`: challenged first, then answered from the store as before.
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/outside",
+            RequestInit::get(HeaderMap::new()),
+            stored(),
+            observer(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(srv.hit_count("/outside"), 2, "not sent upfront");
+
+        // Credentials withheld by the request's mode are not sent upfront either.
+        let omit = RequestInit::get(HeaderMap::new()).with_credentials(RequestCredentials::Omit);
+        let (meta, _) = auth_fetch(&srv, "/area/other", omit, stored(), observer())
+            .await
+            .unwrap();
+        assert_eq!(meta.status, 401);
     }
 
     #[tokio::test(flavor = "current_thread")]
