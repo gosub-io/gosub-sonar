@@ -803,6 +803,11 @@ impl Fetcher {
                     } else {
                         "cancelled before the request was sent"
                     };
+                    // The request ends here, so it says so, as a cancel anywhere later does.
+                    observer.on_event(NetEvent::Cancelled {
+                        url: req_for_task.url.clone(),
+                        reason: why,
+                    });
                     Err(NetError::Cancelled(why.into()))
                 } else if let (true, Some(slot_guards)) = (should_stream, held.take()) {
                     perform_streaming(
@@ -3217,6 +3222,50 @@ mod tests {
         let (result, log) = fetch_recorded(test_config(), req).await;
         assert!(result.is_error(), "{result:?}");
         assert_eq!(log.event_names(), vec!["Blocked", "Failed"]);
+    }
+
+    /// Every request ends in exactly one of `Finished`, `Failed` or `Cancelled`: also one
+    /// whose callers all cancel, or whose fetcher shuts down, while it waits for a slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_ended_while_waiting_for_a_slot_reports_cancelled() {
+        let srv = start_server().await;
+        let log = Arc::new(RecordingObserver::new());
+        let cfg = FetcherConfig {
+            global_slots: 1,
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(Recording(log.clone()))).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+
+        // The first holds the only slot; the other two wait for it.
+        let (hold, _) = oneshot::channel();
+        let (req, token) = make_req(srv.url("/hang"), Priority::Normal);
+        fetcher.submit(req, token, hold).await;
+        let (cancelled, cancelled_rx) = oneshot::channel();
+        let (req, token) = make_req(srv.url("/fast"), Priority::Normal);
+        fetcher.submit(req, token.clone(), cancelled).await;
+        let (stopped, stopped_rx) = oneshot::channel();
+        let (req, stop_token) = make_req(srv.url("/timed"), Priority::Normal);
+        fetcher.submit(req, stop_token, stopped).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        token.cancel();
+        let _ = cancelled_rx.await;
+        shutdown.cancel();
+        let _ = stopped_rx.await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let ended = log.cancellations();
+        assert!(
+            ended.contains(&"cancelled before the request was sent"),
+            "{ended:?}"
+        );
+        assert!(
+            ended.contains(&"fetcher shut down before the request was sent"),
+            "{ended:?}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

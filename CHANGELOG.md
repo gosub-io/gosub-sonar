@@ -153,6 +153,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Events: a request the scheduler refused before sending it (URL policy, bad port, mixed
   content) reported `Blocked` and nothing after it, so an observer could not tell it had ended.
   `Failed` follows as the terminal event now, as it already did for a block on a redirect hop
+- Events: a request whose callers all cancelled, or whose fetcher shut down, while it waited
+  for a connection slot ended without any event, so an observer never learned it was over. It
+  reports `Cancelled` now, as a request cancelled at any later point does
 
 ## [0.12.0] - 2026-10-10
 
