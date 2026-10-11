@@ -4667,8 +4667,8 @@ mod tests {
         );
     }
 
-    /// `Sec-Fetch-User: ?1` is only sent on user-activated navigations; everything else
-    /// omits the header.
+    /// `Sec-Fetch-User: ?1` is only sent on user-activated navigation requests, which Fetch
+    /// defines by destination; everything else omits the header.
     #[tokio::test(flavor = "current_thread")]
     async fn sec_fetch_user_marks_user_navigations() {
         let srv = TestServer::new()
@@ -4677,20 +4677,36 @@ mod tests {
             .await;
 
         let cases = [
-            (RequestMode::Navigate, true, "?1"),
-            (RequestMode::Navigate, false, "<absent>"),
-            (RequestMode::NoCors, true, "<absent>"),
-        ];
-        for (mode, activated, expected) in cases {
-            let init = RequestInit::get(HeaderMap::new()).with_fetch_metadata(
+            (
                 RequestDestination::Document,
+                RequestMode::Navigate,
+                true,
+                "?1",
+            ),
+            (
+                RequestDestination::Document,
+                RequestMode::Navigate,
+                false,
+                "<absent>",
+            ),
+            (RequestDestination::Embed, RequestMode::NoCors, true, "?1"),
+            (
+                RequestDestination::Image,
+                RequestMode::NoCors,
+                true,
+                "<absent>",
+            ),
+        ];
+        for (destination, mode, activated, expected) in cases {
+            let init = RequestInit::get(HeaderMap::new()).with_fetch_metadata(
+                destination,
                 mode,
                 activated,
             );
             assert_eq!(
                 header_seen_by_server(&srv, "/user", init).await,
                 expected,
-                "{mode:?} activated={activated}"
+                "{destination:?} {mode:?} activated={activated}"
             );
         }
     }

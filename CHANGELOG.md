@@ -114,6 +114,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CORS: a `Content-Type` with a byte above 0x7F in a parameter (`text/plain;charset=\xE9`)
   was not CORS-safelisted, because it was read as UTF-8, and cost an unneeded preflight. It is
   read byte for byte now, as Fetch's isomorphic decode does
+- `Sec-Fetch-User` keyed on `RequestMode::Navigate`, while Fetch Metadata keys it on a navigation
+  request, which is a matter of destination (`document`, `embed`, `frame`, `iframe`, `object`).
+  A user-activated `embed` or `object` load went without it, and a navigate-mode request of
+  another destination got it
 
 ## [0.12.0] - 2026-10-10
 

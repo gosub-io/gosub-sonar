@@ -243,7 +243,9 @@ fn registrable_domain(_host: &str) -> Option<&str> {
 ///
 /// Per spec these only go to potentially trustworthy targets; a plaintext hop has them
 /// removed, including values carried over from an earlier hop. `Sec-Fetch-User` is only ever
-/// `?1` on a user-activated navigation; otherwise the header is absent.
+/// `?1` on a user-activated navigation request, which Fetch defines by its destination
+/// (`document`, `embed`, `frame`, `iframe`, `object`), not its mode; otherwise the header is
+/// absent.
 pub(crate) fn apply_sec_fetch_headers(
     headers: &mut HeaderMap,
     target: &Url,
@@ -265,7 +267,15 @@ pub(crate) fn apply_sec_fetch_headers(
     );
     headers.insert(&SEC_FETCH_MODE, HeaderValue::from_static(mode.as_str()));
     headers.insert(&SEC_FETCH_SITE, HeaderValue::from_static(site.as_str()));
-    if mode == RequestMode::Navigate && user_activated {
+    let navigation = matches!(
+        destination,
+        RequestDestination::Document
+            | RequestDestination::Embed
+            | RequestDestination::Frame
+            | RequestDestination::Iframe
+            | RequestDestination::Object
+    );
+    if navigation && user_activated {
         headers.insert(&SEC_FETCH_USER, HeaderValue::from_static("?1"));
     } else {
         headers.remove(&SEC_FETCH_USER);
@@ -465,20 +475,52 @@ mod tests {
         assert!(headers.get("sec-fetch-site").is_none());
     }
 
+    /// Fetch Metadata §2.4: "If r is not a navigation request, or if r's user-activation is
+    /// false, return." A navigation request is one by destination: `document`, `embed`,
+    /// `frame`, `iframe` or `object`, whatever the mode.
     #[test]
     fn sec_fetch_user_requires_a_user_activated_navigation() {
         let target = u("https://example.com/a");
         let cases = [
-            (RequestMode::Navigate, true, Some("?1")),
-            (RequestMode::Navigate, false, None),
-            (RequestMode::NoCors, true, None),
+            (
+                RequestDestination::Document,
+                RequestMode::Navigate,
+                true,
+                Some("?1"),
+            ),
+            (
+                RequestDestination::Document,
+                RequestMode::Navigate,
+                false,
+                None,
+            ),
+            (
+                RequestDestination::Iframe,
+                RequestMode::Navigate,
+                true,
+                Some("?1"),
+            ),
+            (
+                RequestDestination::Embed,
+                RequestMode::NoCors,
+                true,
+                Some("?1"),
+            ),
+            (
+                RequestDestination::Object,
+                RequestMode::NoCors,
+                true,
+                Some("?1"),
+            ),
+            (RequestDestination::Empty, RequestMode::Navigate, true, None),
+            (RequestDestination::Image, RequestMode::NoCors, true, None),
         ];
-        for (mode, activated, expected) in cases {
+        for (destination, mode, activated, expected) in cases {
             let mut headers = HeaderMap::new();
             apply_sec_fetch_headers(
                 &mut headers,
                 &target,
-                RequestDestination::Document,
+                destination,
                 mode,
                 SecFetchSite::None,
                 activated,
@@ -486,7 +528,7 @@ mod tests {
             assert_eq!(
                 headers.get("sec-fetch-user").map(|v| v.to_str().unwrap()),
                 expected,
-                "{mode:?} activated={activated}"
+                "{destination:?} {mode:?} activated={activated}"
             );
         }
     }
