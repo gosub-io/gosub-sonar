@@ -9,11 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `mixed_content::evaluate_for`: the mixed content check for a request with a known
+  destination. `evaluate` keeps its signature and judges a request of no particular kind
 - `CorsPreflightCache::clear`, which drops the grants for one origin and URL. It has a default
   that does nothing, so existing implementations keep compiling
 
 ### Changed
 
+- Mixed content: the default `MixedContentPolicy::Block` follows Mixed Content Level 2. An
+  `http` image, audio or video request from a secure document is fetched over `https` instead
+  of being blocked, unless its host is an IP address; everything else is still blocked. Before,
+  every such request was blocked and an embedder had to classify images itself, which
+  `ResourceKind` could not
 - CORS: a preflight grant made with credentials also covers the same request without them, as
   Fetch's preflight cache matches, so a page mixing both is not asked twice. It is judged by
   the credentialed rules it was made under, where `*` is not a wildcard
@@ -95,6 +102,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `Default` mode. Fetch handles it as `NoStore`, so it now also carries
   `Pragma: no-cache` and `Cache-Control: no-cache`, and a cache between sonar and the server
   does not answer the condition in the server's place
+- Referrer: every redirect hop computed its `Referer` from the document URL again, so a
+  referrer an earlier hop had cut down to its origin, or withheld, came back in full later in
+  the chain. A cross-origin server could recover the full document URL, query string included,
+  by redirecting to itself with `Referrer-Policy: unsafe-url`. Each hop now starts from what
+  the hop before it sent (Fetch, main fetch step 9)
+- Referrer: an `https` document requesting `http://` on an HSTS host was judged against the
+  upgraded `https` URL, so `strict-origin-when-cross-origin` sent the origin where browsers
+  send nothing. The referrer is decided before the HSTS rewrite now, as Fetch orders it (main
+  fetch steps 9 and 11)
+- `localhost.` and `*.localhost.`, the fully qualified forms with a trailing dot, were not
+  potentially trustworthy, so a secure page's request to them was blocked as mixed content and
+  a referrer from them was not treated as leaving a secure origin (secure contexts §3.1)
+- Mixed content: a top-level navigation from an `https` document to an `http` URL was
+  blocked when the request carried the document's origin, so following a plain link or an
+  `https` page's redirect to `http` failed. A request with destination `document` is not mixed
+  content (Mixed Content §4.4); `iframe` and `frame` still are
 - CORS: CORS-safelisted header values were checked one by one but never added up, so a
   request could carry any amount of data to a cross-origin server in `Accept`,
   `Accept-Language` and the like without a preflight. Values totalling more than 1024 bytes now
