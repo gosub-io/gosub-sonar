@@ -147,6 +147,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request, which is a matter of destination (`document`, `embed`, `frame`, `iframe`, `object`).
   A user-activated `embed` or `object` load went without it, and a navigate-mode request of
   another destination got it
+- Fetcher: a request still queued when `run` stopped was never answered, and `fetch` or
+  `submit` after it had stopped waited forever, though `fetch` documents an error for a
+  fetcher that stops before delivering. Both are answered with `NetError::Cancelled` now
 
 ## [0.12.0] - 2026-10-10
 

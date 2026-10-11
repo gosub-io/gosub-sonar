@@ -364,6 +364,10 @@ pub struct Fetcher {
 
     wake: Notify,
 
+    /// Set when [`run`](Self::run) has stopped, under all four lane locks, so a request
+    /// submitted after that is answered at once instead of waiting for a loop that is gone.
+    stopped: std::sync::atomic::AtomicBool,
+
     ctx: Arc<dyn FetcherContext>,
 
     built: Arc<ClientsBuilt>,
@@ -423,6 +427,7 @@ impl Fetcher {
             q_idle: tokio::sync::Mutex::new(VecDeque::new()),
             inflight_map: Arc::new(DashMap::new()),
             wake: Notify::new(),
+            stopped: std::sync::atomic::AtomicBool::new(false),
             ctx,
             built,
         })
@@ -463,6 +468,24 @@ impl Fetcher {
                 .or_else(|| try_pop(low))
                 .or_else(|| try_pop(norm))
                 .or_else(|| try_pop(high)),
+        }
+    }
+
+    /// Mark the fetcher stopped and answer everything still queued: under all four lane locks,
+    /// so no `submit` can slip a request in between.
+    async fn stop_queue(&self) {
+        let mut high = self.q_high.lock().await;
+        let mut norm = self.q_norm.lock().await;
+        let mut low = self.q_low.lock().await;
+        let mut idle = self.q_idle.lock().await;
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        for lane in [&mut *high, &mut *norm, &mut *low, &mut *idle] {
+            for item in lane.drain(..) {
+                let _ = item.reply.send(FetchResult::Error(NetError::Cancelled(
+                    "fetcher shut down before the request was sent".into(),
+                )));
+            }
         }
     }
 
@@ -528,6 +551,15 @@ impl Fetcher {
             Priority::Low => self.q_low.lock().await,
             Priority::Idle => self.q_idle.lock().await,
         };
+        // Read under the lane lock, which `run` holds while it sets the flag and empties the
+        // lanes: a request is either drained and answered by it, or sees the flag here.
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            drop(lane);
+            let _ = reply_tx.send(FetchResult::Error(NetError::Cancelled(
+                "fetcher shut down".into(),
+            )));
+            return;
+        }
         lane.push_back(QueueItem {
             req,
             // handle: req_handle,\
@@ -544,11 +576,18 @@ impl Fetcher {
     /// waiting for its slots keeps its priority: a freed slot goes to the highest lane that
     /// can use it, first come first served within a lane.
     /// Spawn this on a Tokio runtime before calling [`fetch`](Self::fetch).
+    ///
+    /// When it stops, every request still waiting in a lane is answered with
+    /// [`NetError::Cancelled`], and so is any submitted afterwards, until `run` is called again.
+    /// Fetches already under way finish as usual.
     pub async fn run(&self, shutdown: CancellationToken) {
         let mut lane_counter: u8 = 0;
+        self.stopped
+            .store(false, std::sync::atomic::Ordering::Release);
 
         loop {
             if shutdown.is_cancelled() {
+                self.stop_queue().await;
                 break;
             }
 
@@ -3122,6 +3161,43 @@ mod tests {
 
     /// A request still waiting for a slot at shutdown is answered and cleaned up like any
     /// other, rather than left in the in-flight map with its listeners hanging.
+    /// `fetch` docs: "if the fetcher stops before delivering, this resolves to a
+    /// `FetchResult::Error`". A request still queued when `run` stops is answered, and so is one
+    /// submitted after it stopped, instead of waiting forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_fetcher_answers_every_caller() {
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+        let url = Url::parse("http://127.0.0.1:9/never").unwrap();
+
+        // Queued before the loop runs; the loop then starts already told to stop.
+        let (req, cancel) = make_req(url.clone(), Priority::Normal);
+        let (tx, queued) = oneshot::channel();
+        fetcher.submit(req, cancel, tx).await;
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        fetcher.run(shutdown).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("a queued request is answered")
+            .unwrap();
+        assert!(
+            matches!(result, FetchResult::Error(NetError::Cancelled(_))),
+            "{result:?}"
+        );
+
+        // After the loop is gone.
+        let late = tokio::time::timeout(
+            Duration::from_secs(1),
+            fetcher.fetch(FetchRequest::builder(Method::GET, url).build()),
+        )
+        .await
+        .expect("a request after shutdown is answered");
+        assert!(
+            matches!(late, FetchResult::Error(NetError::Cancelled(_))),
+            "{late:?}"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_while_waiting_for_a_slot_cleans_up() {
         struct Counting(std::sync::atomic::AtomicUsize);
