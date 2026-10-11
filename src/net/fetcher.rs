@@ -3368,6 +3368,41 @@ mod tests {
         }
     }
 
+    /// A bypass entry with a port takes that port only, in the client that sends the request:
+    /// the server's own port goes direct, any other leaves it going through the proxy.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_bypass_entry_with_a_port_takes_that_port_only() {
+        let srv = TestServer::new()
+            .route("/direct", RouteConfig::ok(b"served directly"))
+            .default_route(RouteConfig::ok(b"served by the proxy"))
+            .start()
+            .await;
+        let port = srv.base_url().port().unwrap();
+        let body_with = |list: String| {
+            let cfg = FetcherConfig {
+                proxy: ProxyConfig::Rules(vec![
+                    ProxyRule::all(srv.base_url().as_str()).bypassing(list)
+                ]),
+                ..test_config()
+            };
+            let req = FetchRequest::builder(Method::GET, srv.url("/direct")).build();
+            async move {
+                match fetch_recorded(cfg, req).await.0 {
+                    FetchResult::Buffered { body, .. } => body,
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        assert_eq!(
+            &body_with(format!("127.0.0.1:{port}")).await[..],
+            b"served directly"
+        );
+        assert_eq!(
+            &body_with(format!("127.0.0.1:{}", port.wrapping_add(1))).await[..],
+            b"served by the proxy"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_while_waiting_for_a_slot_cleans_up() {
         struct Counting(std::sync::atomic::AtomicUsize);

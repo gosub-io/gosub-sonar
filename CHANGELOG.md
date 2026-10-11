@@ -163,6 +163,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Proxy: `*` in a bypass list (`ProxyRule::no_proxy`) did not cover IP addresses, so
   `http://127.0.0.1/` and `http://[::1]/` still went through the proxy, though `*` is documented,
   as in curl's `NO_PROXY`, as every host. It covers them now
+- Proxy: bypass entries in forms other tools accept never matched: an IPv6 address in brackets
+  (`[::1]`), an entry with a port (`localhost:8080`), and a request to a name with a trailing dot
+  (`example.com.`). Traffic the user meant to keep off the proxy went through it. They match
+  now; an entry with a port bypasses that port only, as Go's proxy settings do
 
 ## [0.12.0] - 2026-10-10
 
