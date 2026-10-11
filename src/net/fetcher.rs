@@ -3346,6 +3346,28 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// `ProxyRule::no_proxy`'s `*` bypasses the proxy for an IP host too, in the client that
+    /// sends the request. The test server plays both parts: a request it gets as a proxy (an
+    /// absolute URL) falls through to its default route.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_proxy_star_sends_an_ip_host_directly() {
+        let srv = TestServer::new()
+            .route("/direct", RouteConfig::ok(b"served directly"))
+            .default_route(RouteConfig::ok(b"served by the proxy"))
+            .start()
+            .await;
+        let cfg = FetcherConfig {
+            proxy: ProxyConfig::Rules(vec![ProxyRule::all(srv.base_url().as_str()).bypassing("*")]),
+            ..test_config()
+        };
+        let req = FetchRequest::builder(Method::GET, srv.url("/direct")).build();
+        let (result, _) = fetch_recorded(cfg, req).await;
+        match result {
+            FetchResult::Buffered { body, .. } => assert_eq!(&body[..], b"served directly"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_while_waiting_for_a_slot_cleans_up() {
         struct Counting(std::sync::atomic::AtomicUsize);

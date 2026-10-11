@@ -176,8 +176,8 @@ impl ProxyRule {
             None => {}
         }
 
-        if let Some(ref list) = self.no_proxy {
-            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(list));
+        if let Some(list) = self.bypass_list() {
+            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(&list));
         }
 
         Ok(proxy)
@@ -248,9 +248,27 @@ impl ProxyRule {
             ProxyScope::All => builder.all(proxy_url.to_string()),
         };
         builder
-            .no(self.no_proxy.clone().unwrap_or_default())
+            .no(self.bypass_list().unwrap_or_default())
             .build()
             .intercept(dst)
+    }
+
+    /// The bypass list as the matcher is given it, by the client and by this module alike, so
+    /// the two cannot disagree. `*` is spelled out to also cover IP addresses: the matcher checks
+    /// an IP host against IP entries only, so a bare `*` let `http://127.0.0.1/` through the
+    /// proxy though it is documented, and curl's `NO_PROXY` has it, as everything.
+    fn bypass_list(&self) -> Option<String> {
+        let list = self.no_proxy.as_ref()?;
+        let entries: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .flat_map(|entry| match entry {
+                "*" => vec!["*", "0.0.0.0/0", "::/0"],
+                other => vec![other],
+            })
+            .collect();
+        Some(entries.join(","))
     }
 }
 
@@ -423,6 +441,25 @@ mod tests {
 
         assert!(!ProxyRoutes::Disabled.routes_through_proxy(&url("http://example.com/")));
         assert!(!ProxyRoutes::Rules(vec![]).routes_through_proxy(&url("http://example.com/")));
+    }
+
+    /// `ProxyRule::no_proxy`: `*` is "for everything", as in curl's `NO_PROXY`: IP hosts too, not
+    /// just names.
+    #[test]
+    fn a_star_bypasses_every_host_ip_addresses_included() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        let routes =
+            ProxyRoutes::Rules(vec![ProxyRule::all("http://127.0.0.1:3128").bypassing("*")]);
+        for target in [
+            "http://example.com/",
+            "https://intranet.test/",
+            "http://127.0.0.1:8080/",
+            "http://10.1.2.3/",
+            "http://[::1]/",
+            "http://[2001:db8::1]/",
+        ] {
+            assert!(!routes.routes_through_proxy(&url(target)), "{target}");
+        }
     }
 
     /// The system routes answer from the matcher they were resolved with, not from whatever

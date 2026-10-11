@@ -160,6 +160,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Events: a request whose callers all cancelled, or whose fetcher shut down, while it waited
   for a connection slot ended without any event, so an observer never learned it was over. It
   reports `Cancelled` now, as a request cancelled at any later point does
+- Proxy: `*` in a bypass list (`ProxyRule::no_proxy`) did not cover IP addresses, so
+  `http://127.0.0.1/` and `http://[::1]/` still went through the proxy, though `*` is documented,
+  as in curl's `NO_PROXY`, as every host. It covers them now
 
 ## [0.12.0] - 2026-10-10
 
