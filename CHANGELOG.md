@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache: a `304` that sonar had not asked for was stored when it carried freshness, and
   answered later requests from the cache as an empty `304`. A `304` is never stored; sonar's
   own revalidations still use theirs to freshen the stored response
+- Cache: a `304` that repeated `Content-Encoding` put it back on a stored body that had
+  been decoded, so later hits claimed an encoding their bytes did not have. A decoded entry keeps
+  its encoding headers off (RFC 9111 §3.2)
 
 ## [0.12.0] - 2026-10-10
 

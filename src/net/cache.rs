@@ -308,10 +308,14 @@ impl CacheEntry {
     ) -> Self {
         let mut updated = self.clone();
         for name in headers.keys() {
-            // Content-Length describes the stored body, which the 304 did not carry.
+            // Content-Length describes the stored body, which the 304 did not carry. A decoded
+            // body was stored without its Content-Encoding, and the 304's would put back a
+            // claim the stored bytes no longer meet (RFC 9111 §3.2: the fields the stored
+            // response depends on are not updated).
             if HOP_BY_HOP.contains(name)
                 || name == header::CONTENT_LENGTH
                 || name == header::SET_COOKIE
+                || (self.decoded && name == header::CONTENT_ENCODING)
             {
                 continue;
             }
@@ -1391,6 +1395,34 @@ mod tests {
                 &response
             ));
         }
+    }
+
+    /// RFC 9111 §3.2: a `304` does not update the fields the stored response depends on. A body
+    /// stored decoded keeps having no `Content-Encoding` when the `304` that confirms it repeats
+    /// the encoding; a body stored as it came keeps the one it has.
+    #[test]
+    fn a_304_does_not_put_an_encoding_back_on_a_decoded_body() {
+        let stored = |decoded| {
+            entry_from_response(
+                200,
+                &headers(&[
+                    ("cache-control", "max-age=10"),
+                    ("etag", "\"v1\""),
+                    ("content-encoding", "gzip"),
+                ]),
+                &HeaderMap::new(),
+                Bytes::from_static(b"body"),
+                decoded,
+                at(0),
+                at(0),
+            )
+        };
+        let confirmation = headers(&[("etag", "\"v1\""), ("content-encoding", "gzip")]);
+
+        let decoded = stored(true).updated_by_304(&confirmation, at(100), at(100));
+        assert!(!decoded.headers.contains_key(header::CONTENT_ENCODING));
+        let raw = stored(false).updated_by_304(&confirmation, at(100), at(100));
+        assert_eq!(raw.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
     }
 
     #[test]
