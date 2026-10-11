@@ -41,13 +41,16 @@ const MAX_SIMPLE_BODY: u64 = 10 * 1024 * 1024;
 const MAX_SIMPLE_REDIRECTS: usize = 10;
 
 /// Whether a redirect from `previous` (every hop so far) to `next` is followed.
+///
+/// `previous` starts with the URL first asked for, so it holds one URL more than the redirects
+/// followed so far.
 #[cfg(not(target_arch = "wasm32"))]
 fn allow_redirect(
     previous: &[Url],
     next: &Url,
     allowed_bad_ports: &[u16],
 ) -> Result<(), &'static str> {
-    if previous.len() >= MAX_SIMPLE_REDIRECTS {
+    if previous.len() > MAX_SIMPLE_REDIRECTS {
         return Err("too many redirects");
     }
     if crate::net::port_blocking::should_block(next, allowed_bad_ports) {
@@ -525,8 +528,11 @@ mod tests {
         assert!(refuse_bad_port(&u("http://b.test:8080/"), &[]).is_ok());
         assert!(allow_redirect(&[u("http://a.test/")], &u("http://b.test:25/"), &[25]).is_ok());
         assert!(refuse_bad_port(&u("http://b.test:6667/"), &[6667]).is_ok());
-        let ten = vec![u("http://a.test/"); MAX_SIMPLE_REDIRECTS];
-        assert!(allow_redirect(&ten, &u("http://b.test/"), &[]).is_err());
+        // The first URL and MAX_SIMPLE_REDIRECTS - 1 redirects: one more may follow.
+        let below = vec![u("http://a.test/"); MAX_SIMPLE_REDIRECTS];
+        assert!(allow_redirect(&below, &u("http://b.test/"), &[]).is_ok());
+        let at = vec![u("http://a.test/"); MAX_SIMPLE_REDIRECTS + 1];
+        assert!(allow_redirect(&at, &u("http://b.test/"), &[]).is_err());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -712,6 +718,30 @@ mod tests {
         assert_eq!(opts.connect_timeout, Duration::from_secs(10));
         assert_eq!(opts.timeout, Duration::from_secs(30));
         assert_eq!(opts.max_body, MAX_SIMPLE_BODY);
+    }
+
+    /// Exactly MAX_SIMPLE_REDIRECTS redirects are followed; one more is an error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn simple_get_follows_up_to_the_redirect_limit() {
+        let max = MAX_SIMPLE_REDIRECTS;
+        // /c{n} redirects to /c{n-1}, so /c{n} is a chain of exactly n redirects.
+        let mut srv = TestServer::new().route("/c0", RouteConfig::ok(b"end"));
+        for n in 1..=max + 1 {
+            srv = srv.route(
+                &format!("/c{n}"),
+                RouteConfig::redirect_to(format!("/c{}", n - 1)),
+            );
+        }
+        let srv = srv.start().await;
+
+        let body = simple_get(&srv.url(&format!("/c{max}"))).await;
+        assert_eq!(&body.expect("a chain at the limit")[..], b"end");
+        assert!(
+            simple_get(&srv.url(&format!("/c{}", max + 1)))
+                .await
+                .is_err(),
+            "one redirect over the limit"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

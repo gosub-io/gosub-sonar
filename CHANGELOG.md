@@ -37,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - One redirect short of the limit: the chain made at most 20 requests, so it followed 19
   redirects and failed on the 20th with "too many redirects". It follows 20 now, as Fetch does
   and as the documentation says
+- The simple API (`simple_get`, `sync_get`, `sync_fetch`) had the same off-by-one: it followed
+  9 redirects, not the 10 `MAX_SIMPLE_REDIRECTS` allows, because reqwest's list of earlier URLs
+  starts with the one first asked for
 
 ## [0.12.0] - 2026-10-10
 
