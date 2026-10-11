@@ -5,9 +5,12 @@
 //! idempotent methods only. `Retry-After` is honoured. A custom `dns_resolver` failure shows up
 //! as a connect failure and is retried like one.
 //!
-//! A streamed response is retried until its headers arrive; after that the body belongs to the
+//! A streamed response is retried until the start of its body is in: the headers and the first
+//! few kilobytes read to sniff the content (the peek). Nothing has reached the caller before
+//! that, so a connection that breaks there is still recovered; after it the body belongs to the
 //! caller. A buffered fetch is retried as a whole. Each attempt emits its own events, plus
-//! [`NetEvent::Retrying`] before every wait.
+//! [`NetEvent::Retrying`] before every wait, so a stream retried during its peek shows its
+//! headers once per attempt with a `Retrying` in between.
 use crate::net::events::NetEvent;
 use crate::net::transport::TransportErrorKind;
 use crate::net::types::NetError;

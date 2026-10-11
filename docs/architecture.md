@@ -328,7 +328,8 @@ Cancellation is layered with `tokio_util::sync::CancellationToken`:
 
 Retries (`retry.rs`): `perform_buffered` and `perform_streaming` wrap each attempt in
 `with_retries`, which re-sends after a backoff on a retryable error or status, idempotent methods
-only, honouring `Retry-After`. Streams are retried only until headers arrive.
+only, honouring `Retry-After`. Streams are retried until the start of the body (the peek) is
+in, since nothing has reached the caller before that; a stream that breaks later is not re-sent.
 
 Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enforced by `reqwest`
 (`req_timeout` is reqwest's total request timeout, so it covers the body as well as the headers);
