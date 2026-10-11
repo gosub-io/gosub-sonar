@@ -591,15 +591,17 @@ cache hit is considered.
 ## Authentication challenges
 
 A `401` (origin server) or `407` (proxy) is retried as long as credentials for it can be found.
-`get_with_redirects` re-sends the hop, at most `MAX_AUTH_ATTEMPTS` times, and only a response that
-is not a challenge continues through the redirect chain. Every challenged response is reported as
+`get_with_redirects` re-sends the hop, at most `MAX_AUTH_ATTEMPTS` times for the server and as
+many for the proxy, and only a response that is not a challenge continues through the redirect
+chain. A hop through an authenticating proxy to a protected server carries both answers at once,
+`Proxy-Authorization` and `Authorization`. Every challenged response is reported as
 `NetEvent::AuthRequired`, answered or not.
 
 Per challenged hop, for each challenge in the order the server listed them:
 
 1. `FetcherConfig::credentials` (a `CredentialStore`, in-memory by default) is asked for the
-   challenge's `ProtectionSpace` — target + scheme + origin + realm, and for a proxy without the
-   origin, since a fetcher has one proxy configuration;
+   challenge's `ProtectionSpace` — target + scheme + origin + realm, where the origin is the
+   server's for a server challenge and the proxy's for a proxy challenge;
 2. otherwise `FetcherContext::on_auth_challenge(&challenge)` is asked, so an embedder can answer
    from its own password manager or refuse a scheme it cannot compute;
 3. the answer becomes an `Authorization` / `Proxy-Authorization` header (marked sensitive) and the

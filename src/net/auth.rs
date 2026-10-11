@@ -233,6 +233,12 @@ pub enum Credentials {
 
 impl Credentials {
     /// [`Credentials::Basic`] from anything string-shaped.
+    ///
+    /// The user-id and password are sent as given, as UTF-8. A server whose challenge says
+    /// `charset="UTF-8"` expects them in Unicode normalization form C (RFC 7617 §2.1), so a
+    /// password typed as `e` plus a combining accent may not match one stored as `é`. Normalizing
+    /// is left to whoever collects the password, where it covers every use of it, not just this
+    /// one.
     pub fn basic(username: impl Into<String>, password: impl Into<String>) -> Self {
         Self::Basic {
             username: username.into(),
