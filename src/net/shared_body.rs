@@ -106,6 +106,9 @@ struct State {
     /// it starts reading, so nothing is pushed while there is nobody to receive it.
     first_subscriber: Arc<Notify>,
     has_subscriber: bool,
+    /// Cancelled when the state is dropped: every handle and every subscriber's stream is
+    /// gone, so nobody can read the body any more. `from_reader` stops reading on it.
+    abandoned: CancellationToken,
     /// The error the body ended with, if any. A subscriber's stream yields it after its queue
     /// drains, and one that attaches after the end gets it after the replay.
     error: Option<NetError>,
@@ -115,6 +118,12 @@ struct State {
     /// after which a new (non-live) subscriber can no longer get the whole body.
     replay: Option<Vec<Bytes>>,
     replay_bytes: usize,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        self.abandoned.cancel();
+    }
 }
 
 /// One subscriber's queue, plus the flag that tells its stream why the queue
@@ -164,6 +173,7 @@ impl SharedBody {
                 closed: false,
                 first_subscriber: Arc::new(Notify::new()),
                 has_subscriber: false,
+                abandoned: CancellationToken::new(),
                 error: None,
                 replay_limit,
                 replay: Some(Vec::new()),
@@ -470,6 +480,8 @@ impl SharedBody {
     ///
     /// - On EOF: calls [`finish`](Self::finish).
     /// - On I/O error or policy violation: calls [`error`](Self::error).
+    /// - Once every handle to the returned `SharedBody` and every stream from it is dropped:
+    ///   stops reading, since nobody can read the body any more, and drops `reader`.
     ///
     /// Reading starts when the first subscriber attaches, so that subscriber gets the whole
     /// body even if it subscribes a while after this returns. If nobody subscribes within
@@ -514,7 +526,17 @@ impl SharedBody {
             opts.capacity,
             opts.replay_limit,
         ));
-        let sb_clone = sb.clone();
+        // The pump holds the state weakly, so it stops once every handle and every subscriber's
+        // stream is gone instead of reading on for nobody. Returning drops `reader`, and what
+        // it holds with it (a fetch's connection slots).
+        let (state, abandoned, first_subscriber) = {
+            let st = sb.inner.lock();
+            (
+                Arc::downgrade(&sb.inner),
+                st.abandoned.clone(),
+                st.first_subscriber.clone(),
+            )
+        };
 
         // read in background
         spawn_named("SharedBody::from_reader pump", async move {
@@ -527,6 +549,15 @@ impl SharedBody {
                 max_size,
                 replay_limit: _,
             } = opts;
+
+            // A strong handle only for the moment it is used: one held across a read would keep
+            // the state alive, and the pump with it.
+            let live = || state.upgrade().map(|inner| SharedBody { inner });
+            let fail = |e: NetError| {
+                if let Some(sb) = live() {
+                    sb.error(e);
+                }
+            };
 
             let deadline = total_timeout.map(|d| tokio::time::Instant::now() + d);
             let cancel = cancel.unwrap_or_else(CancellationToken::new);
@@ -545,7 +576,7 @@ impl SharedBody {
 
             // Make sure we haven't already exceeded the total deadline
             if let Err(e) = check_total_deadline(tokio::time::Instant::now()) {
-                sb_clone.error(e);
+                fail(e);
                 return;
             }
 
@@ -556,7 +587,6 @@ impl SharedBody {
             // caller gets the SharedBody through a channel before it can subscribe. Same
             // limits as a read while waiting, so an abandoned result doesn't hold the
             // connection forever.
-            let first_subscriber = sb_clone.inner.lock().first_subscriber.clone();
             let idle_sleep = async {
                 match idle_timeout {
                     Some(d) => tokio::time::sleep(d).await,
@@ -571,16 +601,17 @@ impl SharedBody {
             };
             tokio::select! {
                 _ = first_subscriber.notified() => {}
+                _ = abandoned.cancelled() => return,
                 _ = cancel.cancelled() => {
-                    sb_clone.error(NetError::Cancelled("read cancelled".to_string()));
+                    fail(NetError::Cancelled("read cancelled".to_string()));
                     return;
                 }
                 _ = idle_sleep => {
-                    sb_clone.error(NetError::Timeout("no subscriber attached before read idle timeout".to_string()));
+                    fail(NetError::Timeout("no subscriber attached before read idle timeout".to_string()));
                     return;
                 }
                 _ = deadline_sleep => {
-                    sb_clone.error(NetError::Timeout("total read timeout".to_string()));
+                    fail(NetError::Timeout("total read timeout".to_string()));
                     return;
                 }
             }
@@ -589,7 +620,7 @@ impl SharedBody {
                 // User cancelled the read (fast path; the select below also observes a cancel
                 // that arrives while a read is blocked)
                 if cancel.is_cancelled() {
-                    sb_clone.error(NetError::Cancelled("read cancelled".to_string()));
+                    fail(NetError::Cancelled("read cancelled".to_string()));
                     return;
                 }
 
@@ -623,6 +654,7 @@ impl SharedBody {
                 };
                 let read_res = tokio::select! {
                     r = reader.read(&mut buf[..read_cap]) => r.map_err(|e| NetError::Io(Arc::new(e))),
+                    _ = abandoned.cancelled() => return,
                     _ = cancel.cancelled() => Err(NetError::Cancelled("read cancelled".to_string())),
                     _ = idle_sleep => Err(NetError::Timeout("read idle timeout".to_string())),
                     _ = deadline_sleep => Err(NetError::Timeout("total read timeout".to_string())),
@@ -631,12 +663,14 @@ impl SharedBody {
                 match read_res {
                     Ok(0) => {
                         // EOF — also the probing case where the body ends exactly at max_size
-                        sb_clone.finish();
+                        if let Some(sb) = live() {
+                            sb.finish();
+                        }
                         return;
                     }
                     Ok(_) if probing => {
                         // The reader produced data beyond the max-size budget
-                        sb_clone.error(NetError::Io(Arc::new(std::io::Error::other(
+                        fail(NetError::Io(Arc::new(std::io::Error::other(
                             "max size exceeded during read",
                         ))));
                         return;
@@ -644,17 +678,20 @@ impl SharedBody {
                     Ok(n) => {
                         total_read = total_read.saturating_add(n as u64);
 
-                        // Push to shared body
-                        sb_clone.push(Bytes::copy_from_slice(&buf[..n]));
+                        // Push to shared body, if anyone can still read it
+                        match live() {
+                            Some(sb) => sb.push(Bytes::copy_from_slice(&buf[..n])),
+                            None => return,
+                        }
 
                         // Did we hit the total deadline?
                         if let Err(e) = check_total_deadline(tokio::time::Instant::now()) {
-                            sb_clone.error(e);
+                            fail(e);
                             return;
                         }
                     }
                     Err(e) => {
-                        sb_clone.error(e);
+                        fail(e);
                         return;
                     }
                 }
@@ -1410,6 +1447,74 @@ mod tests {
             .expect("cancel did not interrupt the blocked read")
             .unwrap();
         assert!(item.is_err());
+    }
+
+    /// A reader that never yields, and says when it was dropped.
+    struct DropFlagReader(Arc<std::sync::atomic::AtomicBool>);
+    impl tokio::io::AsyncRead for DropFlagReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+    impl Drop for DropFlagReader {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn drop_flag_body() -> (Arc<SharedBody>, Arc<std::sync::atomic::AtomicBool>) {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sb = SharedBody::from_reader(
+            DropFlagReader(Arc::clone(&dropped)),
+            ReaderOptions::default(),
+        );
+        (sb, dropped)
+    }
+
+    /// Once every handle and every stream is gone nobody can read the body, so the pump stops
+    /// and drops the reader, even with a read blocked and no timeout set.
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_reader_stops_when_nobody_can_read_any_more() {
+        let (sb, dropped) = drop_flag_body();
+        let stream = sb.subscribe_stream();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(sb);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "a stream is still reading"
+        );
+
+        drop(stream);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A handle nobody subscribed through is dropped: the pump stops waiting for a subscriber.
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_reader_stops_when_dropped_before_anyone_subscribes() {
+        let (sb, dropped) = drop_flag_body();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(sb);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// While a handle remains someone can still subscribe, so the last stream going is not
+    /// the end of the body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_reader_keeps_reading_while_a_handle_remains() {
+        let (sb, dropped) = drop_flag_body();
+        drop(sb.subscribe_stream());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        drop(sb);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "current_thread")]

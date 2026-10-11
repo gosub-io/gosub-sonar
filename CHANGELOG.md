@@ -188,6 +188,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fetcher: a request still queued when `run` stopped was never answered, and `fetch` or
   `submit` after it had stopped waited forever, though `fetch` documents an error for a
   fetcher that stops before delivering. Both are answered with `NetError::Cancelled` now
+- Fetcher: a stream every caller had dropped went on being read, to its end or a timeout,
+  holding its connection slots meanwhile; a long or endless response kept them for good. The
+  body stops being read once no handle to it and no stream from it remains, which gives the
+  slots back and ends the reference's outstanding work (`on_ref_done`)
 - Events: a request the scheduler refused before sending it (URL policy, bad port, mixed
   content) reported `Blocked` and nothing after it, so an observer could not tell it had ended.
   `Failed` follows as the terminal event now, as it already did for a block on a redirect hop

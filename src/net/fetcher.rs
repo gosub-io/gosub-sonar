@@ -3379,6 +3379,63 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// A stream its caller gives up on is no longer outstanding work: `on_ref_done` comes when
+    /// the last reader is dropped, not when the body would have ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_ref_done_comes_when_the_last_reader_gives_up() {
+        use tokio::io::AsyncReadExt;
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl FetcherContext for Counting {
+            fn observer_for(
+                &self,
+                _: RequestReference,
+                _: RequestId,
+                _: ResourceKind,
+                _: Initiator,
+            ) -> Arc<dyn NetObserver + Send + Sync> {
+                Arc::new(crate::net::null_emitter::NullEmitter)
+            }
+            fn on_ref_active(&self, _: RequestReference) {}
+            fn on_ref_done(&self, _: RequestReference) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let srv = start_server().await;
+        let ctx = Arc::new(Counting(Default::default()));
+        let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+
+        // 12 KiB dribbled over ~360 ms: read a little of it, then give up.
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_streaming(true)
+            .build();
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = fetcher.fetch(req).await
+        else {
+            panic!("expected a stream");
+        };
+        let mut reader = crate::net::shared_body::SharedBody::combined_reader(peek_buf, shared);
+        let mut first = [0u8; 16];
+        reader.read_exact(&mut first).await.unwrap();
+        assert_eq!(
+            ctx.0.load(Ordering::SeqCst),
+            0,
+            "the body is still being read"
+        );
+
+        drop(reader);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            ctx.0.load(Ordering::SeqCst),
+            1,
+            "once, when the reader was dropped"
+        );
+        shutdown.cancel();
+    }
+
     /// `ProxyRule::no_proxy`'s `*` bypasses the proxy for an IP host too, in the client that
     /// sends the request. The test server plays both parts: a request it gets as a proxy (an
     /// absolute URL) falls through to its default route.

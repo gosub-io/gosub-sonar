@@ -193,10 +193,12 @@ End to end, a fetch through the scheduler goes:
    listener — cloning streams for streaming listeners and draining the `SharedBody` into a single
    buffer for buffered listeners (see [coalescing](#coalescing--fan-out)).
 
-7. **Cleanup.** The entry's `done` token fires, it is removed from `inflight_map`, and
-   `FetcherContext::on_ref_done` is called. The spawned task ends and the slots are released;
-   a streamed fetch hands its slots to the body reader instead, so they come back when the
-   body ends.
+7. **Cleanup.** The entry's `done` token fires and it is removed from `inflight_map`. A
+   buffered fetch then calls `FetcherContext::on_ref_done`, and its slots are released as the
+   spawned task ends. A streamed fetch hands both to the body reader instead: the slots come
+   back and `on_ref_done` is called when the body ends, fails, or nobody can read it any more
+   (every handle to the `SharedBody` and every stream from it dropped), which can be well
+   after the task ended.
 
 ---
 
