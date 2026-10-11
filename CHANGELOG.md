@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The simple API (`simple_get`, `sync_get`, `sync_fetch`) had the same off-by-one: it followed
   9 redirects, not the 10 `MAX_SIMPLE_REDIRECTS` allows, because reqwest's list of earlier URLs
   starts with the one first asked for
+- Cache: a request's `max-stale` also overrode its own `max-age` and `min-fresh`, so
+  `Cache-Control: max-age=10, max-stale` was answered with a stored response of any age. Each
+  is now a condition of its own (RFC 9111 §5.2.1): `max-stale` only lets a stale response
+  through
 
 ## [0.12.0] - 2026-10-10
 

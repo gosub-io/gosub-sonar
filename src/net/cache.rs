@@ -609,14 +609,12 @@ pub fn decide(
 
     let age = entry.current_age(now);
     let lifetime = entry.freshness_lifetime().unwrap_or_else(TimeDelta::zero);
-    let mut usable = age < lifetime;
 
-    if let Some(max_age) = asked.max_age {
-        usable &= age <= TimeDelta::seconds(max_age);
-    }
-    if let Some(min_fresh) = asked.min_fresh {
-        usable &= lifetime - age >= TimeDelta::seconds(min_fresh);
-    }
+    // Fresh, or stale by no more than the request's `max-stale` allows. `max-stale` relaxes only
+    // this: the request's `max-age` and `min-fresh` below are conditions of their own
+    // (RFC 9111 §5.2.1), so a caller that wants nothing older than ten seconds does not get a
+    // minute-old response because it also accepts stale ones.
+    let mut usable = age < lifetime;
     if !usable && !stored.must_revalidate {
         if let Some(max_stale) = asked.max_stale {
             let staleness = age - lifetime;
@@ -626,6 +624,12 @@ pub fn decide(
                 None => true,
             };
         }
+    }
+    if let Some(max_age) = asked.max_age {
+        usable &= age <= TimeDelta::seconds(max_age);
+    }
+    if let Some(min_fresh) = asked.min_fresh {
+        usable &= lifetime - age >= TimeDelta::seconds(min_fresh);
     }
 
     if usable {
@@ -1236,6 +1240,41 @@ mod tests {
         assert!(matches!(
             decide(&must, &asked, false, CacheMode::Default, at(40)),
             CacheDecision::Revalidate(..)
+        ));
+    }
+
+    /// RFC 9111 §5.2.1: `max-stale` lets a stale response through, but the request's `max-age`
+    /// and `min-fresh` still hold. A response 50 s into a 100 s lifetime is too old for
+    /// `max-age=10` and not fresh enough for `min-fresh=60`, whatever `max-stale` says.
+    #[test]
+    fn max_stale_does_not_lift_max_age_or_min_fresh() {
+        let fresh = [entry(&[
+            ("cache-control", "max-age=100"),
+            ("etag", "\"v1\""),
+        ])];
+        for asked in [
+            "max-age=10, max-stale",
+            "max-age=10, max-stale=3600",
+            "min-fresh=60, max-stale",
+        ] {
+            let asked = headers(&[("cache-control", asked)]);
+            assert!(
+                matches!(
+                    decide(&fresh, &asked, false, CacheMode::Default, at(50)),
+                    CacheDecision::Revalidate(..)
+                ),
+                "{asked:?}"
+            );
+        }
+        // A stale response young enough for the request's max-age is still let through.
+        let stale = [entry(&[
+            ("cache-control", "max-age=10"),
+            ("etag", "\"v1\""),
+        ])];
+        let asked = headers(&[("cache-control", "max-age=60, max-stale")]);
+        assert!(matches!(
+            decide(&stale, &asked, false, CacheMode::Default, at(30)),
+            CacheDecision::Use(_)
         ));
     }
 
