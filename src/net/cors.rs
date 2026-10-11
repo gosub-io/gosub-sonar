@@ -452,12 +452,7 @@ pub(crate) fn validate_preflight_response(
         parse_token_list(response, header::ACCESS_CONTROL_ALLOW_METHODS, false)?;
     let (headers, headers_wildcard) =
         parse_token_list(response, header::ACCESS_CONTROL_ALLOW_HEADERS, true)?;
-    let max_age = response
-        .get(header::ACCESS_CONTROL_MAX_AGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .map_or(DEFAULT_PREFLIGHT_MAX_AGE, Duration::from_secs)
-        .min(MAX_PREFLIGHT_MAX_AGE);
+    let max_age = preflight_max_age(response).min(MAX_PREFLIGHT_MAX_AGE);
     Ok(PreflightAllows {
         methods,
         methods_wildcard,
@@ -465,6 +460,26 @@ pub(crate) fn validate_preflight_response(
         headers_wildcard,
         max_age,
     })
+}
+
+/// The `Access-Control-Max-Age` of a preflight response ([Fetch] §4.8 step 7.8): one value of
+/// ASCII digits (`delta-seconds`). A duplicated header, a sign, a fraction or anything else is
+/// a failure and gives the default of five seconds. A number too large to hold saturates.
+#[cfg(not(target_arch = "wasm32"))]
+fn preflight_max_age(response: &HeaderMap) -> Duration {
+    let mut values = response.get_all(header::ACCESS_CONTROL_MAX_AGE).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return DEFAULT_PREFLIGHT_MAX_AGE;
+    };
+    let digits = value.as_bytes().trim_ascii();
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return DEFAULT_PREFLIGHT_MAX_AGE;
+    }
+    let seconds = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|d| d.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    Duration::from_secs(seconds)
 }
 
 /// The request headers a preflight `OPTIONS` carries ([Fetch] §4.9 steps 1–2). The fetcher
@@ -1067,6 +1082,30 @@ mod tests {
         let resp = ok_preflight(&[("access-control-max-age", "999999999")]);
         let allows = validate_preflight_response(200, &resp, &o, false, false).unwrap();
         assert_eq!(allows.max_age, MAX_PREFLIGHT_MAX_AGE);
+
+        // Fetch §4.8 step 7.8: anything but one `delta-seconds` is a failure, and gives 5 s.
+        let max_age = |values: &[&str]| {
+            let pairs: Vec<(&str, &str)> = values
+                .iter()
+                .map(|v| ("access-control-max-age", *v))
+                .collect();
+            validate_preflight_response(200, &ok_preflight(&pairs), &o, false, false)
+                .unwrap()
+                .max_age
+        };
+        for failure in [
+            &["+600"][..],
+            &["-1"],
+            &["1.5"],
+            &["600", "600"],
+            &["ten"],
+            &[""],
+        ] {
+            assert_eq!(max_age(failure), DEFAULT_PREFLIGHT_MAX_AGE, "{failure:?}");
+        }
+        assert_eq!(max_age(&[" 600 "]), Duration::from_secs(600));
+        // Too large for a u64 is still a number of seconds: capped, not defaulted.
+        assert_eq!(max_age(&["99999999999999999999999"]), MAX_PREFLIGHT_MAX_AGE);
     }
 
     #[test]

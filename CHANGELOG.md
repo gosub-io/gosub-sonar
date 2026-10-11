@@ -105,6 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CORS: a response with `Access-Control-Allow-Credentials` twice passed the check on its first
   line, even `true` followed by `false`. Fetch reads the header as one combined value, which is
   then not `true`: only a single `true` grants credentials now (Fetch §4.10)
+- CORS: `Access-Control-Max-Age` accepted `+600` and took the first of two values, caching
+  a grant for as long as either said. Anything but a single number of seconds now falls back
+  to the five-second default (Fetch §4.8)
 
 ## [0.12.0] - 2026-10-10
 
