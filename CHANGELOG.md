@@ -30,6 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The error and the `NetEvent::Cancelled` reason when every caller has cancelled read
   `cancelled net.get_with_redirects`, the name of an internal function; they now say
   `all callers cancelled`
+- Every 3xx was treated as a redirect. A 304 that was not an answer to sonar's own revalidation
+  (cache off, or the caller's own `If-None-Match`) failed with "redirect status 304 without
+  Location header", as did a 300 without a `Location`; a 300 with one was followed. Only 301,
+  302, 303, 307 and 308 are redirects now, as in Fetch; any other 3xx is returned to the caller
 
 ## [0.12.0] - 2026-10-10
 

@@ -1509,9 +1509,11 @@ impl HopResponse {
         }
     }
 
-    /// Whether this is a redirect the chain should follow.
+    /// Whether this is a redirect the chain should follow: 301, 302, 303, 307 or 308, Fetch's
+    /// redirect statuses. Any other 3xx is a response like any other (a 300 is a page listing
+    /// the choices, a 304 nobody asked for still goes to the caller), even with a `Location`.
     pub(crate) fn is_redirection(&self) -> bool {
-        (300..400).contains(&self.status())
+        matches!(self.status(), 301 | 302 | 303 | 307 | 308)
     }
 }
 
@@ -2460,7 +2462,7 @@ async fn get_with_redirects(
             store.commit(Bytes::new(), &observer);
         }
 
-        // 3xx — resolve the Location header
+        // A redirect — resolve the Location header
         let status = hop.status();
         let from = match hop {
             HopResponse::Network(ref resp) => resp.url().clone(),
@@ -2542,15 +2544,8 @@ async fn get_with_redirects(
                 current_headers.remove(header::CONTENT_LENGTH);
                 current_headers.remove(header::TRANSFER_ENCODING);
             }
-            // 307/308: preserve method and body.
-            307 | 308 => {}
-            // Other 3xx: treat conservatively as 302.
-            _ => {
-                if current_method != Method::HEAD {
-                    current_method = Method::GET;
-                }
-                current_body = None;
-            }
+            // 307/308, the only redirects left: preserve method and body.
+            _ => {}
         }
 
         // Strip credential headers when redirecting to a different origin (RFC 9110 §15.4).
@@ -3509,6 +3504,17 @@ mod tests {
             .route("/hop1", RouteConfig::redirect_to("/hop2"))
             .route("/hop2", RouteConfig::redirect_to("/hop3"))
             .route("/hop3", RouteConfig::ok(b"final"))
+            // 3xx answers that are not redirects, one of them with a Location to tempt it.
+            .route(
+                "/multiple-choices",
+                RouteConfig::StatusThenOk {
+                    code: 300,
+                    headers: vec![("Location".into(), "/hop3".into())],
+                    failures: usize::MAX,
+                    body: b"never".to_vec(),
+                },
+            )
+            .route("/not-modified", RouteConfig::status(304, b""))
             .route(
                 "/slow-hop1",
                 RouteConfig::redirect_with_delay("/slow-hop2", Duration::from_millis(150)),
@@ -4069,6 +4075,31 @@ mod tests {
         )
         .await;
         assert!(res.is_err());
+    }
+
+    /// Only 301/302/303/307/308 are redirects. A 300 is returned even with a `Location`, and a
+    /// 304 that is not an answer to sonar's own revalidation goes to the caller as it is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_3xx_that_is_not_a_redirect_is_returned() {
+        let srv = server().await;
+        for (path, status) in [("/multiple-choices", 300), ("/not-modified", 304)] {
+            let ResponseTop { meta, .. } = super::fetch_response_top(
+                client(),
+                srv.url(path),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                observer(),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+            assert_eq!(meta.status, status, "{path}");
+        }
+        assert_eq!(
+            srv.hit_count("/hop3"),
+            0,
+            "the 300's Location is not followed"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
