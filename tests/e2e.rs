@@ -558,6 +558,90 @@ async fn the_preflight_carries_the_referer() {
     shutdown.cancel();
 }
 
+/// Fetch, CORS-preflight cache: a grant made with credentials also covers the same request
+/// without them, so it is not asked again. Judged by the credentialed rules, though: there a
+/// `*` method is a literal, so a credentialed grant that listed `*` (made for a GET with a
+/// custom header) does not cover an uncredentialed DELETE.
+#[tokio::test]
+async fn a_credentialed_grant_covers_the_request_without_credentials() {
+    let home = TestServer::new().start().await;
+    let origin = home.base_url().origin().ascii_serialization();
+    let away = TestServer::new()
+        .route(
+            "/put",
+            RouteConfig::cors(CorsRouteOptions {
+                allow_origin: origin.clone(),
+                allow_methods: Some("PUT".into()),
+                allow_credentials: true,
+                max_age: Some(600),
+                ..Default::default()
+            }),
+        )
+        .route(
+            "/any",
+            RouteConfig::cors(CorsRouteOptions {
+                allow_origin: origin,
+                allow_methods: Some("*".into()),
+                allow_headers: Some("x-custom".into()),
+                allow_credentials: true,
+                max_age: Some(600),
+                ..Default::default()
+            }),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+    let request = |method: Method, path: &str, credentials| {
+        FetchRequest::builder(method, away.url(path))
+            .with_origin(home.base_url().origin())
+            .with_mode(RequestMode::Cors)
+            .with_credentials(credentials)
+            .with_body(RequestBody::text("payload"))
+            .build()
+    };
+
+    assert!(!fetcher
+        .fetch(request(Method::PUT, "/put", RequestCredentials::Include))
+        .await
+        .is_error());
+    assert!(!fetcher
+        .fetch(request(Method::PUT, "/put", RequestCredentials::Omit))
+        .await
+        .is_error());
+    assert_eq!(
+        away.hit_count("OPTIONS /put"),
+        1,
+        "the credentialed grant was used"
+    );
+
+    // A credentialed GET with a custom header is granted and cached, listing `*` as a method.
+    let mut custom = http::HeaderMap::new();
+    custom.insert("x-custom", "1".parse().unwrap());
+    let get = FetchRequest::builder(Method::GET, away.url("/any"))
+        .with_origin(home.base_url().origin())
+        .with_mode(RequestMode::Cors)
+        .with_credentials(RequestCredentials::Include)
+        .with_headers(custom.clone())
+        .build();
+    assert!(!fetcher.fetch(get).await.is_error());
+    assert_eq!(away.hit_count("OPTIONS /any"), 1);
+    // Under credentials that `*` is the method named `*`, so it granted no DELETE: an
+    // uncredentialed DELETE asks for itself rather than reading it as a wildcard.
+    let delete = FetchRequest::builder(Method::DELETE, away.url("/any"))
+        .with_origin(home.base_url().origin())
+        .with_mode(RequestMode::Cors)
+        .with_credentials(RequestCredentials::Omit)
+        .with_headers(custom)
+        .build();
+    let _ = fetcher.fetch(delete).await;
+    assert_eq!(
+        away.hit_count("OPTIONS /any"),
+        2,
+        "asked again without credentials"
+    );
+    shutdown.cancel();
+}
+
 /// Hands the same recording observer to every request, so a test can assert on the events
 /// the fetch stack emitted.
 struct RecordingCtx(Arc<RecordingObserver>);

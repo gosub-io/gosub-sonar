@@ -1954,15 +1954,21 @@ async fn get_with_redirects(
                 if !cors::is_cors_safelisted_method(&current_method) || !unsafe_names.is_empty() {
                     let serialized = cors::serialize_origin(o, origin_tainted);
                     let now = chrono::Utc::now();
-                    let granted = policy
-                        .cors_preflight
-                        .as_ref()
-                        .and_then(|c| c.get(&serialized, &url, credentials_include, now))
-                        .is_some_and(|allows| {
-                            allows
-                                .permits(&current_method, &unsafe_names, credentials_include)
-                                .is_ok()
-                        });
+                    // A grant made with credentials also covers the request without them
+                    // (Fetch, "method cache entry match"). It is judged by the credentialed
+                    // rules it was made under, where a `*` is a literal, not a wildcard.
+                    let granted = policy.cors_preflight.as_ref().is_some_and(|cache| {
+                        let fits = |credentialed: bool| {
+                            cache
+                                .get(&serialized, &url, credentialed, now)
+                                .is_some_and(|allows| {
+                                    allows
+                                        .permits(&current_method, &unsafe_names, credentialed)
+                                        .is_ok()
+                                })
+                        };
+                        fits(credentials_include) || (!credentials_include && fits(true))
+                    });
                     if !granted {
                         let mut pf_headers =
                             cors::preflight_request_headers(&current_method, &unsafe_names);

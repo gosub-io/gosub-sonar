@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CorsPreflightCache::clear`, which drops the grants for one origin and URL. It has a default
   that does nothing, so existing implementations keep compiling
 
+### Changed
+
+- CORS: a preflight grant made with credentials also covers the same request without them, as
+  Fetch's preflight cache matches, so a page mixing both is not asked twice. It is judged by
+  the credentialed rules it was made under, where `*` is not a wildcard
+
 ### Fixed
 
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued
