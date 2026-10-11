@@ -97,6 +97,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   method for ten minutes and then refused the actual request was not asked again until the
   grant expired. A request that relied on a grant and ends in a network error now clears it
   (Fetch §4.4, main fetch)
+- A same-origin WebSocket handshake (`RequestMode::Websocket`) was sent without `Origin`,
+  though the mode's documentation says it always carries one. WebSocket servers check `Origin`
+  to refuse handshakes from other sites. It is sent on every handshake now (Fetch §3.1)
 
 ## [0.12.0] - 2026-10-10
 

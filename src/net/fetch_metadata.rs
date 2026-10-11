@@ -288,8 +288,12 @@ pub(crate) fn origin_header_value(
     target: &Url,
 ) -> Option<String> {
     let cors_like = matches!(mode, RequestMode::Cors | RequestMode::Websocket);
+    // Fetch §3.1: a WebSocket handshake always carries it, same-origin too, since that is what
+    // the server checks to refuse a handshake from another site. A cors request carries it once
+    // its response tainting is cors: when it left its origin, or was redirected away from it.
     let needed = !matches!(*method, Method::GET | Method::HEAD)
-        || (cors_like && (tainted || *initiator != target.origin()));
+        || mode == RequestMode::Websocket
+        || (mode == RequestMode::Cors && (tainted || *initiator != target.origin()));
     if !needed {
         return None;
     }
@@ -550,18 +554,37 @@ mod tests {
             .as_deref(),
             Some("https://example.com")
         );
-        // A WebSocket handshake always sends it cross-origin.
+        // A WebSocket handshake always sends it (Fetch §3.1), cross-origin and same-origin alike.
+        for target in [
+            "wss://other.com/a",
+            "wss://example.com/a",
+            "https://example.com/a",
+        ] {
+            assert_eq!(
+                origin_for(
+                    "https://example.com",
+                    false,
+                    Method::GET,
+                    RequestMode::Websocket,
+                    policy,
+                    target
+                )
+                .as_deref(),
+                Some("https://example.com"),
+                "{target}"
+            );
+        }
+        // A same-origin cors GET does not.
         assert_eq!(
             origin_for(
                 "https://example.com",
                 false,
                 Method::GET,
-                RequestMode::Websocket,
+                RequestMode::Cors,
                 policy,
-                "wss://other.com/a"
-            )
-            .as_deref(),
-            Some("https://example.com")
+                "https://example.com/a"
+            ),
+            None
         );
     }
 
