@@ -3,12 +3,15 @@
 //! An `https` page that pulls a script over plain `http` hands anyone on the network the ability
 //! to rewrite it, defeating the outer TLS connection.
 //!
-//! Enforcement is split. Sonar re-checks **every redirect hop** — the part a caller cannot do
-//! for itself, since a check made before [`Fetcher::fetch`] cannot see an `https://a` →
-//! `http://b` redirect. Classification stays with the embedder: [`ResourceKind`] cannot tell an
-//! image from a script, so a caller that wants to permit *optionally-blockable* content (images,
-//! video, audio) passes [`MixedContentPolicy::Allow`] on those requests via
-//! [`FetchRequest::mixed_content`].
+//! Sonar checks **every redirect hop**, which a caller cannot do for itself: a check made before
+//! [`Fetcher::fetch`] cannot see an `https://a` → `http://b` redirect.
+//!
+//! The default, [`MixedContentPolicy::Block`], is what browsers do (Mixed Content Level 2), by
+//! the request's destination: images, audio and video are *upgradeable*, and are fetched over
+//! `https` instead, unless the host is an IP address; everything else is blocked; and a
+//! top-level navigation (destination `document`) is not mixed content at all. One difference:
+//! Fetch also blocks an image requested for `srcset` or `<picture>` (initiator `imageset`),
+//! which sonar cannot tell from another image, so it is upgraded too.
 //!
 //! To wire it up, set [`FetcherConfig::mixed_content`] for the fetcher-wide default and
 //! [`FetchRequest::origin`] to the initiating document. Without an origin the check is inert,
@@ -20,25 +23,26 @@
 //!
 //! [spec]: https://w3c.github.io/webappsec-mixed-content/
 //! [`Fetcher::fetch`]: crate::net::fetcher::Fetcher::fetch
-//! [`ResourceKind`]: crate::net::types::ResourceKind
 //! [`FetcherConfig::mixed_content`]: crate::net::fetcher::FetcherConfig::mixed_content
 //! [`FetchRequest::origin`]: crate::net::types::FetchRequest::origin
 //! [`FetchRequest::mixed_content`]: crate::net::types::FetchRequest::mixed_content
 
+use crate::net::fetch_metadata::RequestDestination;
 use url::{Host, Origin, Url};
 
 /// What to do with an insecure sub-resource requested by a secure document.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum MixedContentPolicy {
-    /// Send the request unchanged. Use this for optionally-blockable content (images, video,
-    /// audio) that the embedder has chosen to permit, or to opt out of mixed content handling.
+    /// Send the request unchanged: the user agent was told to allow mixed content (Mixed
+    /// Content §4.4), or the embedder opts out of mixed content handling.
     Allow,
     /// Rewrite the request URL to `https` before sending it, as `upgrade-insecure-requests` does.
     /// There is no fallback to `http` if the upgraded request fails.
     Upgrade,
-    /// Reject the request with
-    /// [`NetError::Blocked`](crate::net::types::NetError::Blocked). The default, matching
-    /// browser behaviour for blockable content.
+    /// What browsers do (Mixed Content Level 2), and the default: an image, audio or video
+    /// request is upgraded to `https` unless its host is an IP address, any other request is
+    /// rejected with [`NetError::Blocked`](crate::net::types::NetError::Blocked), and a top-level
+    /// navigation is let through.
     #[default]
     Block,
 }
@@ -65,9 +69,11 @@ pub enum MixedContentAction {
 /// [spec]: https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy
 fn is_loopback_host<S: AsRef<str>>(host: &Host<S>) -> bool {
     match host {
-        // `Url` lowercases domains during parsing, so an ASCII comparison is enough.
+        // `Url` lowercases domains during parsing, so an ASCII comparison is enough. The fully
+        // qualified forms, with one trailing dot, count too (secure contexts §3.1 step 5).
         Host::Domain(d) => {
             let d = d.as_ref();
+            let d = d.strip_suffix('.').unwrap_or(d);
             d == "localhost" || d.ends_with(".localhost")
         }
         // The whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
@@ -121,15 +127,36 @@ fn upgrade(url: &Url) -> Option<Url> {
 /// 3. `url` is *not* potentially trustworthy — the sub-resource is the insecure part.
 ///
 /// Only then does `policy` decide between allowing, upgrading, and blocking.
+///
+/// The request's destination is not known here, so it is judged as a subresource of no
+/// particular kind; [`evaluate_for`] takes it into account.
 pub fn evaluate(
     policy: MixedContentPolicy,
     origin: Option<&Origin>,
     url: &Url,
 ) -> MixedContentAction {
+    evaluate_for(policy, origin, url, RequestDestination::Empty)
+}
+
+/// [`evaluate`] for a request with this destination.
+///
+/// A top-level navigation (destination `document`) is never mixed content: following a link
+/// from an `https` page to an `http` one leaves the secure page rather than loading something
+/// into it (Mixed Content §4.4). Nested documents have their own destinations (`iframe`,
+/// `frame`), and are checked like any subresource.
+pub fn evaluate_for(
+    policy: MixedContentPolicy,
+    origin: Option<&Origin>,
+    url: &Url,
+    destination: RequestDestination,
+) -> MixedContentAction {
     let Some(origin) = origin else {
         return MixedContentAction::Allow;
     };
     if !is_origin_potentially_trustworthy(origin) || is_potentially_trustworthy(url) {
+        return MixedContentAction::Allow;
+    }
+    if destination == RequestDestination::Document && policy == MixedContentPolicy::Block {
         return MixedContentAction::Allow;
     }
 
@@ -140,6 +167,17 @@ pub fn evaluate(
         MixedContentPolicy::Upgrade => upgrade(url).map_or(MixedContentAction::Block, |u| {
             MixedContentAction::Upgrade(u)
         }),
+        // Upgradeable content (Mixed Content §4.1): images, audio and video, except on an IP
+        // host, where a certificate is unlikely and the upgrade would only trade a mixed load
+        // for a failed one.
+        MixedContentPolicy::Block
+            if matches!(
+                destination,
+                RequestDestination::Image | RequestDestination::Audio | RequestDestination::Video
+            ) && matches!(url.host(), Some(Host::Domain(_))) =>
+        {
+            upgrade(url).map_or(MixedContentAction::Block, MixedContentAction::Upgrade)
+        }
         MixedContentPolicy::Block => MixedContentAction::Block,
     }
 }
@@ -241,6 +279,9 @@ mod tests {
         for target in [
             "http://localhost:3000/a.js",
             "http://dev.localhost/a.js",
+            // Secure contexts §3.1 step 5: "localhost." and ".localhost." count as well.
+            "http://localhost./a.js",
+            "http://dev.localhost./a.js",
             "http://127.0.0.1/a.js",
             "http://127.9.9.9/a.js",
             "http://[::1]:8080/a.js",
@@ -288,6 +329,92 @@ mod tests {
         ));
     }
 
+    /// Mixed Content §4.4: a top-level navigation is not mixed content. An `iframe` is, and so
+    /// is a request of unknown destination.
+    #[test]
+    fn a_top_level_navigation_is_not_mixed_content() {
+        let doc = origin("https://example.com");
+        let target = url("http://insecure.example.com/");
+        let verdict =
+            |destination| evaluate_for(MixedContentPolicy::Block, Some(&doc), &target, destination);
+        assert_eq!(
+            verdict(RequestDestination::Document),
+            MixedContentAction::Allow
+        );
+        assert_eq!(
+            verdict(RequestDestination::Iframe),
+            MixedContentAction::Block
+        );
+        assert_eq!(
+            verdict(RequestDestination::Script),
+            MixedContentAction::Block
+        );
+        assert_eq!(
+            evaluate(MixedContentPolicy::Block, Some(&doc), &target),
+            MixedContentAction::Block
+        );
+    }
+
+    /// Mixed Content §4.1: images, audio and video are upgradeable. From a secure document they
+    /// are fetched over `https` instead of being blocked, except on an IP host; every other
+    /// destination is blocked.
+    #[test]
+    fn images_audio_and_video_are_upgraded_by_default() {
+        let doc = origin("https://example.com");
+        let verdict = |target: &str, destination| {
+            evaluate_for(
+                MixedContentPolicy::Block,
+                Some(&doc),
+                &url(target),
+                destination,
+            )
+        };
+        for destination in [
+            RequestDestination::Image,
+            RequestDestination::Audio,
+            RequestDestination::Video,
+        ] {
+            assert_eq!(
+                verdict("http://cdn.example.com:8080/cat.png", destination),
+                MixedContentAction::Upgrade(url("https://cdn.example.com:8080/cat.png")),
+                "{destination:?}"
+            );
+            for ip in [
+                "http://93.184.216.34/cat.png",
+                "http://[2001:db8::1]/cat.png",
+            ] {
+                assert_eq!(
+                    verdict(ip, destination),
+                    MixedContentAction::Block,
+                    "{destination:?} {ip}"
+                );
+            }
+        }
+        for destination in [
+            RequestDestination::Script,
+            RequestDestination::Style,
+            RequestDestination::Font,
+            RequestDestination::Iframe,
+            RequestDestination::Empty,
+        ] {
+            assert_eq!(
+                verdict("http://cdn.example.com/x", destination),
+                MixedContentAction::Block,
+                "{destination:?}"
+            );
+        }
+        // `Allow` still lets an image through as it is.
+        assert_eq!(
+            evaluate_for(
+                MixedContentPolicy::Allow,
+                Some(&doc),
+                &url("http://cdn.example.com/cat.png"),
+                RequestDestination::Image
+            ),
+            MixedContentAction::Allow
+        );
+    }
+
     #[test]
     fn opaque_origin_is_not_trustworthy() {
         // `data:` URLs produce an opaque origin.
@@ -299,6 +426,7 @@ mod tests {
         for target in [
             "http://notlocalhost/a.js",
             "http://localhost.evil.com/a.js",
+            "http://localhost../a.js",
             "http://128.0.0.1/a.js",
             "http://[::2]/a.js",
         ] {

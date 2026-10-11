@@ -67,6 +67,13 @@ impl ReferrerPolicy {
     /// user agents fall back to the stricter policy they do recognise instead of ignoring the
     /// header entirely. Returns `None` when nothing in the list is recognised, meaning the
     /// current policy stands.
+    ///
+    /// An element that is not a valid token at all (`foo_bar`, a quoted string) is skipped like
+    /// an unknown one. That follows browsers rather than the letter of the spec, where such an
+    /// element makes the whole header fail (Referrer Policy §8.1, via Fetch's "extract header
+    /// list values") and the current policy would stand. Browsers keep the valid tokens, which
+    /// is never looser than the spec: `no-referrer, foo_bar` gives `no-referrer` here instead
+    /// of leaving a weaker policy in place.
     pub fn parse_header(value: &str) -> Option<Self> {
         value.split(',').filter_map(Self::parse_token).next_back()
     }

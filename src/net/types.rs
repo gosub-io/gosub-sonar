@@ -1165,8 +1165,9 @@ impl FetchRequestBuilder {
         self
     }
 
-    /// Overrides the fetcher-wide mixed content policy. Use [`MixedContentPolicy::Allow`] for
-    /// optionally-blockable resources; requires [`with_origin`](Self::with_origin).
+    /// Overrides the fetcher-wide mixed content policy; requires [`with_origin`](Self::with_origin).
+    /// The default already upgrades images, audio and video by their destination, as browsers
+    /// do; see [`MixedContentPolicy::Block`].
     pub fn with_mixed_content(mut self, policy: MixedContentPolicy) -> Self {
         self.mixed_content = Some(policy);
         self

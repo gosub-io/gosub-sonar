@@ -164,6 +164,7 @@ pub(crate) fn hop_checks(
     url: &Url,
     mixed_content: MixedContentPolicy,
     origin: Option<&Origin>,
+    destination: RequestDestination,
     allowed_bad_ports: &[u16],
     url_allowed: &dyn Fn(&Url) -> bool,
 ) -> HopCheck {
@@ -171,7 +172,7 @@ pub(crate) fn hop_checks(
         return HopCheck::Reject(BlockReason::UnsupportedScheme);
     }
 
-    let target = match mixed_content::evaluate(mixed_content, origin, url) {
+    let target = match mixed_content::evaluate_for(mixed_content, origin, url, destination) {
         MixedContentAction::Allow => url.clone(),
         MixedContentAction::Upgrade(upgraded) => upgraded,
         MixedContentAction::Block => return HopCheck::Reject(BlockReason::MixedContent),
@@ -1642,9 +1643,12 @@ fn credentials_for_challenges(
 ///   header. A cross-origin or cors-mode `Location` with credentials is refused outright.
 /// - Insecure hops requested by a secure `init.origin` are blocked or upgraded per
 ///   `init.mixed_content`, re-evaluated at every hop so a redirect cannot escape the check.
-/// - `Referer` is recomputed from `init.referrer` and `init.referrer_policy` at every hop, since
-///   the same-origin and downgrade determinations change as the chain moves. A `Referrer-Policy`
-///   header on a 3xx response replaces the policy for the remaining hops.
+/// - `Referer` is recomputed at every hop, since the same-origin and downgrade determinations
+///   change as the chain moves, from the referrer the previous hop sent (Fetch, main fetch step
+///   9): `init.referrer` on the first hop, and what was left of it after that. A referrer once
+///   reduced to its origin, or withheld, stays so for the rest of the chain. A
+///   `Referrer-Policy` header on a 3xx response replaces the policy for the remaining hops, but
+///   cannot bring back what an earlier hop already cut.
 /// - `Origin` and the `Sec-Fetch-*` headers are likewise recomputed at every hop from
 ///   `init.origin`, `init.destination`, and `init.mode`. `Sec-Fetch-Site` only degrades across
 ///   the chain, and `Origin` collapses to `null` once the chain redirects away from an origin
@@ -1680,6 +1684,11 @@ async fn get_with_redirects(
     let origin = init.origin;
     // A redirect may replace this for the remaining hops (Fetch, HTTP-redirect fetch).
     let mut referrer_policy = init.referrer_policy;
+    // The request's referrer as the chain has left it (Fetch, main fetch step 9): each hop
+    // determines its `Referer` from what the hop before it sent, not from the document URL, so
+    // a referrer once cut down to its origin stays cut down, and one once withheld stays
+    // withheld, however the chain moves or what policy a redirect announces.
+    let mut chain_referrer = init.referrer.clone();
     // `Sec-Fetch-Site` describes the whole chain, not the current hop: it starts at same-origin
     // and can only degrade, so a detour through a foreign site is still visible when the chain
     // lands back home.
@@ -1713,9 +1722,17 @@ async fn get_with_redirects(
         // (possibly upgraded) URL and runs `url_allowed` last, so the policy hook always vets the
         // URL actually sent. All of this re-runs on every hop: an https document may be redirected
         // onto plain http, which the caller cannot see and so cannot check for itself.
+        //
+        // The URL as it stood before an HSTS rewrite is kept for the referrer: Fetch determines
+        // the referrer (main fetch step 9) before it applies HSTS (step 11), so an `https`
+        // document linking to `http://` is a downgrade for the referrer even when HSTS then sends
+        // the request over TLS.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut before_hsts: Option<Url> = None;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ref store) = policy.hsts {
             if hsts::should_upgrade(store.as_ref(), &url, chrono::Utc::now()) {
+                before_hsts = Some(url.clone());
                 let upgraded = hsts::upgrade(&url);
                 observer.on_event(NetEvent::SecurityUpgraded {
                     from: url.clone(),
@@ -1730,6 +1747,7 @@ async fn get_with_redirects(
             &url,
             init.mixed_content,
             origin.as_ref(),
+            init.destination,
             &policy.allowed_bad_ports,
             &|u| (policy.url_allowed)(u),
         ) {
@@ -1807,9 +1825,28 @@ async fn get_with_redirects(
             }
         }
 
-        // Recomputed per hop; see the note on this function.
+        // Recomputed per hop from what the last hop sent; see `chain_referrer`. Judged against
+        // the URL before any HSTS rewrite, with only a mixed content upgrade applied, which
+        // Fetch makes first (main fetch step 6); see `before_hsts`.
         if let Some(ref source) = init.referrer {
-            let sent = match referrer::determine(source, referrer_policy, &url) {
+            let referrer_target = match before_hsts {
+                Some(ref plain) => {
+                    match mixed_content::evaluate_for(
+                        init.mixed_content,
+                        origin.as_ref(),
+                        plain,
+                        init.destination,
+                    ) {
+                        MixedContentAction::Upgrade(upgraded) => upgraded,
+                        _ => plain.clone(),
+                    }
+                }
+                None => url.clone(),
+            };
+            let determined = chain_referrer.as_ref().and_then(|current| {
+                referrer::determine(current, referrer_policy, &referrer_target)
+            });
+            let sent = match determined {
                 Some(value) => match value.as_str().parse() {
                     Ok(header_value) => {
                         current_headers.insert(header::REFERER, header_value);
@@ -1827,6 +1864,7 @@ async fn get_with_redirects(
                     None
                 }
             };
+            chain_referrer = sent.clone();
             // Measured against what would go out with no policy. A source that is never sent
             // (not http or https) has nothing to reduce.
             if let Some(full) = referrer::strip(source) {
@@ -4445,14 +4483,13 @@ mod tests {
         );
     }
 
-    /// The header is recomputed per hop: leaving the referrer's origin reveals only that origin,
-    /// then a redirect landing back home may reveal the full path.
+    /// Fetch, main fetch step 9: each hop determines its referrer from the one the previous hop
+    /// sent. Leaving the referrer's origin reveals only that origin, and a redirect landing back
+    /// home does not bring the path back: the request's referrer is the origin by then.
     ///
-    /// Two servers are required. One server cannot express "cross-origin then same-origin", so
-    /// both hops would compute the same value and the test would pass even if the header were
-    /// computed once up front.
+    /// Two servers are required. One server cannot express "cross-origin then same-origin".
     #[tokio::test(flavor = "current_thread")]
-    async fn referer_is_recomputed_after_a_redirect() {
+    async fn a_reduced_referrer_stays_reduced_after_a_redirect() {
         let home = TestServer::new()
             .route("/echo", RouteConfig::echo_referer_header())
             .start()
@@ -4476,11 +4513,183 @@ mod tests {
             home.base_url().as_str()
         );
 
-        // Redirected back home it is same-origin, so the full path is revealed. Computing the
-        // header once up front would still be sending the bare origin here.
+        // Redirected back home: same-origin again, but the request's referrer is the bare
+        // origin now, and that is all that comes back.
         assert_eq!(
             referer_seen_by_server(&away, "/hop", Some(&doc), policy).await,
-            doc
+            home.base_url().as_str()
+        );
+    }
+
+    /// Fetch, main fetch step 9, and Referrer Policy §8.2: a redirect may change the policy for
+    /// the hops after it, but the policy applies to the referrer as the chain has left it. A
+    /// server answering with `Referrer-Policy: unsafe-url` cannot recover the full URL an
+    /// origin-only policy cut away.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redirect_policy_cannot_widen_the_referrer_again() {
+        let srv = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_with_referrer_policy("/echo", "unsafe-url"),
+            )
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+        let doc = "https://example.com/secret?tok=1";
+        for policy in [
+            ReferrerPolicy::Origin,
+            ReferrerPolicy::StrictOriginWhenCrossOrigin,
+        ] {
+            assert_eq!(
+                referer_seen_by_server(&srv, "/hop", Some(doc), policy).await,
+                "https://example.com/",
+                "{policy}"
+            );
+        }
+    }
+
+    /// Mixed Content §4.4: a top-level navigation from an `https` document to an `http` URL is
+    /// not mixed content; the same URL as a script is. Nothing listens at the target, so the
+    /// navigation fails to connect, but it is not blocked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_top_level_navigation_is_not_blocked_as_mixed_content() {
+        let reason = |destination, mode| async move {
+            let rec = Arc::new(RecordingObserver::new());
+            let init = RequestInit::get(HeaderMap::new())
+                .with_mixed_content(
+                    Some(Url::parse("https://example.com/").unwrap().origin()),
+                    MixedContentPolicy::Block,
+                )
+                .with_fetch_metadata(destination, mode, true);
+            let _ = super::fetch_response_top(
+                client(),
+                Url::parse("http://insecure.invalid/").unwrap(),
+                init,
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await;
+            rec.blocked_reason()
+        };
+        assert_eq!(
+            reason(RequestDestination::Document, RequestMode::Navigate).await,
+            None
+        );
+        assert_eq!(
+            reason(RequestDestination::Script, RequestMode::NoCors).await,
+            Some(BlockReason::MixedContent)
+        );
+    }
+
+    /// Mixed Content §4.1: under the default policy, an `http` image on a secure page is fetched
+    /// over `https` instead of being blocked; a script at the same URL is blocked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_insecure_image_is_upgraded_by_default() {
+        let outcome = |destination| async move {
+            let rec = Arc::new(RecordingObserver::new());
+            let init = RequestInit::get(HeaderMap::new())
+                .with_mixed_content(
+                    Some(Url::parse("https://example.com/").unwrap().origin()),
+                    MixedContentPolicy::default(),
+                )
+                .with_fetch_metadata(destination, RequestMode::NoCors, false);
+            // Nothing listens there; what matters is what was decided before the send.
+            let _ = super::fetch_response_top(
+                client(),
+                Url::parse("http://cdn.invalid/cat.png").unwrap(),
+                init,
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await;
+            (rec.blocked_reason(), rec.upgrades())
+        };
+        let (blocked, upgrades) = outcome(RequestDestination::Image).await;
+        assert_eq!(blocked, None);
+        assert_eq!(
+            upgrades,
+            vec![(
+                "http://cdn.invalid/cat.png".to_string(),
+                "https://cdn.invalid/cat.png".to_string(),
+                UpgradeReason::MixedContent
+            )]
+        );
+        let (blocked, _) = outcome(RequestDestination::Script).await;
+        assert_eq!(blocked, Some(BlockReason::MixedContent));
+    }
+
+    /// Fetch, main fetch: the referrer is determined (step 9) before HSTS rewrites the URL
+    /// (step 11). An `https` document requesting `http://` on an HSTS host is a downgrade for the
+    /// referrer, so `strict-origin-when-cross-origin` sends none, though the request itself goes
+    /// out over TLS. With the URL already `https`, the origin is sent as usual.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_referrer_is_judged_before_the_hsts_upgrade() {
+        let store = Arc::new(crate::net::hsts::InMemoryHstsStore::new());
+        crate::net::hsts::HstsStore::store(
+            store.as_ref(),
+            "hsts.test",
+            crate::net::hsts::HstsEntry {
+                expires_at: chrono::Utc::now() + chrono::Duration::days(30),
+                include_subdomains: false,
+            },
+        );
+        let sent = |target: &'static str| {
+            let store = store.clone();
+            async move {
+                let rec = Arc::new(RecordingObserver::new());
+                let init = RequestInit::get(HeaderMap::new()).with_referrer(
+                    Some(Url::parse("https://example.com/page").unwrap()),
+                    ReferrerPolicy::StrictOriginWhenCrossOrigin,
+                );
+                // Nothing listens there; the referrer is decided before the send fails.
+                let _ = super::fetch_response_top(
+                    client(),
+                    Url::parse(target).unwrap(),
+                    init,
+                    CancellationToken::new(),
+                    rec.clone(),
+                    NetPolicy::default().with_hsts(Some(store)),
+                )
+                .await;
+                rec.modifications()
+                    .into_iter()
+                    .find_map(|(_, change)| match change {
+                        RequestChange::ReferrerReduced { to, .. } => {
+                            Some(to.map(|u| u.to_string()))
+                        }
+                        _ => None,
+                    })
+            }
+        };
+        assert_eq!(sent("http://hsts.test/x").await, Some(None));
+        assert_eq!(
+            sent("https://hsts.test/x").await,
+            Some(Some("https://example.com/".to_string()))
+        );
+    }
+
+    /// Fetch, main fetch step 9: once a hop determines no referrer, the request's referrer is
+    /// `no-referrer`, and the hops after it send none either, even back on the document's own
+    /// origin under `same-origin`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_withheld_referrer_stays_withheld_after_a_redirect() {
+        let home = TestServer::new()
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+        let away = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute(home.url("/echo").as_str()),
+            )
+            .start()
+            .await;
+        let doc = format!("{}page?q=1", home.base_url());
+        assert_eq!(
+            referer_seen_by_server(&away, "/hop", Some(&doc), ReferrerPolicy::SameOrigin).await,
+            "<absent>"
         );
     }
 

@@ -692,6 +692,7 @@ impl Fetcher {
                 &req.url,
                 effective_mixed_content(&req, &self.cfg),
                 req.origin.as_ref(),
+                req.destination,
                 &self.cfg.allowed_bad_ports,
                 &|u| self.ctx.is_url_allowed(u),
             ) {
