@@ -45,7 +45,11 @@ static SEC_FETCH_USER: header::HeaderName = header::HeaderName::from_static("sec
 /// sent as `Sec-Fetch-Dest`.
 ///
 /// [Fetch §2.2.5]: https://fetch.spec.whatwg.org/#concept-request-destination
+///
+/// Non-exhaustive: Fetch adds values (`webidentity`, `webtransport` are ones sonar does not
+/// have yet), and adding them here must not break a `match` downstream.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
+#[non_exhaustive]
 pub enum RequestDestination {
     /// No particular destination (the default — e.g. `fetch()`, beacons, downloads).
     /// Sent as the token `empty`.
@@ -132,7 +136,11 @@ impl RequestDestination {
 /// headers so the server sees the same request a browser would send.
 ///
 /// [Fetch §2.2.5]: https://fetch.spec.whatwg.org/#concept-request-mode
+///
+/// Non-exhaustive: Fetch adds values (`webidentity`, `webtransport` are ones sonar does not
+/// have yet), and adding them here must not break a `match` downstream.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
+#[non_exhaustive]
 pub enum RequestMode {
     /// Cross-origin allowed without the response being readable cross-origin — how browsers
     /// load `<img>`, `<script>`, and most other markup-initiated subresources. The default.

@@ -801,7 +801,8 @@ impl FetchRequest {
 
     /// Generates a key for coalescing in-flight requests: two requests with the same key may
     /// share one response. Covers the method, URL, every header, the body and the size cap,
-    /// plus the request fields that change what a hop sends or accepts. `None` for a request
+    /// plus the request fields that change what a hop sends or accepts, `auto_decode` among
+    /// them: a decoded and a raw body are different responses. `None` for a request
     /// that must not be coalesced: a method other than GET/HEAD, or a streamed body.
     ///
     /// While cookies may ride along, requests with different references never share a key:
@@ -822,14 +823,16 @@ impl FetchRequest {
         }
         // The named headers above are the common ones, kept readable; the rest of the map
         // varies the response just as much (an API key, a conditional header), so all of it
-        // is hashed, in a fixed order so insertion order does not matter.
+        // is hashed, in a fixed order so insertion order does not matter. Sorted by name only,
+        // and stably: the values of one name go out in the order they were added, which is
+        // part of the request.
         let all_headers = {
             let mut pairs: Vec<(&str, &[u8])> = self
                 .headers
                 .iter()
                 .map(|(n, v)| (n.as_str(), v.as_bytes()))
                 .collect();
-            pairs.sort_unstable();
+            pairs.sort_by(|a, b| a.0.cmp(b.0));
             let mut buf = Vec::new();
             for (n, v) in pairs {
                 buf.extend_from_slice(n.as_bytes());
@@ -841,8 +844,14 @@ impl FetchRequest {
         };
         let body = match &self.body {
             None => "n".to_string(),
-            // A streamed body cannot be compared, so the request goes on its own.
-            Some(b) => format!("{:x}", short_hash(b.as_bytes()?)),
+            // A streamed body cannot be compared, so the request goes on its own. The body's
+            // `Content-Type` goes out with it (unless a header sets one), so the same bytes as
+            // JSON and as a form are different requests.
+            Some(b) => format!(
+                "{:x}:{:x}",
+                short_hash(b.as_bytes()?),
+                short_hash(b.content_type.as_deref().unwrap_or("").as_bytes())
+            ),
         };
         let max_bytes = self.max_bytes.map_or("n".to_string(), |m| m.to_string());
 
@@ -1005,7 +1014,7 @@ impl FetchRequest {
         // field, or two different requests could spell the same key.
         let lp = |s: &str| format!("{}:{}", s.len(), s);
         Some(format!(
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={};Cache={};H={};B={};MB={}",
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={};Cache={};H={};B={};MB={};D={}",
             self.method,
             lp(&url),
             lp(range),
@@ -1021,7 +1030,8 @@ impl FetchRequest {
             cache_mode,
             all_headers,
             body,
-            max_bytes
+            max_bytes,
+            u8::from(self.auto_decode)
         ))
     }
 }
@@ -1594,8 +1604,8 @@ mod tests {
             // FM: default destination and mode, no initiating origin, no user navigation.
             // Cred and Cache: the default credentials mode, for the default reference, and normal
             // HTTP caching.
-            // H: every header, sorted. B=n: no body. MB=n: no size cap.
-            "M={};U={}:{};R=10:bytes=0-99;A=9:text/html;AL=5:en-US;AE=4:gzip;Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include@{};Cache=default;H={};B=n;MB=n",
+            // H: every header, sorted. B=n: no body. MB=n: no size cap. D=1: decoded.
+            "M={};U={}:{};R=10:bytes=0-99;A=9:text/html;AL=5:en-US;AE=4:gzip;Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include@{};Cache=default;H={};B=n;MB=n;D=1",
             fr.method,
             url_norm.len(),
             url_norm,
@@ -1639,6 +1649,11 @@ mod tests {
             with(&[("x-b", "2"), ("x-a", "1")]),
             "insertion order does not"
         );
+        assert_ne!(
+            with(&[("x-pref", "nl"), ("x-pref", "en")]),
+            with(&[("x-pref", "en"), ("x-pref", "nl")]),
+            "the order of one name's values does: it is what goes out"
+        );
 
         let key_for = |b: FetchRequestBuilder| b.build().generate_request_key();
         let plain = key_for(FetchRequest::builder(Method::GET, url.clone())).unwrap();
@@ -1652,6 +1667,23 @@ mod tests {
         assert_ne!(
             key_for(FetchRequest::builder(Method::GET, url.clone()).with_max_bytes(1024)).unwrap(),
             plain
+        );
+        // A raw and a decoded body are different responses.
+        assert_ne!(
+            key_for(FetchRequest::builder(Method::GET, url.clone()).with_auto_decode(false))
+                .unwrap(),
+            plain
+        );
+        // The same bytes with another `Content-Type` are another request on the wire.
+        assert_ne!(
+            key_for(
+                FetchRequest::builder(Method::GET, url.clone()).with_body(RequestBody::json("{}"))
+            )
+            .unwrap(),
+            key_for(
+                FetchRequest::builder(Method::GET, url.clone()).with_body(RequestBody::form("{}"))
+            )
+            .unwrap()
         );
         #[cfg(not(target_arch = "wasm32"))]
         assert!(

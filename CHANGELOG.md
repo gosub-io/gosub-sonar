@@ -34,6 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepted on, for paths at or below the directory where it was accepted (RFC 7617 §2.2), as
   browsers do. A protected site no longer costs a `401` round trip on every request, nor a
   request body sent twice
+- `FetcherContext::on_ref_done` for a streamed fetch fires when the stream ends (read to its
+  end, failed, or given up), not when its headers arrive. It tracks outstanding work, and a
+  download still under way is that: before, a loading indicator driven by it cleared while the
+  body was still coming
+- **Breaking:** `RequestDestination` and `RequestMode` are `#[non_exhaustive]`. Fetch adds to
+  both (`webidentity`, `webtransport`), and adding a value should not break a `match`
+  downstream again; a `match` on either needs a `_` arm once
 
 ### Fixed
 
@@ -178,6 +185,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the two challenges then alternated until the attempts ran out, and the proxy password the
   proxy had just accepted was forgotten from the store. The proxy and the server now each have
   their own credentials, attempts and store handling on a hop (RFC 9110 §11.6-11.7)
+- Fetcher: a request still queued when `run` stopped was never answered, and `fetch` or
+  `submit` after it had stopped waited forever, though `fetch` documents an error for a
+  fetcher that stops before delivering. Both are answered with `NetError::Cancelled` now
+- Fetcher: a stream every caller had dropped went on being read, to its end or a timeout,
+  holding its connection slots meanwhile; a long or endless response kept them for good. The
+  body stops being read once no handle to it and no stream from it remains, which gives the
+  slots back and ends the reference's outstanding work (`on_ref_done`)
+- Events: a request the scheduler refused before sending it (URL policy, bad port, mixed
+  content) reported `Blocked` and nothing after it, so an observer could not tell it had ended.
+  `Failed` follows as the terminal event now, as it already did for a block on a redirect hop
+- Events: a request whose callers all cancelled, or whose fetcher shut down, while it waited
+  for a connection slot ended without any event, so an observer never learned it was over. It
+  reports `Cancelled` now, as a request cancelled at any later point does
+- Proxy: `*` in a bypass list (`ProxyRule::no_proxy`) did not cover IP addresses, so
+  `http://127.0.0.1/` and `http://[::1]/` still went through the proxy, though `*` is documented,
+  as in curl's `NO_PROXY`, as every host. It covers them now
+- Proxy: bypass entries in forms other tools accept never matched: an IPv6 address in brackets
+  (`[::1]`), an entry with a port (`localhost:8080`), and a request to a name with a trailing dot
+  (`example.com.`). Traffic the user meant to keep off the proxy went through it. They match
+  now; an entry with a port bypasses that port only, as Go's proxy settings do
+- Coalescing: two GET requests whose bodies had the same bytes but a different
+  `Content-Type` (`RequestBody::json` and `RequestBody::form`) shared one fetch, though they
+  send different requests. The body's content type is part of the key now
+- Coalescing: the key sorted header values as well as names, so `X-Pref: nl` then `en` and
+  `en` then `nl` shared one fetch, though they go out differently. Values of one name keep
+  their order in the key now
+- Coalescing: a request that may not share a fetch (a POST, a streamed body) was kept apart
+  from the others only by a nanosecond timestamp in its key. On a coarse clock two identical
+  POSTs could share a key, and the second body was never sent. Each gets a number of its own
+  now
+- Coalescing: `FetchRequest::generate_request_key` left out `auto_decode`, so a raw and a
+  decoded request got the same public key; only the fetcher's run loop added it. The key
+  includes it now, built in one place
 
 ## [0.12.0] - 2026-10-10
 

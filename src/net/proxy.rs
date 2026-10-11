@@ -75,7 +75,9 @@ pub struct ProxyRule {
     pub auth: Option<ProxyAuth>,
     /// Hosts that bypass this proxy, in `NO_PROXY` syntax: comma-separated entries, each a
     /// domain (matching that domain and its subdomains), an IP address, a CIDR block, or `*` for
-    /// everything. `None` sends every in-scope request through the proxy — note that this does
+    /// everything. An IPv6 address may be in brackets (`[::1]`), a domain may end in a dot, and
+    /// an entry may name a port (`localhost:8080`, `[::1]:8080`) to bypass that port only.
+    /// `None` sends every in-scope request through the proxy — note that this does
     /// *not* fall back to the `NO_PROXY` environment variable, since configuring a rule
     /// programmatically opts out of the environment entirely.
     pub no_proxy: Option<String>,
@@ -155,12 +157,25 @@ impl ProxyRule {
             );
         }
 
-        let mut proxy = match self.scope {
-            ProxyScope::Http => reqwest::Proxy::http(&self.url),
-            ProxyScope::Https => reqwest::Proxy::https(&self.url),
-            ProxyScope::All => reqwest::Proxy::all(&self.url),
-        }
-        .with_context(|| format!("unusable proxy URL {:?}", self.url))?;
+        // A bypass entry with a port is beyond the matcher, which only knows hosts: such a rule
+        // decides per request itself, with the same answer `intercept_any` gives.
+        let mut proxy = if self.port_entries().is_empty() {
+            match self.scope {
+                ProxyScope::Http => reqwest::Proxy::http(&self.url),
+                ProxyScope::Https => reqwest::Proxy::https(&self.url),
+                ProxyScope::All => reqwest::Proxy::all(&self.url),
+            }
+            .with_context(|| format!("unusable proxy URL {:?}", self.url))?
+        } else {
+            let proxy_url = Url::parse(&self.url)
+                .with_context(|| format!("unusable proxy URL {:?}", self.url))?;
+            let rule = self.clone();
+            reqwest::Proxy::custom(move |url: &Url| {
+                let dst: http::Uri = url.as_str().parse().ok()?;
+                rule.intercept_any(proxy_url.clone(), &dst)
+                    .map(|_| proxy_url.clone())
+            })
+        };
 
         match self.auth {
             Some(ProxyAuth::Basic {
@@ -176,8 +191,8 @@ impl ProxyRule {
             None => {}
         }
 
-        if let Some(ref list) = self.no_proxy {
-            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(list));
+        if let Some(list) = self.bypass_list() {
+            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(&list));
         }
 
         Ok(proxy)
@@ -241,6 +256,9 @@ impl ProxyRule {
 
     /// [`intercept`](Self::intercept) without the filter: socks proxies match too.
     fn intercept_any(&self, proxy_url: Url, dst: &http::Uri) -> Option<proxy_matcher::Intercept> {
+        if self.bypassed_by_port(dst) {
+            return None;
+        }
         let builder = proxy_matcher::Matcher::builder();
         let builder = match self.scope {
             ProxyScope::Http => builder.http(proxy_url.to_string()),
@@ -248,10 +266,135 @@ impl ProxyRule {
             ProxyScope::All => builder.all(proxy_url.to_string()),
         };
         builder
-            .no(self.no_proxy.clone().unwrap_or_default())
+            .no(self.bypass_list().unwrap_or_default())
             .build()
             .intercept(dst)
     }
+
+    /// The bypass list as the matcher is given it, by the client and by this module alike, so
+    /// the two cannot disagree. Entries are read the way other tools write them:
+    ///
+    /// - `*` is spelled out to also cover IP addresses: the matcher checks an IP host against IP
+    ///   entries only, so a bare `*` let `http://127.0.0.1/` through the proxy though it is
+    ///   documented, and curl's `NO_PROXY` has it, as everything.
+    /// - an IPv6 address may come in brackets, as in a URL: `[::1]`.
+    /// - a name may end in a dot, and covers the name with or without one.
+    /// - an entry with a port (`localhost:8080`, `[::1]:8080`) is left out here and checked by
+    ///   [`bypassed_by_port`](Self::bypassed_by_port): it bypasses that port only.
+    fn bypass_list(&self) -> Option<String> {
+        let list = self.no_proxy.as_ref()?;
+        let mut entries: Vec<String> = Vec::new();
+        for entry in bypass_entries(list) {
+            match entry {
+                BypassEntry::Everything => {
+                    entries.extend(["*", "0.0.0.0/0", "::/0"].map(String::from))
+                }
+                BypassEntry::Host { host, port: None } => {
+                    if host.parse::<std::net::IpAddr>().is_err() {
+                        entries.push(format!("{host}."));
+                    }
+                    entries.push(host);
+                }
+                BypassEntry::Host { port: Some(_), .. } => {}
+                BypassEntry::Verbatim(entry) => entries.push(entry),
+            }
+        }
+        Some(entries.join(","))
+    }
+
+    /// The bypass entries that name a port.
+    fn port_entries(&self) -> Vec<(String, u16)> {
+        self.no_proxy
+            .as_deref()
+            .map(bypass_entries)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                BypassEntry::Host {
+                    host,
+                    port: Some(port),
+                } => Some((host, port)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether `dst` is exempt through an entry with a port: the same host, or a subdomain of
+    /// it, on that port. A request without a port has its scheme's.
+    fn bypassed_by_port(&self, dst: &http::Uri) -> bool {
+        let Some(host) = dst.host() else {
+            return false;
+        };
+        let host = normalize_host(host);
+        let port = dst.port_u16().unwrap_or(match dst.scheme_str() {
+            Some("https") => 443,
+            _ => 80,
+        });
+        self.port_entries().iter().any(|(entry, entry_port)| {
+            *entry_port == port && {
+                let entry = entry.trim_start_matches('.');
+                host == entry || host.ends_with(&format!(".{entry}"))
+            }
+        })
+    }
+}
+
+/// One entry of a bypass list.
+enum BypassEntry {
+    /// `*`.
+    Everything,
+    /// A name or an IP address, without brackets or a trailing dot, perhaps with a port.
+    Host { host: String, port: Option<u16> },
+    /// Anything else, such as a CIDR block, handed to the matcher as written.
+    Verbatim(String),
+}
+
+/// Split a `NO_PROXY`-style list into its entries.
+fn bypass_entries(list: &str) -> Vec<BypassEntry> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|entry| {
+            if entry == "*" {
+                return BypassEntry::Everything;
+            }
+            if entry.contains('/') {
+                return BypassEntry::Verbatim(entry.to_string());
+            }
+            // `[v6]` or `[v6]:port`.
+            if let Some(rest) = entry.strip_prefix('[') {
+                if let Some((host, after)) = rest.split_once(']') {
+                    let port = after.strip_prefix(':').and_then(|p| p.parse().ok());
+                    return BypassEntry::Host {
+                        host: normalize_host(host),
+                        port,
+                    };
+                }
+            }
+            // `host:port`; a bare IPv6 address has more than one colon and no port.
+            if let Some((host, port)) = entry.split_once(':') {
+                if !host.contains(':') && !port.contains(':') {
+                    if let Ok(port) = port.parse() {
+                        return BypassEntry::Host {
+                            host: normalize_host(host),
+                            port: Some(port),
+                        };
+                    }
+                }
+            }
+            BypassEntry::Host {
+                host: normalize_host(entry),
+                port: None,
+            }
+        })
+        .collect()
+}
+
+/// A host as entries and requests are compared: lowercase, without IPv6 brackets or a trailing
+/// dot.
+fn normalize_host(host: &str) -> String {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
 }
 
 /// How the fetcher chooses a proxy for outgoing requests.
@@ -423,6 +566,60 @@ mod tests {
 
         assert!(!ProxyRoutes::Disabled.routes_through_proxy(&url("http://example.com/")));
         assert!(!ProxyRoutes::Rules(vec![]).routes_through_proxy(&url("http://example.com/")));
+    }
+
+    /// `ProxyRule::no_proxy`: `*` is "for everything", as in curl's `NO_PROXY`: IP hosts too, not
+    /// just names.
+    #[test]
+    fn a_star_bypasses_every_host_ip_addresses_included() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        let routes =
+            ProxyRoutes::Rules(vec![ProxyRule::all("http://127.0.0.1:3128").bypassing("*")]);
+        for target in [
+            "http://example.com/",
+            "https://intranet.test/",
+            "http://127.0.0.1:8080/",
+            "http://10.1.2.3/",
+            "http://[::1]/",
+            "http://[2001:db8::1]/",
+        ] {
+            assert!(!routes.routes_through_proxy(&url(target)), "{target}");
+        }
+    }
+
+    /// Bypass entries as other tools write them: an IPv6 address in brackets, a name with a
+    /// trailing dot (and a request to one), and a host with a port, which bypasses that port only.
+    #[test]
+    fn bypass_entries_in_the_forms_other_tools_use() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        let routes = |list: &str| {
+            ProxyRoutes::Rules(vec![ProxyRule::all("http://127.0.0.1:3128").bypassing(list)])
+        };
+        let bypassed = |list: &str, target: &str| !routes(list).routes_through_proxy(&url(target));
+
+        assert!(bypassed("[::1]", "http://[::1]/"));
+        assert!(bypassed("[::1]", "http://[::1]:8080/"));
+        assert!(bypassed("example.com", "http://example.com./"));
+        assert!(bypassed("example.com", "http://a.example.com./"));
+        assert!(bypassed("example.com.", "http://example.com/"));
+        assert!(bypassed("Example.COM", "http://example.com/"));
+
+        // A port bypasses that port only; a URL without one has its scheme's.
+        assert!(bypassed("localhost:8080", "http://localhost:8080/"));
+        assert!(!bypassed("localhost:8080", "http://localhost:9090/"));
+        assert!(!bypassed("localhost:8080", "http://localhost/"));
+        assert!(bypassed("intranet.test:443", "https://intranet.test/"));
+        assert!(bypassed("intranet.test:443", "https://a.intranet.test/"));
+        assert!(!bypassed("intranet.test:443", "http://intranet.test/"));
+        assert!(bypassed("[::1]:8080", "http://[::1]:8080/"));
+        assert!(!bypassed("[::1]:8080", "http://[::1]:9090/"));
+        assert!(bypassed("10.0.0.5:8080", "http://10.0.0.5:8080/"));
+        assert!(!bypassed("10.0.0.5:8080", "http://10.0.0.6:8080/"));
+
+        // Still not a match: a name that only ends in the same letters, a CIDR, a bare IPv6.
+        assert!(!bypassed("example.com", "http://notexample.com/"));
+        assert!(bypassed("10.0.0.0/8", "http://10.9.9.9/"));
+        assert!(bypassed("::1", "http://[::1]/"));
     }
 
     /// The system routes answer from the matcher they were resolved with, not from whatever

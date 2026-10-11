@@ -7,6 +7,7 @@ use crate::net::cache::{HttpCache, InMemoryHttpCache};
 use crate::net::cors::{CorsPreflightCache, InMemoryPreflightCache};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::dns::DnsResolver;
+use crate::net::events::NetEvent;
 use crate::net::fetch::{
     blocked, fetch_response_complete, fetch_response_top, hop_checks, HopCheck, NetPolicy,
     RequestInit, ResponseTop,
@@ -19,6 +20,7 @@ use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::proxy::{ProxyConfig, ProxyRoutes};
+use crate::net::request_ref::RequestReference;
 use crate::net::retry::{self, RetryPolicy};
 use crate::net::shared_body::{ReaderOptions, SharedBody, DEFAULT_REPLAY_LIMIT};
 use crate::net::slots::{SlotPool, Slots};
@@ -364,6 +366,13 @@ pub struct Fetcher {
 
     wake: Notify,
 
+    /// Set when [`run`](Self::run) has stopped, under all four lane locks, so a request
+    /// submitted after that is answered at once instead of waiting for a loop that is gone.
+    stopped: std::sync::atomic::AtomicBool,
+
+    /// Numbers the requests that may not be coalesced, so each gets a key of its own.
+    unshared: std::sync::atomic::AtomicU64,
+
     ctx: Arc<dyn FetcherContext>,
 
     built: Arc<ClientsBuilt>,
@@ -423,6 +432,8 @@ impl Fetcher {
             q_idle: tokio::sync::Mutex::new(VecDeque::new()),
             inflight_map: Arc::new(DashMap::new()),
             wake: Notify::new(),
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            unshared: std::sync::atomic::AtomicU64::new(0),
             ctx,
             built,
         })
@@ -430,8 +441,8 @@ impl Fetcher {
 
     // Weighted round-robin dequeue across the four priority lanes.
     // The 15-slot cycle gives approximate weights: High=8, Normal=4, Low=2, Idle=1.
-    // When the preferred lane is empty the next non-empty lane is tried in
-    // descending priority order. This only orders a backlog the run loop finds: requests then
+    // When the preferred lane is empty the nearest non-empty lane is tried, then outward
+    // (on a Low turn: Normal, High, Idle). This only orders a backlog the run loop finds: requests then
     // wait for slots in the `SlotPool`, which applies the same weights where the waiting is.
     fn pick_lane<'a>(
         &'a self,
@@ -463,6 +474,24 @@ impl Fetcher {
                 .or_else(|| try_pop(low))
                 .or_else(|| try_pop(norm))
                 .or_else(|| try_pop(high)),
+        }
+    }
+
+    /// Mark the fetcher stopped and answer everything still queued: under all four lane locks,
+    /// so no `submit` can slip a request in between.
+    async fn stop_queue(&self) {
+        let mut high = self.q_high.lock().await;
+        let mut norm = self.q_norm.lock().await;
+        let mut low = self.q_low.lock().await;
+        let mut idle = self.q_idle.lock().await;
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Release);
+        for lane in [&mut *high, &mut *norm, &mut *low, &mut *idle] {
+            for item in lane.drain(..) {
+                let _ = item.reply.send(FetchResult::Error(NetError::Cancelled(
+                    "fetcher shut down before the request was sent".into(),
+                )));
+            }
         }
     }
 
@@ -528,6 +557,15 @@ impl Fetcher {
             Priority::Low => self.q_low.lock().await,
             Priority::Idle => self.q_idle.lock().await,
         };
+        // Read under the lane lock, which `run` holds while it sets the flag and empties the
+        // lanes: a request is either drained and answered by it, or sees the flag here.
+        if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+            drop(lane);
+            let _ = reply_tx.send(FetchResult::Error(NetError::Cancelled(
+                "fetcher shut down".into(),
+            )));
+            return;
+        }
         lane.push_back(QueueItem {
             req,
             // handle: req_handle,\
@@ -544,11 +582,18 @@ impl Fetcher {
     /// waiting for its slots keeps its priority: a freed slot goes to the highest lane that
     /// can use it, first come first served within a lane.
     /// Spawn this on a Tokio runtime before calling [`fetch`](Self::fetch).
+    ///
+    /// When it stops, every request still waiting in a lane is answered with
+    /// [`NetError::Cancelled`], and so is any submitted afterwards, until `run` is called again.
+    /// Fetches already under way finish as usual.
     pub async fn run(&self, shutdown: CancellationToken) {
         let mut lane_counter: u8 = 0;
+        self.stopped
+            .store(false, std::sync::atomic::Ordering::Release);
 
         loop {
             if shutdown.is_cancelled() {
+                self.stop_queue().await;
                 break;
             }
 
@@ -591,17 +636,19 @@ impl Fetcher {
             req.mixed_content = Some(effective_mixed_content(&req, &self.cfg));
 
             let key_opt = req.request_key(&self.ctx.cookie_jar_key(req.reference));
-            let key_str = {
-                let base = match key_opt {
-                    Some(k) => k,
-                    None => format!(
-                        "{} {} @{}",
-                        req.method,
-                        req.url,
-                        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-                    ),
-                };
-                format!("{};D={}", base, req.auto_decode as u8)
+            let key_str = match key_opt {
+                Some(k) => k,
+                // A request that may not share a fetch (a POST, a streamed body) gets a key
+                // no other request has. A counter, not the clock: two identical POSTs on
+                // one clock tick would otherwise share a key, and the second body would
+                // never be sent.
+                None => format!(
+                    "{} {} #{}",
+                    req.method,
+                    req.url,
+                    self.unshared
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
             };
 
             // Register the reply channel while still holding the DashMap entry guard.
@@ -701,7 +748,14 @@ impl Fetcher {
             };
 
             if let Some(reason) = reject {
-                let err = FetchResult::Error(blocked(&observer, req.url.clone(), reason));
+                // `Blocked` names the cause; `Failed` ends the request, as on any other path
+                // (see `NetEvent::Blocked`).
+                let error = blocked(&observer, req.url.clone(), reason);
+                observer.on_event(NetEvent::Failed {
+                    url: req.url.clone(),
+                    error: anyhow::Error::new(error.clone()),
+                });
+                let err = FetchResult::Error(error);
                 // Remove before finish — see the registration comment above for the ordering.
                 self.inflight_map
                     .remove_if(&key_str, |_, e| Arc::ptr_eq(e, &inflight_entry));
@@ -746,6 +800,12 @@ impl Fetcher {
                 };
                 // Held here until the task ends, or by the body of a streamed fetch.
                 let mut held = acquire.await;
+                // Likewise the reference's outstanding work: a stream is still work until its
+                // body ends, so it takes this along; otherwise it ends with the task.
+                let mut ref_done = Some(RefDone {
+                    ctx: ctx_clone.clone(),
+                    reference: req.reference,
+                });
 
                 let should_stream =
                     req.streaming || inflight_entry2.wants_streaming.load(Ordering::Relaxed);
@@ -756,6 +816,11 @@ impl Fetcher {
                     } else {
                         "cancelled before the request was sent"
                     };
+                    // The request ends here, so it says so, as a cancel anywhere later does.
+                    observer.on_event(NetEvent::Cancelled {
+                        url: req_for_task.url.clone(),
+                        reason: why,
+                    });
                     Err(NetError::Cancelled(why.into()))
                 } else if let (true, Some(slot_guards)) = (should_stream, held.take()) {
                     perform_streaming(
@@ -768,6 +833,7 @@ impl Fetcher {
                         pool.clone(),
                         built.clone(),
                         slot_guards,
+                        &mut ref_done,
                     )
                     .await
                 } else {
@@ -800,7 +866,7 @@ impl Fetcher {
 
                 inflight_entry2.done.cancel();
 
-                ctx_clone.on_ref_done(req.reference);
+                drop(ref_done);
                 drop(held);
             });
         }
@@ -993,10 +1059,25 @@ fn build_client(
     }
 }
 
-/// A body reader that keeps the fetch's slots until it is dropped.
+/// A body reader that keeps the fetch's slots, and its reference's outstanding work, until it
+/// is dropped: when the stream has been read to its end, failed, or been given up.
 struct HoldsSlots<R> {
     inner: R,
     _slots: Slots,
+    _done: Option<RefDone>,
+}
+
+/// Calls [`FetcherContext::on_ref_done`] for a reference when dropped, so the call is made once,
+/// wherever the fetch's work actually ends.
+struct RefDone {
+    ctx: Arc<dyn FetcherContext>,
+    reference: RequestReference,
+}
+
+impl Drop for RefDone {
+    fn drop(&mut self) {
+        self.ctx.on_ref_done(self.reference);
+    }
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HoldsSlots<R> {
@@ -1077,6 +1158,7 @@ async fn perform_streaming(
     origins: Arc<SlotPool>,
     built: Arc<ClientsBuilt>,
     slots: Slots,
+    ref_done: &mut Option<RefDone>,
 ) -> Result<FetchResult, NetError> {
     let client = Arc::new(client.clone());
     // Only the header phase is retried; the body goes straight to the caller.
@@ -1121,6 +1203,7 @@ async fn perform_streaming(
     let reader = HoldsSlots {
         inner: reader,
         _slots: slots,
+        _done: ref_done.take(),
     };
     Ok(FetchResult::Stream {
         meta,
@@ -3149,6 +3232,295 @@ mod tests {
 
     /// A request still waiting for a slot at shutdown is answered and cleaned up like any
     /// other, rather than left in the in-flight map with its listeners hanging.
+    /// `fetch` docs: "if the fetcher stops before delivering, this resolves to a
+    /// `FetchResult::Error`". A request still queued when `run` stops is answered, and so is one
+    /// submitted after it stopped, instead of waiting forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stopped_fetcher_answers_every_caller() {
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+        let url = Url::parse("http://127.0.0.1:9/never").unwrap();
+
+        // Queued before the loop runs; the loop then starts already told to stop.
+        let (req, cancel) = make_req(url.clone(), Priority::Normal);
+        let (tx, queued) = oneshot::channel();
+        fetcher.submit(req, cancel, tx).await;
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        fetcher.run(shutdown).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), queued)
+            .await
+            .expect("a queued request is answered")
+            .unwrap();
+        assert!(
+            matches!(result, FetchResult::Error(NetError::Cancelled(_))),
+            "{result:?}"
+        );
+
+        // After the loop is gone.
+        let late = tokio::time::timeout(
+            Duration::from_secs(1),
+            fetcher.fetch(FetchRequest::builder(Method::GET, url).build()),
+        )
+        .await
+        .expect("a request after shutdown is answered");
+        assert!(
+            matches!(late, FetchResult::Error(NetError::Cancelled(_))),
+            "{late:?}"
+        );
+    }
+
+    /// `NetEvent::Blocked`: "A request hop was refused by policy and never sent.
+    /// `NetEvent::Failed` follows as the terminal event." Also when the scheduler refuses the
+    /// request before it is sent at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_blocked_before_sending_ends_with_failed() {
+        // Port 25 is on the bad-port list: refused by the scheduler's pre-flight check.
+        let req =
+            FetchRequest::builder(Method::GET, Url::parse("http://127.0.0.1:25/").unwrap()).build();
+        let (result, log) = fetch_recorded(test_config(), req).await;
+        assert!(result.is_error(), "{result:?}");
+        assert_eq!(log.event_names(), vec!["Blocked", "Failed"]);
+    }
+
+    /// Every request ends in exactly one of `Finished`, `Failed` or `Cancelled`: also one
+    /// whose callers all cancel, or whose fetcher shuts down, while it waits for a slot.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_ended_while_waiting_for_a_slot_reports_cancelled() {
+        let srv = start_server().await;
+        let log = Arc::new(RecordingObserver::new());
+        let cfg = FetcherConfig {
+            global_slots: 1,
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(Recording(log.clone()))).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+
+        // The first holds the only slot; the other two wait for it.
+        let (hold, _) = oneshot::channel();
+        let (req, token) = make_req(srv.url("/hang"), Priority::Normal);
+        fetcher.submit(req, token, hold).await;
+        let (cancelled, cancelled_rx) = oneshot::channel();
+        let (req, token) = make_req(srv.url("/fast"), Priority::Normal);
+        fetcher.submit(req, token.clone(), cancelled).await;
+        let (stopped, stopped_rx) = oneshot::channel();
+        let (req, stop_token) = make_req(srv.url("/timed"), Priority::Normal);
+        fetcher.submit(req, stop_token, stopped).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        token.cancel();
+        let _ = cancelled_rx.await;
+        shutdown.cancel();
+        let _ = stopped_rx.await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let ended = log.cancellations();
+        assert!(
+            ended.contains(&"cancelled before the request was sent"),
+            "{ended:?}"
+        );
+        assert!(
+            ended.contains(&"fetcher shut down before the request was sent"),
+            "{ended:?}"
+        );
+    }
+
+    /// `FetcherContext::on_ref_done`: "Called once when all subscribers for a fetch are done",
+    /// the outstanding-work signal. A stream is outstanding work until its body ends: not when
+    /// its headers arrive, which is when the caller gets it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_ref_done_waits_for_a_stream_to_end() {
+        use tokio::io::AsyncReadExt;
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl FetcherContext for Counting {
+            fn observer_for(
+                &self,
+                _: RequestReference,
+                _: RequestId,
+                _: ResourceKind,
+                _: Initiator,
+            ) -> Arc<dyn NetObserver + Send + Sync> {
+                Arc::new(crate::net::null_emitter::NullEmitter)
+            }
+            fn on_ref_active(&self, _: RequestReference) {}
+            fn on_ref_done(&self, _: RequestReference) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let srv = start_server().await;
+        let ctx = Arc::new(Counting(Default::default()));
+        let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+
+        // 12 KiB dribbled over ~360 ms: headers at once, the body still coming.
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_streaming(true)
+            .build();
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = fetcher.fetch(req).await
+        else {
+            panic!("expected a stream");
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ctx.0.load(Ordering::SeqCst), 0, "the body is still coming");
+
+        let mut body = Vec::new();
+        crate::net::shared_body::SharedBody::combined_reader(peek_buf, shared)
+            .read_to_end(&mut body)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 12 * 1024);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ctx.0.load(Ordering::SeqCst), 1, "once, when the body ended");
+        shutdown.cancel();
+    }
+
+    /// A stream its caller gives up on is no longer outstanding work: `on_ref_done` comes when
+    /// the last reader is dropped, not when the body would have ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn on_ref_done_comes_when_the_last_reader_gives_up() {
+        use tokio::io::AsyncReadExt;
+        struct Counting(std::sync::atomic::AtomicUsize);
+        impl FetcherContext for Counting {
+            fn observer_for(
+                &self,
+                _: RequestReference,
+                _: RequestId,
+                _: ResourceKind,
+                _: Initiator,
+            ) -> Arc<dyn NetObserver + Send + Sync> {
+                Arc::new(crate::net::null_emitter::NullEmitter)
+            }
+            fn on_ref_active(&self, _: RequestReference) {}
+            fn on_ref_done(&self, _: RequestReference) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let srv = start_server().await;
+        let ctx = Arc::new(Counting(Default::default()));
+        let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+
+        // 12 KiB dribbled over ~360 ms: read a little of it, then give up.
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+            .with_streaming(true)
+            .build();
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = fetcher.fetch(req).await
+        else {
+            panic!("expected a stream");
+        };
+        let mut reader = crate::net::shared_body::SharedBody::combined_reader(peek_buf, shared);
+        let mut first = [0u8; 16];
+        reader.read_exact(&mut first).await.unwrap();
+        assert_eq!(
+            ctx.0.load(Ordering::SeqCst),
+            0,
+            "the body is still being read"
+        );
+
+        drop(reader);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            ctx.0.load(Ordering::SeqCst),
+            1,
+            "once, when the reader was dropped"
+        );
+        shutdown.cancel();
+    }
+
+    /// `ProxyRule::no_proxy`'s `*` bypasses the proxy for an IP host too, in the client that
+    /// sends the request. The test server plays both parts: a request it gets as a proxy (an
+    /// absolute URL) falls through to its default route.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_proxy_star_sends_an_ip_host_directly() {
+        let srv = TestServer::new()
+            .route("/direct", RouteConfig::ok(b"served directly"))
+            .default_route(RouteConfig::ok(b"served by the proxy"))
+            .start()
+            .await;
+        let cfg = FetcherConfig {
+            proxy: ProxyConfig::Rules(vec![ProxyRule::all(srv.base_url().as_str()).bypassing("*")]),
+            ..test_config()
+        };
+        let req = FetchRequest::builder(Method::GET, srv.url("/direct")).build();
+        let (result, _) = fetch_recorded(cfg, req).await;
+        match result {
+            FetchResult::Buffered { body, .. } => assert_eq!(&body[..], b"served directly"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A bypass entry with a port takes that port only, in the client that sends the request:
+    /// the server's own port goes direct, any other leaves it going through the proxy.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_bypass_entry_with_a_port_takes_that_port_only() {
+        let srv = TestServer::new()
+            .route("/direct", RouteConfig::ok(b"served directly"))
+            .default_route(RouteConfig::ok(b"served by the proxy"))
+            .start()
+            .await;
+        let port = srv.base_url().port().unwrap();
+        let body_with = |list: String| {
+            let cfg = FetcherConfig {
+                proxy: ProxyConfig::Rules(vec![
+                    ProxyRule::all(srv.base_url().as_str()).bypassing(list)
+                ]),
+                ..test_config()
+            };
+            let req = FetchRequest::builder(Method::GET, srv.url("/direct")).build();
+            async move {
+                match fetch_recorded(cfg, req).await.0 {
+                    FetchResult::Buffered { body, .. } => body,
+                    other => panic!("{other:?}"),
+                }
+            }
+        };
+        assert_eq!(
+            &body_with(format!("127.0.0.1:{port}")).await[..],
+            b"served directly"
+        );
+        assert_eq!(
+            &body_with(format!("127.0.0.1:{}", port.wrapping_add(1))).await[..],
+            b"served by the proxy"
+        );
+    }
+
+    /// Identical POSTs are never coalesced: each is sent, however close together they come.
+    #[tokio::test(flavor = "current_thread")]
+    async fn identical_posts_are_each_sent() {
+        let srv = TestServer::new()
+            .route("/submit", RouteConfig::echo_body())
+            .start()
+            .await;
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+        // Queued before the loop runs, so they are dequeued back to back.
+        let mut replies = Vec::new();
+        for _ in 0..8 {
+            let req = FetchRequest::builder(Method::POST, srv.url("/submit"))
+                .with_body(crate::net::types::RequestBody::text("same"))
+                .build();
+            let (tx, rx) = oneshot::channel();
+            fetcher.submit(req, CancellationToken::new(), tx).await;
+            replies.push(rx);
+        }
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+        for rx in replies {
+            assert!(!rx.await.unwrap().is_error());
+        }
+        assert_eq!(srv.hit_count("/submit"), 8);
+        shutdown.cancel();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn shutdown_while_waiting_for_a_slot_cleans_up() {
         struct Counting(std::sync::atomic::AtomicUsize);
