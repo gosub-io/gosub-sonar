@@ -571,6 +571,15 @@ pub trait CorsPreflightCache: Send + Sync {
         allows: PreflightAllows,
         now: DateTime<Utc>,
     );
+
+    /// Drop the grants for `origin` and `url`, with and without credentials ([Fetch] §4.9,
+    /// "clear cache entries"). Called when a request that relied on a grant ended in a network
+    /// error, so the server is asked again next time rather than trusted for up to the grant's
+    /// `max-age` after it may have changed its mind. The default does nothing, for a cache
+    /// that cannot remove entries.
+    ///
+    /// [Fetch]: https://fetch.spec.whatwg.org/#concept-cache-clear
+    fn clear(&self, _origin: &str, _url: &Url) {}
 }
 
 /// In-process [`CorsPreflightCache`] with no persistence; expired entries are pruned on
@@ -647,6 +656,13 @@ impl CorsPreflightCache for InMemoryPreflightCache {
         }
         entries.insert(key, (allows, expires));
     }
+
+    fn clear(&self, origin: &str, url: &Url) {
+        let mut entries = self.entries.write();
+        for credentials in [false, true] {
+            entries.remove(&Self::key(origin, url, credentials));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -676,6 +692,34 @@ mod tests {
         let first = Url::parse("https://api.test/0").unwrap();
         assert!(cache.get("https://a.test", &first, false, now).is_none());
         assert!(cache.get("https://a.test", &extra, false, now).is_some());
+    }
+
+    /// Fetch §4.9, clear cache entries: both grants for the origin and URL go, with and without
+    /// credentials; others stay.
+    #[test]
+    fn clear_drops_the_grants_for_one_origin_and_url() {
+        let cache = InMemoryPreflightCache::new();
+        let now = Utc::now();
+        let allows = PreflightAllows {
+            methods: Vec::new(),
+            methods_wildcard: false,
+            headers: Vec::new(),
+            headers_wildcard: false,
+            max_age: Duration::from_secs(600),
+        };
+        let url = Url::parse("https://api.test/x").unwrap();
+        let other = Url::parse("https://api.test/y").unwrap();
+        for credentials in [false, true] {
+            cache.put("https://a.test", &url, credentials, allows.clone(), now);
+        }
+        cache.put("https://a.test", &other, false, allows.clone(), now);
+        cache.put("https://b.test", &url, false, allows, now);
+
+        cache.clear("https://a.test", &url);
+        assert!(cache.get("https://a.test", &url, false, now).is_none());
+        assert!(cache.get("https://a.test", &url, true, now).is_none());
+        assert!(cache.get("https://a.test", &other, false, now).is_some());
+        assert!(cache.get("https://b.test", &url, false, now).is_some());
     }
 
     fn origin(s: &str) -> url::Origin {

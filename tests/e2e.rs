@@ -453,6 +453,56 @@ async fn oversized_safelisted_headers_are_preflighted() {
     shutdown.cancel();
 }
 
+/// Fetch §4.4, main fetch: "If corsWithPreflightResponse is a network error, then clear cache
+/// entries using request." A server grants `PUT` for ten minutes, then fails the actual request
+/// its CORS check; the next `PUT` asks it again instead of trusting the cached grant.
+#[tokio::test]
+async fn a_failed_request_drops_its_preflight_grant() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let home = TestServer::new().start().await;
+    let origin = home.base_url().origin().ascii_serialization();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let preflights = Arc::new(AtomicUsize::new(0));
+    let seen = preflights.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let response = if buf[..n].starts_with(b"OPTIONS ") {
+                seen.fetch_add(1, Ordering::SeqCst);
+                format!(
+                    "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: {origin}\r\n\
+                     Access-Control-Allow-Methods: PUT\r\nAccess-Control-Max-Age: 600\r\n\
+                     Connection: close\r\n\r\n"
+                )
+            } else {
+                // No Access-Control-Allow-Origin: the CORS check fails.
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string()
+            };
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/data")).unwrap();
+
+    for _ in 0..2 {
+        let req = FetchRequest::builder(Method::PUT, url.clone())
+            .with_origin(home.base_url().origin())
+            .with_mode(RequestMode::Cors)
+            .with_credentials(RequestCredentials::Omit)
+            .with_body(RequestBody::text("payload"))
+            .build();
+        let result = fetcher.fetch(req).await;
+        assert!(result.is_error(), "{result:?}");
+    }
+    assert_eq!(preflights.load(Ordering::SeqCst), 2);
+    shutdown.cancel();
+}
+
 /// Hands the same recording observer to every request, so a test can assert on the events
 /// the fetch stack emitted.
 struct RecordingCtx(Arc<RecordingObserver>);

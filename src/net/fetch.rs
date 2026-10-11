@@ -189,6 +189,35 @@ pub(crate) fn hop_checks(
     HopCheck::Proceed(target)
 }
 
+/// A preflight grant a hop is relying on, dropped from the cache unless the hop's response
+/// passes its CORS check (Fetch §4.4, main fetch: "If corsWithPreflightResponse is a network
+/// error, then clear cache entries using request"). Every way a hop can fail after its grant
+/// returns early, so the drop is what catches them all.
+#[cfg(not(target_arch = "wasm32"))]
+struct PreflightGrant {
+    cache: Arc<dyn CorsPreflightCache>,
+    origin: String,
+    url: Url,
+    kept: bool,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PreflightGrant {
+    /// The hop's response passed: the grant stays cached.
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for PreflightGrant {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.cache.clear(&self.origin, &self.url);
+        }
+    }
+}
+
 /// Callback type for the URL allowlist check.
 pub type UrlFilter = Box<dyn Fn(&Url) -> bool + Send + Sync>;
 
@@ -1917,6 +1946,8 @@ async fn get_with_redirects(
         // Native-only: on wasm32 the browser preflights itself and does not surface the
         // `Access-Control-*` response headers this validation would need.
         #[cfg(not(target_arch = "wasm32"))]
+        let mut preflight_grant: Option<PreflightGrant> = None;
+        #[cfg(not(target_arch = "wasm32"))]
         if init.mode == RequestMode::Cors && tainting == ResponseTainting::Cors {
             if let Some(ref o) = origin {
                 let unsafe_names = cors::unsafe_request_header_names(&current_headers);
@@ -1984,6 +2015,12 @@ async fn get_with_redirects(
                             cache.put(&serialized, &url, credentials_include, allows, now);
                         }
                     }
+                    preflight_grant = policy.cors_preflight.as_ref().map(|cache| PreflightGrant {
+                        cache: cache.clone(),
+                        origin: serialized,
+                        url: url.clone(),
+                        kept: false,
+                    });
                 }
             }
         }
@@ -2098,6 +2135,10 @@ async fn get_with_redirects(
                             return Err(blocked(&observer, url, BlockReason::Cors(e)));
                         }
                     }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(grant) = preflight_grant.take() {
+                    grant.keep();
                 }
                 observer.on_event(NetEvent::Cache {
                     url: url.clone(),
@@ -2301,6 +2342,10 @@ async fn get_with_redirects(
                             return Err(blocked(&observer, url, BlockReason::Cors(e)));
                         }
                     }
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(grant) = preflight_grant.take() {
+                    grant.keep();
                 }
 
                 // A `304` answers a revalidation: the stored body stands, with the headers the

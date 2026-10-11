@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `CorsPreflightCache::clear`, which drops the grants for one origin and URL. It has a default
+  that does nothing, so existing implementations keep compiling
+
 ### Fixed
 
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued
@@ -88,6 +93,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request could carry any amount of data to a cross-origin server in `Accept`,
   `Accept-Language` and the like without a preflight. Values totalling more than 1024 bytes now
   need one, for every safelisted name (Fetch §2.2.2, CORS-unsafe request-header names)
+- CORS: a preflight grant outlived a request that then failed. A server that granted a
+  method for ten minutes and then refused the actual request was not asked again until the
+  grant expired. A request that relied on a grant and ends in a network error now clears it
+  (Fetch §4.4, main fetch)
 
 ## [0.12.0] - 2026-10-10
 
