@@ -367,10 +367,12 @@ connection goes to exactly the addresses it returns (a rebound name can't redire
 connection). Return `Err` to refuse a host. `url_allowed` checks URLs, the resolver checks
 addresses; a policy usually wants both. Native-only.
 
-Redirects are handled manually in `get_with_redirects` (up to `MAX_REDIRECTS` = 20 hops and
+Redirects are handled manually in `get_with_redirects` (up to `MAX_REDIRECTS` = 20 redirects and
 within `redirect_timeout`) with
 browser-matching semantics:
 
+- Only 301, 302, 303, 307 and 308 are redirects (Fetch). Any other 3xx, a 300 or a 304 nobody
+  asked for, is returned to the caller like any response, `Location` or not.
 - Method/body downgraded on 301/302/303, preserved on 307/308 (RFC 7231 §6.4).
 - `Authorization` and `Cookie` (`SENSITIVE_REDIRECT_HEADERS`) are stripped on cross-origin
   redirects (RFC 9110 §15.4), and the cookie jar is re-queried for the new origin.
