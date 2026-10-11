@@ -320,7 +320,8 @@ Cancellation is layered with `tokio_util::sync::CancellationToken`:
   caller waiting for it either. A caller whose token fires after the result was handed to it
   keeps the result.
 - The `FetchInflightEntry::parent_cancel` fires only when the *last* subscriber cancels, aborting
-  the shared fetch.
+  the shared fetch. A request that arrives while that fetch winds down does not join it: it
+  takes its place in `inflight_map` and starts a fresh one.
 - A `shutdown` token passed to `Fetcher::run` stops the whole scheduler and ends every wait for
   a slot.
 

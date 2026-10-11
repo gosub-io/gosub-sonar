@@ -265,7 +265,9 @@ impl Default for FetcherConfig {
 ///
 /// 1. **Leader** — the first request for a key creates the entry and starts the real HTTP fetch.
 /// 2. **Followers** — subsequent requests with the same key join via `waiter.register()` without
-///    starting a second fetch.  They receive the same result when the leader finishes.
+///    starting a second fetch.  They receive the same result when the leader finishes.  A request
+///    that finds an entry every subscriber has cancelled does not join it: it replaces the entry
+///    and leads a fresh fetch.
 /// 3. **Cancellation** — each subscriber brings its own `CancellationToken`.  When one fires,
 ///    the subscriber's listener is taken out of the waiter and answered with
 ///    `NetError::Cancelled` at once (`Waiter::cancel`), and `dec_sub_and_maybe_cancel`
@@ -292,9 +294,22 @@ pub struct FetchInflightEntry {
 }
 
 impl FetchInflightEntry {
+    /// Counts one more subscriber in, unless every subscriber has already cancelled: once the
+    /// count has reached zero the fetch is being torn down, and joining it would only hand the
+    /// newcomer that cancellation. Returns whether the subscriber was counted in.
     #[inline]
-    fn inc_sub(&self) {
-        self.subs.fetch_add(1, Ordering::Relaxed);
+    fn try_inc_sub(&self) -> bool {
+        let mut n = self.subs.load(Ordering::Acquire);
+        while n > 0 {
+            match self
+                .subs
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+        false
     }
 
     /// Decrements the subscriber count and, if this was the last subscriber, cancels the
@@ -596,24 +611,36 @@ impl Fetcher {
             // guaranteed to register before the drain; otherwise it finds the map vacant and
             // becomes the leader of a fresh fetch. Registering after releasing the guard would
             // leave a window where the result is lost and the subscriber gets a RecvError.
+            //
+            // An entry whose subscribers have all cancelled stays in the map until its leader
+            // has wound down. A request that finds one (a caller retrying right after it
+            // cancelled, say) takes its place and leads a fresh fetch; the old leader only ever
+            // removes its own entry, so it leaves the new one alone.
+            let new_entry = |req: &FetchRequest| {
+                Arc::new(FetchInflightEntry {
+                    parent_cancel: CancellationToken::new(),
+                    waiter: Arc::new(Waiter::new()),
+                    wants_streaming: AtomicBool::new(req.streaming),
+                    done: CancellationToken::new(),
+                    subs: AtomicUsize::new(1),
+                })
+            };
             let (inflight_entry, is_leader, listener) =
                 match self.inflight_map.entry(key_str.clone()) {
-                    Entry::Occupied(entry) => {
+                    Entry::Occupied(entry) if entry.get().try_inc_sub() => {
                         let arc = entry.get().clone();
                         let listener = arc.waiter.register(reply_tx, req.streaming);
-                        arc.inc_sub();
                         (arc, false, listener)
                     }
-                    Entry::Vacant(v) => {
-                        let arc = Arc::new(FetchInflightEntry {
-                            parent_cancel: CancellationToken::new(),
-                            waiter: Arc::new(Waiter::new()),
-                            wants_streaming: AtomicBool::new(req.streaming),
-                            done: CancellationToken::new(),
-                            subs: AtomicUsize::new(0),
-                        });
+                    Entry::Occupied(mut entry) => {
+                        let arc = new_entry(&req);
                         let listener = arc.waiter.register(reply_tx, req.streaming);
-                        arc.inc_sub();
+                        entry.insert(arc.clone());
+                        (arc, true, listener)
+                    }
+                    Entry::Vacant(v) => {
+                        let arc = new_entry(&req);
+                        let listener = arc.waiter.register(reply_tx, req.streaming);
                         v.insert(arc.clone());
                         (arc, true, listener)
                     }
@@ -675,7 +702,8 @@ impl Fetcher {
             if let Some(reason) = reject {
                 let err = FetchResult::Error(blocked(&observer, req.url.clone(), reason));
                 // Remove before finish — see the registration comment above for the ordering.
-                self.inflight_map.remove(&key_str);
+                self.inflight_map
+                    .remove_if(&key_str, |_, e| Arc::ptr_eq(e, &inflight_entry));
                 inflight_entry.waiter.finish(err, None).await;
                 inflight_entry.done.cancel();
                 self.ctx.on_ref_done(req.reference);
@@ -762,8 +790,10 @@ impl Fetcher {
 
                 // Remove from the map before draining the waiter: entry() and remove() serialize
                 // on the shard lock, so any follower that found this entry has already registered,
-                // and later arrivals find the map vacant and start a fresh fetch instead.
-                inflight.remove(&key_for_remove);
+                // and later arrivals find the map vacant and start a fresh fetch instead. Only
+                // this fetch's own entry: one that replaced it after every subscriber here
+                // cancelled belongs to another leader.
+                inflight.remove_if(&key_for_remove, |_, e| Arc::ptr_eq(e, &inflight_entry2));
 
                 inflight_entry2.waiter.finish(fr, cfg.max_body_bytes).await;
 
@@ -1435,16 +1465,19 @@ mod tests {
             parent_cancel: CancellationToken::new(),
             waiter: Arc::new(Waiter::new()),
             wants_streaming: AtomicBool::new(false),
-            subs: AtomicUsize::new(0),
+            subs: AtomicUsize::new(1),
             done: CancellationToken::new(),
         };
-        entry.inc_sub();
-        entry.inc_sub();
+        assert!(entry.try_inc_sub());
         assert!(!entry.parent_cancel.is_cancelled());
         entry.dec_sub_and_maybe_cancel();
         assert!(!entry.parent_cancel.is_cancelled());
         entry.dec_sub_and_maybe_cancel();
         assert!(entry.parent_cancel.is_cancelled());
+        assert!(
+            !entry.try_inc_sub(),
+            "nobody joins a fetch every caller left"
+        );
     }
 
     // ── Integration (requires mock server) ────────────────────────────────────
@@ -1718,6 +1751,52 @@ mod tests {
             FetchResult::Buffered { .. }
         ));
         assert_eq!(srv.hit_count("/slow"), 1);
+        shutdown.cancel();
+    }
+
+    /// A caller that cancels and asks again straight away gets a fresh fetch, not the one it
+    /// just left: that one is being torn down, and joining it would hand the retry its
+    /// cancellation. Each round races the retry against the old fetch winding down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetcher_a_retry_after_cancelling_does_not_join_the_cancelled_fetch() {
+        let srv = TestServer::new()
+            .route(
+                "/slow",
+                RouteConfig::delay(Duration::from_millis(100), b"body".to_vec()),
+            )
+            .start()
+            .await;
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+
+        for round in 0..20 {
+            let token = CancellationToken::new();
+            let first = tokio::spawn({
+                let (f, url, token) = (fetcher.clone(), srv.url("/slow"), token.clone());
+                async move {
+                    f.fetch_with_cancel(FetchRequest::builder(Method::GET, url).build(), token)
+                        .await
+                }
+            });
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            token.cancel();
+            let result = first.await.unwrap();
+            assert!(
+                matches!(result, FetchResult::Error(NetError::Cancelled(_))),
+                "{result:?}"
+            );
+
+            let retry = fetcher
+                .fetch(FetchRequest::builder(Method::GET, srv.url("/slow")).build())
+                .await;
+            assert!(
+                matches!(retry, FetchResult::Buffered { .. }),
+                "round {round}: {retry:?}"
+            );
+        }
+        assert_eq!(fetcher.inflight_map.len(), 0, "nothing left in flight");
         shutdown.cancel();
     }
 

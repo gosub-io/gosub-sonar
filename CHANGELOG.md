@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It now returns at once with `NetError::Cancelled`, as `fetch_with_cancel` and the
   architecture doc describe; a caller whose token fires after the result was handed to it keeps
   the result
+- A request that arrived while a fetch every caller had cancelled was still winding down joined
+  that fetch and got its cancellation; a caller retrying right after it cancelled hit this
+  nearly every time. It now starts a fresh fetch
 - The error and the `NetEvent::Cancelled` reason when every caller has cancelled read
   `cancelled net.get_with_redirects`, the name of an internal function; they now say
   `all callers cancelled`
