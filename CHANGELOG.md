@@ -177,6 +177,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the others only by a nanosecond timestamp in its key. On a coarse clock two identical
   POSTs could share a key, and the second body was never sent. Each gets a number of its own
   now
+- Coalescing: `FetchRequest::generate_request_key` left out `auto_decode`, so a raw and a
+  decoded request got the same public key; only the fetcher's run loop added it. The key
+  includes it now, built in one place
 
 ## [0.12.0] - 2026-10-10
 

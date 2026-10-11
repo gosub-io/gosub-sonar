@@ -801,7 +801,8 @@ impl FetchRequest {
 
     /// Generates a key for coalescing in-flight requests: two requests with the same key may
     /// share one response. Covers the method, URL, every header, the body and the size cap,
-    /// plus the request fields that change what a hop sends or accepts. `None` for a request
+    /// plus the request fields that change what a hop sends or accepts, `auto_decode` among
+    /// them: a decoded and a raw body are different responses. `None` for a request
     /// that must not be coalesced: a method other than GET/HEAD, or a streamed body.
     ///
     /// While cookies may ride along, requests with different references never share a key:
@@ -1013,7 +1014,7 @@ impl FetchRequest {
         // field, or two different requests could spell the same key.
         let lp = |s: &str| format!("{}:{}", s.len(), s);
         Some(format!(
-            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={};Cache={};H={};B={};MB={}",
+            "M={};U={};R={};A={};AL={};AE={};Auth={};C={};MC={};Ref={};FM={};Cred={};Cache={};H={};B={};MB={};D={}",
             self.method,
             lp(&url),
             lp(range),
@@ -1029,7 +1030,8 @@ impl FetchRequest {
             cache_mode,
             all_headers,
             body,
-            max_bytes
+            max_bytes,
+            u8::from(self.auto_decode)
         ))
     }
 }
@@ -1602,8 +1604,8 @@ mod tests {
             // FM: default destination and mode, no initiating origin, no user navigation.
             // Cred and Cache: the default credentials mode, for the default reference, and normal
             // HTTP caching.
-            // H: every header, sorted. B=n: no body. MB=n: no size cap.
-            "M={};U={}:{};R=10:bytes=0-99;A=9:text/html;AL=5:en-US;AE=4:gzip;Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include@{};Cache=default;H={};B=n;MB=n",
+            // H: every header, sorted. B=n: no body. MB=n: no size cap. D=1: decoded.
+            "M={};U={}:{};R=10:bytes=0-99;A=9:text/html;AL=5:en-US;AE=4:gzip;Auth={};C={};MC=n;Ref=n;FM=empty:no-cors:n:-;Cred=include@{};Cache=default;H={};B=n;MB=n;D=1",
             fr.method,
             url_norm.len(),
             url_norm,
@@ -1664,6 +1666,12 @@ mod tests {
         );
         assert_ne!(
             key_for(FetchRequest::builder(Method::GET, url.clone()).with_max_bytes(1024)).unwrap(),
+            plain
+        );
+        // A raw and a decoded body are different responses.
+        assert_ne!(
+            key_for(FetchRequest::builder(Method::GET, url.clone()).with_auto_decode(false))
+                .unwrap(),
             plain
         );
         // The same bytes with another `Content-Type` are another request on the wire.

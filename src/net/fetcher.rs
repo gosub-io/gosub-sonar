@@ -636,22 +636,19 @@ impl Fetcher {
             req.mixed_content = Some(effective_mixed_content(&req, &self.cfg));
 
             let key_opt = req.request_key(&self.ctx.cookie_jar_key(req.reference));
-            let key_str = {
-                let base = match key_opt {
-                    Some(k) => k,
-                    // A request that may not share a fetch (a POST, a streamed body) gets a key
-                    // no other request has. A counter, not the clock: two identical POSTs on
-                    // one clock tick would otherwise share a key, and the second body would
-                    // never be sent.
-                    None => format!(
-                        "{} {} #{}",
-                        req.method,
-                        req.url,
-                        self.unshared
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    ),
-                };
-                format!("{};D={}", base, req.auto_decode as u8)
+            let key_str = match key_opt {
+                Some(k) => k,
+                // A request that may not share a fetch (a POST, a streamed body) gets a key
+                // no other request has. A counter, not the clock: two identical POSTs on
+                // one clock tick would otherwise share a key, and the second body would
+                // never be sent.
+                None => format!(
+                    "{} {} #{}",
+                    req.method,
+                    req.url,
+                    self.unshared
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                ),
             };
 
             // Register the reply channel while still holding the DashMap entry guard.
