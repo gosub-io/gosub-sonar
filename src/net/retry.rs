@@ -91,12 +91,20 @@ fn random_unit() -> f64 {
 
 /// Parses `Retry-After` (seconds or HTTP date). `None` if absent or unparsable; a past date
 /// gives zero.
+///
+/// A date may come in any of the three HTTP-date formats, as RFC 9110 §5.6.7 requires of a
+/// recipient: IMF-fixdate, RFC 850 and asctime. An RFC 2822 date with a numeric zone is
+/// accepted too.
 pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(header::RETRY_AFTER)?.to_str().ok()?.trim();
     if let Ok(secs) = value.parse::<u64>() {
         return Some(Duration::from_secs(secs));
     }
-    let at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let at = crate::net::cache::parse_http_date(value).or_else(|| {
+        chrono::DateTime::parse_from_rfc2822(value)
+            .ok()
+            .map(|at| at.with_timezone(&chrono::Utc))
+    })?;
     let wait = at.signed_duration_since(chrono::Utc::now());
     Some(wait.to_std().unwrap_or(Duration::ZERO))
 }
@@ -247,5 +255,25 @@ mod tests {
             "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
         );
         assert_eq!(retry_after(&h), Some(Duration::ZERO));
+    }
+
+    /// RFC 9110 §5.6.7: "A recipient that parses a timestamp value in an HTTP field MUST accept
+    /// all three HTTP-date formats." An hour ahead, in each of them.
+    #[test]
+    fn retry_after_takes_every_http_date_format() {
+        let ahead = chrono::Utc::now() + chrono::Duration::hours(1);
+        for date in [
+            ahead.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
+            ahead.format("%A, %d-%b-%y %H:%M:%S GMT").to_string(),
+            ahead.format("%a %b %e %H:%M:%S %Y").to_string(),
+        ] {
+            let mut h = HeaderMap::new();
+            h.insert(header::RETRY_AFTER, date.parse().unwrap());
+            let wait = retry_after(&h).unwrap_or_else(|| panic!("{date}"));
+            assert!(
+                wait > Duration::from_secs(3500) && wait <= Duration::from_secs(3600),
+                "{date}: {wait:?}"
+            );
+        }
     }
 }

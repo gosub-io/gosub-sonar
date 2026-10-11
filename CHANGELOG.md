@@ -84,6 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `Default` mode. Fetch handles it as `NoStore`, so it now also carries
   `Pragma: no-cache` and `Cache-Control: no-cache`, and a cache between sonar and the server
   does not answer the condition in the server's place
+- Retry: `Retry-After` dates were only read in RFC 2822 form, so the RFC 850 and asctime
+  forms, which RFC 9110 §5.6.7 says a recipient MUST accept, were ignored, and a server asking
+  to be left alone for an hour was retried after the normal backoff. All three HTTP-date
+  formats are read now
 
 ## [0.12.0] - 2026-10-10
 
