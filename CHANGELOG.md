@@ -108,6 +108,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CORS: `Access-Control-Max-Age` accepted `+600` and took the first of two values, caching
   a grant for as long as either said. Anything but a single number of seconds now falls back
   to the five-second default (Fetch §4.8)
+- CORS: `Range: bytes=5-1`, a start past the end, counted as CORS-safelisted and went to a
+  cross-origin server without a preflight. It is not a range at all (Fetch, parse a single range
+  header value)
 
 ## [0.12.0] - 2026-10-10
 

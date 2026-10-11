@@ -187,12 +187,23 @@ pub fn is_cors_safelisted_request_header(name: &HeaderName, value: &[u8]) -> boo
                     !start.is_empty()
                         && start.bytes().all(|b| b.is_ascii_digit())
                         && end.bytes().all(|b| b.is_ascii_digit())
+                        // A start past the end is no range at all (Fetch, parse a single range
+                        // header value).
+                        && (end.is_empty() || !decimal_greater(start, end))
                 }
                 None => false,
             }
         }
         _ => false,
     }
+}
+
+/// Whether the decimal number `a` is greater than `b`, both strings of ASCII digits of any
+/// length, as Fetch reads a range's bounds.
+fn decimal_greater(a: &str, b: &str) -> bool {
+    let a = a.trim_start_matches('0');
+    let b = b.trim_start_matches('0');
+    (a.len(), a) > (b.len(), b)
 }
 
 /// Forbidden request header ([Fetch] §2.2.2): controlled by the user agent — here, by the
@@ -812,6 +823,31 @@ mod tests {
             &n("range"),
             b"bytes=0-50,100-150"
         ));
+        // Fetch, parse a single range header value: a start past the end is failure. Compared
+        // as numbers, of any length, not as text.
+        for invalid in [
+            &b"bytes=5-1"[..],
+            b"bytes=10-9",
+            b"bytes=100000000000000000000-1",
+        ] {
+            assert!(
+                !is_cors_safelisted_request_header(&n("range"), invalid),
+                "{}",
+                String::from_utf8_lossy(invalid)
+            );
+        }
+        for valid in [
+            &b"bytes=5-5"[..],
+            b"bytes=9-10",
+            b"bytes=007-10",
+            b"bytes=1-100000000000000000000",
+        ] {
+            assert!(
+                is_cors_safelisted_request_header(&n("range"), valid),
+                "{}",
+                String::from_utf8_lossy(valid)
+            );
+        }
         assert!(!is_cors_safelisted_request_header(&n("x-custom"), b"1"));
         // Over the 128-byte value cap.
         let long = vec![b'a'; 129];
