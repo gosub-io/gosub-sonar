@@ -2612,8 +2612,15 @@ async fn get_with_redirects(
         })?;
 
         // A `Location` with embedded `user:password` is refused for a cors-mode request, and
-        // for any request when it points at another origin (Fetch §4.4 steps 9–10): following
+        // for any request when it points at another origin than the hop it came from: following
         // it would replay attacker-chosen credentials against the new target.
+        //
+        // Deliberately stricter than Fetch §4.5 steps 9-10, which only refuse a cors-mode
+        // request whose Location's origin differs from the *request's* origin, or a chain whose
+        // response tainting is already cors, and otherwise follow with the credentials kept.
+        // Credentials in a redirect target are an attack pattern rather than something a site
+        // relies on, and sonar strips them from what it follows anyway, so refusing more only
+        // costs a redirect browsers would follow.
         if (!to.username().is_empty() || to.password().is_some())
             && (init.mode == RequestMode::Cors || from.origin() != to.origin())
         {
