@@ -477,6 +477,13 @@ pub fn is_storable(
     if *method != Method::GET && *method != Method::HEAD {
         return false;
     }
+    // A `304` is not a response to keep: it confirms one the client already has, and carries no
+    // body of its own (RFC 9110 §15.4.5). Stored, it would answer later requests with an empty
+    // `304` that nobody asked for. Sonar's own revalidations never reach this point: their
+    // `304` freshens the stored entry instead.
+    if status == 304 {
+        return false;
+    }
     if RequestDirectives::parse(request).no_store || bypasses_cache(request) {
         return false;
     }
@@ -1367,6 +1374,23 @@ mod tests {
         assert!(!two_lines.is_fresh(at(10)));
         let longer_first = entry(&[("cache-control", "max-age=600, max-age=0")]);
         assert!(longer_first.is_fresh(at(10)));
+    }
+
+    /// RFC 9111 §3 and RFC 9110 §15.4.5: a `304` is not a representation, whatever freshness
+    /// it carries, so it is never stored as one.
+    #[test]
+    fn a_304_is_never_stored() {
+        for response in [
+            headers(&[("cache-control", "max-age=60")]),
+            headers(&[("cache-control", "public, max-age=60"), ("etag", "\"v1\"")]),
+        ] {
+            assert!(!is_storable(
+                &Method::GET,
+                &HeaderMap::new(),
+                304,
+                &response
+            ));
+        }
     }
 
     #[test]

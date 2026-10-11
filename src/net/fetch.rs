@@ -5733,6 +5733,41 @@ mod tests {
         .unwrap()
     }
 
+    /// A `304` sonar did not ask for (no revalidation of its own) goes to the caller and is not
+    /// stored, even with freshness: the next fetch asks the server again instead of being
+    /// answered with an empty `304` from the cache.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unsolicited_304_is_not_stored() {
+        let srv = TestServer::new()
+            .route(
+                "/not-modified",
+                RouteConfig::StatusThenOk {
+                    code: 304,
+                    headers: vec![("Cache-Control".into(), "max-age=60".into())],
+                    failures: usize::MAX,
+                    body: Vec::new(),
+                },
+            )
+            .start()
+            .await;
+        let (_, cache) = caching_policy();
+        for round in 1..=2 {
+            let policy = NetPolicy::default().with_cache(Some(cache.clone()));
+            let (meta, _) = cache_fetch(
+                &srv,
+                "/not-modified",
+                RequestInit::default(),
+                policy,
+                observer(),
+            )
+            .await;
+            assert_eq!(meta.status, 304);
+            assert!(!meta.from_cache, "round {round}");
+        }
+        assert!(cache.is_empty());
+        assert_eq!(srv.hit_count("/not-modified"), 2);
+    }
+
     /// A fresh stored response answers the next fetch without a request going out.
     #[tokio::test(flavor = "current_thread")]
     async fn a_fresh_response_is_served_from_the_cache() {

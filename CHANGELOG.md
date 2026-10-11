@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache: a response that gave `max-age` twice was fresh for the last value, so
   `max-age=0, max-age=600` was stored as fresh for ten minutes. The first one counts now
   (RFC 9111 §4.2.1)
+- Cache: a `304` that sonar had not asked for was stored when it carried freshness, and
+  answered later requests from the cache as an empty `304`. A `304` is never stored; sonar's
+  own revalidations still use theirs to freshen the stored response
 
 ## [0.12.0] - 2026-10-10
 
