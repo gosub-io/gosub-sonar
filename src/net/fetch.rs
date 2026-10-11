@@ -164,6 +164,7 @@ pub(crate) fn hop_checks(
     url: &Url,
     mixed_content: MixedContentPolicy,
     origin: Option<&Origin>,
+    destination: RequestDestination,
     allowed_bad_ports: &[u16],
     url_allowed: &dyn Fn(&Url) -> bool,
 ) -> HopCheck {
@@ -171,7 +172,7 @@ pub(crate) fn hop_checks(
         return HopCheck::Reject(BlockReason::UnsupportedScheme);
     }
 
-    let target = match mixed_content::evaluate(mixed_content, origin, url) {
+    let target = match mixed_content::evaluate_for(mixed_content, origin, url, destination) {
         MixedContentAction::Allow => url.clone(),
         MixedContentAction::Upgrade(upgraded) => upgraded,
         MixedContentAction::Block => return HopCheck::Reject(BlockReason::MixedContent),
@@ -1746,6 +1747,7 @@ async fn get_with_redirects(
             &url,
             init.mixed_content,
             origin.as_ref(),
+            init.destination,
             &policy.allowed_bad_ports,
             &|u| (policy.url_allowed)(u),
         ) {
@@ -1829,7 +1831,12 @@ async fn get_with_redirects(
         if let Some(ref source) = init.referrer {
             let referrer_target = match before_hsts {
                 Some(ref plain) => {
-                    match mixed_content::evaluate(init.mixed_content, origin.as_ref(), plain) {
+                    match mixed_content::evaluate_for(
+                        init.mixed_content,
+                        origin.as_ref(),
+                        plain,
+                        init.destination,
+                    ) {
                         MixedContentAction::Upgrade(upgraded) => upgraded,
                         _ => plain.clone(),
                     }
@@ -4539,6 +4546,40 @@ mod tests {
                 "{policy}"
             );
         }
+    }
+
+    /// Mixed Content §4.4: a top-level navigation from an `https` document to an `http` URL is
+    /// not mixed content; the same URL as a script is. Nothing listens at the target, so the
+    /// navigation fails to connect, but it is not blocked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_top_level_navigation_is_not_blocked_as_mixed_content() {
+        let reason = |destination, mode| async move {
+            let rec = Arc::new(RecordingObserver::new());
+            let init = RequestInit::get(HeaderMap::new())
+                .with_mixed_content(
+                    Some(Url::parse("https://example.com/").unwrap().origin()),
+                    MixedContentPolicy::Block,
+                )
+                .with_fetch_metadata(destination, mode, true);
+            let _ = super::fetch_response_top(
+                client(),
+                Url::parse("http://insecure.invalid/").unwrap(),
+                init,
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await;
+            rec.blocked_reason()
+        };
+        assert_eq!(
+            reason(RequestDestination::Document, RequestMode::Navigate).await,
+            None
+        );
+        assert_eq!(
+            reason(RequestDestination::Script, RequestMode::NoCors).await,
+            Some(BlockReason::MixedContent)
+        );
     }
 
     /// Fetch, main fetch: the referrer is determined (step 9) before HSTS rewrites the URL

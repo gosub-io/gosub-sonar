@@ -25,6 +25,7 @@
 //! [`FetchRequest::origin`]: crate::net::types::FetchRequest::origin
 //! [`FetchRequest::mixed_content`]: crate::net::types::FetchRequest::mixed_content
 
+use crate::net::fetch_metadata::RequestDestination;
 use url::{Host, Origin, Url};
 
 /// What to do with an insecure sub-resource requested by a secure document.
@@ -123,15 +124,36 @@ fn upgrade(url: &Url) -> Option<Url> {
 /// 3. `url` is *not* potentially trustworthy — the sub-resource is the insecure part.
 ///
 /// Only then does `policy` decide between allowing, upgrading, and blocking.
+///
+/// The request's destination is not known here, so it is judged as a subresource of no
+/// particular kind; [`evaluate_for`] takes it into account.
 pub fn evaluate(
     policy: MixedContentPolicy,
     origin: Option<&Origin>,
     url: &Url,
 ) -> MixedContentAction {
+    evaluate_for(policy, origin, url, RequestDestination::Empty)
+}
+
+/// [`evaluate`] for a request with this destination.
+///
+/// A top-level navigation (destination `document`) is never mixed content: following a link
+/// from an `https` page to an `http` one leaves the secure page rather than loading something
+/// into it (Mixed Content §4.4). Nested documents have their own destinations (`iframe`,
+/// `frame`), and are checked like any subresource.
+pub fn evaluate_for(
+    policy: MixedContentPolicy,
+    origin: Option<&Origin>,
+    url: &Url,
+    destination: RequestDestination,
+) -> MixedContentAction {
     let Some(origin) = origin else {
         return MixedContentAction::Allow;
     };
     if !is_origin_potentially_trustworthy(origin) || is_potentially_trustworthy(url) {
+        return MixedContentAction::Allow;
+    }
+    if destination == RequestDestination::Document && policy == MixedContentPolicy::Block {
         return MixedContentAction::Allow;
     }
 
@@ -291,6 +313,32 @@ mod tests {
         assert!(is_potentially_trustworthy(
             &Url::parse("file:///home/me/index.html").unwrap()
         ));
+    }
+
+    /// Mixed Content §4.4: a top-level navigation is not mixed content. An `iframe` is, and so
+    /// is a request of unknown destination.
+    #[test]
+    fn a_top_level_navigation_is_not_mixed_content() {
+        let doc = origin("https://example.com");
+        let target = url("http://insecure.example.com/");
+        let verdict =
+            |destination| evaluate_for(MixedContentPolicy::Block, Some(&doc), &target, destination);
+        assert_eq!(
+            verdict(RequestDestination::Document),
+            MixedContentAction::Allow
+        );
+        assert_eq!(
+            verdict(RequestDestination::Iframe),
+            MixedContentAction::Block
+        );
+        assert_eq!(
+            verdict(RequestDestination::Script),
+            MixedContentAction::Block
+        );
+        assert_eq!(
+            evaluate(MixedContentPolicy::Block, Some(&doc), &target),
+            MixedContentAction::Block
+        );
     }
 
     #[test]

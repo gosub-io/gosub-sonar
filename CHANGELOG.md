@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `mixed_content::evaluate_for`: the mixed content check for a request with a known
+  destination. `evaluate` keeps its signature and judges a request of no particular kind
+
 ### Fixed
 
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued
@@ -96,6 +101,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `localhost.` and `*.localhost.`, the fully qualified forms with a trailing dot, were not
   potentially trustworthy, so a secure page's request to them was blocked as mixed content and
   a referrer from them was not treated as leaving a secure origin (secure contexts §3.1)
+- Mixed content: a top-level navigation from an `https` document to an `http` URL was
+  blocked when the request carried the document's origin, so following a plain link or an
+  `https` page's redirect to `http` failed. A request with destination `document` is not mixed
+  content (Mixed Content §4.4); `iframe` and `frame` still are
 
 ## [0.12.0] - 2026-10-10
 
