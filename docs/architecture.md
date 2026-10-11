@@ -271,7 +271,8 @@ fetch runs as a stream. Then in `Waiter::finish`:
 - A **`Buffered`** result is sent to every listener as-is.
 - A **`Stream`** result is cloned to streaming listeners, and for buffered listeners the
   `SharedBody` is drained to its end into a single `Bytes` via `stream_to_bytes`. There is never a
-  second network request or a second copy of the body.
+  second network request or a second copy of the body. The buffered listeners stay registered
+  until the body is in, so one that cancels meanwhile is still answered at once.
 
 ---
 
@@ -315,10 +316,13 @@ file on disk — writing to a temp file and atomically renaming on success (see 
 Cancellation is layered with `tokio_util::sync::CancellationToken`:
 
 - Each subscriber passes its own `CancellationToken` to `submit`; when a caller cancels, its
-  listener is removed and the subscriber count drops. Cancelling one caller does not cancel the
-  shared fetch.
+  listener is removed, it is answered at once with `NetError::Cancelled`, and the subscriber
+  count drops. Cancelling one caller does not cancel the shared fetch, and does not keep that
+  caller waiting for it either. A caller whose token fires after the result was handed to it
+  keeps the result.
 - The `FetchInflightEntry::parent_cancel` fires only when the *last* subscriber cancels, aborting
-  the shared fetch.
+  the shared fetch. A request that arrives while that fetch winds down does not join it: it
+  takes its place in `inflight_map` and starts a fresh one.
 - A `shutdown` token passed to `Fetcher::run` stops the whole scheduler and ends every wait for
   a slot.
 

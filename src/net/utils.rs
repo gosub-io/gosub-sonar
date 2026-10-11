@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncReadExt, ReadBuf};
 use tokio::sync::oneshot;
@@ -106,6 +107,8 @@ impl tokio::io::AsyncRead for BytesAsyncReader {
 
 /// An entry in the waiter, representing a listener and whether it wants streaming or buffered response.
 struct WaiterEntry {
+    /// Names the entry, so one listener can be taken out again (see [`Waiter::cancel`]).
+    id: u64,
     /// Listener for this entry.
     tx: oneshot::Sender<FetchResult>,
     /// Whether the listener wants a streaming response (true) or buffered (false).
@@ -121,12 +124,15 @@ pub struct Waiter {
     /// List of listeners (oneshot senders) waiting for the result.
     /// Uses a non-async mutex so register() is synchronous and never needs to be awaited.
     listeners: Mutex<Vec<WaiterEntry>>,
+    /// The id the next registration gets.
+    next_id: AtomicU64,
 }
 
 impl Waiter {
     pub fn new() -> Self {
         Self {
             listeners: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(0),
         }
     }
 
@@ -136,32 +142,53 @@ impl Waiter {
     }
 
     /// Register a consumer for this waiter. We need to know if the consumer is streaming or not.
+    /// Returns the listener's id, for [`cancel`](Self::cancel).
     ///
     /// This is a plain (non-async) call — the lock is held only for the duration of the push.
-    pub fn register(&self, tx: oneshot::Sender<FetchResult>, wants_streaming: bool) {
+    pub fn register(&self, tx: oneshot::Sender<FetchResult>, wants_streaming: bool) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.listeners.lock().push(WaiterEntry {
+            id,
             tx,
             wants_streaming,
         });
+        id
+    }
+
+    /// Takes one listener out and answers it with `err` at once, so a caller that gives up
+    /// stops waiting even while others still wait for the same fetch.
+    ///
+    /// Does nothing when the listener is no longer registered: [`finish`](Self::finish) already
+    /// took it, and it gets (or has) the result. Returns whether the listener was taken out.
+    pub fn cancel(&self, id: u64, err: NetError) -> bool {
+        let entry = {
+            let mut ls = self.listeners.lock();
+            ls.iter().position(|e| e.id == id).map(|at| ls.remove(at))
+        };
+        match entry {
+            Some(entry) => {
+                let _ = entry.tx.send(FetchResult::Error(err));
+                true
+            }
+            None => false,
+        }
     }
 
     /// Process the fetch result with the listeners.
     ///
-    /// Drains the listener list under the lock, releases the lock, then delivers results.
+    /// Takes the listeners out under the lock, releases the lock, then delivers results.
     /// The lock is never held across I/O so slow body streaming does not block new registrations.
+    ///
+    /// A streamed result reaches the streaming listeners at once. The buffered ones stay
+    /// registered while the body is collected for them, so one that gives up meanwhile is still
+    /// answered by [`cancel`](Self::cancel) at once instead of waiting for the whole body.
     ///
     /// `buffered_cap` bounds the body a buffered listener of a streamed result collects.
     pub async fn finish(self: &Arc<Self>, result: FetchResult, buffered_cap: Option<usize>) {
-        // Drain under lock, release before any async I/O
-        let ls: Vec<WaiterEntry> = self.listeners.lock().drain(..).collect();
-
         match result {
             FetchResult::Buffered { meta, body } => {
-                let res = FetchResult::Buffered {
-                    meta: meta.clone(),
-                    body: body.clone(),
-                };
-                for entry in ls {
+                let res = FetchResult::Buffered { meta, body };
+                for entry in self.take_all() {
                     let _ = entry.tx.send(res.clone());
                 }
             }
@@ -170,56 +197,50 @@ impl Waiter {
                 peek_buf,
                 shared,
             } => {
-                let mut streaming_ls = Vec::new();
-                let mut buffered_ls = Vec::new();
-                for entry in ls {
-                    if entry.wants_streaming {
-                        streaming_ls.push(entry.tx);
-                    } else {
-                        buffered_ls.push(entry.tx);
-                    }
-                }
+                let (streaming_ls, any_buffered) = {
+                    let mut ls = self.listeners.lock();
+                    let (streaming, buffered): (Vec<_>, Vec<_>) =
+                        ls.drain(..).partition(|e| e.wants_streaming);
+                    *ls = buffered;
+                    (streaming, !ls.is_empty())
+                };
 
                 // Every listener gets the body from the beginning, however late it subscribes,
                 // up to the SharedBody's replay limit (past it, an error).
-                for tx in streaming_ls {
+                for entry in streaming_ls {
                     let res = FetchResult::Stream {
                         meta: meta.clone(),
                         peek_buf: peek_buf.clone(),
                         shared: shared.clone(),
                     };
-                    let _ = tx.send(res);
+                    let _ = entry.tx.send(res);
                 }
 
-                // Lock is released; stream I/O happens without blocking register()
-                if !buffered_ls.is_empty() {
-                    match stream_to_bytes(peek_buf, shared, buffered_cap).await {
-                        Ok(b) => {
-                            let res = FetchResult::Buffered {
-                                meta: meta.clone(),
-                                body: b,
-                            };
-                            for tx in buffered_ls {
-                                let _ = tx.send(res.clone());
-                            }
-                        }
-                        Err(e) => {
-                            // `e` is already a typed NetError — pass it through unwrapped.
-                            let res = FetchResult::Error(e);
-                            for tx in buffered_ls {
-                                let _ = tx.send(res.clone());
-                            }
-                        }
+                // Lock is released; stream I/O happens without blocking register() or cancel()
+                if any_buffered {
+                    let res = match stream_to_bytes(peek_buf, shared, buffered_cap).await {
+                        Ok(b) => FetchResult::Buffered { meta, body: b },
+                        // `e` is already a typed NetError — pass it through unwrapped.
+                        Err(e) => FetchResult::Error(e),
+                    };
+                    // Whoever did not cancel while the body was read.
+                    for entry in self.take_all() {
+                        let _ = entry.tx.send(res.clone());
                     }
                 }
             }
             FetchResult::Error(e) => {
-                let res = FetchResult::Error(e.clone());
-                for entry in ls {
+                let res = FetchResult::Error(e);
+                for entry in self.take_all() {
                     let _ = entry.tx.send(res.clone());
                 }
             }
         }
+    }
+
+    /// Takes every listener out, under the lock.
+    fn take_all(&self) -> Vec<WaiterEntry> {
+        self.listeners.lock().drain(..).collect()
     }
 }
 
@@ -384,6 +405,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn waiter_cancel_answers_one_listener_and_keeps_the_rest() {
+        let waiter = Waiter::new_arc();
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        let first = waiter.register(tx1, false);
+        waiter.register(tx2, false);
+
+        assert!(waiter.cancel(first, NetError::Cancelled("gave up".into())));
+        // The cancelled listener hears now, before any result exists.
+        assert!(matches!(
+            rx1.await.unwrap(),
+            FetchResult::Error(NetError::Cancelled(_))
+        ));
+
+        waiter
+            .finish(
+                FetchResult::Buffered {
+                    meta: dummy_meta(),
+                    body: Bytes::from_static(b"BODY"),
+                },
+                None,
+            )
+            .await;
+        assert!(matches!(rx2.await.unwrap(), FetchResult::Buffered { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiter_cancel_after_finish_leaves_the_result() {
+        let waiter = Waiter::new_arc();
+        let (tx, rx) = oneshot::channel();
+        let id = waiter.register(tx, false);
+        waiter
+            .finish(
+                FetchResult::Buffered {
+                    meta: dummy_meta(),
+                    body: Bytes::from_static(b"BODY"),
+                },
+                None,
+            )
+            .await;
+
+        assert!(!waiter.cancel(id, NetError::Cancelled("too late".into())));
+        assert!(matches!(rx.await.unwrap(), FetchResult::Buffered { .. }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn waiter_finishes_buffered_to_all() {
         let waiter = Waiter::new_arc();
         let (tx1, rx1) = oneshot::channel();
@@ -474,6 +541,51 @@ mod tests {
                 assert_eq!(&body[..], b"PEEK-TAIL1TAIL2");
             }
             _ => panic!("expected buffered"),
+        }
+    }
+
+    /// A buffered listener of a streamed result that gives up while the body is still being
+    /// read is answered at once; the one that stays gets the whole body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiter_buffered_listener_can_cancel_while_the_body_is_read() {
+        let waiter = Waiter::new_arc();
+        let (tx_quit, rx_quit) = oneshot::channel();
+        let (tx_stay, rx_stay) = oneshot::channel();
+        let quitter = waiter.register(tx_quit, false);
+        waiter.register(tx_stay, false);
+
+        let shared = Arc::new(SharedBody::new(8));
+        let finishing = tokio::spawn({
+            let (waiter, shared) = (waiter.clone(), shared.clone());
+            async move {
+                waiter
+                    .finish(
+                        FetchResult::Stream {
+                            meta: dummy_meta(),
+                            peek_buf: PeekBuf::from_slice(b"PEEK-"),
+                            shared,
+                        },
+                        None,
+                    )
+                    .await
+            }
+        });
+        // finish() is now reading a body that has not ended.
+        sleep(Duration::from_millis(10)).await;
+        assert!(!finishing.is_finished());
+
+        assert!(waiter.cancel(quitter, NetError::Cancelled("gave up".into())));
+        assert!(matches!(
+            rx_quit.await.unwrap(),
+            FetchResult::Error(NetError::Cancelled(_))
+        ));
+
+        shared.push(Bytes::from_static(b"TAIL"));
+        shared.finish();
+        finishing.await.unwrap();
+        match rx_stay.await.unwrap() {
+            FetchResult::Buffered { body, .. } => assert_eq!(&body[..], b"PEEK-TAIL"),
+            other => panic!("expected buffered, got {other:?}"),
         }
     }
 
