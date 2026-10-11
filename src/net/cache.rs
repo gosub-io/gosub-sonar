@@ -55,8 +55,10 @@ const HEURISTIC_MAX_SECS: i64 = 24 * 60 * 60;
 /// "heuristically cacheable"). `206` is absent: partial responses need range support.
 const DEFAULT_CACHEABLE: &[u16] = &[200, 203, 204, 300, 301, 308, 404, 405, 410, 414, 501];
 
-/// Headers that describe the connection rather than the response, and are never stored
-/// (RFC 9110 §7.6.1).
+/// Headers that describe the connection rather than the response (RFC 9110 §7.6.1), or the proxy
+/// the request went through, and are never stored. RFC 9111 §3.1 names the proxy ones:
+/// `Proxy-Authenticate`, `Proxy-Authorization`, and [`PROXY_AUTHENTICATION_INFO`], which has no
+/// constant in `http` and so is checked by name.
 const HOP_BY_HOP: &[HeaderName] = &[
     header::CONNECTION,
     header::PROXY_AUTHENTICATE,
@@ -66,6 +68,9 @@ const HOP_BY_HOP: &[HeaderName] = &[
     header::TRANSFER_ENCODING,
     header::UPGRADE,
 ];
+
+/// `Proxy-Authentication-Info` (RFC 9110 §11.7.3), never stored either; see [`HOP_BY_HOP`].
+const PROXY_AUTHENTICATION_INFO: &str = "proxy-authentication-info";
 
 /// How a request uses the cache, mirroring the Fetch standard's request cache mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -313,6 +318,7 @@ impl CacheEntry {
             // claim the stored bytes no longer meet (RFC 9111 §3.2: the fields the stored
             // response depends on are not updated).
             if HOP_BY_HOP.contains(name)
+                || name == PROXY_AUTHENTICATION_INFO
                 || name == header::CONTENT_LENGTH
                 || name == header::SET_COOKIE
                 || (self.decoded && name == header::CONTENT_ENCODING)
@@ -534,6 +540,7 @@ pub fn entry_from_response(
     for name in HOP_BY_HOP {
         headers.remove(name);
     }
+    headers.remove(PROXY_AUTHENTICATION_INFO);
     // A cache hit must not re-apply a cookie the jar has long since stored or dropped.
     headers.remove(header::SET_COOKIE);
     if decoded {
@@ -1654,6 +1661,22 @@ mod tests {
             stored.headers.get(header::CONTENT_TYPE).unwrap(),
             "text/html"
         );
+
+        // RFC 9111 §3.1: the headers of the proxy a request went through are not stored either.
+        let stored = entry(&[
+            ("cache-control", "max-age=60"),
+            ("proxy-authenticate", "Basic realm=\"p\""),
+            ("proxy-authentication-info", "nextnonce=\"n\""),
+        ]);
+        assert!(!stored.headers.contains_key(header::PROXY_AUTHENTICATE));
+        assert!(!stored.headers.contains_key("proxy-authentication-info"));
+        // Nor does a 304 bring one in.
+        let updated = stored.updated_by_304(
+            &headers(&[("proxy-authentication-info", "nextnonce=\"m\"")]),
+            at(1),
+            at(1),
+        );
+        assert!(!updated.headers.contains_key("proxy-authentication-info"));
     }
 
     #[test]

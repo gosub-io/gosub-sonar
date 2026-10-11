@@ -58,6 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache: a `304` that repeated `Content-Encoding` put it back on a stored body that had
   been decoded, so later hits claimed an encoding their bytes did not have. A decoded entry keeps
   its encoding headers off (RFC 9111 §3.2)
+- Cache: `Proxy-Authentication-Info` was stored with a response, though RFC 9111 §3.1 says the
+  headers of the proxy a request went through must not be
 
 ## [0.12.0] - 2026-10-10
 
