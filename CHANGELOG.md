@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `mixed_content::evaluate_for`: the mixed content check for a request with a known
   destination. `evaluate` keeps its signature and judges a request of no particular kind
 
+### Changed
+
+- Mixed content: the default `MixedContentPolicy::Block` follows Mixed Content Level 2. An
+  `http` image, audio or video request from a secure document is fetched over `https` instead
+  of being blocked, unless its host is an IP address; everything else is still blocked. Before,
+  every such request was blocked and an embedder had to classify images itself, which
+  `ResourceKind` could not
+
 ### Fixed
 
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued

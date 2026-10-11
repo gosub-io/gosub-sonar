@@ -4582,6 +4582,44 @@ mod tests {
         );
     }
 
+    /// Mixed Content §4.1: under the default policy, an `http` image on a secure page is fetched
+    /// over `https` instead of being blocked; a script at the same URL is blocked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_insecure_image_is_upgraded_by_default() {
+        let outcome = |destination| async move {
+            let rec = Arc::new(RecordingObserver::new());
+            let init = RequestInit::get(HeaderMap::new())
+                .with_mixed_content(
+                    Some(Url::parse("https://example.com/").unwrap().origin()),
+                    MixedContentPolicy::default(),
+                )
+                .with_fetch_metadata(destination, RequestMode::NoCors, false);
+            // Nothing listens there; what matters is what was decided before the send.
+            let _ = super::fetch_response_top(
+                client(),
+                Url::parse("http://cdn.invalid/cat.png").unwrap(),
+                init,
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await;
+            (rec.blocked_reason(), rec.upgrades())
+        };
+        let (blocked, upgrades) = outcome(RequestDestination::Image).await;
+        assert_eq!(blocked, None);
+        assert_eq!(
+            upgrades,
+            vec![(
+                "http://cdn.invalid/cat.png".to_string(),
+                "https://cdn.invalid/cat.png".to_string(),
+                UpgradeReason::MixedContent
+            )]
+        );
+        let (blocked, _) = outcome(RequestDestination::Script).await;
+        assert_eq!(blocked, Some(BlockReason::MixedContent));
+    }
+
     /// Fetch, main fetch: the referrer is determined (step 9) before HSTS rewrites the URL
     /// (step 11). An `https` document requesting `http://` on an HSTS host is a downgrade for the
     /// referrer, so `strict-origin-when-cross-origin` sends none, though the request itself goes
