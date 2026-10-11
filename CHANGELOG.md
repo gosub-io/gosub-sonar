@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** the minimum supported Rust version is 1.92, up from 1.88, the same as
+  gosub-engine's. Dependencies have started to need newer compilers (`uuid` 1.27 needs 1.89),
+  and one floor across the gosub crates is one toolchain to test
 - Mixed content: the default `MixedContentPolicy::Block` follows Mixed Content Level 2. An
   `http` image, audio or video request from a secure document is fetched over `https` instead
   of being blocked, unless its host is an IP address; everything else is still blocked. Before,

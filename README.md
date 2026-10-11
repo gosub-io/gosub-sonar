@@ -404,7 +404,7 @@ native only.
   integration tests. Native only.
 - `socks` — `socks4://`, `socks5://` and `socks5h://` proxy URLs.
 
-Minimum supported Rust version: 1.88.
+Minimum supported Rust version: 1.92.
 
 ## Examples
 
