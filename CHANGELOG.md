@@ -167,6 +167,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`[::1]`), an entry with a port (`localhost:8080`), and a request to a name with a trailing dot
   (`example.com.`). Traffic the user meant to keep off the proxy went through it. They match
   now; an entry with a port bypasses that port only, as Go's proxy settings do
+- Coalescing: two GET requests whose bodies had the same bytes but a different
+  `Content-Type` (`RequestBody::json` and `RequestBody::form`) shared one fetch, though they
+  send different requests. The body's content type is part of the key now
 
 ## [0.12.0] - 2026-10-10
 

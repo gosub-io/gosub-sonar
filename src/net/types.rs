@@ -841,8 +841,14 @@ impl FetchRequest {
         };
         let body = match &self.body {
             None => "n".to_string(),
-            // A streamed body cannot be compared, so the request goes on its own.
-            Some(b) => format!("{:x}", short_hash(b.as_bytes()?)),
+            // A streamed body cannot be compared, so the request goes on its own. The body's
+            // `Content-Type` goes out with it (unless a header sets one), so the same bytes as
+            // JSON and as a form are different requests.
+            Some(b) => format!(
+                "{:x}:{:x}",
+                short_hash(b.as_bytes()?),
+                short_hash(b.content_type.as_deref().unwrap_or("").as_bytes())
+            ),
         };
         let max_bytes = self.max_bytes.map_or("n".to_string(), |m| m.to_string());
 
@@ -1652,6 +1658,17 @@ mod tests {
         assert_ne!(
             key_for(FetchRequest::builder(Method::GET, url.clone()).with_max_bytes(1024)).unwrap(),
             plain
+        );
+        // The same bytes with another `Content-Type` are another request on the wire.
+        assert_ne!(
+            key_for(
+                FetchRequest::builder(Method::GET, url.clone()).with_body(RequestBody::json("{}"))
+            )
+            .unwrap(),
+            key_for(
+                FetchRequest::builder(Method::GET, url.clone()).with_body(RequestBody::form("{}"))
+            )
+            .unwrap()
         );
         #[cfg(not(target_arch = "wasm32"))]
         assert!(
