@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end, failed, or given up), not when its headers arrive. It tracks outstanding work, and a
   download still under way is that: before, a loading indicator driven by it cleared while the
   body was still coming
+- **Breaking:** `RequestDestination` and `RequestMode` are `#[non_exhaustive]`. Fetch adds to
+  both (`webidentity`, `webtransport`), and adding a value should not break a `match`
+  downstream again; a `match` on either needs a `_` arm once
 
 ### Fixed
 
