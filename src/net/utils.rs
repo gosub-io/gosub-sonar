@@ -176,21 +176,19 @@ impl Waiter {
 
     /// Process the fetch result with the listeners.
     ///
-    /// Drains the listener list under the lock, releases the lock, then delivers results.
+    /// Takes the listeners out under the lock, releases the lock, then delivers results.
     /// The lock is never held across I/O so slow body streaming does not block new registrations.
+    ///
+    /// A streamed result reaches the streaming listeners at once. The buffered ones stay
+    /// registered while the body is collected for them, so one that gives up meanwhile is still
+    /// answered by [`cancel`](Self::cancel) at once instead of waiting for the whole body.
     ///
     /// `buffered_cap` bounds the body a buffered listener of a streamed result collects.
     pub async fn finish(self: &Arc<Self>, result: FetchResult, buffered_cap: Option<usize>) {
-        // Drain under lock, release before any async I/O
-        let ls: Vec<WaiterEntry> = self.listeners.lock().drain(..).collect();
-
         match result {
             FetchResult::Buffered { meta, body } => {
-                let res = FetchResult::Buffered {
-                    meta: meta.clone(),
-                    body: body.clone(),
-                };
-                for entry in ls {
+                let res = FetchResult::Buffered { meta, body };
+                for entry in self.take_all() {
                     let _ = entry.tx.send(res.clone());
                 }
             }
@@ -199,56 +197,50 @@ impl Waiter {
                 peek_buf,
                 shared,
             } => {
-                let mut streaming_ls = Vec::new();
-                let mut buffered_ls = Vec::new();
-                for entry in ls {
-                    if entry.wants_streaming {
-                        streaming_ls.push(entry.tx);
-                    } else {
-                        buffered_ls.push(entry.tx);
-                    }
-                }
+                let (streaming_ls, any_buffered) = {
+                    let mut ls = self.listeners.lock();
+                    let (streaming, buffered): (Vec<_>, Vec<_>) =
+                        ls.drain(..).partition(|e| e.wants_streaming);
+                    *ls = buffered;
+                    (streaming, !ls.is_empty())
+                };
 
                 // Every listener gets the body from the beginning, however late it subscribes,
                 // up to the SharedBody's replay limit (past it, an error).
-                for tx in streaming_ls {
+                for entry in streaming_ls {
                     let res = FetchResult::Stream {
                         meta: meta.clone(),
                         peek_buf: peek_buf.clone(),
                         shared: shared.clone(),
                     };
-                    let _ = tx.send(res);
+                    let _ = entry.tx.send(res);
                 }
 
-                // Lock is released; stream I/O happens without blocking register()
-                if !buffered_ls.is_empty() {
-                    match stream_to_bytes(peek_buf, shared, buffered_cap).await {
-                        Ok(b) => {
-                            let res = FetchResult::Buffered {
-                                meta: meta.clone(),
-                                body: b,
-                            };
-                            for tx in buffered_ls {
-                                let _ = tx.send(res.clone());
-                            }
-                        }
-                        Err(e) => {
-                            // `e` is already a typed NetError — pass it through unwrapped.
-                            let res = FetchResult::Error(e);
-                            for tx in buffered_ls {
-                                let _ = tx.send(res.clone());
-                            }
-                        }
+                // Lock is released; stream I/O happens without blocking register() or cancel()
+                if any_buffered {
+                    let res = match stream_to_bytes(peek_buf, shared, buffered_cap).await {
+                        Ok(b) => FetchResult::Buffered { meta, body: b },
+                        // `e` is already a typed NetError — pass it through unwrapped.
+                        Err(e) => FetchResult::Error(e),
+                    };
+                    // Whoever did not cancel while the body was read.
+                    for entry in self.take_all() {
+                        let _ = entry.tx.send(res.clone());
                     }
                 }
             }
             FetchResult::Error(e) => {
-                let res = FetchResult::Error(e.clone());
-                for entry in ls {
+                let res = FetchResult::Error(e);
+                for entry in self.take_all() {
                     let _ = entry.tx.send(res.clone());
                 }
             }
         }
+    }
+
+    /// Takes every listener out, under the lock.
+    fn take_all(&self) -> Vec<WaiterEntry> {
+        self.listeners.lock().drain(..).collect()
     }
 }
 
@@ -549,6 +541,51 @@ mod tests {
                 assert_eq!(&body[..], b"PEEK-TAIL1TAIL2");
             }
             _ => panic!("expected buffered"),
+        }
+    }
+
+    /// A buffered listener of a streamed result that gives up while the body is still being
+    /// read is answered at once; the one that stays gets the whole body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn waiter_buffered_listener_can_cancel_while_the_body_is_read() {
+        let waiter = Waiter::new_arc();
+        let (tx_quit, rx_quit) = oneshot::channel();
+        let (tx_stay, rx_stay) = oneshot::channel();
+        let quitter = waiter.register(tx_quit, false);
+        waiter.register(tx_stay, false);
+
+        let shared = Arc::new(SharedBody::new(8));
+        let finishing = tokio::spawn({
+            let (waiter, shared) = (waiter.clone(), shared.clone());
+            async move {
+                waiter
+                    .finish(
+                        FetchResult::Stream {
+                            meta: dummy_meta(),
+                            peek_buf: PeekBuf::from_slice(b"PEEK-"),
+                            shared,
+                        },
+                        None,
+                    )
+                    .await
+            }
+        });
+        // finish() is now reading a body that has not ended.
+        sleep(Duration::from_millis(10)).await;
+        assert!(!finishing.is_finished());
+
+        assert!(waiter.cancel(quitter, NetError::Cancelled("gave up".into())));
+        assert!(matches!(
+            rx_quit.await.unwrap(),
+            FetchResult::Error(NetError::Cancelled(_))
+        ));
+
+        shared.push(Bytes::from_static(b"TAIL"));
+        shared.finish();
+        finishing.await.unwrap();
+        match rx_stay.await.unwrap() {
+            FetchResult::Buffered { body, .. } => assert_eq!(&body[..], b"PEEK-TAIL"),
+            other => panic!("expected buffered, got {other:?}"),
         }
     }
 

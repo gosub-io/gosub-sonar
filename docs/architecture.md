@@ -271,7 +271,8 @@ fetch runs as a stream. Then in `Waiter::finish`:
 - A **`Buffered`** result is sent to every listener as-is.
 - A **`Stream`** result is cloned to streaming listeners, and for buffered listeners the
   `SharedBody` is drained to its end into a single `Bytes` via `stream_to_bytes`. There is never a
-  second network request or a second copy of the body.
+  second network request or a second copy of the body. The buffered listeners stay registered
+  until the body is in, so one that cancels meanwhile is still answered at once.
 
 ---
 
