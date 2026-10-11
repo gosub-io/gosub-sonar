@@ -65,6 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now add what Fetch adds (HTTP-network-or-cache fetch): `Cache-Control: max-age=0` for
   `NoCache`, `Pragma: no-cache` and `Cache-Control: no-cache` for the other two, unless the
   caller set those headers. Neither triggers a CORS preflight
+- Cache: a `max-age` that was not a number of seconds (`max-age=abc`) was ignored, and the
+  response was then fresh by its `Expires` or the `Last-Modified` heuristic. It counts as
+  `max-age=0` now, as RFC 9111 §4.2.1 encourages and browsers do
 
 ## [0.12.0] - 2026-10-10
 

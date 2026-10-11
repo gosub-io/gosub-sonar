@@ -377,7 +377,10 @@ impl ResponseDirectives {
     /// Parse the `Cache-Control` field lines of a response.
     ///
     /// A `max-age` given more than once counts the first time only (RFC 9111 §4.2.1), so a
-    /// later `max-age=31536000` cannot extend an earlier `max-age=0`.
+    /// later `max-age=31536000` cannot extend an earlier `max-age=0`. One that is not a number of
+    /// seconds (`max-age=abc`, `max-age=-1`, a bare `max-age`) counts as `max-age=0`: the server
+    /// meant to say something about freshness, and §4.2.1 encourages taking that as stale
+    /// rather than falling back to `Expires` or a guess.
     pub fn parse(headers: &HeaderMap) -> Self {
         let mut out = Self::default();
         let mut max_age_seen = false;
@@ -393,7 +396,7 @@ impl ResponseDirectives {
                 "public" => out.public = true,
                 "max-age" if !max_age_seen => {
                     max_age_seen = true;
-                    out.max_age = value.and_then(|v| delta_seconds(&v));
+                    out.max_age = Some(value.and_then(|v| delta_seconds(&v)).unwrap_or(0));
                 }
                 _ => {}
             }
@@ -1430,6 +1433,21 @@ mod tests {
         assert!(!decoded.headers.contains_key(header::CONTENT_ENCODING));
         let raw = stored(false).updated_by_304(&confirmation, at(100), at(100));
         assert_eq!(raw.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
+    }
+
+    /// RFC 9111 §4.2.1: a response with invalid freshness information is taken as stale. An
+    /// unparsable `max-age` does not fall through to `Expires` or the `Last-Modified` heuristic.
+    #[test]
+    fn an_invalid_max_age_is_stale() {
+        for max_age in ["max-age=abc", "max-age=-1", "max-age=1.5", "max-age"] {
+            let e = entry(&[
+                ("cache-control", max_age),
+                ("date", &http_date(at(0))),
+                ("expires", &http_date(at(600))),
+                ("last-modified", &http_date(at(-365 * 24 * 3600))),
+            ]);
+            assert!(!e.is_fresh(at(10)), "{max_age}");
+        }
     }
 
     #[test]
