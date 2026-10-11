@@ -1721,9 +1721,17 @@ async fn get_with_redirects(
         // (possibly upgraded) URL and runs `url_allowed` last, so the policy hook always vets the
         // URL actually sent. All of this re-runs on every hop: an https document may be redirected
         // onto plain http, which the caller cannot see and so cannot check for itself.
+        //
+        // The URL as it stood before an HSTS rewrite is kept for the referrer: Fetch determines
+        // the referrer (main fetch step 9) before it applies HSTS (step 11), so an `https`
+        // document linking to `http://` is a downgrade for the referrer even when HSTS then sends
+        // the request over TLS.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut before_hsts: Option<Url> = None;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(ref store) = policy.hsts {
             if hsts::should_upgrade(store.as_ref(), &url, chrono::Utc::now()) {
+                before_hsts = Some(url.clone());
                 let upgraded = hsts::upgrade(&url);
                 observer.on_event(NetEvent::SecurityUpgraded {
                     from: url.clone(),
@@ -1815,11 +1823,22 @@ async fn get_with_redirects(
             }
         }
 
-        // Recomputed per hop from what the last hop sent; see `chain_referrer`.
+        // Recomputed per hop from what the last hop sent; see `chain_referrer`. Judged against
+        // the URL before any HSTS rewrite, with only a mixed content upgrade applied, which
+        // Fetch makes first (main fetch step 6); see `before_hsts`.
         if let Some(ref source) = init.referrer {
-            let determined = chain_referrer
-                .as_ref()
-                .and_then(|current| referrer::determine(current, referrer_policy, &url));
+            let referrer_target = match before_hsts {
+                Some(ref plain) => {
+                    match mixed_content::evaluate(init.mixed_content, origin.as_ref(), plain) {
+                        MixedContentAction::Upgrade(upgraded) => upgraded,
+                        _ => plain.clone(),
+                    }
+                }
+                None => url.clone(),
+            };
+            let determined = chain_referrer.as_ref().and_then(|current| {
+                referrer::determine(current, referrer_policy, &referrer_target)
+            });
             let sent = match determined {
                 Some(value) => match value.as_str().parse() {
                     Ok(header_value) => {
@@ -4520,6 +4539,56 @@ mod tests {
                 "{policy}"
             );
         }
+    }
+
+    /// Fetch, main fetch: the referrer is determined (step 9) before HSTS rewrites the URL
+    /// (step 11). An `https` document requesting `http://` on an HSTS host is a downgrade for the
+    /// referrer, so `strict-origin-when-cross-origin` sends none, though the request itself goes
+    /// out over TLS. With the URL already `https`, the origin is sent as usual.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_referrer_is_judged_before_the_hsts_upgrade() {
+        let store = Arc::new(crate::net::hsts::InMemoryHstsStore::new());
+        crate::net::hsts::HstsStore::store(
+            store.as_ref(),
+            "hsts.test",
+            crate::net::hsts::HstsEntry {
+                expires_at: chrono::Utc::now() + chrono::Duration::days(30),
+                include_subdomains: false,
+            },
+        );
+        let sent = |target: &'static str| {
+            let store = store.clone();
+            async move {
+                let rec = Arc::new(RecordingObserver::new());
+                let init = RequestInit::get(HeaderMap::new()).with_referrer(
+                    Some(Url::parse("https://example.com/page").unwrap()),
+                    ReferrerPolicy::StrictOriginWhenCrossOrigin,
+                );
+                // Nothing listens there; the referrer is decided before the send fails.
+                let _ = super::fetch_response_top(
+                    client(),
+                    Url::parse(target).unwrap(),
+                    init,
+                    CancellationToken::new(),
+                    rec.clone(),
+                    NetPolicy::default().with_hsts(Some(store)),
+                )
+                .await;
+                rec.modifications()
+                    .into_iter()
+                    .find_map(|(_, change)| match change {
+                        RequestChange::ReferrerReduced { to, .. } => {
+                            Some(to.map(|u| u.to_string()))
+                        }
+                        _ => None,
+                    })
+            }
+        };
+        assert_eq!(sent("http://hsts.test/x").await, Some(None));
+        assert_eq!(
+            sent("https://hsts.test/x").await,
+            Some(Some("https://example.com/".to_string()))
+        );
     }
 
     /// Fetch, main fetch step 9: once a hop determines no referrer, the request's referrer is

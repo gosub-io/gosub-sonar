@@ -89,6 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the chain. A cross-origin server could recover the full document URL, query string included,
   by redirecting to itself with `Referrer-Policy: unsafe-url`. Each hop now starts from what
   the hop before it sent (Fetch, main fetch step 9)
+- Referrer: an `https` document requesting `http://` on an HSTS host was judged against the
+  upgraded `https` URL, so `strict-origin-when-cross-origin` sent the origin where browsers
+  send nothing. The referrer is decided before the HSTS rewrite now, as Fetch orders it (main
+  fetch steps 9 and 11)
 
 ## [0.12.0] - 2026-10-10
 
