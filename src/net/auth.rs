@@ -166,10 +166,18 @@ impl AuthChallenge {
 
     /// The protection space this challenge belongs to, i.e. the key credentials for it are
     /// stored under.
+    ///
+    /// Scheme names are case-insensitive (RFC 9110 §11.1), so an unknown scheme is keyed in
+    /// lowercase: `Newauth` and `NEWAUTH` are one space. The challenge keeps the server's
+    /// spelling for the header.
     pub fn protection_space(&self) -> ProtectionSpace {
+        let scheme = match &self.scheme {
+            AuthScheme::Other(name) => AuthScheme::Other(name.to_ascii_lowercase()),
+            known => known.clone(),
+        };
         ProtectionSpace {
             target: self.target,
-            scheme: self.scheme.clone(),
+            scheme,
             origin: match self.target {
                 AuthTarget::Server => Some(self.url.origin().ascii_serialization()),
                 AuthTarget::Proxy => self
@@ -648,6 +656,21 @@ mod tests {
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].scheme, AuthScheme::Basic);
         assert_eq!(c[0].realm.as_deref(), Some("Café"));
+    }
+
+    /// RFC 9110 §11.1: "It uses a case-insensitive token to identify the authentication scheme".
+    /// One unknown scheme in two spellings is one protection space; the challenge keeps the
+    /// spelling the server sent.
+    #[test]
+    fn an_unknown_scheme_is_one_protection_space_in_any_case() {
+        let lower = challenges(r#"Newauth realm="x""#);
+        let upper = challenges(r#"NEWAUTH realm="x""#);
+        assert_eq!(lower[0].protection_space(), upper[0].protection_space());
+        assert_eq!(upper[0].scheme.as_str(), "NEWAUTH");
+        assert_ne!(
+            lower[0].protection_space(),
+            challenges(r#"Otherauth realm="x""#)[0].protection_space()
+        );
     }
 
     #[test]

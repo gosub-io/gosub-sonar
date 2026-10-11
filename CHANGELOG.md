@@ -97,6 +97,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Auth: Basic credentials with a control character in the user-id or password (a tab, NUL,
   DEL) were encoded and sent, though RFC 7617 §2 says they MUST NOT contain any. Such
   credentials give no header now, like a colon in the user-id already did
+- Auth: an unknown scheme was keyed as spelled, so credentials stored for `Newauth` were not
+  found when the server wrote `NEWAUTH`, and the user was asked again. Scheme names are
+  case-insensitive (RFC 9110 §11.1); the protection space keys them in lowercase
 
 ## [0.12.0] - 2026-10-10
 
