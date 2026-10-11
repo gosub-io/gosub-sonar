@@ -367,7 +367,7 @@ connection goes to exactly the addresses it returns (a rebound name can't redire
 connection). Return `Err` to refuse a host. `url_allowed` checks URLs, the resolver checks
 addresses; a policy usually wants both. Native-only.
 
-Redirects are handled manually in `get_with_redirects` (up to `MAX_REDIRECTS` = 20 hops and
+Redirects are handled manually in `get_with_redirects` (up to `MAX_REDIRECTS` = 20 redirects and
 within `redirect_timeout`) with
 browser-matching semantics:
 

@@ -34,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (cache off, or the caller's own `If-None-Match`) failed with "redirect status 304 without
   Location header", as did a 300 without a `Location`; a 300 with one was followed. Only 301,
   302, 303, 307 and 308 are redirects now, as in Fetch; any other 3xx is returned to the caller
+- One redirect short of the limit: the chain made at most 20 requests, so it followed 19
+  redirects and failed on the 20th with "too many redirects". It follows 20 now, as Fetch does
+  and as the documentation says
 
 ## [0.12.0] - 2026-10-10
 

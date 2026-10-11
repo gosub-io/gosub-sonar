@@ -1704,8 +1704,10 @@ async fn get_with_redirects(
     // Armed by the first redirect; `None` until then, and for good without a budget.
     let mut redirect_deadline: Option<tokio::time::Instant> = None;
 
-    // `redirects` counts the redirects followed so far.
-    for redirects in 0..MAX_REDIRECTS {
+    // `redirects` counts the redirects followed so far. One request more than the limit: the
+    // chain may follow MAX_REDIRECTS redirects, and only a redirect after those is an error
+    // (Fetch, HTTP-redirect fetch: a network error when the count is already 20).
+    for redirects in 0..=MAX_REDIRECTS {
         // HSTS upgrade first: a stored policy forces `https` for a known host regardless of the
         // mixed-content setting. `hop_checks` then re-checks the scheme and mixed content on the
         // (possibly upgraded) URL and runs `url_allowed` last, so the policy hook always vets the
@@ -4121,6 +4123,37 @@ mod tests {
             .to_string()
             .cow_to_ascii_lowercase()
             .contains("redirect"));
+        // The first request and MAX_REDIRECTS redirects; the redirect after those is refused.
+        assert_eq!(srv.hit_count("/loop"), super::MAX_REDIRECTS + 1);
+    }
+
+    /// Exactly MAX_REDIRECTS redirects are followed; one more is an error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_redirect_limit_is_the_number_of_redirects_followed() {
+        let max = super::MAX_REDIRECTS;
+        // /c{n} redirects to /c{n-1}, so /c{n} is a chain of exactly n redirects.
+        let mut srv = TestServer::new().route("/c0", RouteConfig::ok(b"end"));
+        for n in 1..=max + 1 {
+            srv = srv.route(
+                &format!("/c{n}"),
+                RouteConfig::redirect_to(format!("/c{}", n - 1)),
+            );
+        }
+        let srv = srv.start().await;
+        let fetch = |n: usize| {
+            super::fetch_response_top(
+                client(),
+                srv.url(&format!("/c{n}")),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                observer(),
+                NetPolicy::default(),
+            )
+        };
+
+        let ResponseTop { meta, .. } = fetch(max).await.expect("a chain at the limit");
+        assert_eq!(meta.status, 200);
+        assert!(fetch(max + 1).await.is_err(), "one redirect over the limit");
     }
 
     #[tokio::test(flavor = "current_thread")]
