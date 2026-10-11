@@ -160,9 +160,9 @@ pub fn is_cors_safelisted_request_header(name: &HeaderName, value: &[u8]) -> boo
             if value.iter().copied().any(is_cors_unsafe_header_byte) {
                 return false;
             }
-            let Ok(s) = std::str::from_utf8(value) else {
-                return false;
-            };
+            // Isomorphic decode, one byte to one char, as Fetch has it: a parameter may carry
+            // bytes 0x80-0xFF, which are not UTF-8 but leave the MIME type's essence alone.
+            let s: String = value.iter().map(|&b| char::from(b)).collect();
             let essence = s
                 .split(';')
                 .next()
@@ -822,6 +822,16 @@ mod tests {
         assert!(!is_cors_safelisted_request_header(
             &n("range"),
             b"bytes=0-50,100-150"
+        ));
+        // Fetch §2.2.2: `Content-Type` is isomorphic decoded, so a byte above 0x7F in a
+        // parameter leaves `text/plain` safelisted.
+        assert!(is_cors_safelisted_request_header(
+            &n("content-type"),
+            b"text/plain;charset=\xE9"
+        ));
+        assert!(!is_cors_safelisted_request_header(
+            &n("content-type"),
+            b"text/pl\xE9in"
         ));
         // Fetch, parse a single range header value: a start past the end is failure. Compared
         // as numbers, of any length, not as text.

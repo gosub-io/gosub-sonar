@@ -111,6 +111,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CORS: `Range: bytes=5-1`, a start past the end, counted as CORS-safelisted and went to a
   cross-origin server without a preflight. It is not a range at all (Fetch, parse a single range
   header value)
+- CORS: a `Content-Type` with a byte above 0x7F in a parameter (`text/plain;charset=\xE9`)
+  was not CORS-safelisted, because it was read as UTF-8, and cost an unneeded preflight. It is
+  read byte for byte now, as Fetch's isomorphic decode does
 
 ## [0.12.0] - 2026-10-10
 
