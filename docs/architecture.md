@@ -330,7 +330,8 @@ Cancellation is layered with `tokio_util::sync::CancellationToken`:
 
 Retries (`retry.rs`): `perform_buffered` and `perform_streaming` wrap each attempt in
 `with_retries`, which re-sends after a backoff on a retryable error or status, idempotent methods
-only, honouring `Retry-After`. Streams are retried only until headers arrive.
+only, honouring `Retry-After`. Streams are retried until the start of the body (the peek) is
+in, since nothing has reached the caller before that; a stream that breaks later is not re-sent.
 
 Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enforced by `reqwest`
 (`req_timeout` is reqwest's total request timeout, so it covers the body as well as the headers);
@@ -594,15 +595,17 @@ cache hit is considered.
 ## Authentication challenges
 
 A `401` (origin server) or `407` (proxy) is retried as long as credentials for it can be found.
-`get_with_redirects` re-sends the hop, at most `MAX_AUTH_ATTEMPTS` times, and only a response that
-is not a challenge continues through the redirect chain. Every challenged response is reported as
+`get_with_redirects` re-sends the hop, at most `MAX_AUTH_ATTEMPTS` times for the server and as
+many for the proxy, and only a response that is not a challenge continues through the redirect
+chain. A hop through an authenticating proxy to a protected server carries both answers at once,
+`Proxy-Authorization` and `Authorization`. Every challenged response is reported as
 `NetEvent::AuthRequired`, answered or not.
 
 Per challenged hop, for each challenge in the order the server listed them:
 
 1. `FetcherConfig::credentials` (a `CredentialStore`, in-memory by default) is asked for the
-   challenge's `ProtectionSpace` — target + scheme + origin + realm, and for a proxy without the
-   origin, since a fetcher has one proxy configuration;
+   challenge's `ProtectionSpace` — target + scheme + origin + realm, where the origin is the
+   server's for a server challenge and the proxy's for a proxy challenge;
 2. otherwise `FetcherContext::on_auth_challenge(&challenge)` is asked, so an embedder can answer
    from its own password manager or refuse a scheme it cannot compute;
 3. the answer becomes an `Authorization` / `Proxy-Authorization` header (marked sensitive) and the
@@ -631,6 +634,13 @@ Two limits:
 Credentials do not survive a hop: the header is added to the send, not to the request, so a
 redirect starts from the caller's headers again (and `Authorization` is in
 `SENSITIVE_REDIRECT_HEADERS` for a hand-set one).
+
+A site already logged in to gets its `Basic` credentials with the first send instead of after a
+`401` every time, as browsers do. The store says what to send (`CredentialStore::upfront_for`):
+`InMemoryCredentialStore` sends a `Basic` server password to the origin it was accepted on, for
+paths at or below the directory where it was accepted (RFC 7617 §2.2), and nothing else. The
+same conditions apply as for answering a challenge, per hop, so a redirect to another origin
+finds nothing to send. A store that does not implement it keeps the challenge-first behaviour.
 
 ---
 

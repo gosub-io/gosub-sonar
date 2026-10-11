@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destination. `evaluate` keeps its signature and judges a request of no particular kind
 - `CorsPreflightCache::clear`, which drops the grants for one origin and URL. It has a default
   that does nothing, so existing implementations keep compiling
+- `CredentialStore::accepted_at` and `CredentialStore::upfront_for`, for sending credentials
+  before a challenge. Both have defaults that do nothing, so existing stores keep compiling and
+  keep the challenge-first behaviour
 
 ### Changed
 
@@ -24,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CORS: a preflight grant made with credentials also covers the same request without them, as
   Fetch's preflight cache matches, so a page mixing both is not asked twice. It is judged by
   the credentialed rules it was made under, where `*` is not a wildcard
+- Auth: `InMemoryCredentialStore` sends a `Basic` server password upfront, to the origin it was
+  accepted on, for paths at or below the directory where it was accepted (RFC 7617 §2.2), as
+  browsers do. A protected site no longer costs a `401` round trip on every request, nor a
+  request body sent twice
 - `FetcherContext::on_ref_done` for a streamed fetch fires when the stream ends (read to its
   end, failed, or given up), not when its headers arrive. It tracks outstanding work, and a
   download still under way is that: before, a loading indicator driven by it cleared while the
@@ -154,6 +161,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request, which is a matter of destination (`document`, `embed`, `frame`, `iframe`, `object`).
   A user-activated `embed` or `object` load went without it, and a navigate-mode request of
   another destination got it
+- Retry: `Retry-After` dates were only read in RFC 2822 form, so the RFC 850 and asctime
+  forms, which RFC 9110 §5.6.7 says a recipient MUST accept, were ignored, and a server asking
+  to be left alone for an hour was retried after the normal backoff. All three HTTP-date
+  formats are read now
+- Retry: `Retry-After: +5` was read as five seconds, and a number of seconds too large for a
+  u64 was dropped, so the request was retried after the normal backoff instead of hardly at
+  all. delay-seconds is digits only, and a huge one saturates (RFC 9110 §10.2.3)
+- Auth: a challenge whose realm had a byte above 0x7F (`realm="Café"`) was dropped whole,
+  so no login was possible on that server. Such bytes are opaque data in a quoted-string
+  (RFC 9110 §5.5); the challenge is parsed, with the realm read as UTF-8
+- Auth: Basic credentials with a control character in the user-id or password (a tab, NUL,
+  DEL) were encoded and sent, though RFC 7617 §2 says they MUST NOT contain any. Such
+  credentials give no header now, like a colon in the user-id already did
+- Auth: an unknown scheme was keyed as spelled, so credentials stored for `Newauth` were not
+  found when the server wrote `NEWAUTH`, and the user was asked again. Scheme names are
+  case-insensitive (RFC 9110 §11.1); the protection space keys them in lowercase
+- Auth: a hop through an authenticating proxy to a protected server could not succeed. The
+  answer to the server's 401 replaced the proxy's `Proxy-Authorization` instead of joining it,
+  the two challenges then alternated until the attempts ran out, and the proxy password the
+  proxy had just accepted was forgotten from the store. The proxy and the server now each have
+  their own credentials, attempts and store handling on a hop (RFC 9110 §11.6-11.7)
 - Fetcher: a request still queued when `run` stopped was never answered, and `fetch` or
   `submit` after it had stopped waited forever, though `fetch` documents an error for a
   fetcher that stops before delivering. Both are answered with `NetError::Cancelled` now
