@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Cache-Control: max-age=10, max-stale` was answered with a stored response of any age. Each
   is now a condition of its own (RFC 9111 §5.2.1): `max-stale` only lets a stale response
   through
+- Cache: `Pragma: no-cache` on a request without `Cache-Control` was ignored, so a fresh
+  stored response was used where RFC 9111 §5.4 says to revalidate it
 
 ## [0.12.0] - 2026-10-10
 

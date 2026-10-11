@@ -15,7 +15,8 @@
 //! - freshness from `Cache-Control: max-age`, `Expires`/`Date`, or the `Last-Modified` heuristic
 //!   (§4.2), with the age of the stored response corrected for `Age` and request latency (§4.2.3)
 //! - request directives `no-store`, `no-cache`, `max-age`, `max-stale`, `min-fresh` and
-//!   `only-if-cached` (§5.2.1)
+//!   `only-if-cached` (§5.2.1), and `Pragma: no-cache` from a request without `Cache-Control`
+//!   (§5.4)
 //! - conditional revalidation of a stale entry with `If-None-Match` / `If-Modified-Since`, and a
 //!   `304` that updates the stored headers and reuses the stored body (§4.3)
 //! - `Vary`: one entry per combination of the request headers the response varies on (§4.1)
@@ -402,8 +403,19 @@ pub struct RequestDirectives {
 
 impl RequestDirectives {
     /// Parse the `Cache-Control` field lines of a request.
+    ///
+    /// A request without `Cache-Control` that says `Pragma: no-cache` asks for `no-cache`: HTTP/1.0
+    /// clients and caches still send it that way, and RFC 9111 §5.4 has it count as one.
     pub fn parse(headers: &HeaderMap) -> Self {
         let mut out = Self::default();
+        if !headers.contains_key(header::CACHE_CONTROL) {
+            out.no_cache = headers
+                .get_all(header::PRAGMA)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(','))
+                .any(|d| d.trim().eq_ignore_ascii_case("no-cache"));
+        }
         for (name, value) in directives(headers) {
             match name.as_str() {
                 "no-store" => out.no_store = true,
@@ -1274,6 +1286,35 @@ mod tests {
         let asked = headers(&[("cache-control", "max-age=60, max-stale")]);
         assert!(matches!(
             decide(&stale, &asked, false, CacheMode::Default, at(30)),
+            CacheDecision::Use(_)
+        ));
+    }
+
+    /// RFC 9111 §5.4: a request with `Pragma: no-cache` and no `Cache-Control` is treated as if
+    /// it carried `Cache-Control: no-cache`. With a `Cache-Control` present, `Pragma` is ignored.
+    #[test]
+    fn pragma_no_cache_counts_when_there_is_no_cache_control() {
+        let fresh = [entry(&[
+            ("cache-control", "max-age=100"),
+            ("etag", "\"v1\""),
+        ])];
+        let decision = |asked: &[(&str, &str)]| {
+            decide(&fresh, &headers(asked), false, CacheMode::Default, at(1))
+        };
+        assert!(matches!(
+            decision(&[("pragma", "no-cache")]),
+            CacheDecision::Revalidate(..)
+        ));
+        assert!(matches!(
+            decision(&[("pragma", "foo, No-Cache")]),
+            CacheDecision::Revalidate(..)
+        ));
+        assert!(matches!(
+            decision(&[("pragma", "no-cache"), ("cache-control", "max-stale")]),
+            CacheDecision::Use(_)
+        ));
+        assert!(matches!(
+            decision(&[("pragma", "foo")]),
             CacheDecision::Use(_)
         ));
     }
