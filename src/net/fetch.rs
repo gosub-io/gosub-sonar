@@ -73,6 +73,23 @@ pub(crate) fn blocked(
     NetError::Blocked { reason, url }
 }
 
+/// `method` normalized (Fetch §2.2.1): a byte-case-insensitive `DELETE`, `GET`, `HEAD`,
+/// `OPTIONS`, `POST` or `PUT` is uppercased, any other method is left as it is. Every check in
+/// this crate that compares against [`Method::GET`] and the rest relies on it.
+pub(crate) fn normalize_method(method: Method) -> Method {
+    [
+        Method::DELETE,
+        Method::GET,
+        Method::HEAD,
+        Method::OPTIONS,
+        Method::POST,
+        Method::PUT,
+    ]
+    .into_iter()
+    .find(|m| m.as_str().eq_ignore_ascii_case(method.as_str()))
+    .unwrap_or(method)
+}
+
 /// Remove the `user:password@` from `url`. Returns whether there was one, so the caller can
 /// report [`RequestChange::UrlCredentialsRemoved`]. The client would turn embedded credentials
 /// into an `Authorization` header, which lets a page or a redirect send credentials of its
@@ -1732,7 +1749,7 @@ async fn get_with_redirects(
     policy: NetPolicy,
 ) -> Result<ChainOutcome, NetError> {
     let mut url = url;
-    let mut current_method = init.method;
+    let mut current_method = normalize_method(init.method);
     // Where the chain has been: every hop's URL before the current one (Fetch, request's URL
     // list), for the cookie hook to judge `SameSite` across the chain.
     let mut url_list: Vec<Url> = Vec::new();
@@ -7086,6 +7103,32 @@ mod tests {
 
         fn changes(rec: &RecordingObserver) -> Vec<RequestChange> {
             rec.modifications().into_iter().map(|(_, c)| c).collect()
+        }
+
+        /// The six methods Fetch normalizes go out uppercased, whatever case the caller wrote
+        /// them in (Fetch §2.2.1); any other method is left alone.
+        #[tokio::test(flavor = "current_thread")]
+        async fn methods_are_normalized() {
+            let srv = TestServer::new()
+                .default_route(RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            for (written, sent) in [
+                ("get", "GET"),
+                ("pOsT", "POST"),
+                ("Delete", "DELETE"),
+                ("patch", "patch"),
+            ] {
+                let method = Method::from_bytes(written.as_bytes()).unwrap();
+                let rec = recorded(
+                    client(),
+                    srv.url("/"),
+                    RequestInit::new(method, HeaderMap::new(), None),
+                    NetPolicy::default(),
+                )
+                .await;
+                assert_eq!(rec.requests_sent().pop().unwrap().0.as_str(), sent);
+            }
         }
 
         /// POST and PUT without a body send `Content-Length: 0` (Fetch §4.6); GET sends none.

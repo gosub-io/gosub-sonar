@@ -537,6 +537,9 @@ impl Fetcher {
         reply_tx: oneshot::Sender<FetchResult>,
     ) {
         let mut req = req;
+        // Before anything keys on the method: the coalescing key, the cache and every policy
+        // compare against the uppercase methods.
+        req.method = crate::net::fetch::normalize_method(req.method);
         // So a `{:?}` of the request anywhere prints credentials redacted.
         crate::net::utils::mark_sensitive(&mut req.headers);
         if log::log_enabled!(log::Level::Debug) {

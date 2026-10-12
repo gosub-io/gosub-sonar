@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RequestChange::HeadersRemoved`
 - A POST or PUT without a body went out without `Content-Length`, which strict servers answer
   with `411`. It sends `Content-Length: 0` now (Fetch §4.6, RFC 9110 §8.6)
+- Methods were sent as written: `get` went out as `get`, and every check that compares against
+  `GET`, `POST` and the rest missed it, the cache key and cache invalidation, the CORS
+  safelist and the redirect rules among them. `DELETE`, `GET`, `HEAD`, `OPTIONS`, `POST` and
+  `PUT` in any case are uppercased now (Fetch §2.2.1); other methods are left as they are
 
 ## [0.13.0] - 2026-10-12
 
