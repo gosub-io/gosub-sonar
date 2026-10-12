@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Proxy credentials went to the wrong proxy. With several `ProxyRule`s, a plain-`http`
+  request took its `Proxy-Authorization` from the first rule that matched *and* had
+  credentials, while the client connected through the first rule that matched. Rules
+  `[all(A), all(B).with_basic_auth(..)]` sent B's password to A. With a socks rule first, an
+  http rule's credentials went through the socks tunnel to the origin server itself. The
+  first rule that routes the request now decides, with its own credentials or none
+  (RFC 9110 §11.7.2)
+
 ## [0.13.0] - 2026-10-12
 
 ### Added

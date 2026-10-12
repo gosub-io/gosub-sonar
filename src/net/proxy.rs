@@ -432,14 +432,15 @@ impl ProxyConfig {
     ///   the environment. Restating that here would mean guessing at inputs this crate never
     ///   saw, which is the opposite of the point.
     ///
-    /// Rules are consulted in order and the first one that both matches and carries credentials
-    /// answers -- which is the client's rule, not this crate's ([reqwest `Client::proxy_auth`]).
-    /// In a list where an earlier rule matches without credentials and a later one matches with
-    /// them, the client attaches the later rule's credentials while connecting through the
-    /// earlier rule's proxy. That is worth knowing about, and worth reporting truthfully, which
-    /// is the whole reason this mirrors the client instead of deciding for itself.
+    /// The rule that answers is the first one that routes the request, the one whose proxy the
+    /// client connects through, and its credentials or none at all: credentials belong to the
+    /// proxy that demanded them (RFC 9110 §11.7.2), so a later rule's never go to an earlier
+    /// rule's proxy. When that first rule is a socks proxy, the next HTTP recipient is the
+    /// origin server, and nothing is sent. The header is written into the request before the
+    /// client sees it, and the client then leaves it alone ([reqwest `Client::proxy_auth`]), so
+    /// this choice is the one that reaches the wire.
     ///
-    /// [reqwest `Client::proxy_auth`]: https://docs.rs/reqwest/0.13.4/src/reqwest/async_impl/client.rs.html
+    /// [reqwest `Client::proxy_auth`]: https://docs.rs/reqwest/0.13.5/src/reqwest/async_impl/client.rs.html
     pub(crate) fn proxy_authorization(&self, url: &Url) -> Option<http::HeaderValue> {
         if url.scheme() != "http" {
             return None;
@@ -451,7 +452,8 @@ impl ProxyConfig {
         let dst: http::Uri = url.as_str().parse().ok()?;
         rules
             .iter()
-            .find_map(|rule| rule.non_tunnel_authorization(&dst))
+            .find(|rule| rule.routes(&dst))?
+            .non_tunnel_authorization(&dst)
     }
 
     /// Apply this configuration to a client builder.
@@ -736,21 +738,37 @@ mod tests {
         );
     }
 
-    /// The first rule that both matches and carries credentials answers, which is the rule the
-    /// client itself would take the header from -- including the case where an earlier rule
-    /// matches without credentials, where the client attaches these while connecting through
-    /// that earlier proxy. Mirrored rather than corrected: the report has to describe what the
-    /// client does.
+    /// Credentials belong to the proxy that demanded them (RFC 9110 §11.7.2): the first rule
+    /// that routes the request is the proxy the client connects through, so its credentials
+    /// answer, or none when it has none. A later rule's credentials are never sent to it.
     #[test]
-    fn the_first_matching_credentialed_rule_answers() {
+    fn the_first_routing_rule_answers_with_its_own_credentials() {
         let cfg = ProxyConfig::Rules(vec![
             ProxyRule::all("http://first.corp:8080"),
+            ProxyRule::all("http://second.corp:8080").with_basic_auth("alice", "hunter2"),
+        ]);
+        assert_eq!(authorization(&cfg, "http://target.example/"), None);
+
+        // Bypassed by the first rule, the request goes through the second, with its credentials.
+        let cfg = ProxyConfig::Rules(vec![
+            ProxyRule::all("http://first.corp:8080").bypassing("target.example"),
             ProxyRule::all("http://second.corp:8080").with_basic_auth("alice", "hunter2"),
         ]);
         assert_eq!(
             authorization(&cfg, "http://target.example/").as_deref(),
             Some("Basic YWxpY2U6aHVudGVyMg==")
         );
+    }
+
+    /// Behind a socks proxy the next HTTP recipient is the origin server, so an http rule
+    /// further down must not put its proxy credentials on the request.
+    #[test]
+    fn a_socks_rule_first_means_no_proxy_authorization() {
+        let cfg = ProxyConfig::Rules(vec![
+            ProxyRule::all("socks5h://127.0.0.1:1080"),
+            ProxyRule::all("http://proxy.corp:8080").with_basic_auth("alice", "hunter2"),
+        ]);
+        assert_eq!(authorization(&cfg, "http://target.example/"), None);
     }
 
     /// The environment is the client's to read, so a system-proxy configuration is left to it

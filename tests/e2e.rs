@@ -797,6 +797,42 @@ async fn a_configured_proxy_s_authorization_is_reported_and_sent() {
     shutdown.cancel();
 }
 
+/// With two rules, the request goes through the first rule's proxy, and that proxy gets no
+/// credentials when its rule has none: a later rule's belong to a different proxy (RFC 9110
+/// §11.7.2). The mock server stands in for the first proxy and echoes what it received.
+#[tokio::test]
+async fn a_later_rule_s_proxy_credentials_are_not_sent_to_an_earlier_rule_s_proxy() {
+    let proxy = TestServer::new()
+        .default_route(RouteConfig::echo_request_headers())
+        .start()
+        .await;
+    let cfg = FetcherConfig {
+        proxy: ProxyConfig::Rules(vec![
+            ProxyRule::all(format!("http://{}", proxy.socket_addr())),
+            ProxyRule::all("http://second.invalid:8080").with_basic_auth("alice", "hunter2"),
+        ]),
+        ..FetcherConfig::default()
+    };
+    let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+    let shutdown = CancellationToken::new();
+    let (f, c) = (fetcher.clone(), shutdown.clone());
+    tokio::spawn(async move { f.run(c).await });
+
+    let req = FetchRequest::builder(
+        Method::GET,
+        Url::parse("http://proxied.example/resource").unwrap(),
+    )
+    .build();
+    let on_the_wire = headers_on_the_wire(&fetcher, req).await;
+    assert!(
+        !on_the_wire
+            .iter()
+            .any(|l| l.starts_with("proxy-authorization:")),
+        "the first proxy got another proxy's credentials: {on_the_wire:?}"
+    );
+    shutdown.cancel();
+}
+
 /// `Accept` is composed from the destination rather than left to the client, which would send
 /// a bare `*/*` for everything -- and send it after the report was emitted.
 #[tokio::test]
