@@ -46,6 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A response with both `no-cache` and `immutable` was used from the cache without asking the
+  server while fresh. `no-cache` means never use it unvalidated (RFC 9111 §5.2.2.4), and
+  `immutable` cannot lift that
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued
   by priority but spawned every request straight away, and the spawned tasks then waited on
   the global and per-origin semaphores in whatever order they happened to reach them: a `High`

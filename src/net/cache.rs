@@ -700,9 +700,10 @@ pub fn decide(
     }
 
     // A forced revalidation still honours `immutable`, which says the response does not change
-    // while it is fresh.
+    // while it is fresh. A response that says `no-cache` itself is never used unvalidated
+    // (RFC 9111 §5.2.2.4, a MUST that `immutable`, RFC 8246, cannot lift).
     if mode == CacheMode::NoCache || asked.no_cache || stored.no_cache {
-        if stored.immutable && entry.is_fresh(now) {
+        if stored.immutable && !stored.no_cache && entry.is_fresh(now) {
             return CacheDecision::Use(entry.clone());
         }
         return revalidate(entry);
@@ -1662,6 +1663,26 @@ mod tests {
         assert!(matches!(
             decide(&[], &HeaderMap::new(), false, CacheMode::ForceCache, now),
             CacheDecision::Send
+        ));
+    }
+
+    /// A response that says `no-cache` is revalidated before every use (RFC 9111 §5.2.2.4),
+    /// `immutable` and fresh or not.
+    #[test]
+    fn a_no_cache_response_is_revalidated_even_when_immutable() {
+        let stored = [entry(&[
+            ("cache-control", "max-age=600, immutable, no-cache"),
+            ("etag", "\"v1\""),
+        ])];
+        assert!(matches!(
+            decide(
+                &stored,
+                &HeaderMap::new(),
+                false,
+                CacheMode::Default,
+                at(30)
+            ),
+            CacheDecision::Revalidate(..)
         ));
     }
 
