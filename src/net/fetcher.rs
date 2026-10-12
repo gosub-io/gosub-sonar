@@ -16,6 +16,7 @@ use crate::net::fetch_metadata::RequestDestination;
 use crate::net::fetcher_context::FetcherContext;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::hsts::{self, HstsStore, InMemoryHstsStore};
+use crate::net::lifecycle::Lifecycle;
 use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
@@ -619,6 +620,8 @@ impl Fetcher {
                 }
                 continue;
             };
+            // What the caller asked for, before anything below rewrites it.
+            let requested = req.url.clone();
 
             // Upgrade before the key is derived, or an http:// and an https:// request for the
             // same HSTS host hash to different keys and run as two fetches instead of coalescing
@@ -725,9 +728,13 @@ impl Fetcher {
                 continue;
             }
 
-            let observer =
+            let lifecycle = Lifecycle::accept(
                 self.ctx
-                    .observer_for(req.reference, req.req_id, req.kind, req.initiator);
+                    .observer_for(req.reference, req.req_id, req.kind, req.initiator),
+                requested,
+                false,
+            );
+            let observer: Arc<dyn NetObserver + Send + Sync> = lifecycle;
 
             // Pre-flight checks. Only the leader ever sends bytes, so only the leader evaluates
             // them; rejecting here avoids waiting on a connection slot for a request that will
@@ -3305,7 +3312,7 @@ mod tests {
 
     /// `NetEvent::Blocked`: "A request hop was refused by policy and never sent.
     /// `NetEvent::Failed` follows as the terminal event." Also when the scheduler refuses the
-    /// request before it is sent at all.
+    /// request before it is sent at all: it was accepted, never started, and ends.
     #[tokio::test(flavor = "current_thread")]
     async fn a_request_blocked_before_sending_ends_with_failed() {
         // Port 25 is on the bad-port list: refused by the scheduler's pre-flight check.
@@ -3313,7 +3320,35 @@ mod tests {
             FetchRequest::builder(Method::GET, Url::parse("http://127.0.0.1:25/").unwrap()).build();
         let (result, log) = fetch_recorded(test_config(), req).await;
         assert!(result.is_error(), "{result:?}");
-        assert_eq!(log.event_names(), vec!["Blocked", "Failed"]);
+        assert_eq!(log.event_names(), vec!["Accepted", "Blocked", "Failed"]);
+    }
+
+    /// Every request opens with `Accepted`, before its attempt's `Started`, and ends once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_opens_with_accepted() {
+        let srv = start_server().await;
+        let (result, log) = fetch_recorded(
+            test_config(),
+            make_req(srv.url("/fast"), Priority::Normal).0,
+        )
+        .await;
+        assert!(!result.is_error(), "{result:?}");
+        let names = log.event_names();
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("Accepted"),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.get(1).map(String::as_str),
+            Some("Started"),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("Finished"),
+            "{names:?}"
+        );
     }
 
     /// Every request ends in exactly one of `Finished`, `Failed` or `Cancelled`: also one

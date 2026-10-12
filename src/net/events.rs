@@ -141,7 +141,20 @@ pub enum NetEvent {
         truncated: bool,
     },
 
-    /// Resource started loading
+    /// The fetcher took the request: the first event of every request, before any check,
+    /// any wait for a connection slot, any attempt. Every request that reports `Accepted` ends
+    /// with exactly one [`NetEvent::Finished`], [`NetEvent::Failed`] or
+    /// [`NetEvent::Cancelled`], and reports nothing after it.
+    Accepted {
+        /// URL as the caller asked for it, before any upgrade to `https`
+        url: Url,
+        /// The request shares a fetch another request started (coalescing), and sends nothing
+        /// of its own
+        joined: bool,
+    },
+    /// An attempt at the request started: it has its connection slot and goes out. Once per
+    /// attempt, so a retried request reports it again; a request refused or cancelled before
+    /// it was sent reports none.
     Started {
         /// URL being fetched
         url: Url,

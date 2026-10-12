@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `NetEvent::Accepted { url, joined }`: the first event of every request the `Fetcher` takes,
+  before any check or wait. Every request that reports it ends with exactly one `Finished`,
+  `Failed` or `Cancelled` and reports nothing after that, so an observer can open a row on
+  `Accepted` and close it on the end. `url` is the one the caller asked for, before an upgrade
+  to `https`
 - `mixed_content::evaluate_for`: the mixed content check for a request with a known
   destination. `evaluate` keeps its signature and judges a request of no particular kind
 - `CorsPreflightCache::clear`, which drops the grants for one origin and URL. It has a default
@@ -21,6 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `NetEvent::Started` means an attempt went out: once per attempt, after the request got its
+  connection slot. A request refused before it was sent reports `Accepted`, `Blocked` and
+  `Failed`, and one cancelled while it waited `Accepted` and `Cancelled`, neither with a
+  `Started`. A second end the fetch stack reports for a request is dropped
 - **Breaking:** a retried request ends once. Before, every attempt reported its own
   `Finished`, `Failed` or `Cancelled`, so a consumer that takes the first end as the request's
   (the engine's network process does) saw a `503` that was then retried into a `200` as the
