@@ -199,6 +199,9 @@ pub enum BlockReason {
     /// The URL's port is one the Fetch standard refuses (SMTP, IRC, FTP, ...).
     /// See [`port_blocking`](crate::net::port_blocking).
     BadPort,
+    /// A request with an initiating origin used `CONNECT`, `TRACE` or `TRACK`, which web
+    /// content may not send. See [`is_forbidden_method`](crate::net::cors::is_forbidden_method).
+    ForbiddenMethod,
 }
 
 impl Display for BlockReason {
@@ -209,6 +212,7 @@ impl Display for BlockReason {
             BlockReason::UnsupportedScheme => "unsupported URL scheme",
             BlockReason::NotCached => "not in the cache",
             BlockReason::BadPort => "bad port",
+            BlockReason::ForbiddenMethod => "forbidden method",
             BlockReason::Cors(err) => return write!(f, "CORS: {err}"),
         };
         f.write_str(s)
@@ -284,6 +288,17 @@ pub enum RequestChange {
         /// The removed headers.
         headers: Vec<HeaderName>,
     },
+    /// Headers the caller set were not sent. `Content-Length` and `Transfer-Encoding` frame the
+    /// message and are worked out from the body (RFC 9112 section 6), so a caller's value is
+    /// never sent. On a request with an initiating origin, every forbidden request-header
+    /// (Fetch section 2.2.2, see
+    /// [`is_forbidden_request_header_value`](crate::net::cors::is_forbidden_request_header_value))
+    /// is removed too: those are the user agent's to set, not web content's. Reported once, on
+    /// the first hop.
+    HeadersRemoved {
+        /// The removed headers.
+        headers: Vec<HeaderName>,
+    },
     /// A redirect changed the method, and any request body was dropped with it
     /// (RFC 9110 section 15.4).
     MethodDowngraded {
@@ -317,6 +332,13 @@ impl Display for RequestChange {
             }
             RequestChange::SensitiveHeadersStripped { headers } => {
                 f.write_str("stripped headers on a cross-origin redirect:")?;
+                for h in headers {
+                    write!(f, " {h}")?;
+                }
+                Ok(())
+            }
+            RequestChange::HeadersRemoved { headers } => {
+                f.write_str("removed headers the caller set:")?;
                 for h in headers {
                     write!(f, " {h}")?;
                 }
@@ -673,8 +695,9 @@ fn regular_file(meta: &std::fs::Metadata) -> std::io::Result<u64> {
 /// ([Fetch §2.2.5], *credentials mode*).
 ///
 /// This gates only what the fetcher itself attaches; headers set by hand in
-/// [`FetchRequest::headers`] (e.g. `Authorization`) are the embedder's own decision and go out
-/// regardless. Beyond cookies, the mode also drives the CORS rules: a credentialed cross-origin
+/// [`FetchRequest::headers`] (e.g. `Authorization`) go out regardless. A hand-set `Cookie` is a
+/// forbidden request-header, and is removed from a request with an initiating origin
+/// ([`RequestChange::HeadersRemoved`]). Beyond cookies, the mode also drives the CORS rules: a credentialed cross-origin
 /// request needs `Access-Control-Allow-Credentials` and cannot be authorized by a wildcard.
 ///
 /// [Fetch §2.2.5]: https://fetch.spec.whatwg.org/#concept-request-credentials-mode
@@ -787,6 +810,10 @@ pub struct FetchRequest {
     /// budget for this request, `Some(Some(d))` sets it to `d`.
     pub redirect_timeout: Option<Option<Duration>>,
     /// HTTP Headers (unified).
+    ///
+    /// `Accept-Language` is not added by the fetcher. Fetch §4.1 leaves "an appropriate value"
+    /// to the user agent, and the language preference belongs to the embedder, per profile or
+    /// tab, so it sets the header here on every request.
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
     /// `None` for GET and HEAD requests.
