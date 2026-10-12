@@ -667,8 +667,10 @@ stripped on a cross-origin redirect, and a method changed by a redirect. `Upgrad
 `RequestChange` are `#[non_exhaustive]`. A hop's changes come before its `RequestSent`. Changes
 made while following a redirect come right after its `Redirected`. A hop nothing changed reports
 nothing. A refused hop is `Blocked`, never one of these. The `Sec-Fetch-*` headers are always
-computed rather than changed, so they only show in `RequestSent`. Only the observer of the request
-that leads a coalesced fetch gets events. Followers get its result and no events.
+computed rather than changed, so they only show in `RequestSent`. Coalesced requests each report
+their own lifecycle (`net::lifecycle`): every one opens with `Accepted` (`joined` for a follower)
+and ends once, with its own `Cancelled` when its caller cancels. The request that started the
+fetch reports everything the fetch does; a follower gets only the shared `Progress` and the end.
 
 `NetEvent` is `#[non_exhaustive]`: a `match` over it needs a catch-all arm, and new events can
 be added without a breaking release.

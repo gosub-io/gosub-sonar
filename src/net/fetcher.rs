@@ -16,7 +16,7 @@ use crate::net::fetch_metadata::RequestDestination;
 use crate::net::fetcher_context::FetcherContext;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::hsts::{self, HstsStore, InMemoryHstsStore};
-use crate::net::lifecycle::Lifecycle;
+use crate::net::lifecycle::{Lifecycle, Shared};
 use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
@@ -294,6 +294,9 @@ pub struct FetchInflightEntry {
     /// Cancelled by the leader after `waiter.finish()` to unblock child-cancel watcher tasks
     /// that are waiting on either subscriber cancellation or fetch completion.
     done: CancellationToken,
+    /// What the fetch reports to: every request waiting on it. Set by the leader before any
+    /// other request can join.
+    shared: std::sync::OnceLock<Arc<Shared>>,
 }
 
 impl FetchInflightEntry {
@@ -676,6 +679,7 @@ impl Fetcher {
                     wants_streaming: AtomicBool::new(req.streaming),
                     done: CancellationToken::new(),
                     subs: AtomicUsize::new(1),
+                    shared: std::sync::OnceLock::new(),
                 })
             };
             let (inflight_entry, is_leader, listener) =
@@ -703,23 +707,60 @@ impl Fetcher {
                 self.ctx.on_ref_active(req.reference);
             }
 
+            // Every request has its own lifecycle, a follower's included: it reports from
+            // `Accepted` to its own end (see `lifecycle`).
+            let lifecycle = Lifecycle::accept(
+                self.ctx
+                    .observer_for(req.reference, req.req_id, req.kind, req.initiator),
+                requested.clone(),
+                !is_leader,
+            );
+            if let Some(ref to) = upgraded {
+                lifecycle.on_event(NetEvent::SecurityUpgraded {
+                    from: requested.clone(),
+                    to: to.clone(),
+                    reason: crate::net::types::UpgradeReason::Hsts,
+                });
+            }
+            let shared = if is_leader {
+                let shared = Shared::new(lifecycle.clone());
+                let _ = inflight_entry.shared.set(shared.clone());
+                Some(shared)
+            } else {
+                // The leader set it in this same loop, before any request could join.
+                if let Some(shared) = inflight_entry.shared.get() {
+                    shared.attach(lifecycle.clone());
+                }
+                None
+            };
+
+            // Watches this caller until its request has ended. A caller that cancels ends its
+            // own request there and then, even while others still want the result; a result
+            // already handed to it is not taken back.
             let child_cancel = cancel.clone();
             let entry_for_cancel = inflight_entry.clone();
-            let done = entry_for_cancel.done.clone();
+            let ended = lifecycle.ended();
+            let caller = lifecycle.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = child_cancel.cancelled() => {
-                        // This caller stops waiting now, even while others still want the
-                        // result; unless the result was already handed to it, which it keeps.
                         entry_for_cancel.waiter.cancel(
                             listener,
                             NetError::Cancelled("cancelled by the caller".into()),
                         );
                         entry_for_cancel.dec_sub_and_maybe_cancel();
+                        if let Some(shared) = entry_for_cancel.shared.get() {
+                            shared.detach(&caller);
+                        }
+                        caller.on_event(NetEvent::Cancelled {
+                            url: caller.url().clone(),
+                            reason: "cancelled by the caller",
+                        });
                     }
-                    _ = done.cancelled() => {}
+                    _ = ended.cancelled() => {}
                 }
             });
+            drop(lifecycle);
 
             if req.streaming {
                 inflight_entry
@@ -727,25 +768,11 @@ impl Fetcher {
                     .store(true, Ordering::Relaxed);
             }
 
-            if !is_leader {
+            let Some(shared) = shared else {
                 continue;
-            }
-
-            let requested_for_upgrade = requested.clone();
-            let lifecycle = Lifecycle::accept(
-                self.ctx
-                    .observer_for(req.reference, req.req_id, req.kind, req.initiator),
-                requested,
-                false,
-            );
-            let observer: Arc<dyn NetObserver + Send + Sync> = lifecycle;
-            if let Some(ref to) = upgraded {
-                observer.on_event(NetEvent::SecurityUpgraded {
-                    from: requested_for_upgrade.clone(),
-                    to: to.clone(),
-                    reason: crate::net::types::UpgradeReason::Hsts,
-                });
-            }
+            };
+            // The fetch reports to every request waiting on it.
+            let observer: Arc<dyn NetObserver + Send + Sync> = shared;
 
             // Pre-flight checks. Only the leader ever sends bytes, so only the leader evaluates
             // them; rejecting here avoids waiting on a connection slot for a request that will
@@ -1569,6 +1596,7 @@ mod tests {
             wants_streaming: AtomicBool::new(false),
             subs: AtomicUsize::new(1),
             done: CancellationToken::new(),
+            shared: std::sync::OnceLock::new(),
         };
         assert!(entry.try_inc_sub());
         assert!(!entry.parent_cancel.is_cancelled());
@@ -2956,8 +2984,8 @@ mod tests {
     }
 
     /// Security events reach the fetcher's observer. Coalesced requests share one fetch, and
-    /// the change is reported once, by the leader. A follower gets the leader's result and
-    /// no events of its own.
+    /// the change is reported once, to the request that started it. A follower has its own
+    /// lifecycle, but no request changes of its own: it sent nothing.
     #[tokio::test(flavor = "current_thread")]
     async fn request_changes_are_reported_once_through_the_fetcher() {
         let srv = start_server().await;
@@ -3360,6 +3388,138 @@ mod tests {
         assert_eq!(log.event_names(), vec!["Accepted", "Blocked", "Failed"]);
     }
 
+    /// A context that records each request's events apart, by request id.
+    #[derive(Default)]
+    struct PerRequest(
+        parking_lot::Mutex<std::collections::HashMap<RequestId, Arc<RecordingObserver>>>,
+    );
+
+    impl PerRequest {
+        /// The request's event names, a `Cancelled` with its reason (`Cancelled: why`).
+        fn names(&self, id: RequestId) -> Vec<String> {
+            let Some(rec) = self.0.lock().get(&id).cloned() else {
+                return Vec::new();
+            };
+            let mut reasons = rec.cancellations().into_iter();
+            rec.event_names()
+                .into_iter()
+                .map(|name| match name.as_str() {
+                    "Cancelled" => format!("Cancelled: {}", reasons.next().unwrap_or_default()),
+                    _ => name,
+                })
+                .collect()
+        }
+    }
+
+    impl FetcherContext for PerRequest {
+        fn observer_for(
+            &self,
+            _: RequestReference,
+            id: RequestId,
+            _: ResourceKind,
+            _: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            self.0
+                .lock()
+                .entry(id)
+                .or_insert_with(|| Arc::new(RecordingObserver::new()))
+                .clone()
+        }
+        fn on_ref_active(&self, _: RequestReference) {}
+        fn on_ref_done(&self, _: RequestReference) {}
+    }
+
+    /// Two callers of one fetch, `a` first: submits both, cancels `cancel_first` or
+    /// `cancel_second` part-way, and returns each request's events once both are answered.
+    async fn two_callers(cancel_first: bool, cancel_second: bool) -> (Vec<String>, Vec<String>) {
+        let srv = TestServer::new()
+            .route(
+                "/co",
+                RouteConfig::delay(Duration::from_millis(300), b"shared".to_vec()),
+            )
+            .start()
+            .await;
+        let ctx = Arc::new(PerRequest::default());
+        let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+        let (a, ca) = make_req(srv.url("/co"), Priority::Normal);
+        let (b, cb) = make_req(srv.url("/co"), Priority::Normal);
+        let (ida, idb) = (a.req_id, b.req_id);
+        let (ta, ra) = oneshot::channel();
+        let (tb, rb) = oneshot::channel();
+        fetcher.submit(a, ca.clone(), ta).await;
+        fetcher.submit(b, cb.clone(), tb).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        if cancel_first {
+            ca.cancel();
+        }
+        if cancel_second {
+            cb.cancel();
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), ra).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), rb).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(srv.hit_count("/co"), 1, "one fetch for both");
+        shutdown.cancel();
+        (ctx.names(ida), ctx.names(idb))
+    }
+
+    /// A request that joins another's fetch has its own lifecycle: `Accepted`, the shared
+    /// progress, and its own end. The one that started the fetch reports the fetch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_coalesced_request_has_its_own_lifecycle() {
+        let (leader, follower) = two_callers(false, false).await;
+        assert_eq!(
+            leader.first().map(String::as_str),
+            Some("Accepted"),
+            "{leader:?}"
+        );
+        assert!(leader.contains(&"Started".to_string()), "{leader:?}");
+        assert_eq!(
+            leader.last().map(String::as_str),
+            Some("Finished"),
+            "{leader:?}"
+        );
+        assert_eq!(
+            follower.first().map(String::as_str),
+            Some("Accepted"),
+            "{follower:?}"
+        );
+        assert!(!follower.contains(&"Started".to_string()), "{follower:?}");
+        assert_eq!(
+            follower.last().map(String::as_str),
+            Some("Finished"),
+            "{follower:?}"
+        );
+    }
+
+    /// A caller that cancels ends its own request with `Cancelled`, whichever of the two it
+    /// is, while the fetch goes on for the other, which finishes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_caller_ends_its_own_request() {
+        let (leader, follower) = two_callers(true, false).await;
+        assert_eq!(
+            leader.last().map(String::as_str),
+            Some("Cancelled: cancelled by the caller"),
+            "{leader:?}"
+        );
+        assert_eq!(
+            follower.last().map(String::as_str),
+            Some("Finished"),
+            "{follower:?}"
+        );
+
+        let (leader, follower) = two_callers(false, true).await;
+        assert_eq!(
+            leader.last().map(String::as_str),
+            Some("Finished"),
+            "{leader:?}"
+        );
+        assert_eq!(follower, ["Accepted", "Cancelled: cancelled by the caller"]);
+    }
+
     /// Every request opens with `Accepted`, before its attempt's `Started`, and ends once.
     #[tokio::test(flavor = "current_thread")]
     async fn a_request_opens_with_accepted() {
@@ -3421,11 +3581,9 @@ mod tests {
         let _ = stopped_rx.await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
+        // The caller that cancelled ends with its own cancel, at once.
         let ended = log.cancellations();
-        assert!(
-            ended.contains(&"cancelled before the request was sent"),
-            "{ended:?}"
-        );
+        assert!(ended.contains(&"cancelled by the caller"), "{ended:?}");
         assert!(
             ended.contains(&"fetcher shut down before the request was sent"),
             "{ended:?}"

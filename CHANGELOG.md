@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** a request that joins another's fetch (coalescing) reports its own lifecycle. It
+  used to get no events at all: no start, no end, and an engine that tracks requests from
+  their events kept it open for good. Now each request gets an observer from
+  `FetcherContext::observer_for`, opens with `Accepted { joined: true }`, gets the shared
+  `Progress` and its own end. A caller that cancels ends its request with `Cancelled` at
+  once, whether it started the fetch or joined it, while the fetch goes on for the others; a
+  cancelled leader used to report `Finished` once the fetch it no longer wanted ended
 - `NetEvent::Started` means an attempt went out: once per attempt, after the request got its
   connection slot. A request refused before it was sent reports `Accepted`, `Blocked` and
   `Failed`, and one cancelled while it waited `Accepted` and `Cancelled`, neither with a
