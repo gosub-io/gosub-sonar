@@ -114,29 +114,43 @@ impl NetObserver for Lifecycle {
 pub(crate) struct Shared {
     /// The request that started the fetch: gets every event.
     leader: Arc<Lifecycle>,
-    /// The requests still waiting on the fetch, the leader among them until it ends.
-    attached: Mutex<Vec<Arc<Lifecycle>>>,
+    /// The requests still waiting on the fetch, the leader among them until it ends, and the
+    /// fetch's end once it has had one, for a request that joins after it.
+    attached: Mutex<(Vec<Arc<Lifecycle>>, Option<NetEvent>)>,
 }
 
 impl Shared {
     pub(crate) fn new(leader: Arc<Lifecycle>) -> Arc<Self> {
         Arc::new(Self {
-            attached: Mutex::new(vec![leader.clone()]),
+            attached: Mutex::new((vec![leader.clone()], None)),
             leader,
         })
     }
 
-    /// Another request joins the fetch.
+    /// Another request joins the fetch. One that joins once the fetch has ended (it can, until
+    /// the fetch is out of the in-flight map) gets that end at once.
     pub(crate) fn attach(&self, request: Arc<Lifecycle>) {
-        self.lock().push(request);
+        let end = {
+            let mut state = self.lock();
+            match state.1.as_ref() {
+                Some(end) => copy(end),
+                None => {
+                    state.0.push(request.clone());
+                    None
+                }
+            }
+        };
+        if let Some(end) = end {
+            request.on_event(end);
+        }
     }
 
     /// A request leaves the fetch, ending on its own.
     pub(crate) fn detach(&self, request: &Arc<Lifecycle>) {
-        self.lock().retain(|r| !Arc::ptr_eq(r, request));
+        self.lock().0.retain(|r| !Arc::ptr_eq(r, request));
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Arc<Lifecycle>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, (Vec<Arc<Lifecycle>>, Option<NetEvent>)> {
         self.attached.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -149,9 +163,11 @@ impl NetObserver for Shared {
             return;
         }
         let attached: Vec<Arc<Lifecycle>> = if ev.is_terminal() {
-            std::mem::take(&mut *self.lock())
+            let mut state = self.lock();
+            state.1 = copy(&ev);
+            std::mem::take(&mut state.0)
         } else {
-            self.lock().clone()
+            self.lock().0.clone()
         };
         let mut ev = Some(ev);
         for (i, request) in attached.iter().enumerate() {
@@ -292,6 +308,23 @@ mod tests {
         );
         assert_eq!(follow.event_names(), ["Accepted", "Progress", "Failed"]);
         assert_eq!(gone.event_names(), ["Accepted", "Progress", "Cancelled"]);
+    }
+
+    /// A request that joins a fetch after the fetch's end still gets that end.
+    #[test]
+    fn a_request_that_joins_after_the_end_gets_it() {
+        let lead = Arc::new(RecordingObserver::new());
+        let shared = Shared::new(Lifecycle::accept(lead.clone(), url(), false, None));
+        shared.on_event(NetEvent::Finished {
+            received_bytes: 1,
+            elapsed: Duration::ZERO,
+            url: url(),
+        });
+        let late = Arc::new(RecordingObserver::new());
+        let joined = Lifecycle::accept(late.clone(), url(), true, None);
+        shared.attach(joined.clone());
+        assert!(joined.has_ended());
+        assert_eq!(late.event_names(), ["Accepted", "Finished"]);
     }
 
     #[test]
