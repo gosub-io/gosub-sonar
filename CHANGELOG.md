@@ -73,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Progress` went back where the first bytes of a body, read to sniff it, ended and the rest
+  began: the whole first chunk was counted, and then the part past the sniffed bytes again
+  (8131, then 5376). It counts what reached the caller now, so it only goes up
 - After a redirect, `Finished`, and a `Failed` or `Cancelled` while the body was read, named the
   URL first asked for instead of the one the body came from. They name the last hop now, as a
   response served from the cache already did

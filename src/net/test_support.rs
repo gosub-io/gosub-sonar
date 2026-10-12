@@ -1398,6 +1398,19 @@ impl RecordingObserver {
             .count()
     }
 
+    /// The byte count of every `Progress` event, in order.
+    pub fn progress(&self) -> Vec<u64> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Progress { received_bytes, .. } => Some(*received_bytes),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The URL of every `Finished` event.
     pub fn finished_urls(&self) -> Vec<url::Url> {
         self.events

@@ -1027,14 +1027,9 @@ async fn fetch_response_top_inner(
             Some(Ok(chunk)) => {
                 received_net += chunk.len() as u64;
 
-                observer.on_event(NetEvent::Progress {
-                    received_bytes: received_net,
-                    elapsed: started.elapsed(),
-                    expected_length: meta.content_length,
-                });
-
                 let need = PEEK_MAX.saturating_sub(peek_buf_vec.len());
-                if chunk.len() <= need {
+                let fits = chunk.len() <= need;
+                if fits {
                     // Entire chunk fits in our peek_buf.
                     peek_buf_vec.extend_from_slice(&chunk);
                 } else {
@@ -1044,6 +1039,16 @@ async fn fetch_response_top_inner(
                     // 'excess' buffer
                     peek_buf_vec.extend_from_slice(&chunk[..need]);
                     excess = Some(chunk.slice(need..));
+                }
+
+                // Counted as the body goes to the caller: the peek here, the excess when the
+                // reader below hands it on, so the count never goes back.
+                observer.on_event(NetEvent::Progress {
+                    received_bytes: peek_buf_vec.len() as u64,
+                    elapsed: started.elapsed(),
+                    expected_length: meta.content_length,
+                });
+                if !fits {
                     break;
                 }
             }
@@ -1129,8 +1134,7 @@ async fn fetch_response_top_inner(
     let stream = body_stream.map_err(|e: NetError| e.to_io());
     let inner_reader = StreamReader::new(stream);
 
-    // Update the progress counter to the point of the bytes read (note: this can cause a strange
-    // decrease in bytes read in the progress events?)
+    // The progress count so far: the peek, which is what reached the caller.
     let already_delivered = received_net - excess_len;
 
     // The body's end names the URL it came from, the last hop of the chain.
@@ -7067,6 +7071,35 @@ mod tests {
             )
             .await;
             rec
+        }
+
+        /// `Progress` counts what reached the caller and never goes back, also where the
+        /// first bytes, read to sniff the body, end and the rest of it begins.
+        #[tokio::test(flavor = "current_thread")]
+        async fn progress_never_goes_back() {
+            let body = vec![b'x'; 64 * 1024];
+            let srv = TestServer::new()
+                .route("/big", RouteConfig::ok(body.clone()))
+                .start()
+                .await;
+            let rec = Arc::new(RecordingObserver::new());
+            let mut top = super::super::fetch_response_top(
+                client(),
+                srv.url("/big"),
+                RequestInit::default(),
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            // Small reads, so the bytes read past the sniffed ones are counted in steps.
+            let mut small = [0u8; 256];
+            while top.reader.read(&mut small).await.unwrap() > 0 {}
+            let progress = rec.progress();
+            assert!(progress.len() > 1, "{progress:?}");
+            assert!(progress.windows(2).all(|w| w[0] <= w[1]), "{progress:?}");
+            assert_eq!(progress.last(), Some(&(body.len() as u64)));
         }
 
         /// `Finished` names the URL that finished loading: after a redirect, the last hop.
