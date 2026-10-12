@@ -199,6 +199,9 @@ pub enum BlockReason {
     /// The URL's port is one the Fetch standard refuses (SMTP, IRC, FTP, ...).
     /// See [`port_blocking`](crate::net::port_blocking).
     BadPort,
+    /// A request with an initiating origin used `CONNECT`, `TRACE` or `TRACK`, which web
+    /// content may not send. See [`is_forbidden_method`](crate::net::cors::is_forbidden_method).
+    ForbiddenMethod,
 }
 
 impl Display for BlockReason {
@@ -209,6 +212,7 @@ impl Display for BlockReason {
             BlockReason::UnsupportedScheme => "unsupported URL scheme",
             BlockReason::NotCached => "not in the cache",
             BlockReason::BadPort => "bad port",
+            BlockReason::ForbiddenMethod => "forbidden method",
             BlockReason::Cors(err) => return write!(f, "CORS: {err}"),
         };
         f.write_str(s)

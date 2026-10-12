@@ -241,6 +241,16 @@ pub fn is_forbidden_request_header(name: &HeaderName) -> bool {
         )
 }
 
+/// Forbidden method ([Fetch] §2.2.1): `CONNECT`, `TRACE` or `TRACK` in any case. Web content
+/// may not send one; `TRACE` echoes the request back, credentials included.
+///
+/// [Fetch]: https://fetch.spec.whatwg.org/#forbidden-method
+pub fn is_forbidden_method(method: &http::Method) -> bool {
+    ["CONNECT", "TRACE", "TRACK"]
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(method.as_str()))
+}
+
 /// Most bytes the CORS-safelisted header values of one request may add up to before they need a
 /// preflight after all ([Fetch] §2.2.2, CORS-unsafe request-header names).
 ///

@@ -1770,6 +1770,11 @@ async fn get_with_redirects(
         );
     }
     let origin = init.origin;
+    // Web content may not send these (Fetch §2.2.1). A request without an origin is the
+    // embedder's own and may.
+    if origin.is_some() && cors::is_forbidden_method(&current_method) {
+        return Err(blocked(&observer, url, BlockReason::ForbiddenMethod));
+    }
     // A redirect may replace this for the remaining hops (Fetch, HTTP-redirect fetch).
     let mut referrer_policy = init.referrer_policy;
     // The request's referrer as the chain has left it (Fetch, main fetch step 9): each hop
@@ -7103,6 +7108,56 @@ mod tests {
 
         fn changes(rec: &RecordingObserver) -> Vec<RequestChange> {
             rec.modifications().into_iter().map(|(_, c)| c).collect()
+        }
+
+        /// `CONNECT`, `TRACE` and `TRACK`, in any case, are refused for a request with an
+        /// initiating origin before anything is sent (Fetch §2.2.1). Without an origin the
+        /// request is the embedder's and goes out.
+        #[tokio::test(flavor = "current_thread")]
+        async fn forbidden_methods_are_refused_for_web_content() {
+            let srv = TestServer::new()
+                .default_route(RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let origin = Some(srv.url("/").origin());
+            for written in ["TRACE", "track", "Connect"] {
+                let method = Method::from_bytes(written.as_bytes()).unwrap();
+                let init = RequestInit::new(method, HeaderMap::new(), None)
+                    .with_mixed_content(origin.clone(), MixedContentPolicy::default());
+                let res = super::super::fetch_response_complete(
+                    client(),
+                    srv.url("/x"),
+                    init,
+                    CancellationToken::new(),
+                    observer(),
+                    None,
+                    Duration::from_secs(3),
+                    Some(Duration::from_secs(5)),
+                    NetPolicy::default(),
+                )
+                .await;
+                assert!(
+                    matches!(
+                        res,
+                        Err(NetError::Blocked {
+                            reason: BlockReason::ForbiddenMethod,
+                            ..
+                        })
+                    ),
+                    "{written}: {res:?}"
+                );
+            }
+            assert_eq!(srv.hit_count("/x"), 0);
+
+            let rec = recorded(
+                client(),
+                srv.url("/y"),
+                RequestInit::new(Method::TRACE, HeaderMap::new(), None),
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(rec.requests_sent().len(), 1);
+            assert_eq!(srv.hit_count("/y"), 1);
         }
 
         /// The six methods Fetch normalizes go out uppercased, whatever case the caller wrote

@@ -12,8 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `RequestChange::HeadersRemoved`: headers the caller set that were not sent, reported once on
   the first hop. `RequestChange` is `#[non_exhaustive]`, so this needs no new `match` arm
 
+### Changed
+
+- **Breaking:** `BlockReason` gained `ForbiddenMethod`, so an exhaustive `match` on it outside
+  this crate needs an arm for it. `cors::is_forbidden_method` exposes the rule
+
 ### Fixed
 
+- A request with an initiating origin could use `CONNECT`, `TRACE` or `TRACK`, which Fetch
+  forbids web content (§2.2.1); `TRACE` echoes the request back, cookies included. Such a
+  request is refused with `BlockReason::ForbiddenMethod` before anything is sent. A request
+  without an origin is the embedder's own and still goes out
 - A caller's `Content-Length` was sent instead of the body's: a smaller one cut the body short
   (the rest of it was lost and the fetch reported success), a larger one left the server
   waiting for bytes that never came. `Content-Length` and `Transfer-Encoding` are now always
