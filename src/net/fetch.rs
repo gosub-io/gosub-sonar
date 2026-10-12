@@ -2473,8 +2473,12 @@ async fn get_with_redirects(
                         continue;
                     }
                     if resp.status().as_u16() == 304 {
-                        let mut updated =
-                            entry.updated_by_304(resp.headers(), requested_at, received_at);
+                        let mut updated = entry.updated_by_304(
+                            resp.headers(),
+                            requested_at,
+                            received_at,
+                            &current_headers,
+                        );
                         // The connection that confirmed the entry is where it now comes from.
                         updated.peer_addr = origin_peer(&resp, &url, &policy);
                         let updated = Arc::new(updated);

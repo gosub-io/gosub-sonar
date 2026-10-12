@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `CacheEntry::updated_by_304` takes the revalidating request's headers, for the
+  `Vary` a `304` may bring
 - **Breaking:** `ResponseDirectives` gained the field `must_understand`, so building one with
   a struct literal needs it, or `..Default::default()`
 - `CacheMode::NoCache`, and a request's `Cache-Control: no-cache`, used a fresh `immutable`
@@ -52,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `304` that brought a `Vary` left the stored response selected by its old one: a
+  `Vary: *`, after which nothing may match (RFC 9111 §4.1), still matched every request.
+  The `304`'s `Vary` replaces the stored one now (RFC 9110 §15.4.5)
 - A `304` without any validator freshened a stored response that had one. Such a `304`
   selects only a response without validators (RFC 9111 §4.3.4), so it refetches now, as does
   one whose only validator is a `Last-Modified` the stored response lacks. A server sending

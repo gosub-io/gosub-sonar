@@ -236,7 +236,8 @@ impl CacheEntry {
     /// `decoded` is the requesting fetch's auto-decode setting: a stored decoded body is not the
     /// same resource as the encoded one the raw caller asked for.
     pub fn matches(&self, request: &HeaderMap, decoded: bool) -> bool {
-        if self.decoded != decoded {
+        // `Vary: *` always fails to match (RFC 9111 §4.1).
+        if self.decoded != decoded || self.vary.iter().any(|(name, _)| name == "*") {
             return false;
         }
         self.vary.iter().all(|(name, stored)| {
@@ -362,11 +363,16 @@ impl CacheEntry {
 
     /// The entry as updated by a `304` (RFC 9111 §4.3.4): the stored body, the stored headers with
     /// everything the `304` carried written over them, and the age clock restarted.
+    ///
+    /// A `Vary` on the `304` replaces the stored one (RFC 9110 §15.4.5), so the entry is
+    /// selected by the headers it names from now on, with the values `request`, the
+    /// revalidating request, carried. A `Vary: *` leaves an entry nothing matches.
     pub fn updated_by_304(
         &self,
         headers: &HeaderMap,
         requested_at: DateTime<Utc>,
         received_at: DateTime<Utc>,
+        request: &HeaderMap,
     ) -> Self {
         let mut updated = self.clone();
         let connection = connection_listed(headers);
@@ -388,6 +394,17 @@ impl CacheEntry {
             for value in headers.get_all(name) {
                 updated.headers.append(name, value.clone());
             }
+        }
+        if headers.contains_key(header::VARY) {
+            updated.vary = vary_names(&updated.headers)
+                .into_iter()
+                .map(|name| {
+                    let value = HeaderName::try_from(name.as_str())
+                        .ok()
+                        .and_then(|n| vary_value(request, &n));
+                    (name, value)
+                })
+                .collect();
         }
         updated.requested_at = requested_at;
         updated.received_at = received_at;
@@ -1556,9 +1573,10 @@ mod tests {
         };
         let confirmation = headers(&[("etag", "\"v1\""), ("content-encoding", "gzip")]);
 
-        let decoded = stored(true).updated_by_304(&confirmation, at(100), at(100));
+        let decoded =
+            stored(true).updated_by_304(&confirmation, at(100), at(100), &HeaderMap::new());
         assert!(!decoded.headers.contains_key(header::CONTENT_ENCODING));
-        let raw = stored(false).updated_by_304(&confirmation, at(100), at(100));
+        let raw = stored(false).updated_by_304(&confirmation, at(100), at(100), &HeaderMap::new());
         assert_eq!(raw.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
     }
 
@@ -1636,6 +1654,33 @@ mod tests {
         let modified = |time| headers(&[("last-modified", &http_date(time))]);
         assert!(!dated.contradicted_by(&modified(at(-100))));
         assert!(dated.contradicted_by(&modified(at(-50))));
+    }
+
+    /// A `304` that brings `Vary` replaces the stored one (RFC 9110 §15.4.5): `Vary: *` leaves
+    /// an entry nothing matches (RFC 9111 §4.1), and a new name selects by the value the
+    /// revalidating request carried.
+    #[test]
+    fn a_304_that_brings_vary_replaces_it() {
+        let stored = entry(&[("cache-control", "max-age=60"), ("etag", "\"v1\"")]);
+        let asked = headers(&[("accept-language", "nl")]);
+        assert!(stored.matches(&asked, false));
+
+        let star = stored.updated_by_304(
+            &headers(&[("etag", "\"v1\""), ("vary", "*")]),
+            at(1),
+            at(1),
+            &asked,
+        );
+        assert!(!star.matches(&asked, false));
+
+        let by_language = stored.updated_by_304(
+            &headers(&[("etag", "\"v1\""), ("vary", "accept-language")]),
+            at(1),
+            at(1),
+            &asked,
+        );
+        assert!(by_language.matches(&asked, false));
+        assert!(!by_language.matches(&headers(&[("accept-language", "en")]), false));
     }
 
     /// RFC 9111 §4.3.4: a `304` without a validator selects a stored response only if that one
@@ -2035,6 +2080,7 @@ mod tests {
             ]),
             at(1),
             at(1),
+            &HeaderMap::new(),
         );
         assert!(!updated.headers.contains_key("x-hop-304"));
         assert!(updated.headers.contains_key("x-new"));
@@ -2048,6 +2094,7 @@ mod tests {
             &headers(&[("proxy-authentication-info", "nextnonce=\"m\"")]),
             at(1),
             at(1),
+            &HeaderMap::new(),
         );
         assert!(!updated.headers.contains_key("proxy-authentication-info"));
     }
@@ -2088,6 +2135,7 @@ mod tests {
             ]),
             at(100),
             at(100),
+            &HeaderMap::new(),
         );
 
         assert_eq!(&updated.body[..], b"body", "the stored body is reused");
