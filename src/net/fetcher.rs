@@ -416,10 +416,10 @@ impl Fetcher {
             "FetcherConfig.h2_per_origin must be >= 1"
         );
 
-        // Read the environment's proxies alongside the clients, which read them while building.
+        // The environment's proxies are read once, here, and both clients are built from that.
         let built = Arc::new(ClientsBuilt::new(&config));
-        let client = build_client(&config, true, &ctx)?;
-        let client_raw = build_client(&config, false, &ctx)?;
+        let client = build_client(&config, true, &ctx, &built)?;
+        let client_raw = build_client(&config, false, &ctx, &built)?;
 
         Ok(Self {
             client,
@@ -996,6 +996,7 @@ fn build_client(
     cfg: &FetcherConfig,
     decode: bool,
     ctx: &Arc<dyn FetcherContext>,
+    built: &ClientsBuilt,
 ) -> anyhow::Result<reqwest::Client> {
     // The browser's fetch() owns TLS, connection management, timeouts, proxying, and transparent
     // decompression; none of the tuning knobs below exist in reqwest's wasm backend.
@@ -1006,7 +1007,7 @@ fn build_client(
     // cannot see, so this is a loss of reporting rather than of enforcement.
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (decode, ctx);
+        let _ = (decode, ctx, built);
         let mut b = reqwest::Client::builder();
         if let Some(ref ua) = cfg.user_agent {
             b = b.user_agent(ua);
@@ -1054,7 +1055,7 @@ fn build_client(
         // Observation only - forwards the request and returns the connector's own result
         // unchanged - so it is installed for every client rather than gated on config.
         b = b.connector_layer(crate::net::connect_timing::ConnectTimingLayer);
-        b = cfg.proxy.apply(b)?;
+        b = built.proxy.apply(b)?;
         Ok(b.build()?)
     }
 }
@@ -1120,11 +1121,11 @@ fn build_policy(
         // Same reason as the user agent: the client would attach `Proxy-Authorization` itself,
         // while executing the request, and an observer would never see the header its own
         // configuration put there.
-        let proxy = cfg.proxy.clone();
+        let proxy = built.clone();
         let proxy_for = built.clone();
         let proxied = built.clone();
         let policy = policy
-            .with_proxy_authorization(Box::new(move |url| proxy.proxy_authorization(url)))
+            .with_proxy_authorization(Box::new(move |url| proxy.proxy.proxy_authorization(url)))
             .with_proxy_for(Box::new(move |url| proxy_for.proxy.plain_http_proxy(url)))
             .with_proxied(Box::new(move |url| proxied.proxy.routes_through_proxy(url)))
             .with_dns_resolver(cfg.dns_resolver.clone())

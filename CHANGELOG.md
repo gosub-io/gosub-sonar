@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProxyRule::with_basic_auth` percent-decoded its username and password: `al%40ice` reached
   the proxy as `al@ice`. They go into the proxy URL encoded now, and arrive as given (RFC 7617
   §2), on the plain-http header and the `CONNECT` alike
+- `NO_PROXY` from the environment did not get the bypass rules `ProxyRule::no_proxy` has:
+  `NO_PROXY=*` still sent `127.0.0.1` and `[::1]` through the proxy, and `[::1]` or a name
+  with a trailing dot matched nothing. An empty `HTTP_PROXY` also hid a set `http_proxy`.
+  `ProxyConfig::System` now reads the variables itself, as the rules `ProxyConfig::Rules`
+  would hold, so one `NO_PROXY` string means one thing. The environment is read once per
+  `Fetcher`, and the client, the reported `Proxy-Authorization` and the 407 handling all go by
+  that one reading; with no proxy variable set, the operating system's settings apply as before
 
 ## [0.13.0] - 2026-10-12
 

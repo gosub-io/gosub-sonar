@@ -1,8 +1,7 @@
 //! Programmatic proxy configuration for the [`Fetcher`].
 //!
-//! Without configuration the fetcher keeps reqwest's default behaviour and reads the
-//! `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` environment variables — see
-//! [`ProxyConfig::System`]. An embedder that has its own proxy settings (a browser's network
+//! Without configuration the fetcher reads the `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` /
+//! `NO_PROXY` environment variables -- see [`ProxyConfig::System`]. An embedder that has its own proxy settings (a browser's network
 //! preferences, a PAC-derived result, a per-profile override) sets
 //! [`FetcherConfig::proxy`] instead, which takes the environment out of the picture entirely.
 //!
@@ -426,8 +425,24 @@ fn normalize_host(host: &str) -> String {
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub enum ProxyConfig {
     /// Take the proxy from the environment: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and the
-    /// `NO_PROXY` bypass list (lowercase spellings included). The default, and what the fetcher
-    /// did before proxies were configurable.
+    /// `NO_PROXY` bypass list. The default.
+    ///
+    /// Each is read as the rules of [`ProxyConfig::Rules`] would be written: `HTTP_PROXY` an
+    /// [`ProxyRule::http`], `HTTPS_PROXY` an [`ProxyRule::https`], `ALL_PROXY` an
+    /// [`ProxyRule::all`] for whatever the other two leave, each bypassing `NO_PROXY` in the
+    /// syntax [`ProxyRule::no_proxy`] describes. The uppercase name wins over the lowercase
+    /// one, an empty value counts as unset, and a value without a scheme is an `http` proxy. An
+    /// unusable value is skipped with a warning rather than failing the fetcher.
+    ///
+    /// Under CGI (`REQUEST_METHOD` is set) the environment is ignored and every request goes
+    /// direct: a CGI server passes a request's `Proxy` header to its program as `HTTP_PROXY`,
+    /// so the client of that server would choose it (httpoxy, CVE-2016-5385).
+    ///
+    /// When no variable names a proxy, the operating system's settings are used where there
+    /// are any (macOS, Windows), as reqwest reads them.
+    ///
+    /// The environment is read once, when the [`Fetcher`](crate::net::fetcher::Fetcher) is
+    /// built.
     #[default]
     System,
     /// Send every request directly, ignoring the environment variables.
@@ -444,18 +459,123 @@ impl ProxyConfig {
         ProxyConfig::Rules(vec![ProxyRule::all(url)])
     }
 
+    /// Apply this configuration to a client builder, reading the environment now for
+    /// [`ProxyConfig::System`].
+    pub(crate) fn apply(
+        &self,
+        builder: reqwest::ClientBuilder,
+    ) -> anyhow::Result<reqwest::ClientBuilder> {
+        ProxyRoutes::resolve(self).apply(builder)
+    }
+}
+
+/// The rules [`ProxyConfig::System`] reads from the environment through `var`, or `None` when
+/// no variable names a proxy. See [`ProxyConfig::System`] for how each is read.
+fn env_rules(var: &dyn Fn(&str) -> Option<String>) -> Option<Vec<ProxyRule>> {
+    let first = |names: &[&str]| {
+        names
+            .iter()
+            .filter_map(|name| var(name))
+            .map(|value| value.trim().to_string())
+            .find(|value| !value.is_empty())
+    };
+    if var("REQUEST_METHOD").is_some() {
+        return Some(Vec::new());
+    }
+    let http = first(&["HTTP_PROXY", "http_proxy"]);
+    let https = first(&["HTTPS_PROXY", "https_proxy"]);
+    let all = first(&["ALL_PROXY", "all_proxy"]);
+    if http.is_none() && https.is_none() && all.is_none() {
+        return None;
+    }
+    let no_proxy = first(&["NO_PROXY", "no_proxy"]);
+    let with_scheme = |url: String| {
+        if url.contains("://") {
+            url
+        } else {
+            format!("http://{url}")
+        }
+    };
+    let rules = [
+        (ProxyScope::Http, http),
+        (ProxyScope::Https, https),
+        (ProxyScope::All, all),
+    ]
+    .into_iter()
+    .filter_map(|(scope, url)| {
+        let rule = ProxyRule {
+            no_proxy: no_proxy.clone(),
+            ..ProxyRule::new(scope, with_scheme(url?))
+        };
+        match rule.to_reqwest() {
+            Ok(_) => Some(rule),
+            Err(e) => {
+                log::warn!("ignoring the proxy from the environment: {e:#}");
+                None
+            }
+        }
+    })
+    .collect();
+    Some(rules)
+}
+
+/// A [`ProxyConfig`] resolved once, with the environment read for [`ProxyConfig::System`].
+/// The client is built from it and requests are judged by it, so the two cannot disagree;
+/// asking the environment again per request would answer for settings the client never saw.
+pub(crate) enum ProxyRoutes {
+    /// No variable named a proxy: the operating system's settings, as hyper-util reads them for
+    /// reqwest (macOS, Windows; nothing elsewhere).
+    System(Box<proxy_matcher::Matcher>),
+    Disabled,
+    Rules(Vec<ProxyRule>),
+}
+
+impl ProxyRoutes {
+    /// Resolve `config`, reading the environment now for [`ProxyConfig::System`].
+    pub(crate) fn resolve(config: &ProxyConfig) -> Self {
+        match config {
+            ProxyConfig::System => match env_rules(&|name| std::env::var(name).ok()) {
+                Some(rules) => ProxyRoutes::Rules(rules),
+                None => ProxyRoutes::System(Box::new(proxy_matcher::Matcher::from_system())),
+            },
+            ProxyConfig::Disabled => ProxyRoutes::Disabled,
+            ProxyConfig::Rules(rules) => ProxyRoutes::Rules(rules.clone()),
+        }
+    }
+
+    /// Apply these routes to a client builder.
+    ///
+    /// [`ProxyRoutes::System`] leaves the builder as it is: reqwest reads the same operating
+    /// system settings itself. The others clear it first so nothing else is appended to them.
+    pub(crate) fn apply(
+        &self,
+        builder: reqwest::ClientBuilder,
+    ) -> anyhow::Result<reqwest::ClientBuilder> {
+        match self {
+            ProxyRoutes::System(_) => Ok(builder),
+            ProxyRoutes::Disabled => Ok(builder.no_proxy()),
+            ProxyRoutes::Rules(rules) => {
+                // `no_proxy()` first: with an empty `rules` nothing else would switch the
+                // client's own environment lookup off.
+                let mut builder = builder.no_proxy();
+                for rule in rules {
+                    builder = builder.proxy(rule.to_reqwest()?);
+                }
+                Ok(builder)
+            }
+        }
+    }
+
     /// The `Proxy-Authorization` the HTTP client will attach to a request for `url`, so that
     /// [`NetEvent::RequestSent`](crate::net::events::NetEvent::RequestSent) reports a header
     /// this crate would otherwise only watch the client add.
     ///
-    /// Answers only for an `http` URL, and only for [`ProxyConfig::Rules`]:
+    /// Answers only for an `http` URL, and only for rules:
     ///
     /// - An `https` request is tunnelled, and the client puts the credentials on the `CONNECT`
     ///   request instead. That is a separate exchange no observer sees, and it carries no
     ///   header on the request this reports.
-    /// - [`ProxyConfig::System`] leaves the choice of proxy to the client, which reads it from
-    ///   the environment. Restating that here would mean guessing at inputs this crate never
-    ///   saw, which is the opposite of the point.
+    /// - The operating system's settings are the client's to read.
     ///
     /// The rule that answers is the first one that routes the request, the one whose proxy the
     /// client connects through, and its credentials or none at all: credentials belong to the
@@ -470,63 +590,14 @@ impl ProxyConfig {
         if url.scheme() != "http" {
             return None;
         }
-        let rules = match *self {
-            ProxyConfig::Rules(ref rules) => rules,
-            ProxyConfig::System | ProxyConfig::Disabled => return None,
+        let ProxyRoutes::Rules(ref rules) = *self else {
+            return None;
         };
         let dst: http::Uri = url.as_str().parse().ok()?;
         rules
             .iter()
             .find(|rule| rule.routes(&dst))?
             .non_tunnel_authorization(&dst)
-    }
-
-    /// Apply this configuration to a client builder.
-    ///
-    /// [`ProxyConfig::System`] leaves the builder untouched, since reading the environment is
-    /// reqwest's own default; the other variants clear it first so no environment proxy leaks in.
-    pub(crate) fn apply(
-        &self,
-        builder: reqwest::ClientBuilder,
-    ) -> anyhow::Result<reqwest::ClientBuilder> {
-        match self {
-            ProxyConfig::System => Ok(builder),
-            ProxyConfig::Disabled => Ok(builder.no_proxy()),
-            ProxyConfig::Rules(rules) => {
-                // `no_proxy()` first: with an empty `rules` nothing else would switch the
-                // environment lookup off, and a caller that spelled out its rules never wants
-                // `HTTP_PROXY` silently appended to them.
-                let mut builder = builder.no_proxy();
-                for rule in rules {
-                    builder = builder.proxy(rule.to_reqwest()?);
-                }
-                Ok(builder)
-            }
-        }
-    }
-}
-
-/// A [`ProxyConfig`] resolved the way a client built from it resolved it. reqwest reads the
-/// environment for [`ProxyConfig::System`] once, while building the client, and routes by that
-/// for the client's lifetime; asking the environment again per request would answer for
-/// settings the client never saw. Take this next to the client it describes.
-pub(crate) enum ProxyRoutes {
-    /// The environment's proxies, as they were when the client was built.
-    System(Box<proxy_matcher::Matcher>),
-    Disabled,
-    Rules(Vec<ProxyRule>),
-}
-
-impl ProxyRoutes {
-    /// Resolve `config`, reading the environment now for [`ProxyConfig::System`].
-    pub(crate) fn resolve(config: &ProxyConfig) -> Self {
-        match config {
-            ProxyConfig::System => {
-                ProxyRoutes::System(Box::new(proxy_matcher::Matcher::from_system()))
-            }
-            ProxyConfig::Disabled => ProxyRoutes::Disabled,
-            ProxyConfig::Rules(rules) => ProxyRoutes::Rules(rules.clone()),
-        }
     }
 
     /// The http(s) proxy a plain-`http` request to `url` goes through, without credentials;
@@ -700,7 +771,8 @@ mod tests {
 
     /// The `Proxy-Authorization` reported for `url` under `cfg`, as a string.
     fn authorization(cfg: &ProxyConfig, url: &str) -> Option<String> {
-        cfg.proxy_authorization(&Url::parse(url).unwrap())
+        ProxyRoutes::resolve(cfg)
+            .proxy_authorization(&Url::parse(url).unwrap())
             .map(|v| v.to_str().unwrap().to_string())
     }
 
@@ -818,18 +890,124 @@ mod tests {
         assert_eq!(authorization(&cfg, "http://target.example/"), None);
     }
 
-    /// The environment is the client's to read, so a system-proxy configuration is left to it
-    /// rather than restated from inputs this crate never saw.
+    /// The operating system's settings are the client's to read, and a disabled proxy has no
+    /// credentials to report.
     #[test]
-    fn system_and_disabled_report_nothing() {
+    fn system_settings_and_disabled_report_nothing() {
+        let url = Url::parse("http://target.example/").unwrap();
+        let os = ProxyRoutes::System(Box::new(
+            proxy_matcher::Matcher::builder()
+                .all("http://alice:hunter2@127.0.0.1:3128".to_string())
+                .build(),
+        ));
+        assert_eq!(os.proxy_authorization(&url), None);
+        assert_eq!(ProxyRoutes::Disabled.proxy_authorization(&url), None);
+    }
+
+    /// The routes [`env_rules`] makes of `vars`, or `None` when it finds no proxy.
+    fn env(vars: &[(&str, &str)]) -> Option<ProxyRoutes> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        env_rules(&|name| vars.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()))
+            .map(ProxyRoutes::Rules)
+    }
+
+    /// The proxy a plain-http request to `target` goes through under `routes`, as a string.
+    fn via(routes: &ProxyRoutes, target: &str) -> Option<String> {
+        routes
+            .plain_http_proxy(&Url::parse(target).unwrap())
+            .map(|u| u.to_string())
+    }
+
+    /// `NO_PROXY` from the environment means what `ProxyRule::no_proxy` means: `*` covers IP
+    /// hosts too, an IPv6 address may be in brackets, a name may end in a dot.
+    #[test]
+    fn env_no_proxy_is_read_like_a_rules_bypass_list() {
+        let url = |s: &str| Url::parse(s).unwrap();
+        let star = env(&[("HTTP_PROXY", "http://127.0.0.1:3128"), ("NO_PROXY", "*")]).unwrap();
+        for target in [
+            "http://example.com/",
+            "http://127.0.0.1:8080/",
+            "http://[::1]/",
+        ] {
+            assert!(!star.routes_through_proxy(&url(target)), "{target}");
+        }
+
+        let forms = env(&[
+            ("ALL_PROXY", "http://127.0.0.1:3128"),
+            ("no_proxy", "[::1], intranet.example."),
+        ])
+        .unwrap();
+        assert!(!forms.routes_through_proxy(&url("http://[::1]/")));
+        assert!(!forms.routes_through_proxy(&url("https://intranet.example/")));
+        assert!(forms.routes_through_proxy(&url("http://example.com/")));
+    }
+
+    /// Each variable covers its own scheme, `ALL_PROXY` whatever is left, and an empty value
+    /// counts as unset rather than hiding the lowercase spelling.
+    #[test]
+    fn env_variables_by_scheme_with_empty_values_unset() {
+        let routes = env(&[
+            ("HTTP_PROXY", ""),
+            ("http_proxy", "http://lower.test:3128"),
+            ("ALL_PROXY", "http://all.test:3128"),
+        ])
+        .unwrap();
         assert_eq!(
-            authorization(&ProxyConfig::System, "http://target.example/"),
-            None
+            via(&routes, "http://example.com/").as_deref(),
+            Some("http://lower.test:3128/")
         );
+        assert!(routes.routes_through_proxy(&Url::parse("https://example.com/").unwrap()));
+
+        // Uppercase wins when both are set, as in hyper-util and Go.
+        let both = env(&[
+            ("HTTP_PROXY", "http://upper.test:3128"),
+            ("http_proxy", "http://lower.test:3128"),
+        ])
+        .unwrap();
         assert_eq!(
-            authorization(&ProxyConfig::Disabled, "http://target.example/"),
-            None
+            via(&both, "http://example.com/").as_deref(),
+            Some("http://upper.test:3128/")
         );
+        assert!(!both.routes_through_proxy(&Url::parse("https://example.com/").unwrap()));
+    }
+
+    /// A value without a scheme is an http proxy, an unusable one is skipped, and no proxy
+    /// variable at all leaves the choice to the operating system's settings.
+    #[test]
+    fn env_values_without_a_scheme_unusable_or_absent() {
+        let bare = env(&[("HTTP_PROXY", "proxy.test:3128")]).unwrap();
+        assert_eq!(
+            via(&bare, "http://example.com/").as_deref(),
+            Some("http://proxy.test:3128/")
+        );
+
+        let broken = env(&[
+            ("HTTP_PROXY", "http://[not-an-address"),
+            ("ALL_PROXY", "http://all.test:3128"),
+        ])
+        .unwrap();
+        assert_eq!(
+            via(&broken, "http://example.com/").as_deref(),
+            Some("http://all.test:3128/")
+        );
+
+        assert!(env(&[("NO_PROXY", "*")]).is_none());
+        assert!(env(&[("HTTP_PROXY", "  ")]).is_none());
+    }
+
+    /// httpoxy (CVE-2016-5385): under CGI a request's `Proxy` header arrives as `HTTP_PROXY`,
+    /// so the environment is not trusted for a proxy at all.
+    #[test]
+    fn under_cgi_the_environment_names_no_proxy() {
+        let cgi = env(&[
+            ("REQUEST_METHOD", "GET"),
+            ("HTTP_PROXY", "http://evil.test:3128"),
+        ])
+        .unwrap();
+        assert!(!cgi.routes_through_proxy(&Url::parse("http://example.com/").unwrap()));
     }
 
     #[test]
