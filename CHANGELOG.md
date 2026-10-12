@@ -54,6 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A response without `Date` was stored without one, so a cache hit carried no `Date` at all.
+  It is stored with the time it arrived (RFC 9110 §6.6.1)
 - A `304` that brought a `Vary` left the stored response selected by its old one: a
   `Vary: *`, after which nothing may match (RFC 9111 §4.1), still matched every request.
   The `304`'s `Vary` replaces the stored one now (RFC 9110 §15.4.5)

@@ -640,6 +640,12 @@ pub fn entry_from_response(
     headers.remove(PROXY_AUTHENTICATION_INFO);
     // A cache hit must not re-apply a cookie the jar has long since stored or dropped.
     headers.remove(header::SET_COOKIE);
+    // A response is cached with the time it arrived when it carries none (RFC 9110 §6.6.1).
+    if !headers.contains_key(header::DATE) {
+        if let Ok(date) = header::HeaderValue::from_str(&format_http_date(received_at)) {
+            headers.insert(header::DATE, date);
+        }
+    }
     if decoded {
         headers.remove(header::CONTENT_ENCODING);
         headers.remove(header::CONTENT_LENGTH);
@@ -869,6 +875,11 @@ pub fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
         }
     }
     None
+}
+
+/// `time` as an IMF-fixdate (RFC 9110 §5.6.7), the form an HTTP-date is sent in.
+fn format_http_date(time: DateTime<Utc>) -> String {
+    time.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 /// A header's value as an HTTP-date, or `None` when absent or unparsable.
@@ -1153,6 +1164,20 @@ mod tests {
 
     fn key() -> CacheKey {
         CacheKey::new(&Method::GET, &Url::parse("https://example.com/a").unwrap())
+    }
+
+    /// A response without `Date` is stored with the time it arrived (RFC 9110 §6.6.1); one
+    /// with a `Date` keeps it.
+    #[test]
+    fn a_response_without_date_is_stored_with_one() {
+        let stored = entry(&[("cache-control", "max-age=60")]);
+        assert_eq!(stored.headers[header::DATE], http_date(at(0)).as_str());
+        let dated = entry(&[
+            ("cache-control", "max-age=60"),
+            ("date", &http_date(at(-5))),
+        ]);
+        assert_eq!(dated.headers[header::DATE], http_date(at(-5)).as_str());
+        assert_eq!(dated.headers.get_all(header::DATE).iter().count(), 1);
     }
 
     #[test]
