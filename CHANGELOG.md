@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `304` without any validator freshened a stored response that had one. Such a `304`
+  selects only a response without validators (RFC 9111 §4.3.4), so it refetches now, as does
+  one whose only validator is a `Last-Modified` the stored response lacks. A server sending
+  that `304` already breaks RFC 9110 §15.4.5; the cost is one full request
 - A `304` that brought an `ETag` the stored response did not have, as when a server starts
   sending them, freshened the stored response and stored the tag with it. Nothing showed the
   stored body was the one the tag names, and every later revalidation confirmed it again. Such

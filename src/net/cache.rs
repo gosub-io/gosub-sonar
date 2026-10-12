@@ -326,6 +326,7 @@ impl CacheEntry {
     /// - Either `ETag` never selects an entry stored without one.
     /// - A `Last-Modified` and no `ETag` selects it only if the stored `Last-Modified` is the
     ///   same.
+    /// - No validator at all selects it only if the entry has none either.
     pub fn contradicted_by(&self, response: &HeaderMap) -> bool {
         let etag = |headers: &HeaderMap| {
             headers
@@ -347,7 +348,9 @@ impl CacheEntry {
                 response.get(header::LAST_MODIFIED),
             ) {
                 (Some(stored), Some(sent)) => stored != sent,
-                _ => false,
+                (None, Some(_)) => true,
+                // No validator at all: it selects only an entry that has none either.
+                (_, None) => self.is_revalidatable(),
             },
         }
     }
@@ -1619,7 +1622,6 @@ mod tests {
         assert!(!stored.contradicted_by(&with("\"v1\"")));
         assert!(stored.contradicted_by(&with("W/\"v2\"")));
         assert!(!stored.contradicted_by(&with("W/\"v1\"")));
-        assert!(!stored.contradicted_by(&HeaderMap::new()));
 
         let weak = entry(&[("cache-control", "max-age=10"), ("etag", "W/\"v1\"")]);
         assert!(weak.contradicted_by(&with("W/\"v2\"")));
@@ -1634,6 +1636,23 @@ mod tests {
         let modified = |time| headers(&[("last-modified", &http_date(time))]);
         assert!(!dated.contradicted_by(&modified(at(-100))));
         assert!(dated.contradicted_by(&modified(at(-50))));
+    }
+
+    /// RFC 9111 §4.3.4: a `304` without a validator selects a stored response only if that one
+    /// has no validator either; one with a `Last-Modified` the entry lacks selects nothing.
+    #[test]
+    fn a_304_without_validators_selects_only_an_entry_without() {
+        let none = HeaderMap::new();
+        let tagged = entry(&[("cache-control", "max-age=10"), ("etag", "\"v1\"")]);
+        assert!(tagged.contradicted_by(&none));
+        let dated = entry(&[
+            ("cache-control", "max-age=10"),
+            ("last-modified", &http_date(at(-100))),
+        ]);
+        assert!(dated.contradicted_by(&none));
+        let bare = entry(&[("cache-control", "max-age=10")]);
+        assert!(!bare.contradicted_by(&none));
+        assert!(tagged.contradicted_by(&headers(&[("last-modified", &http_date(at(-100)))])));
     }
 
     /// RFC 9111 §4.3.4: if none of the stored responses has the `304`'s strong validator, none
