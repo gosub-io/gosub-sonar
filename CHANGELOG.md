@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `spawn_pump` ends in `Err` whenever the transfer fails: a read error, the idle
+  or total timeout, a cancel, or for a file target its setup, write or rename. A file-only pump
+  that failed used to resolve to `Ok(None)` with no event, the same as one that was asked for
+  no file, so a download that died looked like nothing at all. `Ok(None)` now only means no
+  file was asked for. A write error at the end of the stream is a `Warning` naming the URL,
+  like the others, instead of an `Io` event
 - **Breaking:** `FetcherContext::on_ref_active` and `on_ref_done` are called for every request,
   not once per fetch for the request that started it. A tab whose request joined another tab's
   fetch was never counted as busy, and the tab that started the fetch stayed busy until every
