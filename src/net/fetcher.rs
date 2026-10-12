@@ -886,29 +886,26 @@ fn effective_mixed_content(req: &FetchRequest, cfg: &FetcherConfig) -> MixedCont
     req.mixed_content.unwrap_or(cfg.mixed_content)
 }
 
-/// The `Accept` value sent for a destination when the caller did not set one.
-///
-/// Browsers vary the header by what the resource will be used as, and servers negotiate on it:
-/// a URL that can answer with either HTML or JSON needs to be told which one is wanted. The
-/// values follow the shape browsers send, without a vendor's exact list -- the point is a
-/// truthful, destination-appropriate preference, not impersonating a particular browser.
+/// The `Accept` value sent for a destination when the caller did not set one: the values
+/// [Fetch §4.1] gives, `*/*` for every destination it does not name. Servers negotiate on it,
+/// so a URL that can answer with either HTML or JSON is told which one is wanted, and an image
+/// URL is not told about a format the engine may not decode. A caller that wants another value
+/// sets its own `Accept`.
 ///
 /// Every value here is CORS-safelisted ([Fetch] §4.6), so setting one never turns a simple
 /// cross-origin request into a preflighted one.
 ///
+/// [Fetch §4.1]: https://fetch.spec.whatwg.org/#fetching
 /// [Fetch]: https://fetch.spec.whatwg.org/#cors-safelisted-request-header
 fn default_accept(destination: RequestDestination) -> &'static str {
     use RequestDestination as D;
     match destination {
-        // Markup that a navigation or a nested browsing context will parse as a document.
-        D::Document | D::Iframe | D::Frame | D::Object | D::Embed => {
+        D::Document | D::Iframe | D::Frame => {
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
-        D::Image => "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
+        D::Image => "image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
+        D::Json => "application/json,*/*;q=0.5",
         D::Style => "text/css,*/*;q=0.1",
-        // Scripts, fonts, media, workers, manifests, reports, and bare `fetch()`: no format
-        // preference to express, and a narrow value here would reject servers that answer
-        // with an unusual but perfectly loadable type.
         _ => "*/*",
     }
 }
@@ -4373,6 +4370,23 @@ mod tests {
             accept(RequestDestination::Style).as_deref(),
             Some("text/css,*/*;q=0.1")
         );
+        // Fetch §4.1, exactly. `object` and `embed` are not among the destinations that get the
+        // document value.
+        assert_eq!(
+            accept(RequestDestination::Image).as_deref(),
+            Some("image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+        );
+        assert_eq!(
+            accept(RequestDestination::Json).as_deref(),
+            Some("application/json,*/*;q=0.5")
+        );
+        for destination in [RequestDestination::Object, RequestDestination::Embed] {
+            assert_eq!(
+                accept(destination).as_deref(),
+                Some("*/*"),
+                "{destination:?}"
+            );
+        }
         // A destination with no format preference still gets a value, because the client
         // would otherwise supply this one itself after the request was reported.
         assert_eq!(accept(RequestDestination::Script).as_deref(), Some("*/*"));

@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `BlockReason` gained `ForbiddenMethod`, so an exhaustive `match` on it outside
   this crate needs an arm for it. `cors::is_forbidden_method` exposes the rule
 
+- The default `Accept` is the value Fetch §4.1 gives for each destination. Images send
+  `image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5` instead of a list naming AVIF first, a
+  format the engine does not decode, so a server negotiating on it sent images that could not
+  be shown. `json` sends `application/json,*/*;q=0.5` instead of `*/*`, and `object` and
+  `embed` send `*/*` instead of the document value
+
 ### Fixed
 
 - A request with an initiating origin carried the caller's forbidden request-headers (Fetch
