@@ -632,6 +632,9 @@ impl Fetcher {
                     req.url = hsts::upgrade(&req.url);
                 }
             }
+            // Reported to the request once it is accepted, below: the redirect loop only sees
+            // the `https` URL and has nothing left to report.
+            let upgraded = (req.url != requested).then(|| req.url.clone());
 
             // Pin the mixed-content policy to its resolved value before keying, so a request that
             // inherits the fetcher default and one that names the same policy explicitly land in
@@ -728,6 +731,7 @@ impl Fetcher {
                 continue;
             }
 
+            let requested_for_upgrade = requested.clone();
             let lifecycle = Lifecycle::accept(
                 self.ctx
                     .observer_for(req.reference, req.req_id, req.kind, req.initiator),
@@ -735,6 +739,13 @@ impl Fetcher {
                 false,
             );
             let observer: Arc<dyn NetObserver + Send + Sync> = lifecycle;
+            if let Some(ref to) = upgraded {
+                observer.on_event(NetEvent::SecurityUpgraded {
+                    from: requested_for_upgrade.clone(),
+                    to: to.clone(),
+                    reason: crate::net::types::UpgradeReason::Hsts,
+                });
+            }
 
             // Pre-flight checks. Only the leader ever sends bytes, so only the leader evaluates
             // them; rejecting here avoids waiting on a connection slot for a request that will
@@ -2351,6 +2362,32 @@ mod tests {
         assert_eq!(seen[0].certificate.as_deref(), srv.cert_der());
         assert!(store.is_accepted("tls.test", &seen[0].fingerprint.unwrap()));
         shutdown.cancel();
+    }
+
+    /// RFC 6797 §8.3: an HSTS host's `http` URL goes out as `https`, and the request says so
+    /// with `SecurityUpgraded` right after `Accepted`, which carries the URL as asked for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_hsts_upgrade_of_the_first_hop_is_reported() {
+        let hsts = Arc::new(InMemoryHstsStore::new());
+        hsts.store(
+            "hsts-upgrade.invalid",
+            crate::net::hsts::HstsEntry {
+                expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+                include_subdomains: false,
+            },
+        );
+        let cfg = FetcherConfig {
+            hsts: Some(hsts),
+            ..test_config()
+        };
+        let req = FetchRequest::builder(
+            Method::GET,
+            Url::parse("http://hsts-upgrade.invalid/").unwrap(),
+        )
+        .build();
+        let (_, log) = fetch_recorded(cfg, req).await;
+        let names = log.event_names();
+        assert_eq!(names[..2], ["Accepted", "SecurityUpgraded"], "{names:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]

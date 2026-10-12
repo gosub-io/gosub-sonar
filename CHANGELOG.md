@@ -61,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An HSTS upgrade of a request's first hop was not reported: the fetcher rewrote the URL
+  before the request had an observer, so `SecurityUpgraded` never came and the request looked
+  as if the caller had asked for `https`. It is reported right after `Accepted` now
+  (RFC 6797 §8.3)
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued
   by priority but spawned every request straight away, and the spawned tasks then waited on
   the global and per-origin semaphores in whatever order they happened to reach them: a `High`
