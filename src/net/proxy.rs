@@ -178,10 +178,19 @@ impl ProxyRule {
         };
 
         match self.auth {
+            // `basic_auth` puts the pair in the proxy URL, which the matcher percent-decodes, so
+            // it goes in encoded. A rule with a port entry is matched by a closure instead, and
+            // reqwest encodes the pair into the header as given.
             Some(ProxyAuth::Basic {
                 ref username,
                 ref password,
-            }) => proxy = proxy.basic_auth(username, password),
+            }) => {
+                proxy = if self.port_entries().is_empty() {
+                    proxy.basic_auth(&userinfo_encoded(username), &userinfo_encoded(password))
+                } else {
+                    proxy.basic_auth(username, password)
+                }
+            }
             Some(ProxyAuth::Custom(ref value)) => {
                 let header = value.parse().with_context(|| {
                     format!("proxy {:?}: invalid Proxy-Authorization value", self.url)
@@ -215,10 +224,12 @@ impl ProxyRule {
             ref password,
         } = *auth
         {
-            // Where `reqwest::Proxy::basic_auth` puts them, so the matcher derives the same
-            // header from the same place.
-            proxy_url.set_username(username).ok()?;
-            proxy_url.set_password(Some(password)).ok()?;
+            // Where `reqwest::Proxy::basic_auth` puts them, encoded as `to_reqwest` encodes
+            // them, so the matcher derives the same header from the same place.
+            proxy_url.set_username(&userinfo_encoded(username)).ok()?;
+            proxy_url
+                .set_password(Some(&userinfo_encoded(password)))
+                .ok()?;
         }
 
         let intercept = self.intercept(proxy_url, dst)?;
@@ -388,6 +399,20 @@ fn bypass_entries(list: &str) -> Vec<BypassEntry> {
             }
         })
         .collect()
+}
+
+/// `s` percent-encoded for the userinfo of a URL, every byte but the unreserved ones (RFC 3986
+/// §2.3), so that decoding it gives `s` back whatever it contains, a `%` included.
+fn userinfo_encoded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// A host as entries and requests are compared: lowercase, without IPv6 brackets or a trailing
@@ -728,6 +753,25 @@ mod tests {
     fn a_socks_proxy_reports_no_header() {
         let cfg = credentialed(ProxyRule::all("socks5://proxy.corp:1080"));
         assert_eq!(authorization(&cfg, "http://target.example/"), None);
+    }
+
+    /// `with_basic_auth` takes the username and password as they are: a `%` in either is a
+    /// `%`, not the start of an escape (RFC 7617 §2). Also for a rule with a port entry, which
+    /// the client matches by a closure and encodes differently.
+    #[test]
+    fn basic_credentials_are_taken_verbatim() {
+        // base64("al%40ice:p%41ss: x")
+        let expected = Some("Basic YWwlNDBpY2U6cCU0MXNzOiB4");
+        for rule in [
+            ProxyRule::all("http://proxy.corp:8080"),
+            ProxyRule::all("http://proxy.corp:8080").bypassing("intranet.test:8080"),
+        ] {
+            let cfg = ProxyConfig::Rules(vec![rule.with_basic_auth("al%40ice", "p%41ss: x")]);
+            assert_eq!(
+                authorization(&cfg, "http://target.example/").as_deref(),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `Proxy-Authorization` the caller set followed a cross-origin redirect, to a host that may
   be reached directly and is then an origin server, not the proxy. It is stripped with
   `Authorization` and `Cookie` now, and reported in `SensitiveHeadersStripped`
+- `ProxyRule::with_basic_auth` percent-decoded its username and password: `al%40ice` reached
+  the proxy as `al@ice`. They go into the proxy URL encoded now, and arrive as given (RFC 7617
+  §2), on the plain-http header and the `CONNECT` alike
 
 ## [0.13.0] - 2026-10-12
 

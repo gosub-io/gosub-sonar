@@ -4359,6 +4359,78 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// The head of the first request a raw listener receives, answered with a `403` so an
+    /// https request stops at its `CONNECT`.
+    async fn first_proxy_request_head() -> (std::net::SocketAddr, oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..n]);
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            let _ = tx.send(String::from_utf8_lossy(&head).into_owned());
+        });
+        (addr, rx)
+    }
+
+    /// The tunnel's credentials are the ones given to `with_basic_auth`, a `%` included: the
+    /// client encodes these itself, apart from the header this crate reports for plain http.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connect_carries_basic_credentials_verbatim() {
+        let (addr, head) = first_proxy_request_head().await;
+        let cfg = FetcherConfig {
+            proxy: ProxyConfig::Rules(vec![
+                ProxyRule::all(format!("http://{addr}")).with_basic_auth("al%40ice", "p%41ss: x")
+            ]),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+
+        let (req, cancel) = make_req(
+            Url::parse("https://unroutable.invalid/").unwrap(),
+            Priority::Normal,
+        );
+        let (tx, _rx) = oneshot::channel();
+        fetcher.submit(req, cancel, tx).await;
+        let head = tokio::time::timeout(Duration::from_secs(3), head)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            head.starts_with("CONNECT unroutable.invalid:443 "),
+            "{head}"
+        );
+        // base64("al%40ice:p%41ss: x")
+        let sent = head.lines().find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.eq_ignore_ascii_case("proxy-authorization")
+                .then(|| value.trim().to_string())
+        });
+        assert_eq!(
+            sent.as_deref(),
+            Some("Basic YWwlNDBpY2U6cCU0MXNzOiB4"),
+            "{head}"
+        );
+        shutdown.cancel();
+    }
+
     #[test]
     fn accept_is_set_here_so_it_can_be_reported() {
         let cfg = FetcherConfig::default();
