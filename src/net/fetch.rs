@@ -2527,6 +2527,18 @@ async fn get_with_redirects(
                     headers: resp.headers().clone(),
                 });
 
+                // A `101` is a final response only to a WebSocket handshake (Fetch §4.7,
+                // HTTP-network fetch) or a request that asked for an upgrade itself. Any other is
+                // a protocol switch nothing here speaks, not a response to hand on.
+                if resp.status() == http::StatusCode::SWITCHING_PROTOCOLS
+                    && init.mode != RequestMode::Websocket
+                    && !current_headers.contains_key(header::UPGRADE)
+                {
+                    return Err(NetError::Other(Arc::new(anyhow!(
+                        "{url}: 101 Switching Protocols to a request that asked for no upgrade"
+                    ))));
+                }
+
                 // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
                 // a site first arms it, and that response is consumed below.
                 // RFC 6797 §8.1: not from a connection the user clicked through.
@@ -7254,6 +7266,28 @@ mod tests {
                 sent_header(&rec, "accept-encoding").as_deref(),
                 Some("zstd")
             );
+        }
+
+        /// A `101` nobody asked for is a network error, not the response (Fetch §4.7).
+        #[tokio::test(flavor = "current_thread")]
+        async fn an_unsolicited_101_is_a_network_error() {
+            let srv = TestServer::new()
+                .route("/switch", RouteConfig::status(101, b""))
+                .start()
+                .await;
+            let res = super::super::fetch_response_complete(
+                client(),
+                srv.url("/switch"),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(3),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await;
+            assert!(matches!(res, Err(NetError::Other(_))), "{res:?}");
         }
 
         /// A request with `Range` asks for the representation unencoded (Fetch §4.6), and a

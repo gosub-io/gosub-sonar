@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are removed before the first hop now and reported as `RequestChange::HeadersRemoved`;
   `cors::is_forbidden_request_header_value` exposes the rule. A request without an origin is
   the embedder's own and keeps them
+- A `101 Switching Protocols` to a request that asked for no upgrade was handed on as the
+  final response, with a connection that now spoke something else. It is a network error now
+  (`NetError::Other`), as Fetch §4.7 makes it; a WebSocket handshake or a request with its own
+  `Upgrade` still gets its `101`
 - A request with `Range` advertised `gzip, br, deflate`, so a server could answer with a
   range of the compressed bytes. It asks for `identity` now (Fetch §4.6), appended to an
   `Accept-Encoding` the caller set
