@@ -688,7 +688,13 @@ pub fn decide(
     }
 
     let only_if_cached = mode == CacheMode::OnlyIfCached || asked.only_if_cached;
-    let Some(entry) = entries.iter().find(|e| e.matches(request, decoded)) else {
+    // Of several that match, the most recent by `Date` (RFC 9111 §4), the time it arrived for
+    // one without.
+    let Some(entry) = entries
+        .iter()
+        .filter(|e| e.matches(request, decoded))
+        .max_by_key(|e| header_date(&e.headers, header::DATE).unwrap_or(e.received_at))
+    else {
         return if only_if_cached {
             CacheDecision::NotCached
         } else {
@@ -1753,6 +1759,39 @@ mod tests {
             ),
             CacheDecision::Use(_)
         ));
+    }
+
+    /// When more than one stored response matches, the most recent one by `Date` is used
+    /// (RFC 9111 §4), whatever order they were stored in.
+    #[test]
+    fn the_most_recent_matching_variant_is_used() {
+        let variant = |vary: &str, date: i64| {
+            Arc::new(entry_from_response(
+                200,
+                &headers(&[
+                    ("cache-control", "max-age=600"),
+                    ("vary", vary),
+                    ("date", &http_date(at(date))),
+                ]),
+                &headers(&[("accept", "text/html"), ("accept-language", "nl")]),
+                Bytes::from_static(b"body"),
+                false,
+                at(date),
+                at(date),
+            ))
+        };
+        let older = variant("accept", 0);
+        let newer = variant("accept-language", 10);
+        let asked = headers(&[("accept", "text/html"), ("accept-language", "nl")]);
+        for stored in [
+            [older.clone(), newer.clone()],
+            [newer.clone(), older.clone()],
+        ] {
+            match decide(&stored, &asked, false, CacheMode::Default, at(20)) {
+                CacheDecision::Use(used) => assert_eq!(used.vary, newer.vary),
+                other => panic!("expected Use, got {other:?}"),
+            }
+        }
     }
 
     #[test]
