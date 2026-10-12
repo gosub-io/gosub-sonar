@@ -48,12 +48,15 @@ use url::{Origin, Url};
 ///
 /// `Referer` and `Origin` are included so hand-set values cannot leak to a third-party host.
 /// When the caller supplies a referrer or an initiating origin instead, the values are
-/// recomputed for each hop anyway, so removing them here costs nothing.
+/// recomputed for each hop anyway, so removing them here costs nothing. A hand-set
+/// `Proxy-Authorization` belongs to the proxy that demanded it (RFC 9110 §11.7.2), and the next
+/// host may be reached directly; a configured rule's is recomputed per hop.
 const SENSITIVE_REDIRECT_HEADERS: &[header::HeaderName] = &[
     header::AUTHORIZATION,
     header::COOKIE,
     header::REFERER,
     header::ORIGIN,
+    header::PROXY_AUTHORIZATION,
 ];
 
 /// `Referrer-Policy` is not in `http`'s well-known header set, so name it once here rather than
@@ -405,9 +408,11 @@ pub struct NetPolicy {
     /// [`NetPolicy::with_proxy_authorization`].
     #[cfg(not(target_arch = "wasm32"))]
     pub proxy_authorization: Option<ProxyAuthorizationFn>,
-    /// The http(s) proxy a plain-`http` request goes through, without credentials. A `407` is
-    /// only treated as a proxy challenge on a hop this names; any other `407` is returned as
-    /// is. `None` (default): no hop is proxied. Set via [`NetPolicy::with_proxy_for`].
+    /// The http(s) proxy a request goes through, without credentials. A `407` is only treated
+    /// as a proxy challenge on a plain-`http` hop this names; any other `407` is returned as
+    /// is. On an `https` hop it names the proxy in
+    /// [`NetError::ProxyAuthRequired`].
+    /// `None` (default): no hop is proxied. Set via [`NetPolicy::with_proxy_for`].
     #[cfg(not(target_arch = "wasm32"))]
     pub proxy_for: Option<ProxyForFn>,
     /// Whether a request goes through a proxy (http, https or socks). A proxied response's
@@ -1585,6 +1590,7 @@ fn send_error(
     url: &Url,
     what: &str,
     observer: &Arc<dyn NetObserver + Send + Sync>,
+    policy: &NetPolicy,
 ) -> NetError {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(tls) = crate::net::tls::classify(&e, url) {
@@ -1594,8 +1600,18 @@ fn send_error(
         });
         return NetError::Tls(tls);
     }
+    // Without a proxy to name, the tunnel failure stays a connect failure.
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::net::transport::is_proxy_auth_required(&e) {
+        if let Some(proxy) = policy.proxy_for.as_ref().and_then(|f| f(url)) {
+            return NetError::ProxyAuthRequired {
+                proxy: Arc::new(proxy),
+                url: url.clone(),
+            };
+        }
+    }
     #[cfg(target_arch = "wasm32")]
-    let _ = (url, observer);
+    let _ = (url, observer, policy);
     let mut err = TransportError::from_client(&e);
     err.message = format!("{what}: {}", err.message);
     NetError::Transport(err)
@@ -2182,7 +2198,7 @@ async fn get_with_redirects(
                                 observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled during CORS preflight" });
                                 return Err(NetError::Cancelled("cancelled during CORS preflight".into()));
                             }
-                            r = &mut fut => r.map_err(|e| send_error(e, &url, "CORS preflight request failed", &observer))?
+                            r = &mut fut => r.map_err(|e| send_error(e, &url, "CORS preflight request failed", &observer, &policy))?
                         };
                         // Reported before validation: a preflight the server answered cost
                         // this round-trip whether or not the answer turns out to permit the
@@ -2466,6 +2482,7 @@ async fn get_with_redirects(
                         &url,
                         "net.get_with_redirects request build failed",
                         &observer,
+                        &policy,
                     )
                 })?;
                 #[cfg(not(target_arch = "wasm32"))]
@@ -2516,7 +2533,7 @@ async fn get_with_redirects(
                             redirects
                         )));
                     }
-                    r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer))?
+                    r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer, &policy))?
                 };
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -2649,7 +2666,9 @@ async fn get_with_redirects(
                 // answering it would leak the proxy credentials (or the password dialog) to
                 // any server that sends the status. wasm32: the browser owns the proxy.
                 #[cfg(not(target_arch = "wasm32"))]
-                let proxy = policy.proxy_for.as_ref().and_then(|f| f(&url));
+                let proxy = (url.scheme() == "http")
+                    .then(|| policy.proxy_for.as_ref().and_then(|f| f(&url)))
+                    .flatten();
                 #[cfg(target_arch = "wasm32")]
                 let proxy: Option<Url> = None;
                 let may_answer = match target {
@@ -8187,8 +8206,9 @@ mod tests {
             assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
         }
 
-        /// A cross-origin redirect drops the caller's `Authorization`, `Cookie` and `Referer`.
-        /// Reported once, after the `Redirected`, listing only what was there.
+        /// A cross-origin redirect drops the caller's `Authorization`, `Cookie`, `Referer` and
+        /// `Proxy-Authorization`. Reported once, after the `Redirected`, listing only what was
+        /// there.
         #[tokio::test(flavor = "current_thread")]
         async fn sensitive_headers_stripped_on_a_cross_origin_redirect() {
             let away = TestServer::new()
@@ -8209,6 +8229,10 @@ mod tests {
                 h.insert(header::AUTHORIZATION, "Bearer t".parse().unwrap());
                 h.insert(header::COOKIE, "a=1".parse().unwrap());
                 h.insert(header::REFERER, "http://example.com/".parse().unwrap());
+                h.insert(
+                    header::PROXY_AUTHORIZATION,
+                    "Basic Ym9iOnMz".parse().unwrap(),
+                );
                 h
             };
 
@@ -8224,10 +8248,17 @@ mod tests {
                 vec![(
                     away.url("/end").to_string(),
                     RequestChange::SensitiveHeadersStripped {
-                        headers: vec![header::AUTHORIZATION, header::COOKIE, header::REFERER],
+                        headers: vec![
+                            header::AUTHORIZATION,
+                            header::COOKIE,
+                            header::REFERER,
+                            header::PROXY_AUTHORIZATION,
+                        ],
                     }
                 )]
             );
+            let last = rec.requests_sent().pop().unwrap();
+            assert_eq!(last.2.get(header::PROXY_AUTHORIZATION), None);
             let names = stream(&rec);
             let redirected = names.iter().position(|n| n == "Redirected").unwrap();
             assert_eq!(names[redirected + 1], "RequestModified", "{names:?}");

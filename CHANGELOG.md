@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `NetError` gained `ProxyAuthRequired { proxy, url }`, for a proxy that answers
+  the `CONNECT` of an `https` request with `407`. It was a `Transport` error of kind `Connect`,
+  told apart only by its message, and retried like a connection that failed. An embedder can
+  now recognise it, name the proxy to the user, and build a fetcher with the credentials. A
+  `match` on `NetError` needs an arm for it
 - **Breaking:** `BlockReason` gained `ForbiddenMethod`, so an exhaustive `match` on it outside
   this crate needs an arm for it. `cors::is_forbidden_method` exposes the rule
 
@@ -69,6 +74,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Proxy credentials went to the wrong proxy. With several `ProxyRule`s, a plain-`http`
+  request took its `Proxy-Authorization` from the first rule that matched *and* had
+  credentials, while the client connected through the first rule that matched. Rules
+  `[all(A), all(B).with_basic_auth(..)]` sent B's password to A. With a socks rule first, an
+  http rule's credentials went through the socks tunnel to the origin server itself. The
+  first rule that routes the request now decides, with its own credentials or none
+  (RFC 9110 §11.7.2)
+- With a socks rule first, a `407` from the origin server behind it was taken for a proxy
+  challenge, because an http rule further down the list was taken for the proxy. Only the
+  first rule that routes a request is its proxy now
+- A `Proxy-Authorization` the caller set followed a cross-origin redirect, to a host that may
+  be reached directly and is then an origin server, not the proxy. It is stripped with
+  `Authorization` and `Cookie` now, and reported in `SensitiveHeadersStripped`
+- `ProxyRule::with_basic_auth` percent-decoded its username and password: `al%40ice` reached
+  the proxy as `al@ice`. They go into the proxy URL encoded now, and arrive as given (RFC 7617
+  §2), on the plain-http header and the `CONNECT` alike
+- `NO_PROXY` from the environment did not get the bypass rules `ProxyRule::no_proxy` has:
+  `NO_PROXY=*` still sent `127.0.0.1` and `[::1]` through the proxy, and `[::1]` or a name
+  with a trailing dot matched nothing. An empty `HTTP_PROXY` also hid a set `http_proxy`.
+  `ProxyConfig::System` now reads the variables itself, as the rules `ProxyConfig::Rules`
+  would hold, so one `NO_PROXY` string means one thing. The environment is read once per
+  `Fetcher`, and the client, the reported `Proxy-Authorization` and the 407 handling all go by
+  that one reading; with no proxy variable set, the operating system's settings apply as before
+- Under CGI (`REQUEST_METHOD` set) every proxy variable was ignored. Only `HTTP_PROXY` is now:
+  it is the one a request can set through a CGI server (httpoxy, CVE-2016-5385).
+  `HTTPS_PROXY`, `ALL_PROXY` and `http_proxy` count again, as in Go
 - A request with an initiating origin carried the caller's forbidden request-headers (Fetch
   §2.2.2): a hand-set `Cookie` under `credentials: omit`, a `Host` naming another site,
   `Sec-*` and `Proxy-*` headers, an `X-HTTP-Method-Override: TRACE`. The CORS rules skip these
