@@ -55,6 +55,12 @@ const HEURISTIC_MAX_SECS: i64 = 24 * 60 * 60;
 /// "heuristically cacheable"). `206` is absent: partial responses need range support.
 const DEFAULT_CACHEABLE: &[u16] = &[200, 203, 204, 300, 301, 308, 404, 405, 410, 414, 501];
 
+/// Statuses whose caching rules this cache implements, for `must-understand` (RFC 9111
+/// §5.2.2.3): the heuristically cacheable ones, and the redirects it follows and stores.
+const UNDERSTOOD: &[u16] = &[
+    200, 203, 204, 300, 301, 302, 307, 308, 404, 405, 410, 414, 501,
+];
+
 /// Headers that describe the connection rather than the response (RFC 9110 §7.6.1), or the proxy
 /// the request went through, and are never stored. RFC 9111 §3.1 names the proxy ones:
 /// `Proxy-Authenticate`, `Proxy-Authorization`, and [`PROXY_AUTHENTICATION_INFO`], which has no
@@ -400,6 +406,9 @@ pub struct ResponseDirectives {
     pub private: bool,
     /// `public`.
     pub public: bool,
+    /// `must-understand` (RFC 9111 §5.2.2.3): store only if the status code's caching rules
+    /// are understood, and then whatever `no-store` says.
+    pub must_understand: bool,
     /// `max-age`, in seconds.
     pub max_age: Option<i64>,
 }
@@ -425,6 +434,7 @@ impl ResponseDirectives {
                 "immutable" => out.immutable = true,
                 "private" => out.private = true,
                 "public" => out.public = true,
+                "must-understand" => out.must_understand = true,
                 "max-age" if !max_age_seen => {
                     max_age_seen = true;
                     out.max_age = Some(value.and_then(|v| delta_seconds(&v)).unwrap_or(0));
@@ -532,7 +542,14 @@ pub fn is_storable(
         return false;
     }
     let directives = ResponseDirectives::parse(response);
-    if directives.no_store {
+    // `must-understand` (RFC 9111 §3, §5.2.2.3): a status whose caching rules are not known
+    // here is not stored, and for one that is, the directive takes the place of the `no-store`
+    // it is sent with for caches that do not know it.
+    if directives.must_understand {
+        if !UNDERSTOOD.contains(&status) {
+            return false;
+        }
+    } else if directives.no_store {
         return false;
     }
     // `Vary: *` says the response depends on something the request headers do not capture, so no
@@ -1663,6 +1680,23 @@ mod tests {
             decide(&[], &HeaderMap::new(), false, CacheMode::ForceCache, now),
             CacheDecision::Send
         ));
+    }
+
+    /// `must-understand` (RFC 9111 §3, §5.2.2.3): a status this cache does not know the rules
+    /// of is not stored; a known one is, and the `no-store` sent with it is for caches that do
+    /// not understand.
+    #[test]
+    fn must_understand_stores_only_understood_statuses() {
+        let response = headers(&[("cache-control", "max-age=60, must-understand, no-store")]);
+        let get = Method::GET;
+        let none = HeaderMap::new();
+        assert!(is_storable(&get, &none, 200, &response));
+        assert!(!is_storable(&get, &none, 299, &response));
+        let without = headers(&[("cache-control", "max-age=60, must-understand")]);
+        assert!(!is_storable(&get, &none, 299, &without));
+        // Without `must-understand`, `no-store` stands.
+        let plain = headers(&[("cache-control", "max-age=60, no-store")]);
+        assert!(!is_storable(&get, &none, 200, &plain));
     }
 
     /// A response that says `no-cache` is revalidated before every use (RFC 9111 §5.2.2.4),

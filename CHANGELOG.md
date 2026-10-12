@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `ResponseDirectives` gained the field `must_understand`, so building one with
+  a struct literal needs it, or `..Default::default()`
 - `CacheMode::NoCache`, and a request's `Cache-Control: no-cache`, used a fresh `immutable`
   response without asking the server. Both always revalidate now, as Fetch's `no-cache` mode
   and RFC 8246 §2.1 say and the `NoCache` docs promised ("a forced reload"). A normal request
@@ -50,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A response with `must-understand` was stored whatever its status, and never when it also
+  said `no-store`. It is stored only for a status whose caching rules this cache implements,
+  and then despite the `no-store` sent along for caches that do not understand
+  (RFC 9111 §3, §5.2.2.3). `ResponseDirectives::must_understand` records it
 - A response with both `no-cache` and `immutable` was used from the cache without asking the
   server while fresh. `no-cache` means never use it unvalidated (RFC 9111 §5.2.2.4), and
   `immutable` cannot lift that
