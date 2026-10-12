@@ -393,7 +393,8 @@ pub struct ResponseDirectives {
     pub no_cache: bool,
     /// `must-revalidate`: may not be served stale, whatever the request asks for.
     pub must_revalidate: bool,
-    /// `immutable`: will not change while fresh, so a forced revalidation can be skipped.
+    /// `immutable` (RFC 8246): will not change while fresh. A fresh response is used without
+    /// asking anyway; a forced revalidation asks regardless, as RFC 8246 §2.1 allows.
     pub immutable: bool,
     /// `private`: not for a shared cache. This one is private, so it only records the fact.
     pub private: bool,
@@ -699,13 +700,11 @@ pub fn decide(
         return CacheDecision::Use(entry.clone());
     }
 
-    // A forced revalidation still honours `immutable`, which says the response does not change
-    // while it is fresh. A response that says `no-cache` itself is never used unvalidated
-    // (RFC 9111 §5.2.2.4, a MUST that `immutable`, RFC 8246, cannot lift).
+    // A forced revalidation asks the server, `immutable` or not: Fetch's `no-cache` mode always
+    // makes a conditional request, and RFC 8246 §2.1 names a request's `no-cache` as the
+    // override `immutable` gives way to. A response that says `no-cache` is never used
+    // unvalidated (RFC 9111 §5.2.2.4).
     if mode == CacheMode::NoCache || asked.no_cache || stored.no_cache {
-        if stored.immutable && !stored.no_cache && entry.is_fresh(now) {
-            return CacheDecision::Use(entry.clone());
-        }
         return revalidate(entry);
     }
 
@@ -1686,8 +1685,11 @@ mod tests {
         ));
     }
 
+    /// A forced revalidation asks the server even for a fresh `immutable` response: Fetch's
+    /// `no-cache` mode always makes a conditional request, and RFC 8246 §2.1 names a request's
+    /// `no-cache` as the override of `immutable`. A normal request uses it while fresh.
     #[test]
-    fn immutable_survives_a_forced_revalidation_while_fresh() {
+    fn a_forced_revalidation_asks_even_for_immutable() {
         let stored = [entry(&[
             ("cache-control", "max-age=600, immutable"),
             ("etag", "\"v1\""),
@@ -1700,18 +1702,22 @@ mod tests {
                 CacheMode::NoCache,
                 at(30)
             ),
-            CacheDecision::Use(_)
+            CacheDecision::Revalidate(..)
         ));
-        // Once stale, even immutable is revalidated.
+        let asked = headers(&[("cache-control", "no-cache")]);
+        assert!(matches!(
+            decide(&stored, &asked, false, CacheMode::Default, at(30)),
+            CacheDecision::Revalidate(..)
+        ));
         assert!(matches!(
             decide(
                 &stored,
                 &HeaderMap::new(),
                 false,
-                CacheMode::NoCache,
-                at(9999)
+                CacheMode::Default,
+                at(30)
             ),
-            CacheDecision::Revalidate(..)
+            CacheDecision::Use(_)
         ));
     }
 

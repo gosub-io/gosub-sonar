@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `CacheMode::NoCache`, and a request's `Cache-Control: no-cache`, used a fresh `immutable`
+  response without asking the server. Both always revalidate now, as Fetch's `no-cache` mode
+  and RFC 8246 §2.1 say and the `NoCache` docs promised ("a forced reload"). A normal request
+  still uses a fresh response without asking
 - **Breaking:** the minimum supported Rust version is 1.92, up from 1.88, the same as
   gosub-engine's. Dependencies have started to need newer compilers (`uuid` 1.27 needs 1.89),
   and one floor across the gosub crates is one toolchain to test
