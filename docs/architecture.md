@@ -194,11 +194,11 @@ End to end, a fetch through the scheduler goes:
    buffer for buffered listeners (see [coalescing](#coalescing--fan-out)).
 
 7. **Cleanup.** The entry's `done` token fires and it is removed from `inflight_map`. A
-   buffered fetch then calls `FetcherContext::on_ref_done`, and its slots are released as the
-   spawned task ends. A streamed fetch hands both to the body reader instead: the slots come
-   back and `on_ref_done` is called when the body ends, fails, or nobody can read it any more
-   (every handle to the `SharedBody` and every stream from it dropped), which can be well
-   after the task ended.
+   buffered fetch's slots are released as the spawned task ends. A streamed fetch hands them to
+   the body reader instead, and they come back when the body ends, fails, or nobody can read it
+   any more (every handle to the `SharedBody` and every stream from it dropped), which can be
+   well after the task ended. `FetcherContext::on_ref_done` is per request, not per fetch: each
+   request's lifecycle calls it as the request ends (`net::lifecycle`).
 
 ---
 
@@ -760,8 +760,8 @@ Implemented by the host and passed to `Fetcher::new`. The bridge between schedul
 
 - `observer_for(reference, req_id, kind, initiator)` — returns the `NetObserver` for a given
   request (lets the host route events per tab/resource).
-- `on_ref_active` / `on_ref_done` — fired when a unique fetch becomes active and when its last
-  subscriber finishes (outstanding-work tracking).
+- `on_ref_active` / `on_ref_done` — fired for every request, a coalesced one included, as it
+  is accepted and as it ends (outstanding-work tracking per reference).
 - `is_url_allowed(url)` — URL policy hook (default: allow all).
 - `cookies_for(reference, url)` — returns the `Cookie` header value for a request hop (default:
   none), wired into `NetPolicy::cookies_for`. `reference` is the request's, so a host with a jar

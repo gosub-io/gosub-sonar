@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `FetcherContext::on_ref_active` and `on_ref_done` are called for every request,
+  not once per fetch for the request that started it. A tab whose request joined another tab's
+  fetch was never counted as busy, and the tab that started the fetch stayed busy until every
+  joined request had its result, however long ago it had cancelled. Each request now counts
+  for its own reference from `Accepted` to its end
 - **Breaking:** a request that joins another's fetch (coalescing) reports its own lifecycle. It
   used to get no events at all: no start, no end, and an engine that tracks requests from
   their events kept it open for good. Now each request gets an observer from

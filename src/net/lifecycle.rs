@@ -13,7 +13,9 @@
 //! `Cancelled` there and then, however long the fetch goes on for the others.
 
 use crate::net::events::NetEvent;
+use crate::net::fetcher_context::FetcherContext;
 use crate::net::observer::NetObserver;
+use crate::net::request_ref::RequestReference;
 use crate::net::types::NetError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,16 +30,24 @@ pub(crate) struct Lifecycle {
     ended: AtomicBool,
     /// Cancelled with the end, for whoever waits on it.
     ended_signal: CancellationToken,
+    /// Told the request is outstanding work from `Accepted` until its end.
+    work: Option<(Arc<dyn FetcherContext>, RequestReference)>,
 }
 
 impl Lifecycle {
     /// Open the lifecycle of a request for `url`, as the caller asked for it: emits
     /// [`NetEvent::Accepted`]. `joined` says the request shares a fetch another caller started.
+    /// With `work`, the request counts as outstanding work for its reference
+    /// ([`FetcherContext::on_ref_active`]) until it ends ([`FetcherContext::on_ref_done`]).
     pub(crate) fn accept(
         inner: Arc<dyn NetObserver + Send + Sync>,
         url: Url,
         joined: bool,
+        work: Option<(Arc<dyn FetcherContext>, RequestReference)>,
     ) -> Arc<Self> {
+        if let Some((ref ctx, reference)) = work {
+            ctx.on_ref_active(reference);
+        }
         inner.on_event(NetEvent::Accepted {
             url: url.clone(),
             joined,
@@ -47,7 +57,15 @@ impl Lifecycle {
             url,
             ended: AtomicBool::new(false),
             ended_signal: CancellationToken::new(),
+            work,
         })
+    }
+
+    /// The request's work is done.
+    fn done(&self) {
+        if let Some((ref ctx, reference)) = self.work {
+            ctx.on_ref_done(reference);
+        }
     }
 
     /// Whether the request has had its end.
@@ -78,6 +96,7 @@ impl NetObserver for Lifecycle {
         }
         self.inner.on_event(ev);
         if terminal {
+            self.done();
             self.ended_signal.cancel();
         }
     }
@@ -203,6 +222,7 @@ impl Drop for Lifecycle {
                 url: self.url.clone(),
                 reason: "request dropped before it ended",
             });
+            self.done();
         }
     }
 }
@@ -220,7 +240,7 @@ mod tests {
     #[test]
     fn opens_with_accepted_and_lets_one_end_through() {
         let rec = Arc::new(RecordingObserver::new());
-        let lifecycle = Lifecycle::accept(rec.clone(), url(), false);
+        let lifecycle = Lifecycle::accept(rec.clone(), url(), false, None);
         lifecycle.on_event(NetEvent::Started { url: url() });
         lifecycle.on_event(NetEvent::Finished {
             received_bytes: 1,
@@ -245,10 +265,10 @@ mod tests {
             Arc::new(RecordingObserver::new()),
             Arc::new(RecordingObserver::new()),
         );
-        let leader = Lifecycle::accept(lead.clone(), url(), false);
+        let leader = Lifecycle::accept(lead.clone(), url(), false, None);
         let shared = Shared::new(leader);
-        let follower = Lifecycle::accept(follow.clone(), url(), true);
-        let leaver = Lifecycle::accept(gone.clone(), url(), true);
+        let follower = Lifecycle::accept(follow.clone(), url(), true, None);
+        let leaver = Lifecycle::accept(gone.clone(), url(), true, None);
         shared.attach(follower.clone());
         shared.attach(leaver.clone());
         shared.on_event(NetEvent::Started { url: url() });
@@ -277,7 +297,7 @@ mod tests {
     #[test]
     fn a_request_dropped_without_an_end_is_cancelled() {
         let rec = Arc::new(RecordingObserver::new());
-        drop(Lifecycle::accept(rec.clone(), url(), true));
+        drop(Lifecycle::accept(rec.clone(), url(), true, None));
         assert_eq!(rec.event_names(), ["Accepted", "Cancelled"]);
     }
 }

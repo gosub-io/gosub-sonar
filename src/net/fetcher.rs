@@ -21,7 +21,6 @@ use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::proxy::{ProxyConfig, ProxyRoutes};
-use crate::net::request_ref::RequestReference;
 use crate::net::retry::{self, RetryPolicy};
 use crate::net::shared_body::{ReaderOptions, SharedBody, DEFAULT_REPLAY_LIMIT};
 use crate::net::slots::{SlotPool, Slots};
@@ -703,17 +702,15 @@ impl Fetcher {
                     }
                 };
 
-            if is_leader {
-                self.ctx.on_ref_active(req.reference);
-            }
-
             // Every request has its own lifecycle, a follower's included: it reports from
-            // `Accepted` to its own end (see `lifecycle`).
+            // `Accepted` to its own end (see `lifecycle`), and is its reference's outstanding
+            // work for as long.
             let lifecycle = Lifecycle::accept(
                 self.ctx
                     .observer_for(req.reference, req.req_id, req.kind, req.initiator),
                 requested.clone(),
                 !is_leader,
+                Some((self.ctx.clone(), req.reference)),
             );
             if let Some(ref to) = upgraded {
                 lifecycle.on_event(NetEvent::SecurityUpgraded {
@@ -806,7 +803,6 @@ impl Fetcher {
                     .remove_if(&key_str, |_, e| Arc::ptr_eq(e, &inflight_entry));
                 inflight_entry.waiter.finish(err, None).await;
                 inflight_entry.done.cancel();
-                self.ctx.on_ref_done(req.reference);
                 continue;
             }
 
@@ -845,12 +841,6 @@ impl Fetcher {
                 };
                 // Held here until the task ends, or by the body of a streamed fetch.
                 let mut held = acquire.await;
-                // Likewise the reference's outstanding work: a stream is still work until its
-                // body ends, so it takes this along; otherwise it ends with the task.
-                let mut ref_done = Some(RefDone {
-                    ctx: ctx_clone.clone(),
-                    reference: req.reference,
-                });
 
                 let should_stream =
                     req.streaming || inflight_entry2.wants_streaming.load(Ordering::Relaxed);
@@ -878,7 +868,6 @@ impl Fetcher {
                         pool.clone(),
                         built.clone(),
                         slot_guards,
-                        &mut ref_done,
                     )
                     .await
                 } else {
@@ -911,7 +900,6 @@ impl Fetcher {
 
                 inflight_entry2.done.cancel();
 
-                drop(ref_done);
                 drop(held);
             });
         }
@@ -1104,25 +1092,11 @@ fn build_client(
     }
 }
 
-/// A body reader that keeps the fetch's slots, and its reference's outstanding work, until it
-/// is dropped: when the stream has been read to its end, failed, or been given up.
+/// A body reader that keeps the fetch's slots until it is dropped: when the stream has been
+/// read to its end, failed, or been given up.
 struct HoldsSlots<R> {
     inner: R,
     _slots: Slots,
-    _done: Option<RefDone>,
-}
-
-/// Calls [`FetcherContext::on_ref_done`] for a reference when dropped, so the call is made once,
-/// wherever the fetch's work actually ends.
-struct RefDone {
-    ctx: Arc<dyn FetcherContext>,
-    reference: RequestReference,
-}
-
-impl Drop for RefDone {
-    fn drop(&mut self) {
-        self.ctx.on_ref_done(self.reference);
-    }
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HoldsSlots<R> {
@@ -1203,7 +1177,6 @@ async fn perform_streaming(
     origins: Arc<SlotPool>,
     built: Arc<ClientsBuilt>,
     slots: Slots,
-    ref_done: &mut Option<RefDone>,
 ) -> Result<FetchResult, NetError> {
     let client = Arc::new(client.clone());
     // Only the header phase is retried; the body goes straight to the caller.
@@ -1248,7 +1221,6 @@ async fn perform_streaming(
     let reader = HoldsSlots {
         inner: reader,
         _slots: slots,
-        _done: ref_done.take(),
     };
     Ok(FetchResult::Stream {
         meta,
@@ -3518,6 +3490,68 @@ mod tests {
             "{leader:?}"
         );
         assert_eq!(follower, ["Accepted", "Cancelled: cancelled by the caller"]);
+    }
+
+    /// Outstanding work is counted per caller: a reference whose request joins another's
+    /// fetch is active until its own request ends, and each reference gets one
+    /// `on_ref_active` and one `on_ref_done`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_caller_counts_as_its_references_work() {
+        #[derive(Default)]
+        struct Work(parking_lot::Mutex<Vec<(RequestReference, &'static str)>>);
+        impl FetcherContext for Work {
+            fn observer_for(
+                &self,
+                _: RequestReference,
+                _: RequestId,
+                _: ResourceKind,
+                _: Initiator,
+            ) -> Arc<dyn NetObserver + Send + Sync> {
+                Arc::new(crate::net::null_emitter::NullEmitter)
+            }
+            fn on_ref_active(&self, r: RequestReference) {
+                self.0.lock().push((r, "active"));
+            }
+            fn on_ref_done(&self, r: RequestReference) {
+                self.0.lock().push((r, "done"));
+            }
+            // One jar for every reference, so the two requests below share a fetch.
+            fn cookie_jar_key(&self, _: RequestReference) -> String {
+                String::new()
+            }
+        }
+        let srv = TestServer::new()
+            .route(
+                "/co",
+                RouteConfig::delay(Duration::from_millis(200), b"shared".to_vec()),
+            )
+            .start()
+            .await;
+        let work = Arc::new(Work::default());
+        let fetcher = Arc::new(Fetcher::new(test_config(), work.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+        let (a, _) = make_req(srv.url("/co"), Priority::Normal);
+        let (mut b, _) = make_req(srv.url("/co"), Priority::Normal);
+        b.reference = RequestReference::Background(7);
+        let (ra, rb) = tokio::join!(fetcher.fetch(a), fetcher.fetch(b));
+        assert!(!ra.is_error() && !rb.is_error());
+        assert_eq!(srv.hit_count("/co"), 1, "one fetch for both");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let calls = work.0.lock().clone();
+        for reference in [
+            RequestReference::Background(0),
+            RequestReference::Background(7),
+        ] {
+            let mine: Vec<_> = calls
+                .iter()
+                .filter(|(r, _)| *r == reference)
+                .map(|(_, c)| *c)
+                .collect();
+            assert_eq!(mine, ["active", "done"], "{reference:?}: {calls:?}");
+        }
+        shutdown.cancel();
     }
 
     /// Every request opens with `Accepted`, before its attempt's `Started`, and ends once.
