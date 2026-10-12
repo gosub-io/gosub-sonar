@@ -141,8 +141,10 @@ pub enum NetEvent {
         truncated: bool,
     },
 
-    /// The fetcher took the request: the first event of every request, before any check,
-    /// any wait for a connection slot, any attempt. Every request that reports `Accepted` ends
+    /// The fetcher took the request: the first event of every request its `run` loop picks
+    /// up, before any check, any wait for a connection slot, any attempt. (A request still
+    /// queued when the fetcher shuts down is answered `Cancelled` through its reply channel
+    /// and never reaches an observer.) Every request that reports `Accepted` ends
     /// with exactly one [`NetEvent::Finished`], [`NetEvent::Failed`] or
     /// [`NetEvent::Cancelled`], and reports nothing after it.
     Accepted {
@@ -152,9 +154,9 @@ pub enum NetEvent {
         /// of its own
         joined: bool,
     },
-    /// An attempt at the request started: it has its connection slot and goes out. Once per
-    /// attempt, so a retried request reports it again; a request refused or cancelled before
-    /// it was sent reports none.
+    /// An attempt at the request started: it has its connection slot and goes out, or is
+    /// answered from the cache. Once per attempt, so a retried request reports it again; a
+    /// request refused or cancelled before it was sent reports none.
     Started {
         /// URL being fetched
         url: Url,

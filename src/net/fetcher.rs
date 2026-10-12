@@ -290,8 +290,7 @@ pub struct FetchInflightEntry {
     /// Count of currently active subscribers.  Decremented on cancellation; triggers
     /// `parent_cancel` when it reaches zero.
     subs: AtomicUsize,
-    /// Cancelled by the leader after `waiter.finish()` to unblock child-cancel watcher tasks
-    /// that are waiting on either subscriber cancellation or fetch completion.
+    /// Cancelled by the leader after `waiter.finish()`: the fetch is over.
     done: CancellationToken,
     /// What the fetch reports to: every request waiting on it. Set by the leader before any
     /// other request can join.
@@ -741,11 +740,15 @@ impl Fetcher {
             tokio::spawn(async move {
                 tokio::select! {
                     _ = child_cancel.cancelled() => {
-                        entry_for_cancel.waiter.cancel(
+                        // Only a caller still waiting counts out of the fetch: one that has its
+                        // stream already reads at its own pace, and the body stops by itself
+                        // once nobody can read it.
+                        if entry_for_cancel.waiter.cancel(
                             listener,
                             NetError::Cancelled("cancelled by the caller".into()),
-                        );
-                        entry_for_cancel.dec_sub_and_maybe_cancel();
+                        ) {
+                            entry_for_cancel.dec_sub_and_maybe_cancel();
+                        }
                         if let Some(shared) = entry_for_cancel.shared.get() {
                             shared.detach(&caller);
                         }
