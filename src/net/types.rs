@@ -810,6 +810,10 @@ pub struct FetchRequest {
     /// budget for this request, `Some(Some(d))` sets it to `d`.
     pub redirect_timeout: Option<Option<Duration>>,
     /// HTTP Headers (unified).
+    ///
+    /// `Accept-Language` is not added by the fetcher. Fetch §4.1 leaves "an appropriate value"
+    /// to the user agent, and the language preference belongs to the embedder, per profile or
+    /// tab, so it sets the header here on every request.
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
     /// `None` for GET and HEAD requests.
