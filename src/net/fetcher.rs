@@ -1172,13 +1172,13 @@ async fn perform_streaming(
         &req.url,
         &cancel,
         &observer,
-        || {
+        |observer| {
             fetch_response_top(
                 client.clone(),
                 req.url.clone(),
                 make_request_init(req, cfg),
                 cancel.clone(),
-                observer.clone(),
+                observer,
                 build_policy(req, cfg, &ctx, origins.clone(), &built),
             )
         },
@@ -1230,13 +1230,13 @@ async fn perform_buffered(
         &req.url,
         &cancel,
         &observer,
-        || {
+        |observer| {
             fetch_response_complete(
                 client.clone(),
                 req.url.clone(),
                 make_request_init(req, cfg),
                 cancel.clone(),
-                observer.clone(),
+                observer,
                 req.max_bytes.or(cfg.max_body_bytes),
                 effective_read_idle_timeout(req, cfg),
                 effective_total_body_timeout(req, cfg),
@@ -2964,6 +2964,40 @@ mod tests {
                 srv.url("/coalesce").to_string(),
                 crate::net::types::RequestChange::UrlCredentialsRemoved
             )]
+        );
+    }
+
+    /// A retried request reports one end, the last attempt's, after every attempt's `Started`
+    /// and the `Retrying` between them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retried_request_ends_once() {
+        let srv = start_server().await;
+        let (result, log) = fetch_recorded(
+            retrying_config(),
+            make_req(srv.url("/flaky"), Priority::Normal).0,
+        )
+        .await;
+        assert_eq!(status_of(&result), 200);
+        let names = log.event_names();
+        let ends: Vec<_> = names
+            .iter()
+            .filter(|n| matches!(n.as_str(), "Finished" | "Failed" | "Cancelled"))
+            .collect();
+        assert_eq!(ends, ["Finished"], "{names:?}");
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("Finished"),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| *n == "Started").count(),
+            3,
+            "{names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| *n == "Retrying").count(),
+            2,
+            "{names:?}"
         );
     }
 

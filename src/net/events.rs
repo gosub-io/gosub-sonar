@@ -196,16 +196,19 @@ pub enum NetEvent {
     /// matching every cause it might have.
     ///
     /// A cancelled request is not a failure: it reports [`NetEvent::Cancelled`] and
-    /// nothing else. Every attempt therefore ends in exactly one of [`NetEvent::Finished`],
-    /// `Failed`, or [`NetEvent::Cancelled`]. A retried attempt's `Failed` is followed by
-    /// [`NetEvent::Retrying`] and a new [`NetEvent::Started`].
+    /// nothing else. Every request therefore ends in exactly one of [`NetEvent::Finished`],
+    /// `Failed`, or [`NetEvent::Cancelled`], once, however many attempts it took: a retried
+    /// attempt reports no end of its own, only [`NetEvent::Retrying`] and the next attempt's
+    /// [`NetEvent::Started`].
     Failed {
         /// URL that failed to load
         url: Url,
         /// Error that caused the failure
         error: anyhow::Error,
     },
-    /// A failed request will be re-sent after `delay`. See [`retry`](mod@crate::net::retry).
+    /// A failed attempt will be re-sent after `delay`. The attempt reports no end of its own:
+    /// `reason` says why it failed, and the request ends once, after its last attempt. See
+    /// [`retry`](mod@crate::net::retry).
     Retrying {
         /// URL being retried
         url: Url,
@@ -318,4 +321,14 @@ pub enum NetEvent {
         /// Short static description of why the fetch was cancelled
         reason: &'static str,
     },
+}
+
+impl NetEvent {
+    /// Whether this event ends the request: `Finished`, `Failed` or `Cancelled`.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            NetEvent::Finished { .. } | NetEvent::Failed { .. } | NetEvent::Cancelled { .. }
+        )
+    }
 }
