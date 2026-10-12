@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A response served from the cache kept the `Age` it arrived with, however long it had been
+  stored since. It carries the cache's own `Age` now (RFC 9111 §4), the stored response's
+  current age
 - A response with `must-understand` was stored whatever its status, and never when it also
   said `no-store`. It is stored only for a status whose caching rules this cache implements,
   and then despite the `no-store` sent along for caches that do not understand

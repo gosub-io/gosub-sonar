@@ -937,7 +937,14 @@ async fn fetch_response_top_inner(
                     .and_then(|s| s.canonical_reason())
                     .unwrap_or("")
                     .to_string(),
-                headers: entry.headers.clone(),
+                headers: {
+                    // A stored response says how old it is (RFC 9111 §4): the cache's own
+                    // `Age`, replacing the one it arrived with.
+                    let mut headers = entry.headers.clone();
+                    let age = entry.current_age(chrono::Utc::now()).num_seconds().max(0);
+                    headers.insert(header::AGE, header::HeaderValue::from(age));
+                    headers
+                },
                 content_length: Some(entry.body.len() as u64),
                 content_type: entry
                     .headers
@@ -6248,6 +6255,39 @@ mod tests {
     /// A policy that knows the test client connects straight to the host.
     fn direct() -> NetPolicy {
         NetPolicy::default().with_proxied(Box::new(|_| false))
+    }
+
+    /// A response from the cache carries an `Age` the cache generated (RFC 9111 §4): here the
+    /// fifty seconds its `Date` already put on it, not the `Age: 7` it arrived with.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cache_hit_carries_a_generated_age() {
+        let date = (chrono::Utc::now() - chrono::TimeDelta::seconds(50))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let srv = TestServer::new()
+            .route(
+                "/aged",
+                RouteConfig::Cacheable(CacheRouteOptions {
+                    extra_headers: vec![("date".into(), date), ("age".into(), "7".into())],
+                    ..CacheRouteOptions::max_age(600, b"x".to_vec())
+                }),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+        let _ = cache_fetch(&srv, "/aged", RequestInit::default(), policy, observer()).await;
+        let (meta, _) = cache_fetch(
+            &srv,
+            "/aged",
+            RequestInit::default(),
+            NetPolicy::default().with_cache(Some(cache)),
+            observer(),
+        )
+        .await;
+        assert!(meta.from_cache);
+        let age: i64 = meta.headers[header::AGE].to_str().unwrap().parse().unwrap();
+        assert!((50..60).contains(&age), "Age: {age}");
+        assert_eq!(meta.headers.get_all(header::AGE).iter().count(), 1);
     }
 
     /// Fetch `path` through the policy, returning the metadata and body.
