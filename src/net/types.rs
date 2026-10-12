@@ -365,6 +365,22 @@ pub enum NetError {
         url: Url,
     },
 
+    /// A proxy wants credentials before it opens a tunnel: it answered the `CONNECT` for an
+    /// `https` request with `407` (RFC 9110 §15.5.8). Nothing reached the server.
+    ///
+    /// The client gives no access to the proxy's `Proxy-Authenticate`, so there is no challenge
+    /// to answer; a plain-`http` request through a proxy gets its `407` as a response and goes
+    /// to the auth hook instead. An embedder prompts for the proxy's credentials and builds a
+    /// fetcher with them ([`ProxyRule::with_basic_auth`](crate::net::proxy::ProxyRule::with_basic_auth)).
+    /// Not retried. Native only.
+    #[error("net error: proxy {proxy} requires authorization for {url}")]
+    ProxyAuthRequired {
+        /// The proxy that refused, without credentials.
+        proxy: Arc<Url>,
+        /// URL of the hop the tunnel was for.
+        url: Url,
+    },
+
     /// Failure reported by the HTTP transport: nothing connected, the client's own deadline
     /// expired, the body stopped part way. [`TransportError::kind`] says which.
     #[error("net error: {0}")]

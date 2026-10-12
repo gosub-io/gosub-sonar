@@ -27,7 +27,7 @@ The library has no dependency on any browser engine and can be used standalone.
   total-body timeouts, request bodies for POST/PUT.
 - Web platform policies, applied on every redirect hop: CORS (preflights, response tainting),
   referrer policy, mixed content, `Origin` and `Sec-Fetch-*` headers, HSTS, cookie hooks,
-  `Authorization`/`Cookie` stripped on cross-origin redirects.
+  `Authorization`/`Cookie`/`Proxy-Authorization` stripped on cross-origin redirects.
 - Transport: TLS errors with user overrides, pluggable DNS (for SSRF policies), proxy
   configuration, default `User-Agent` of `gosub-sonar/<version>` (`FetcherConfig::user_agent`).
 - Authentication: `401`/`407` challenges answered from a credential store or a context hook and

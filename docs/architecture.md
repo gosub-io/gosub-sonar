@@ -381,8 +381,9 @@ browser-matching semantics:
 - Only 301, 302, 303, 307 and 308 are redirects (Fetch). Any other 3xx, a 300 or a 304 nobody
   asked for, is returned to the caller like any response, `Location` or not.
 - Method/body downgraded on 301/302/303, preserved on 307/308 (RFC 7231 §6.4).
-- `Authorization` and `Cookie` (`SENSITIVE_REDIRECT_HEADERS`) are stripped on cross-origin
-  redirects (RFC 9110 §15.4), and the cookie jar is re-queried for the new origin.
+- `Authorization`, `Cookie`, `Referer`, `Origin` and `Proxy-Authorization`
+  (`SENSITIVE_REDIRECT_HEADERS`) are stripped on cross-origin redirects (RFC 9110 §15.4), and
+  the cookie jar is re-queried for the new origin.
 - Only `http`/`https` targets are followed.
 - Each hop is upgraded to `https` if HSTS applies, *before* `url_allowed` is consulted, so the
   hook sees the URL that will actually be requested and no plaintext request is ever opened.
@@ -809,6 +810,7 @@ error can fan out to many listeners:
 |---------|---------|
 | `Blocked` | Hop refused by policy. Carries a `BlockReason` (mixed content, URL policy, unsupported scheme, not cached, CORS) and the URL of the hop that was refused. |
 | `Transport` | The HTTP client failed. Carries a `TransportError`: a `kind` (`Connect`, `Timeout`, `Redirect`, `Body`, `Decode`, `Request`, `Builder`, `Other`) and the client's own message with its source chain flattened into it. |
+| `ProxyAuthRequired` | A proxy answered the `CONNECT` for an `https` request with `407`. Carries the proxy (without credentials) and the hop's URL. Not retried. Native-only. |
 | `Tls` | TLS handshake failed. Carries a `TlsError` (kind, host, message, and with overrides enabled the certificate and fingerprint); also emitted as `NetEvent::TlsFailed`. Native-only. |
 | `Redirect` | Redirect resolution failed (missing `Location`, bad scheme, too many hops, blocked). |
 | `Io` | I/O error reading the body. |

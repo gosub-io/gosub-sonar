@@ -109,6 +109,21 @@ impl TransportError {
     }
 }
 
+/// Whether `e` is a proxy answering a `CONNECT` with `407`. hyper-util reports that as a
+/// `TunnelError::ProxyAuthRequired` in a module it does not export, so it is recognised by its
+/// message; `fetcher::tests::a_407_on_connect_is_proxy_auth_required` fails if that changes.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn is_proxy_auth_required(e: &reqwest::Error) -> bool {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = cur {
+        if err.to_string() == "tunnel error: proxy authorization required" {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
+}
+
 /// Whether a broken transfer sits somewhere under `e`. A decoding client reports one as a
 /// decode error, wrapping either the client's own body error or an `io::Error` whose kind says
 /// the connection ended. `io::Error::source()` skips its inner error, so that is descended into
