@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The fetcher always resolves through a `DnsResolver`: the one configured, or `SystemResolver`,
+  which looks names up as before. `NetEvent::DnsResolved` is now emitted without a resolver of
+  the embedder's too
+
+### Fixed
+
+- `localhost` and the names under it (`app.localhost`, with or without a trailing dot) were
+  looked up through the configured resolver or the system's, which could answer with any
+  address, while the mixed content and referrer rules already took them for loopback. They
+  connect to `::1` and `127.0.0.1` now without a lookup (Fetch, resolve an origin). A
+  configured resolver is asked about each of the two addresses and can still refuse them
+
 ## [0.13.0] - 2026-10-12
 
 ### Added

@@ -1048,9 +1048,13 @@ fn build_client(
         if let Some(ref ua) = cfg.user_agent {
             b = b.user_agent(ua);
         }
-        if let Some(ref resolver) = cfg.dns_resolver {
-            b = b.dns_resolver(Arc::new(crate::net::dns::ReqwestResolver(resolver.clone())));
-        }
+        // Always installed, the system's resolver when none is configured, so that
+        // `localhost` is answered with loopback rather than looked up.
+        let resolver = cfg
+            .dns_resolver
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::net::dns::SystemResolver));
+        b = b.dns_resolver(Arc::new(crate::net::dns::ReqwestResolver(resolver)));
         // Observation only - forwards the request and returns the connector's own result
         // unchanged - so it is installed for every client rather than gated on config.
         b = b.connector_layer(crate::net::connect_timing::ConnectTimingLayer);
