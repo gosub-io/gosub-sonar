@@ -2609,6 +2609,23 @@ async fn get_with_redirects(
             }
         }
 
+        // A `HEAD` that shows the resource changed makes the stored `GET` stale (RFC 9111
+        // §4.3.5); it is dropped, in every partition, like a write would drop it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(cache), HopResponse::Network(resp)) = (policy.cache.as_ref(), &hop) {
+            if current_method == Method::HEAD && resp.status().as_u16() == 200 {
+                let get = CacheKey::new(&Method::GET, &url);
+                let stored = cache.get(&get.clone().in_partition(cache_partition));
+                if stored.iter().any(|e| e.changed_per_head(resp.headers())) {
+                    cache.invalidate(&get);
+                    observer.on_event(NetEvent::Cache {
+                        url: url.clone(),
+                        outcome: CacheOutcome::Invalidated,
+                    });
+                }
+            }
+        }
+
         let peer_addr = match &hop {
             HopResponse::Network(resp) => origin_peer(resp, &url, &policy),
             HopResponse::Cached(entry) => entry.peer_addr,
@@ -6297,6 +6314,66 @@ mod tests {
         let age: i64 = meta.headers[header::AGE].to_str().unwrap().parse().unwrap();
         assert!((50..60).contains(&age), "Age: {age}");
         assert_eq!(meta.headers.get_all(header::AGE).iter().count(), 1);
+    }
+
+    /// A `HEAD` whose `ETag` is not the stored `GET`'s drops the stored `GET` (RFC 9111 §4.3.5),
+    /// so the next `GET` goes to the server.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_head_with_another_etag_drops_the_stored_get() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!("http://{}/r", listener.local_addr().unwrap())).unwrap();
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = gets.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let response = if head.starts_with("HEAD ") {
+                        "HTTP/1.1 200 OK\r\nETag: \"v2\"\r\nContent-Length: 4\r\n\
+                         Connection: close\r\n\r\n"
+                    } else {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nCache-Control: max-age=600\r\n\
+                         Content-Length: 4\r\nConnection: close\r\n\r\nbody"
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let send = |method: Method| {
+            super::fetch_response_complete(
+                client(),
+                base.clone(),
+                RequestInit::new(method, HeaderMap::new(), None),
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(10)),
+                NetPolicy::default().with_cache(Some(cache.clone())),
+            )
+        };
+        send(Method::GET).await.unwrap();
+        send(Method::GET).await.unwrap();
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second GET is a hit"
+        );
+        send(Method::HEAD).await.unwrap();
+        send(Method::GET).await.unwrap();
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the HEAD dropped it"
+        );
     }
 
     /// A `Set-Cookie` on the `304` that confirms a stored response reaches the jar

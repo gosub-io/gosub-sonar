@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `200` to a `HEAD` with another `ETag`, `Last-Modified` or length than the stored `GET`
+  response left that response in the cache to be served while fresh. It is dropped now
+  (RFC 9111 §4.3.5), so the next `GET` asks the server; `CacheEntry::changed_per_head` says
+  when
 - HTTP dates were matched case-sensitively, so a lowercase `Expires` counted as already expired
   and a lowercase `Last-Modified` gave no heuristic freshness. They match case-insensitively
   now (RFC 9111 §4.2)

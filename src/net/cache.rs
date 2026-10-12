@@ -358,6 +358,21 @@ impl CacheEntry {
         }
     }
 
+    /// Whether a `200` to a `HEAD` shows that this stored `GET` response is no longer the
+    /// current one (RFC 9111 §4.3.5): its `ETag` or `Last-Modified` differs, or one side has it
+    /// and the other does not, or its `Content-Length` differs from the stored body's. A decoded
+    /// entry's body length says nothing about the encoded one, so it is not compared.
+    pub fn changed_per_head(&self, head: &HeaderMap) -> bool {
+        let differs = |name: HeaderName| self.headers.get(&name) != head.get(&name);
+        let length = || {
+            head.get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .is_some_and(|len| len != self.body.len())
+        };
+        differs(header::ETAG) || differs(header::LAST_MODIFIED) || (!self.decoded && length())
+    }
+
     /// Whether the entry carries a validator, i.e. whether a `304` can ever come back for it.
     pub fn is_revalidatable(&self) -> bool {
         self.headers.contains_key(header::ETAG) || self.headers.contains_key(header::LAST_MODIFIED)
@@ -1190,6 +1205,33 @@ mod tests {
         ] {
             assert_eq!(parse_http_date(value), Some(expected), "{value}");
         }
+    }
+
+    /// RFC 9111 §4.3.5: a `HEAD` response with another validator or length than the stored
+    /// `GET` shows the stored one is no longer current; the same ones show nothing.
+    #[test]
+    fn a_head_with_other_validators_shows_the_get_changed() {
+        let stored = entry(&[
+            ("cache-control", "max-age=600"),
+            ("etag", "\"v1\""),
+            ("last-modified", &http_date(at(-100))),
+        ]);
+        let same = headers(&[
+            ("etag", "\"v1\""),
+            ("last-modified", &http_date(at(-100))),
+            ("content-length", "4"),
+        ]);
+        assert!(!stored.changed_per_head(&same));
+        let tag = headers(&[("etag", "\"v2\""), ("last-modified", &http_date(at(-100)))]);
+        assert!(stored.changed_per_head(&tag));
+        let dated = headers(&[("etag", "\"v1\""), ("last-modified", &http_date(at(-5)))]);
+        assert!(stored.changed_per_head(&dated));
+        let longer = headers(&[
+            ("etag", "\"v1\""),
+            ("last-modified", &http_date(at(-100))),
+            ("content-length", "40"),
+        ]);
+        assert!(stored.changed_per_head(&longer));
     }
 
     /// An `Age` that is a list counts by its first member (RFC 9111 §5.1).
