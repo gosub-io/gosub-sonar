@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `304` that brought an `ETag` the stored response did not have, as when a server starts
+  sending them, freshened the stored response and stored the tag with it. Nothing showed the
+  stored body was the one the tag names, and every later revalidation confirmed it again. Such
+  a `304` refetches now (RFC 9111 §4.3.4)
 - A `304` that named another version than the stored one by a weak `ETag` or a
   `Last-Modified` still freshened the stored response, and the old body was then served under
   the new validator. Only a strong `ETag` was compared. Each validator now has to correspond

@@ -323,6 +323,7 @@ impl CacheEntry {
     /// - A strong `ETag` selects the entry only if the stored one is the same strong tag
     ///   (strong comparison, RFC 9110 §8.8.3.2).
     /// - A weak `ETag` selects it only if the stored one matches by weak comparison.
+    /// - Either `ETag` never selects an entry stored without one.
     /// - A `Last-Modified` and no `ETag` selects it only if the stored `Last-Modified` is the
     ///   same.
     pub fn contradicted_by(&self, response: &HeaderMap) -> bool {
@@ -338,7 +339,9 @@ impl CacheEntry {
                 opaque(&stored) != opaque(&sent)
             }
             (Some(stored), Some(sent)) => stored.starts_with("W/") || stored != sent,
-            (_, Some(_)) => false,
+            // The entry has no tag for the `304`'s to correspond to (the server has started
+            // sending them, say): nothing proves the stored body is the one it names.
+            (None, Some(_)) => true,
             (_, None) => match (
                 self.headers.get(header::LAST_MODIFIED),
                 response.get(header::LAST_MODIFIED),
@@ -1631,6 +1634,20 @@ mod tests {
         let modified = |time| headers(&[("last-modified", &http_date(time))]);
         assert!(!dated.contradicted_by(&modified(at(-100))));
         assert!(dated.contradicted_by(&modified(at(-50))));
+    }
+
+    /// RFC 9111 §4.3.4: if none of the stored responses has the `304`'s strong validator, none
+    /// is updated. An entry stored without an `ETag` has none to match, so a `304` that brings
+    /// one, strong or weak, refetches.
+    #[test]
+    fn a_304_with_an_etag_the_entry_lacks_contradicts_it() {
+        let dated = entry(&[
+            ("cache-control", "max-age=10"),
+            ("last-modified", &http_date(at(-100))),
+        ]);
+        let sent = |etag: &str| headers(&[("etag", etag), ("last-modified", &http_date(at(-100)))]);
+        assert!(dated.contradicted_by(&sent("\"x\"")));
+        assert!(dated.contradicted_by(&sent("W/\"x\"")));
     }
 
     /// Fetch, HTTP-network-or-cache fetch: a `default` request with a condition of the caller's
