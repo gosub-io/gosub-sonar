@@ -30,7 +30,8 @@
 //! use gosub_sonar::net::dns::{DnsResolver, Resolving};
 //! use gosub_sonar::FetcherConfig;
 //!
-//! /// Resolves through the system resolver but refuses loopback and private ranges.
+//! /// Resolves through the system resolver but refuses loopback, private and link-local
+//! /// ranges, and the unspecified address, which reaches the local host too.
 //! struct PublicOnly;
 //!
 //! impl DnsResolver for PublicOnly {
@@ -39,11 +40,21 @@
 //!         Box::pin(async move {
 //!             let addrs: Vec<SocketAddr> =
 //!                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+//!             let v4_internal = |v4: std::net::Ipv4Addr| {
+//!                 v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+//!             };
 //!             let internal = |ip: std::net::IpAddr| match ip {
-//!                 std::net::IpAddr::V4(v4) => {
-//!                     v4.is_loopback() || v4.is_private() || v4.is_link_local()
-//!                 }
-//!                 std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
+//!                 std::net::IpAddr::V4(v4) => v4_internal(v4),
+//!                 // `::ffff:127.0.0.1` is 127.0.0.1 (RFC 4291 §2.5.5.2): judge it as one.
+//!                 std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+//!                     Some(v4) => v4_internal(v4),
+//!                     None => {
+//!                         v6.is_loopback()
+//!                             || v6.is_unique_local()
+//!                             || v6.is_unicast_link_local()
+//!                             || v6.is_unspecified()
+//!                     }
+//!                 },
 //!             };
 //!             if addrs.iter().any(|a| internal(a.ip())) {
 //!                 return Err(format!("{host} resolves to an internal address").into());

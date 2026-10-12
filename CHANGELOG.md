@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `PublicOnly` resolver in the `dns` module docs, the SSRF policy an embedder would start
+  from, let `[::ffff:127.0.0.1]` through: Rust's IPv6 checks do not look inside an
+  IPv4-mapped address. It judges one as the IPv4 address it is (RFC 4291 §2.5.5.2) now, and
+  refuses the unspecified address and IPv6 link-local too
 - `localhost` and the names under it (`app.localhost`, with or without a trailing dot) were
   looked up through the configured resolver or the system's, which could answer with any
   address, while the mixed content and referrer rules already took them for loopback. They
