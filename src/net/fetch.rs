@@ -48,12 +48,15 @@ use url::{Origin, Url};
 ///
 /// `Referer` and `Origin` are included so hand-set values cannot leak to a third-party host.
 /// When the caller supplies a referrer or an initiating origin instead, the values are
-/// recomputed for each hop anyway, so removing them here costs nothing.
+/// recomputed for each hop anyway, so removing them here costs nothing. A hand-set
+/// `Proxy-Authorization` belongs to the proxy that demanded it (RFC 9110 §11.7.2), and the next
+/// host may be reached directly; a configured rule's is recomputed per hop.
 const SENSITIVE_REDIRECT_HEADERS: &[header::HeaderName] = &[
     header::AUTHORIZATION,
     header::COOKIE,
     header::REFERER,
     header::ORIGIN,
+    header::PROXY_AUTHORIZATION,
 ];
 
 /// `Referrer-Policy` is not in `http`'s well-known header set, so name it once here rather than
@@ -7421,8 +7424,9 @@ mod tests {
             assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
         }
 
-        /// A cross-origin redirect drops the caller's `Authorization`, `Cookie` and `Referer`.
-        /// Reported once, after the `Redirected`, listing only what was there.
+        /// A cross-origin redirect drops the caller's `Authorization`, `Cookie`, `Referer` and
+        /// `Proxy-Authorization`. Reported once, after the `Redirected`, listing only what was
+        /// there.
         #[tokio::test(flavor = "current_thread")]
         async fn sensitive_headers_stripped_on_a_cross_origin_redirect() {
             let away = TestServer::new()
@@ -7443,6 +7447,10 @@ mod tests {
                 h.insert(header::AUTHORIZATION, "Bearer t".parse().unwrap());
                 h.insert(header::COOKIE, "a=1".parse().unwrap());
                 h.insert(header::REFERER, "http://example.com/".parse().unwrap());
+                h.insert(
+                    header::PROXY_AUTHORIZATION,
+                    "Basic Ym9iOnMz".parse().unwrap(),
+                );
                 h
             };
 
@@ -7458,10 +7466,17 @@ mod tests {
                 vec![(
                     away.url("/end").to_string(),
                     RequestChange::SensitiveHeadersStripped {
-                        headers: vec![header::AUTHORIZATION, header::COOKIE, header::REFERER],
+                        headers: vec![
+                            header::AUTHORIZATION,
+                            header::COOKIE,
+                            header::REFERER,
+                            header::PROXY_AUTHORIZATION,
+                        ],
                     }
                 )]
             );
+            let last = rec.requests_sent().pop().unwrap();
+            assert_eq!(last.2.get(header::PROXY_AUTHORIZATION), None);
             let names = stream(&rec);
             let redirected = names.iter().position(|n| n == "Redirected").unwrap();
             assert_eq!(names[redirected + 1], "RequestModified", "{names:?}");

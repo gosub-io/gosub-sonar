@@ -379,8 +379,9 @@ browser-matching semantics:
 - Only 301, 302, 303, 307 and 308 are redirects (Fetch). Any other 3xx, a 300 or a 304 nobody
   asked for, is returned to the caller like any response, `Location` or not.
 - Method/body downgraded on 301/302/303, preserved on 307/308 (RFC 7231 §6.4).
-- `Authorization` and `Cookie` (`SENSITIVE_REDIRECT_HEADERS`) are stripped on cross-origin
-  redirects (RFC 9110 §15.4), and the cookie jar is re-queried for the new origin.
+- `Authorization`, `Cookie`, `Referer`, `Origin` and `Proxy-Authorization`
+  (`SENSITIVE_REDIRECT_HEADERS`) are stripped on cross-origin redirects (RFC 9110 §15.4), and
+  the cookie jar is re-queried for the new origin.
 - Only `http`/`https` targets are followed.
 - Each hop is upgraded to `https` if HSTS applies, *before* `url_allowed` is consulted, so the
   hook sees the URL that will actually be requested and no plaintext request is ever opened.

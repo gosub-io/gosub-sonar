@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - With a socks rule first, a `407` from the origin server behind it was taken for a proxy
   challenge, because an http rule further down the list was taken for the proxy. Only the
   first rule that routes a request is its proxy now
+- A `Proxy-Authorization` the caller set followed a cross-origin redirect, to a host that may
+  be reached directly and is then an origin server, not the proxy. It is stripped with
+  `Authorization` and `Cookie` now, and reported in `SensitiveHeadersStripped`
 
 ## [0.13.0] - 2026-10-12
 
