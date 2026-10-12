@@ -278,10 +278,12 @@ impl CacheEntry {
     /// How old the stored response is now (RFC 9111 §4.2.3), counting the `Age` it arrived with
     /// and the time the request itself took.
     pub fn current_age(&self, now: DateTime<Utc>) -> TimeDelta {
+        // A list (`Age: 100, 200`) counts by its first member (RFC 9111 §5.1).
         let age_value = self
             .headers
             .get(header::AGE)
             .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
             .and_then(delta_seconds)
             .map(TimeDelta::seconds)
             .unwrap_or_else(TimeDelta::zero);
@@ -1164,6 +1166,13 @@ mod tests {
 
     fn key() -> CacheKey {
         CacheKey::new(&Method::GET, &Url::parse("https://example.com/a").unwrap())
+    }
+
+    /// An `Age` that is a list counts by its first member (RFC 9111 §5.1).
+    #[test]
+    fn a_list_age_counts_by_its_first_member() {
+        let stored = entry(&[("cache-control", "max-age=600"), ("age", "100, 200")]);
+        assert_eq!(stored.current_age(at(0)), TimeDelta::seconds(100));
     }
 
     /// A response without `Date` is stored with the time it arrived (RFC 9110 §6.6.1); one

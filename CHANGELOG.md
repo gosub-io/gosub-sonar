@@ -54,6 +54,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An `Age` that came as a list (`Age: 100, 200`) was ignored, so the response counted as new.
+  Its first member counts now (RFC 9111 §5.1)
 - A response without `Date` was stored without one, so a cache hit carried no `Date` at all.
   It is stored with the time it arrived (RFC 9110 §6.6.1)
 - A `304` that brought a `Vary` left the stored response selected by its old one: a
