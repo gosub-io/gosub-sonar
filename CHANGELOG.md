@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The comment on `is_storable` said a status outside the heuristically cacheable ones is
+  stored "when the response says so itself"; the code needs explicit freshness. The comment
+  says that now
 - A `200` to a `HEAD` with another `ETag`, `Last-Modified` or length than the stored `GET`
   response left that response in the cache to be served while fresh. It is dropped now
   (RFC 9111 §4.3.5), so the next `GET` asks the server; `CacheEntry::changed_per_head` says

@@ -630,7 +630,9 @@ pub fn is_storable(
         // push out entries that are used.
         return false;
     }
-    // A status the caching rules do not cover is only storable when the response says so itself.
+    // A status that is not heuristically cacheable is only stored with explicit freshness
+    // (`max-age` or `Expires`). RFC 9111 §3 would also let `public` or `private` make one
+    // storable; that is a MAY, and without freshness such a response is stale on arrival.
     DEFAULT_CACHEABLE.contains(&status) || has_freshness
 }
 
