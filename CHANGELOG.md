@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `RequestChange::HeadersRemoved`: headers the caller set that were not sent, reported once on
+  the first hop. `RequestChange` is `#[non_exhaustive]`, so this needs no new `match` arm
+
+### Fixed
+
+- A caller's `Content-Length` was sent instead of the body's: a smaller one cut the body short
+  (the rest of it was lost and the fetch reported success), a larger one left the server
+  waiting for bytes that never came. `Content-Length` and `Transfer-Encoding` are now always
+  worked out from the body (RFC 9112 §6), and a caller's are dropped with a
+  `RequestChange::HeadersRemoved`
+
 ## [0.13.0] - 2026-10-12
 
 ### Added

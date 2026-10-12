@@ -1738,6 +1738,20 @@ async fn get_with_redirects(
     let mut url_list: Vec<Url> = Vec::new();
     let mut current_headers = init.headers;
     let mut current_body = init.body;
+    // The message framing is the body's (RFC 9112 §6): a caller's `Content-Length` that does
+    // not match it cuts the body short or leaves the server waiting for bytes that never come,
+    // and a `Transfer-Encoding` would contradict the one the connection picks.
+    let removed: Vec<header::HeaderName> = [header::CONTENT_LENGTH, header::TRANSFER_ENCODING]
+        .into_iter()
+        .filter(|name| current_headers.remove(name).is_some())
+        .collect();
+    if !removed.is_empty() {
+        modified(
+            &observer,
+            &url,
+            RequestChange::HeadersRemoved { headers: removed },
+        );
+    }
     let origin = init.origin;
     // A redirect may replace this for the remaining hops (Fetch, HTTP-redirect fetch).
     let mut referrer_policy = init.referrer_policy;
@@ -2317,9 +2331,7 @@ async fn get_with_redirects(
                     // holding a header map, and so below anything that could report it. A
                     // stream needs it regardless, being unsized as far as the client knows.
                     if let Some(len) = explicit_len {
-                        if !current_headers.contains_key(header::CONTENT_LENGTH) {
-                            req_builder = req_builder.header(header::CONTENT_LENGTH, len);
-                        }
+                        req_builder = req_builder.header(header::CONTENT_LENGTH, len);
                     }
                     req_builder = req_builder.body(hop_body);
                 }
@@ -7070,6 +7082,60 @@ mod tests {
 
         fn changes(rec: &RecordingObserver) -> Vec<RequestChange> {
             rec.modifications().into_iter().map(|(_, c)| c).collect()
+        }
+
+        /// A caller's `Content-Length` and `Transfer-Encoding` are not sent: the body frames
+        /// the message (RFC 9112 §6). A shorter `Content-Length` would cut the body, so the
+        /// server echoing what it read gets all of it.
+        #[tokio::test(flavor = "current_thread")]
+        async fn framing_headers_come_from_the_body() {
+            let srv = TestServer::new()
+                .route("/echo", RouteConfig::echo_body())
+                .route("/headers", RouteConfig::echo_request_headers())
+                .start()
+                .await;
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_LENGTH, "3".parse().unwrap());
+            let rec = Arc::new(RecordingObserver::new());
+            let (_, echoed) = super::super::fetch_response_complete(
+                client(),
+                srv.url("/echo"),
+                RequestInit::post(headers, b"0123456789".to_vec()),
+                CancellationToken::new(),
+                rec.clone(),
+                None,
+                Duration::from_secs(3),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(&echoed[..], b"0123456789");
+            assert_eq!(
+                changes(&rec),
+                vec![RequestChange::HeadersRemoved {
+                    headers: vec![header::CONTENT_LENGTH],
+                }]
+            );
+
+            let mut headers = HeaderMap::new();
+            headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+            let (_, echoed) = super::super::fetch_response_complete(
+                client(),
+                srv.url("/headers"),
+                RequestInit::post(headers, b"0123456789".to_vec()),
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(3),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            let echoed = String::from_utf8_lossy(&echoed).to_ascii_lowercase();
+            assert!(!echoed.contains("transfer-encoding"), "{echoed}");
+            assert!(echoed.contains("content-length: 10"), "{echoed}");
         }
 
         /// The names of the events from `first` on, with the ones no test here is about

@@ -284,6 +284,13 @@ pub enum RequestChange {
         /// The removed headers.
         headers: Vec<HeaderName>,
     },
+    /// Headers the caller set were not sent. `Content-Length` and `Transfer-Encoding` frame the
+    /// message and are worked out from the body (RFC 9112 section 6), so a caller's value is
+    /// never sent. Reported once, on the first hop.
+    HeadersRemoved {
+        /// The removed headers.
+        headers: Vec<HeaderName>,
+    },
     /// A redirect changed the method, and any request body was dropped with it
     /// (RFC 9110 section 15.4).
     MethodDowngraded {
@@ -317,6 +324,13 @@ impl Display for RequestChange {
             }
             RequestChange::SensitiveHeadersStripped { headers } => {
                 f.write_str("stripped headers on a cross-origin redirect:")?;
+                for h in headers {
+                    write!(f, " {h}")?;
+                }
+                Ok(())
+            }
+            RequestChange::HeadersRemoved { headers } => {
+                f.write_str("removed headers the caller set:")?;
                 for h in headers {
                     write!(f, " {h}")?;
                 }
