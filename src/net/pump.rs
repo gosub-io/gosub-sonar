@@ -55,16 +55,18 @@ pub struct PumpTargets {
 ///
 /// A failure to *set up* the file target (temp-file creation, open, or peek write) degrades the
 /// same way as a mid-stream write failure: when a `shared` target is present, an observer
-/// warning is emitted and streaming continues without a file target. A file-only pump returns
-/// the error instead — there is nothing left to deliver to.
+/// warning is emitted and streaming continues without a file target, so the subscribers still
+/// get the whole body. A file-only pump stops at once — there is nothing left to deliver to.
 ///
 /// `peek` is emitted *first* to both targets (if present), then the streamed tail.
 ///
 /// # Return
 /// The task resolves to:
 /// - `Ok(Some(final_path))` on a clean EOF and successful rename,
-/// - `Ok(None)` if no file target was requested or the transfer did not produce a file,
-/// - `Err(NetError)` only when file setup fails and there is no `shared` target.
+/// - `Ok(None)` when no file target was requested and the stream ended cleanly,
+/// - `Err(NetError)` whenever the transfer failed: the read error, the timeout or the cancel
+///   above, or for a file target the setup, write or rename that failed. Subscribers of a
+///   `shared` target get the transfer's error too.
 pub fn spawn_pump<R>(
     // Reader we pump from
     mut reader: R,
@@ -89,6 +91,7 @@ where
         // If we need to send to file, first open the file and write the peek data.
         // A setup failure must not strand live subscribers: with a shared target we degrade to
         // stream-only (like a mid-stream write failure); a file-only pump fails outright.
+        let mut file_error: Option<NetError> = None;
         let mut writer = if let Some(dest) = &file_dest {
             let setup = async {
                 let tmp_dest = temp_path_for(dest).map_err(|e| NetError::Io(Arc::new(e)))?;
@@ -119,6 +122,7 @@ where
                         url: url.clone(),
                         message: format!("file setup failed, streaming without file target: {}", e),
                     });
+                    file_error = Some(e);
                     None
                 }
             }
@@ -135,20 +139,15 @@ where
 
         // Peek writes are done. Continue with the main loop that deals with the stream
         let mut buf = BytesMut::with_capacity(16 * 1024);
-        // Tracks whether all file writes succeeded. False → skip atomic rename at end.
-        // Streaming to shared continues regardless so subscribers still get the full body.
-        let mut file_ok = true;
 
-        let finish_ok = loop {
+        // How the transfer ended. A file write that fails stops the file, not the stream:
+        // subscribers still get the whole body, and the failure is in `file_error`.
+        let transfer: Result<(), NetError> = loop {
             let total_left = total_deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
 
             let read_res = tokio::select! {
                 _ = cancel.cancelled() => {
-                    // Cancelled
-                    if let Some(s) = &shared {
-                        s.error(NetError::Cancelled("Pump cancelled".into()));
-                    }
-                    break false;
+                    break Err(NetError::Cancelled("Pump cancelled".into()));
                 }
                 _ = async {
                     // Wait for total time to expire, if set
@@ -158,22 +157,14 @@ where
                         futures_util::future::pending::<()>().await
                     }
                 } => {
-                    if let Some(s) = &shared {
-                        s.error(NetError::Timeout("Pump total timeout".into()));
-                    }
-                    break false;
+                    break Err(NetError::Timeout("Pump total timeout".into()));
                 }
                 r = timeout(idle, reader.read_buf(&mut buf)) => r,
             };
 
             match read_res {
-                Err(_) => {
-                    // Idle timeout — break regardless of whether a file target is present
-                    if let Some(s) = &shared {
-                        s.error(NetError::Timeout("Pump idle timeout".into()));
-                    }
-                    break false;
-                }
+                // Idle timeout — break regardless of whether a file target is present
+                Err(_) => break Err(NetError::Timeout("Pump idle timeout".into())),
                 Ok(Ok(0)) => {
                     // EOF: flush any bytes accumulated in the read buffer
                     if !buf.is_empty() {
@@ -181,25 +172,16 @@ where
                         if let Some(s) = &shared {
                             s.push(chunk.clone());
                         }
-                        if file_ok {
-                            if let Some((_tmp, w)) = &mut writer {
-                                if let Err(e) = w.write_all(&chunk).await {
-                                    observer.on_event(NetEvent::Io {
-                                        message: format!("Failed to write to file: {}", e),
-                                    });
-                                    file_ok = false;
-                                }
-                            }
-                        }
+                        write_to_file(&mut writer, &mut file_error, &chunk, &observer, &url).await;
                     }
-                    if file_ok {
+                    if file_error.is_none() {
                         if let Some((_tmp, w)) = &mut writer {
                             if let Err(e) = w.flush().await {
                                 observer.on_event(NetEvent::Warning {
                                     url: url.clone(),
                                     message: format!("Failed to flush file: {}", e),
                                 });
-                                file_ok = false;
+                                file_error = Some(NetError::Io(Arc::new(e)));
                             }
                         }
                     }
@@ -207,7 +189,7 @@ where
                     if let Some(s) = &shared {
                         s.finish();
                     }
-                    break file_ok;
+                    break Ok(());
                 }
 
                 Ok(Ok(_)) => {
@@ -218,46 +200,55 @@ where
                         if let Some(s) = &shared {
                             s.push(chunk.clone());
                         }
-
-                        // Write to file only while writes are succeeding
-                        if file_ok {
-                            if let Some((_tmp, w)) = &mut writer {
-                                if let Err(e) = w.write_all(&chunk).await {
-                                    observer.on_event(NetEvent::Warning {
-                                        url: url.clone(),
-                                        message: format!("Failed to write to file: {}", e),
-                                    });
-                                    file_ok = false;
-                                }
-                            }
-                        }
+                        write_to_file(&mut writer, &mut file_error, &chunk, &observer, &url).await;
                     }
                 }
-                Ok(Err(e)) => {
-                    // Error reading, send error to shared body. Nothing to be done for the file
-                    if let Some(s) = &shared {
-                        s.error(NetError::Io(Arc::new(e)));
-                    }
-                    break false;
-                }
+                Ok(Err(e)) => break Err(NetError::Io(Arc::new(e))),
             }
         };
 
-        // If we wrote to a file, and finished ok, rename the temp file to the final destination
-        if let Some((tmp, _w)) = writer {
-            if finish_ok {
-                if let Some(dest) = file_dest {
-                    tokio::fs::rename(&tmp, &dest)
-                        .await
-                        .map_err(|e| NetError::Io(Arc::new(e)))?;
-
-                    return Ok(Some(dest));
-                }
-            }
+        // The subscribers hear how the transfer ended; the temporary file goes with `writer`.
+        if let (Err(e), Some(s)) = (&transfer, &shared) {
+            s.error(e.clone());
         }
-
-        Ok(None)
+        transfer?;
+        let Some(dest) = file_dest else {
+            return Ok(None);
+        };
+        if let Some(e) = file_error {
+            return Err(e);
+        }
+        let Some((tmp, _w)) = writer else {
+            return Ok(None);
+        };
+        tokio::fs::rename(&tmp, &dest)
+            .await
+            .map_err(|e| NetError::Io(Arc::new(e)))?;
+        Ok(Some(dest))
     })
+}
+
+/// Write `chunk` to the file target while its writes are succeeding; the first failure is
+/// kept in `file_error` and stops the writes that follow.
+async fn write_to_file(
+    writer: &mut Option<(tempfile::NamedTempFile, BufWriter<tokio::fs::File>)>,
+    file_error: &mut Option<NetError>,
+    chunk: &[u8],
+    observer: &Arc<dyn NetObserver>,
+    url: &Url,
+) {
+    if file_error.is_some() {
+        return;
+    }
+    if let Some((_tmp, w)) = writer {
+        if let Err(e) = w.write_all(chunk).await {
+            observer.on_event(NetEvent::Warning {
+                url: url.clone(),
+                message: format!("Failed to write to file: {}", e),
+            });
+            *file_error = Some(NetError::Io(Arc::new(e)));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -503,7 +494,8 @@ mod tests {
     }
 
     /// A file-setup failure (unwritable destination directory) must not strand shared
-    /// subscribers: the pump degrades to stream-only and they still get the full body.
+    /// subscribers: the pump degrades to stream-only and they still get the full body. The
+    /// file asked for was not made, so the pump ends in that error.
     #[tokio::test(flavor = "current_thread")]
     async fn pump_file_setup_failure_still_streams_to_shared() {
         let shared = Arc::new(SharedBody::new(32));
@@ -532,7 +524,7 @@ mod tests {
             .await
             .expect("subscriber hung after file-setup failure");
         assert_eq!(out, b"head tail");
-        assert_eq!(handle.await.unwrap().unwrap(), None);
+        assert!(matches!(handle.await.unwrap(), Err(NetError::Io(_))));
         assert!(!dest.exists());
     }
 
@@ -553,6 +545,47 @@ mod tests {
             url(),
         );
         assert!(handle.await.unwrap().is_err());
+    }
+
+    /// A file transfer that does not complete ends in its error, file-only or not: read
+    /// error, idle timeout, cancel. No file is left behind.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_file_transfer_ends_in_its_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pump = |reader: Box<dyn AsyncRead + Unpin + Send>, cancel: CancellationToken| {
+            spawn_pump(
+                reader,
+                PumpTargets {
+                    shared: None,
+                    file_dest: Some(dir.path().join("out.bin")),
+                    peek_buf: PeekBuf::from_slice(b"head"),
+                },
+                PumpCfg {
+                    idle: Duration::from_millis(50),
+                    total_deadline: None,
+                },
+                cancel,
+                observer(),
+                url(),
+            )
+        };
+        let read_error = pump(Box::new(ErrorReader), CancellationToken::new());
+        assert!(matches!(read_error.await.unwrap(), Err(NetError::Io(_))));
+        let idle = pump(Box::new(BlockingReader), CancellationToken::new());
+        assert!(matches!(idle.await.unwrap(), Err(NetError::Timeout(_))));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let cancelled = pump(Box::new(BlockingReader), cancel);
+        assert!(matches!(
+            cancelled.await.unwrap(),
+            Err(NetError::Cancelled(_))
+        ));
+        assert!(!dir.path().join("out.bin").exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no temp file left"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

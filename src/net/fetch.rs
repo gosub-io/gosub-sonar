@@ -1066,7 +1066,7 @@ async fn fetch_response_top_inner(
         let next = tokio::select! {
             // Stream cancelled
             _ = cancel.cancelled() => {
-                observer_clone.on_event(NetEvent::Cancelled { url: url.clone(), reason: "peek stream cancelled" });
+                observer_clone.on_event(NetEvent::Cancelled { url: meta.final_url.clone(), reason: "peek stream cancelled" });
                 return Err(NetError::Cancelled("peek stream cancelled".into()));
             }
             // Read bytes from stream
@@ -1078,14 +1078,9 @@ async fn fetch_response_top_inner(
             Some(Ok(chunk)) => {
                 received_net += chunk.len() as u64;
 
-                observer.on_event(NetEvent::Progress {
-                    received_bytes: received_net,
-                    elapsed: started.elapsed(),
-                    expected_length: meta.content_length,
-                });
-
                 let need = PEEK_MAX.saturating_sub(peek_buf_vec.len());
-                if chunk.len() <= need {
+                let fits = chunk.len() <= need;
+                if fits {
                     // Entire chunk fits in our peek_buf.
                     peek_buf_vec.extend_from_slice(&chunk);
                 } else {
@@ -1095,6 +1090,16 @@ async fn fetch_response_top_inner(
                     // 'excess' buffer
                     peek_buf_vec.extend_from_slice(&chunk[..need]);
                     excess = Some(chunk.slice(need..));
+                }
+
+                // Counted as the body goes to the caller: the peek here, the excess when the
+                // reader below hands it on, so the count never goes back.
+                observer.on_event(NetEvent::Progress {
+                    received_bytes: peek_buf_vec.len() as u64,
+                    elapsed: started.elapsed(),
+                    expected_length: meta.content_length,
+                });
+                if !fits {
                     break;
                 }
             }
@@ -1180,15 +1185,15 @@ async fn fetch_response_top_inner(
     let stream = body_stream.map_err(|e: NetError| e.to_io());
     let inner_reader = StreamReader::new(stream);
 
-    // Update the progress counter to the point of the bytes read (note: this can cause a strange
-    // decrease in bytes read in the progress events?)
+    // The progress count so far: the peek, which is what reached the caller.
     let already_delivered = received_net - excess_len;
 
+    // The body's end names the URL it came from, the last hop of the chain.
     let progress_reader = ProgressReader::new(
         inner_reader,
         cancel.clone(),
         observer.clone(),
-        url.clone(),
+        meta.final_url.clone(),
         started,
         meta.content_length,
         already_delivered,
@@ -1382,8 +1387,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
     ) -> std::task::Poll<std::io::Result<()>> {
         // When cancelled, we are directly done
         if self.cancel.is_cancelled() {
-            // Maybe it's already cancelled? Then don't send another cancelled event
-            if !self.cancel_emitted {
+            // Only if the read has not ended already: one end per request.
+            if !self.cancel_emitted && !self.finished_emitted && !self.failed_emitted {
                 self.observer.on_event(NetEvent::Cancelled {
                     url: self.url.clone(),
                     reason: "progress reader cancelled",
@@ -7184,6 +7189,85 @@ mod tests {
             )
             .await;
             rec
+        }
+
+        /// A body read to its end has ended: a cancel that comes after adds no second end.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_cancel_after_the_end_adds_no_second_end() {
+            let srv = TestServer::new()
+                .route("/", RouteConfig::ok(vec![b'y'; 20 * 1024]))
+                .start()
+                .await;
+            let rec = Arc::new(RecordingObserver::new());
+            let cancel = CancellationToken::new();
+            let mut top = super::super::fetch_response_top(
+                client(),
+                srv.url("/"),
+                RequestInit::default(),
+                cancel.clone(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            let mut sink = Vec::new();
+            top.reader.read_to_end(&mut sink).await.unwrap();
+            cancel.cancel();
+            let _ = top.reader.read(&mut [0u8; 16]).await;
+            drop(top);
+            let ends: Vec<_> = rec
+                .event_names()
+                .into_iter()
+                .filter(|n| matches!(n.as_str(), "Finished" | "Failed" | "Cancelled"))
+                .collect();
+            assert_eq!(ends, ["Finished"]);
+        }
+
+        /// `Progress` counts what reached the caller and never goes back, also where the
+        /// first bytes, read to sniff the body, end and the rest of it begins.
+        #[tokio::test(flavor = "current_thread")]
+        async fn progress_never_goes_back() {
+            let body = vec![b'x'; 64 * 1024];
+            let srv = TestServer::new()
+                .route("/big", RouteConfig::ok(body.clone()))
+                .start()
+                .await;
+            let rec = Arc::new(RecordingObserver::new());
+            let mut top = super::super::fetch_response_top(
+                client(),
+                srv.url("/big"),
+                RequestInit::default(),
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            // Small reads, so the bytes read past the sniffed ones are counted in steps.
+            let mut small = [0u8; 256];
+            while top.reader.read(&mut small).await.unwrap() > 0 {}
+            let progress = rec.progress();
+            assert!(progress.len() > 1, "{progress:?}");
+            assert!(progress.windows(2).all(|w| w[0] <= w[1]), "{progress:?}");
+            assert_eq!(progress.last(), Some(&(body.len() as u64)));
+        }
+
+        /// `Finished` names the URL that finished loading: after a redirect, the last hop.
+        #[tokio::test(flavor = "current_thread")]
+        async fn finished_names_the_final_url() {
+            let srv = TestServer::new()
+                .route("/a", RouteConfig::redirect_to("/c"))
+                .route("/c", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let rec = recorded(
+                client(),
+                srv.url("/a"),
+                RequestInit::default(),
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(rec.finished_urls(), [srv.url("/c")]);
         }
 
         fn changes(rec: &RecordingObserver) -> Vec<RequestChange> {

@@ -68,8 +68,9 @@ pub enum ResourceKind {
 /// Who or what triggered the fetch.
 ///
 /// Passed back through [`crate::net::fetcher_context::FetcherContext::observer_for`], and
-/// [`User`](Initiator::User) marks a [`RequestMode::Navigate`] request as user-activated,
-/// which sends `Sec-Fetch-User: ?1` — see [`fetch_metadata`](crate::net::fetch_metadata).
+/// [`User`](Initiator::User) marks a navigation request (see
+/// [`RequestDestination::is_navigation`]) as user-activated, which sends `Sec-Fetch-User: ?1` —
+/// see [`fetch_metadata`](crate::net::fetch_metadata).
 /// The net crate does not alter scheduling based on this value.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum Initiator {
@@ -996,7 +997,9 @@ impl FetchRequest {
                     None => "n".to_string(),
                 },
             };
-            let user = if self.mode == RequestMode::Navigate && self.initiator == Initiator::User {
+            // By the rule `Sec-Fetch-User` is sent by, so requests that send different ones
+            // never share a response.
+            let user = if self.destination.is_navigation() && self.initiator == Initiator::User {
                 "u"
             } else {
                 "-"
@@ -1436,6 +1439,44 @@ mod tests {
     use super::*;
     use cow_utils::CowUtils;
     use tokio::io::AsyncReadExt;
+
+    /// The key splits exactly where `Sec-Fetch-User` does: a user-initiated request to a
+    /// navigation destination sends `?1` whatever its mode, so it never shares a response with
+    /// one that does not; anywhere else the initiator changes nothing that goes out.
+    #[test]
+    fn the_key_splits_where_sec_fetch_user_does() {
+        let url = Url::parse("https://example.test/").unwrap();
+        let key = |destination, mode, initiator| {
+            FetchRequest::builder(Method::GET, url.clone())
+                .with_destination(destination)
+                .with_mode(mode)
+                .with_initiator(initiator)
+                .build()
+                .generate_request_key()
+                .unwrap()
+        };
+        for destination in [RequestDestination::Document, RequestDestination::Embed] {
+            for mode in [RequestMode::Navigate, RequestMode::NoCors] {
+                assert_ne!(
+                    key(destination, mode, Initiator::User),
+                    key(destination, mode, Initiator::Other),
+                    "{destination:?} {mode:?}"
+                );
+            }
+        }
+        assert_eq!(
+            key(
+                RequestDestination::Image,
+                RequestMode::Navigate,
+                Initiator::User
+            ),
+            key(
+                RequestDestination::Image,
+                RequestMode::Navigate,
+                Initiator::Other
+            )
+        );
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
