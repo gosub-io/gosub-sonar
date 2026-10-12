@@ -33,10 +33,10 @@ pub enum NetEvent {
     /// the connection pool resolves nothing and reports nothing, which is the honest
     /// answer rather than a zero.
     ///
-    /// Requires a [`DnsResolver`](crate::net::dns::DnsResolver) to be configured on the
-    /// fetcher; reqwest's built-in resolution happens below our level and cannot be timed.
-    /// [`SystemResolver`](crate::net::dns::SystemResolver) is the drop-in for embedders
-    /// with no resolution policy of their own.
+    /// Emitted for the fetcher's resolver, whether a
+    /// [`DnsResolver`](crate::net::dns::DnsResolver) of the embedder's or the
+    /// [`SystemResolver`](crate::net::dns::SystemResolver) it uses when none is configured.
+    /// A `localhost` name reports the two loopback addresses it is answered with.
     DnsResolved {
         /// Hostname that was looked up
         host: String,
@@ -141,7 +141,22 @@ pub enum NetEvent {
         truncated: bool,
     },
 
-    /// Resource started loading
+    /// The fetcher took the request: the first event of every request its `run` loop picks
+    /// up, before any check, any wait for a connection slot, any attempt. (A request still
+    /// queued when the fetcher shuts down is answered `Cancelled` through its reply channel
+    /// and never reaches an observer.) Every request that reports `Accepted` ends
+    /// with exactly one [`NetEvent::Finished`], [`NetEvent::Failed`] or
+    /// [`NetEvent::Cancelled`], and reports nothing after it.
+    Accepted {
+        /// URL as the caller asked for it, before any upgrade to `https`
+        url: Url,
+        /// The request shares a fetch another request started (coalescing), and sends nothing
+        /// of its own
+        joined: bool,
+    },
+    /// An attempt at the request started: it has its connection slot and goes out, or is
+    /// answered from the cache. Once per attempt, so a retried request reports it again; a
+    /// request refused or cancelled before it was sent reports none.
     Started {
         /// URL being fetched
         url: Url,
@@ -196,16 +211,19 @@ pub enum NetEvent {
     /// matching every cause it might have.
     ///
     /// A cancelled request is not a failure: it reports [`NetEvent::Cancelled`] and
-    /// nothing else. Every attempt therefore ends in exactly one of [`NetEvent::Finished`],
-    /// `Failed`, or [`NetEvent::Cancelled`]. A retried attempt's `Failed` is followed by
-    /// [`NetEvent::Retrying`] and a new [`NetEvent::Started`].
+    /// nothing else. Every request therefore ends in exactly one of [`NetEvent::Finished`],
+    /// `Failed`, or [`NetEvent::Cancelled`], once, however many attempts it took: a retried
+    /// attempt reports no end of its own, only [`NetEvent::Retrying`] and the next attempt's
+    /// [`NetEvent::Started`].
     Failed {
         /// URL that failed to load
         url: Url,
         /// Error that caused the failure
         error: anyhow::Error,
     },
-    /// A failed request will be re-sent after `delay`. See [`retry`](mod@crate::net::retry).
+    /// A failed attempt will be re-sent after `delay`. The attempt reports no end of its own:
+    /// `reason` says why it failed, and the request ends once, after its last attempt. See
+    /// [`retry`](mod@crate::net::retry).
     Retrying {
         /// URL being retried
         url: Url,
@@ -318,4 +336,14 @@ pub enum NetEvent {
         /// Short static description of why the fetch was cancelled
         reason: &'static str,
     },
+}
+
+impl NetEvent {
+    /// Whether this event ends the request: `Finished`, `Failed` or `Cancelled`.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            NetEvent::Finished { .. } | NetEvent::Failed { .. } | NetEvent::Cancelled { .. }
+        )
+    }
 }

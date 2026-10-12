@@ -16,11 +16,11 @@ use crate::net::fetch_metadata::RequestDestination;
 use crate::net::fetcher_context::FetcherContext;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::hsts::{self, HstsStore, InMemoryHstsStore};
+use crate::net::lifecycle::{Lifecycle, Shared};
 use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::proxy::{ProxyConfig, ProxyRoutes};
-use crate::net::request_ref::RequestReference;
 use crate::net::retry::{self, RetryPolicy};
 use crate::net::shared_body::{ReaderOptions, SharedBody, DEFAULT_REPLAY_LIMIT};
 use crate::net::slots::{SlotPool, Slots};
@@ -61,7 +61,15 @@ pub struct FetcherConfig {
     pub h1_per_origin: usize,
     /// Maximum concurrent streams **per origin** for HTTP/2 and HTTP/3 (multiplexed).
     pub h2_per_origin: usize,
-    /// Timeout for the TCP + TLS handshake.  Applies before any bytes are sent.
+    /// Budget for opening a connection: name resolution, the TCP connect and, for https, the
+    /// TLS handshake, all within this one deadline. Applies before any bytes are sent.
+    ///
+    /// When a name has several addresses, those of the first address's family are tried one
+    /// after another, each with an equal share of this budget, and the other family starts
+    /// 300 ms after the first attempt (hyper-util's connector). An address that refuses
+    /// fails over at once; one that never answers holds the next back for its whole share.
+    /// That is a known deviation from RFC 8305 (Happy Eyeballs), which starts the next
+    /// attempt after 250 ms and races them.
     pub connect_timeout: Duration,
     /// Deadline for one hop, from sending its first byte until its body has been read. The
     /// client enforces it, and it covers the body as well as the wait for headers, so a
@@ -290,9 +298,11 @@ pub struct FetchInflightEntry {
     /// Count of currently active subscribers.  Decremented on cancellation; triggers
     /// `parent_cancel` when it reaches zero.
     subs: AtomicUsize,
-    /// Cancelled by the leader after `waiter.finish()` to unblock child-cancel watcher tasks
-    /// that are waiting on either subscriber cancellation or fetch completion.
+    /// Cancelled by the leader after `waiter.finish()`: the fetch is over.
     done: CancellationToken,
+    /// What the fetch reports to: every request waiting on it. Set by the leader before any
+    /// other request can join.
+    shared: std::sync::OnceLock<Arc<Shared>>,
 }
 
 impl FetchInflightEntry {
@@ -537,6 +547,9 @@ impl Fetcher {
         reply_tx: oneshot::Sender<FetchResult>,
     ) {
         let mut req = req;
+        // Before anything keys on the method: the coalescing key, the cache and every policy
+        // compare against the uppercase methods.
+        req.method = crate::net::fetch::normalize_method(req.method);
         // So a `{:?}` of the request anywhere prints credentials redacted.
         crate::net::utils::mark_sensitive(&mut req.headers);
         if log::log_enabled!(log::Level::Debug) {
@@ -619,6 +632,8 @@ impl Fetcher {
                 }
                 continue;
             };
+            // What the caller asked for, before anything below rewrites it.
+            let requested = req.url.clone();
 
             // Upgrade before the key is derived, or an http:// and an https:// request for the
             // same HSTS host hash to different keys and run as two fetches instead of coalescing
@@ -629,6 +644,9 @@ impl Fetcher {
                     req.url = hsts::upgrade(&req.url);
                 }
             }
+            // Reported to the request once it is accepted, below: the redirect loop only sees
+            // the `https` URL and has nothing left to report.
+            let upgraded = (req.url != requested).then(|| req.url.clone());
 
             // Pin the mixed-content policy to its resolved value before keying, so a request that
             // inherits the fetcher default and one that names the same policy explicitly land in
@@ -670,6 +688,7 @@ impl Fetcher {
                     wants_streaming: AtomicBool::new(req.streaming),
                     done: CancellationToken::new(),
                     subs: AtomicUsize::new(1),
+                    shared: std::sync::OnceLock::new(),
                 })
             };
             let (inflight_entry, is_leader, listener) =
@@ -693,27 +712,66 @@ impl Fetcher {
                     }
                 };
 
-            if is_leader {
-                self.ctx.on_ref_active(req.reference);
+            // Every request has its own lifecycle, a follower's included: it reports from
+            // `Accepted` to its own end (see `lifecycle`), and is its reference's outstanding
+            // work for as long.
+            let lifecycle = Lifecycle::accept(
+                self.ctx
+                    .observer_for(req.reference, req.req_id, req.kind, req.initiator),
+                requested.clone(),
+                !is_leader,
+                Some((self.ctx.clone(), req.reference)),
+            );
+            if let Some(ref to) = upgraded {
+                lifecycle.on_event(NetEvent::SecurityUpgraded {
+                    from: requested.clone(),
+                    to: to.clone(),
+                    reason: crate::net::types::UpgradeReason::Hsts,
+                });
             }
+            let shared = if is_leader {
+                let shared = Shared::new(lifecycle.clone());
+                let _ = inflight_entry.shared.set(shared.clone());
+                Some(shared)
+            } else {
+                // The leader set it in this same loop, before any request could join.
+                if let Some(shared) = inflight_entry.shared.get() {
+                    shared.attach(lifecycle.clone());
+                }
+                None
+            };
 
+            // Watches this caller until its request has ended. A caller that cancels ends its
+            // own request there and then, even while others still want the result; a result
+            // already handed to it is not taken back.
             let child_cancel = cancel.clone();
             let entry_for_cancel = inflight_entry.clone();
-            let done = entry_for_cancel.done.clone();
+            let ended = lifecycle.ended();
+            let caller = lifecycle.clone();
             tokio::spawn(async move {
                 tokio::select! {
                     _ = child_cancel.cancelled() => {
-                        // This caller stops waiting now, even while others still want the
-                        // result; unless the result was already handed to it, which it keeps.
-                        entry_for_cancel.waiter.cancel(
+                        // Only a caller still waiting counts out of the fetch: one that has its
+                        // stream already reads at its own pace, and the body stops by itself
+                        // once nobody can read it.
+                        if entry_for_cancel.waiter.cancel(
                             listener,
                             NetError::Cancelled("cancelled by the caller".into()),
-                        );
-                        entry_for_cancel.dec_sub_and_maybe_cancel();
+                        ) {
+                            entry_for_cancel.dec_sub_and_maybe_cancel();
+                        }
+                        if let Some(shared) = entry_for_cancel.shared.get() {
+                            shared.detach(&caller);
+                        }
+                        caller.on_event(NetEvent::Cancelled {
+                            url: caller.url().clone(),
+                            reason: "cancelled by the caller",
+                        });
                     }
-                    _ = done.cancelled() => {}
+                    _ = ended.cancelled() => {}
                 }
             });
+            drop(lifecycle);
 
             if req.streaming {
                 inflight_entry
@@ -721,13 +779,11 @@ impl Fetcher {
                     .store(true, Ordering::Relaxed);
             }
 
-            if !is_leader {
+            let Some(shared) = shared else {
                 continue;
-            }
-
-            let observer =
-                self.ctx
-                    .observer_for(req.reference, req.req_id, req.kind, req.initiator);
+            };
+            // The fetch reports to every request waiting on it.
+            let observer: Arc<dyn NetObserver + Send + Sync> = shared;
 
             // Pre-flight checks. Only the leader ever sends bytes, so only the leader evaluates
             // them; rejecting here avoids waiting on a connection slot for a request that will
@@ -761,7 +817,6 @@ impl Fetcher {
                     .remove_if(&key_str, |_, e| Arc::ptr_eq(e, &inflight_entry));
                 inflight_entry.waiter.finish(err, None).await;
                 inflight_entry.done.cancel();
-                self.ctx.on_ref_done(req.reference);
                 continue;
             }
 
@@ -800,12 +855,6 @@ impl Fetcher {
                 };
                 // Held here until the task ends, or by the body of a streamed fetch.
                 let mut held = acquire.await;
-                // Likewise the reference's outstanding work: a stream is still work until its
-                // body ends, so it takes this along; otherwise it ends with the task.
-                let mut ref_done = Some(RefDone {
-                    ctx: ctx_clone.clone(),
-                    reference: req.reference,
-                });
 
                 let should_stream =
                     req.streaming || inflight_entry2.wants_streaming.load(Ordering::Relaxed);
@@ -833,7 +882,6 @@ impl Fetcher {
                         pool.clone(),
                         built.clone(),
                         slot_guards,
-                        &mut ref_done,
                     )
                     .await
                 } else {
@@ -866,7 +914,6 @@ impl Fetcher {
 
                 inflight_entry2.done.cancel();
 
-                drop(ref_done);
                 drop(held);
             });
         }
@@ -883,29 +930,26 @@ fn effective_mixed_content(req: &FetchRequest, cfg: &FetcherConfig) -> MixedCont
     req.mixed_content.unwrap_or(cfg.mixed_content)
 }
 
-/// The `Accept` value sent for a destination when the caller did not set one.
-///
-/// Browsers vary the header by what the resource will be used as, and servers negotiate on it:
-/// a URL that can answer with either HTML or JSON needs to be told which one is wanted. The
-/// values follow the shape browsers send, without a vendor's exact list -- the point is a
-/// truthful, destination-appropriate preference, not impersonating a particular browser.
+/// The `Accept` value sent for a destination when the caller did not set one: the values
+/// [Fetch §4.1] gives, `*/*` for every destination it does not name. Servers negotiate on it,
+/// so a URL that can answer with either HTML or JSON is told which one is wanted, and an image
+/// URL is not told about a format the engine may not decode. A caller that wants another value
+/// sets its own `Accept`.
 ///
 /// Every value here is CORS-safelisted ([Fetch] §4.6), so setting one never turns a simple
 /// cross-origin request into a preflighted one.
 ///
+/// [Fetch §4.1]: https://fetch.spec.whatwg.org/#fetching
 /// [Fetch]: https://fetch.spec.whatwg.org/#cors-safelisted-request-header
 fn default_accept(destination: RequestDestination) -> &'static str {
     use RequestDestination as D;
     match destination {
-        // Markup that a navigation or a nested browsing context will parse as a document.
-        D::Document | D::Iframe | D::Frame | D::Object | D::Embed => {
+        D::Document | D::Iframe | D::Frame => {
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }
-        D::Image => "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
+        D::Image => "image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
+        D::Json => "application/json,*/*;q=0.5",
         D::Style => "text/css,*/*;q=0.1",
-        // Scripts, fonts, media, workers, manifests, reports, and bare `fetch()`: no format
-        // preference to express, and a narrow value here would reject servers that answer
-        // with an unusual but perfectly loadable type.
         _ => "*/*",
     }
 }
@@ -937,19 +981,8 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
             headers.insert(header::ACCEPT, value);
         }
     }
-    if !headers.contains_key(header::ACCEPT_ENCODING) {
-        // Matches what `build_client` enables for a decoding client, so responses are still
-        // decoded exactly as before; a caller that asked for raw bytes advertises nothing it
-        // cannot decode and gets the bytes untouched.
-        let advertised = if req.auto_decode {
-            "gzip, br, deflate"
-        } else {
-            "identity"
-        };
-        if let Ok(value) = advertised.parse() {
-            headers.insert(header::ACCEPT_ENCODING, value);
-        }
-    }
+    // `accept-encoding` is set with the other headers the fetcher owns, once a caller's
+    // forbidden headers are gone (`get_with_redirects`).
 
     let body = req.body.as_ref().map(|b| {
         if let Some(ref ct) = b.content_type {
@@ -1048,9 +1081,13 @@ fn build_client(
         if let Some(ref ua) = cfg.user_agent {
             b = b.user_agent(ua);
         }
-        if let Some(ref resolver) = cfg.dns_resolver {
-            b = b.dns_resolver(Arc::new(crate::net::dns::ReqwestResolver(resolver.clone())));
-        }
+        // Always installed, the system's resolver when none is configured, so that
+        // `localhost` is answered with loopback rather than looked up.
+        let resolver = cfg
+            .dns_resolver
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::net::dns::SystemResolver));
+        b = b.dns_resolver(Arc::new(crate::net::dns::ReqwestResolver(resolver)));
         // Observation only - forwards the request and returns the connector's own result
         // unchanged - so it is installed for every client rather than gated on config.
         b = b.connector_layer(crate::net::connect_timing::ConnectTimingLayer);
@@ -1059,25 +1096,11 @@ fn build_client(
     }
 }
 
-/// A body reader that keeps the fetch's slots, and its reference's outstanding work, until it
-/// is dropped: when the stream has been read to its end, failed, or been given up.
+/// A body reader that keeps the fetch's slots until it is dropped: when the stream has been
+/// read to its end, failed, or been given up.
 struct HoldsSlots<R> {
     inner: R,
     _slots: Slots,
-    _done: Option<RefDone>,
-}
-
-/// Calls [`FetcherContext::on_ref_done`] for a reference when dropped, so the call is made once,
-/// wherever the fetch's work actually ends.
-struct RefDone {
-    ctx: Arc<dyn FetcherContext>,
-    reference: RequestReference,
-}
-
-impl Drop for RefDone {
-    fn drop(&mut self) {
-        self.ctx.on_ref_done(self.reference);
-    }
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for HoldsSlots<R> {
@@ -1158,7 +1181,6 @@ async fn perform_streaming(
     origins: Arc<SlotPool>,
     built: Arc<ClientsBuilt>,
     slots: Slots,
-    ref_done: &mut Option<RefDone>,
 ) -> Result<FetchResult, NetError> {
     let client = Arc::new(client.clone());
     // Only the header phase is retried; the body goes straight to the caller.
@@ -1172,13 +1194,13 @@ async fn perform_streaming(
         &req.url,
         &cancel,
         &observer,
-        || {
+        |observer| {
             fetch_response_top(
                 client.clone(),
                 req.url.clone(),
                 make_request_init(req, cfg),
                 cancel.clone(),
-                observer.clone(),
+                observer,
                 build_policy(req, cfg, &ctx, origins.clone(), &built),
             )
         },
@@ -1203,7 +1225,6 @@ async fn perform_streaming(
     let reader = HoldsSlots {
         inner: reader,
         _slots: slots,
-        _done: ref_done.take(),
     };
     Ok(FetchResult::Stream {
         meta,
@@ -1230,13 +1251,13 @@ async fn perform_buffered(
         &req.url,
         &cancel,
         &observer,
-        || {
+        |observer| {
             fetch_response_complete(
                 client.clone(),
                 req.url.clone(),
                 make_request_init(req, cfg),
                 cancel.clone(),
-                observer.clone(),
+                observer,
                 req.max_bytes.or(cfg.max_body_bytes),
                 effective_read_idle_timeout(req, cfg),
                 effective_total_body_timeout(req, cfg),
@@ -1551,6 +1572,7 @@ mod tests {
             wants_streaming: AtomicBool::new(false),
             subs: AtomicUsize::new(1),
             done: CancellationToken::new(),
+            shared: std::sync::OnceLock::new(),
         };
         assert!(entry.try_inc_sub());
         assert!(!entry.parent_cancel.is_cancelled());
@@ -2346,6 +2368,32 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// RFC 6797 §8.3: an HSTS host's `http` URL goes out as `https`, and the request says so
+    /// with `SecurityUpgraded` right after `Accepted`, which carries the URL as asked for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_hsts_upgrade_of_the_first_hop_is_reported() {
+        let hsts = Arc::new(InMemoryHstsStore::new());
+        hsts.store(
+            "hsts-upgrade.invalid",
+            crate::net::hsts::HstsEntry {
+                expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+                include_subdomains: false,
+            },
+        );
+        let cfg = FetcherConfig {
+            hsts: Some(hsts),
+            ..test_config()
+        };
+        let req = FetchRequest::builder(
+            Method::GET,
+            Url::parse("http://hsts-upgrade.invalid/").unwrap(),
+        )
+        .build();
+        let (_, log) = fetch_recorded(cfg, req).await;
+        let names = log.event_names();
+        assert_eq!(names[..2], ["Accepted", "SecurityUpgraded"], "{names:?}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fetcher_tls_override_is_refused_for_hsts_hosts() {
         let store = Arc::new(crate::net::tls::InMemoryTlsOverrideStore::new());
@@ -2912,8 +2960,8 @@ mod tests {
     }
 
     /// Security events reach the fetcher's observer. Coalesced requests share one fetch, and
-    /// the change is reported once, by the leader. A follower gets the leader's result and
-    /// no events of its own.
+    /// the change is reported once, to the request that started it. A follower has its own
+    /// lifecycle, but no request changes of its own: it sent nothing.
     #[tokio::test(flavor = "current_thread")]
     async fn request_changes_are_reported_once_through_the_fetcher() {
         let srv = start_server().await;
@@ -2964,6 +3012,40 @@ mod tests {
                 srv.url("/coalesce").to_string(),
                 crate::net::types::RequestChange::UrlCredentialsRemoved
             )]
+        );
+    }
+
+    /// A retried request reports one end, the last attempt's, after every attempt's `Started`
+    /// and the `Retrying` between them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retried_request_ends_once() {
+        let srv = start_server().await;
+        let (result, log) = fetch_recorded(
+            retrying_config(),
+            make_req(srv.url("/flaky"), Priority::Normal).0,
+        )
+        .await;
+        assert_eq!(status_of(&result), 200);
+        let names = log.event_names();
+        let ends: Vec<_> = names
+            .iter()
+            .filter(|n| matches!(n.as_str(), "Finished" | "Failed" | "Cancelled"))
+            .collect();
+        assert_eq!(ends, ["Finished"], "{names:?}");
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("Finished"),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| *n == "Started").count(),
+            3,
+            "{names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| *n == "Retrying").count(),
+            2,
+            "{names:?}"
         );
     }
 
@@ -3271,7 +3353,7 @@ mod tests {
 
     /// `NetEvent::Blocked`: "A request hop was refused by policy and never sent.
     /// `NetEvent::Failed` follows as the terminal event." Also when the scheduler refuses the
-    /// request before it is sent at all.
+    /// request before it is sent at all: it was accepted, never started, and ends.
     #[tokio::test(flavor = "current_thread")]
     async fn a_request_blocked_before_sending_ends_with_failed() {
         // Port 25 is on the bad-port list: refused by the scheduler's pre-flight check.
@@ -3279,7 +3361,229 @@ mod tests {
             FetchRequest::builder(Method::GET, Url::parse("http://127.0.0.1:25/").unwrap()).build();
         let (result, log) = fetch_recorded(test_config(), req).await;
         assert!(result.is_error(), "{result:?}");
-        assert_eq!(log.event_names(), vec!["Blocked", "Failed"]);
+        assert_eq!(log.event_names(), vec!["Accepted", "Blocked", "Failed"]);
+    }
+
+    /// A context that records each request's events apart, by request id.
+    #[derive(Default)]
+    struct PerRequest(
+        parking_lot::Mutex<std::collections::HashMap<RequestId, Arc<RecordingObserver>>>,
+    );
+
+    impl PerRequest {
+        /// The request's event names, a `Cancelled` with its reason (`Cancelled: why`).
+        fn names(&self, id: RequestId) -> Vec<String> {
+            let Some(rec) = self.0.lock().get(&id).cloned() else {
+                return Vec::new();
+            };
+            let mut reasons = rec.cancellations().into_iter();
+            rec.event_names()
+                .into_iter()
+                .map(|name| match name.as_str() {
+                    "Cancelled" => format!("Cancelled: {}", reasons.next().unwrap_or_default()),
+                    _ => name,
+                })
+                .collect()
+        }
+    }
+
+    impl FetcherContext for PerRequest {
+        fn observer_for(
+            &self,
+            _: RequestReference,
+            id: RequestId,
+            _: ResourceKind,
+            _: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            self.0
+                .lock()
+                .entry(id)
+                .or_insert_with(|| Arc::new(RecordingObserver::new()))
+                .clone()
+        }
+        fn on_ref_active(&self, _: RequestReference) {}
+        fn on_ref_done(&self, _: RequestReference) {}
+    }
+
+    /// Two callers of one fetch, `a` first: submits both, cancels `cancel_first` or
+    /// `cancel_second` part-way, and returns each request's events once both are answered.
+    async fn two_callers(cancel_first: bool, cancel_second: bool) -> (Vec<String>, Vec<String>) {
+        let srv = TestServer::new()
+            .route(
+                "/co",
+                RouteConfig::delay(Duration::from_millis(300), b"shared".to_vec()),
+            )
+            .start()
+            .await;
+        let ctx = Arc::new(PerRequest::default());
+        let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+        let (a, ca) = make_req(srv.url("/co"), Priority::Normal);
+        let (b, cb) = make_req(srv.url("/co"), Priority::Normal);
+        let (ida, idb) = (a.req_id, b.req_id);
+        let (ta, ra) = oneshot::channel();
+        let (tb, rb) = oneshot::channel();
+        fetcher.submit(a, ca.clone(), ta).await;
+        fetcher.submit(b, cb.clone(), tb).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        if cancel_first {
+            ca.cancel();
+        }
+        if cancel_second {
+            cb.cancel();
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(5), ra).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), rb).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(srv.hit_count("/co"), 1, "one fetch for both");
+        shutdown.cancel();
+        (ctx.names(ida), ctx.names(idb))
+    }
+
+    /// A request that joins another's fetch has its own lifecycle: `Accepted`, the shared
+    /// progress, and its own end. The one that started the fetch reports the fetch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_coalesced_request_has_its_own_lifecycle() {
+        let (leader, follower) = two_callers(false, false).await;
+        assert_eq!(
+            leader.first().map(String::as_str),
+            Some("Accepted"),
+            "{leader:?}"
+        );
+        assert!(leader.contains(&"Started".to_string()), "{leader:?}");
+        assert_eq!(
+            leader.last().map(String::as_str),
+            Some("Finished"),
+            "{leader:?}"
+        );
+        assert_eq!(
+            follower.first().map(String::as_str),
+            Some("Accepted"),
+            "{follower:?}"
+        );
+        assert!(!follower.contains(&"Started".to_string()), "{follower:?}");
+        assert_eq!(
+            follower.last().map(String::as_str),
+            Some("Finished"),
+            "{follower:?}"
+        );
+    }
+
+    /// A caller that cancels ends its own request with `Cancelled`, whichever of the two it
+    /// is, while the fetch goes on for the other, which finishes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_caller_ends_its_own_request() {
+        let (leader, follower) = two_callers(true, false).await;
+        assert_eq!(
+            leader.last().map(String::as_str),
+            Some("Cancelled: cancelled by the caller"),
+            "{leader:?}"
+        );
+        assert_eq!(
+            follower.last().map(String::as_str),
+            Some("Finished"),
+            "{follower:?}"
+        );
+
+        let (leader, follower) = two_callers(false, true).await;
+        assert_eq!(
+            leader.last().map(String::as_str),
+            Some("Finished"),
+            "{leader:?}"
+        );
+        assert_eq!(follower, ["Accepted", "Cancelled: cancelled by the caller"]);
+    }
+
+    /// Outstanding work is counted per caller: a reference whose request joins another's
+    /// fetch is active until its own request ends, and each reference gets one
+    /// `on_ref_active` and one `on_ref_done`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_caller_counts_as_its_references_work() {
+        #[derive(Default)]
+        struct Work(parking_lot::Mutex<Vec<(RequestReference, &'static str)>>);
+        impl FetcherContext for Work {
+            fn observer_for(
+                &self,
+                _: RequestReference,
+                _: RequestId,
+                _: ResourceKind,
+                _: Initiator,
+            ) -> Arc<dyn NetObserver + Send + Sync> {
+                Arc::new(crate::net::null_emitter::NullEmitter)
+            }
+            fn on_ref_active(&self, r: RequestReference) {
+                self.0.lock().push((r, "active"));
+            }
+            fn on_ref_done(&self, r: RequestReference) {
+                self.0.lock().push((r, "done"));
+            }
+            // One jar for every reference, so the two requests below share a fetch.
+            fn cookie_jar_key(&self, _: RequestReference) -> String {
+                String::new()
+            }
+        }
+        let srv = TestServer::new()
+            .route(
+                "/co",
+                RouteConfig::delay(Duration::from_millis(200), b"shared".to_vec()),
+            )
+            .start()
+            .await;
+        let work = Arc::new(Work::default());
+        let fetcher = Arc::new(Fetcher::new(test_config(), work.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+        let (a, _) = make_req(srv.url("/co"), Priority::Normal);
+        let (mut b, _) = make_req(srv.url("/co"), Priority::Normal);
+        b.reference = RequestReference::Background(7);
+        let (ra, rb) = tokio::join!(fetcher.fetch(a), fetcher.fetch(b));
+        assert!(!ra.is_error() && !rb.is_error());
+        assert_eq!(srv.hit_count("/co"), 1, "one fetch for both");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let calls = work.0.lock().clone();
+        for reference in [
+            RequestReference::Background(0),
+            RequestReference::Background(7),
+        ] {
+            let mine: Vec<_> = calls
+                .iter()
+                .filter(|(r, _)| *r == reference)
+                .map(|(_, c)| *c)
+                .collect();
+            assert_eq!(mine, ["active", "done"], "{reference:?}: {calls:?}");
+        }
+        shutdown.cancel();
+    }
+
+    /// Every request opens with `Accepted`, before its attempt's `Started`, and ends once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_opens_with_accepted() {
+        let srv = start_server().await;
+        let (result, log) = fetch_recorded(
+            test_config(),
+            make_req(srv.url("/fast"), Priority::Normal).0,
+        )
+        .await;
+        assert!(!result.is_error(), "{result:?}");
+        let names = log.event_names();
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("Accepted"),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.get(1).map(String::as_str),
+            Some("Started"),
+            "{names:?}"
+        );
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("Finished"),
+            "{names:?}"
+        );
     }
 
     /// Every request ends in exactly one of `Finished`, `Failed` or `Cancelled`: also one
@@ -3315,11 +3619,9 @@ mod tests {
         let _ = stopped_rx.await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
+        // The caller that cancelled ends with its own cancel, at once.
         let ended = log.cancellations();
-        assert!(
-            ended.contains(&"cancelled before the request was sent"),
-            "{ended:?}"
-        );
+        assert!(ended.contains(&"cancelled by the caller"), "{ended:?}");
         assert!(
             ended.contains(&"fetcher shut down before the request was sent"),
             "{ended:?}"
@@ -4381,6 +4683,23 @@ mod tests {
             accept(RequestDestination::Style).as_deref(),
             Some("text/css,*/*;q=0.1")
         );
+        // Fetch §4.1, exactly. `object` and `embed` are not among the destinations that get the
+        // document value.
+        assert_eq!(
+            accept(RequestDestination::Image).as_deref(),
+            Some("image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+        );
+        assert_eq!(
+            accept(RequestDestination::Json).as_deref(),
+            Some("application/json,*/*;q=0.5")
+        );
+        for destination in [RequestDestination::Object, RequestDestination::Embed] {
+            assert_eq!(
+                accept(destination).as_deref(),
+                Some("*/*"),
+                "{destination:?}"
+            );
+        }
         // A destination with no format preference still gets a value, because the client
         // would otherwise supply this one itself after the request was reported.
         assert_eq!(accept(RequestDestination::Script).as_deref(), Some("*/*"));
@@ -4421,53 +4740,6 @@ mod tests {
                 "{destination:?} accept value forces a preflight"
             );
         }
-    }
-
-    #[test]
-    fn accept_encoding_is_set_here_so_it_can_be_reported() {
-        let cfg = FetcherConfig::default();
-
-        // A decoding request advertises what build_client can actually decode.
-        let req = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
-            .with_auto_decode(true)
-            .build();
-        assert_eq!(
-            make_request_init(&req, &cfg)
-                .headers
-                .get(header::ACCEPT_ENCODING)
-                .map(|v| v.to_str().unwrap()),
-            Some("gzip, br, deflate")
-        );
-
-        // A caller that wants the bytes untouched advertises nothing.
-        let raw = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
-            .with_auto_decode(false)
-            .build();
-        assert_eq!(
-            make_request_init(&raw, &cfg)
-                .headers
-                .get(header::ACCEPT_ENCODING)
-                .map(|v| v.to_str().unwrap()),
-            Some("identity")
-        );
-    }
-
-    #[test]
-    fn a_caller_s_own_accept_encoding_is_left_alone() {
-        let cfg = FetcherConfig::default();
-        let mut headers = HeaderMap::new();
-        headers.insert(header::ACCEPT_ENCODING, "zstd".parse().unwrap());
-        let req = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
-            .with_headers(headers)
-            .with_auto_decode(true)
-            .build();
-        assert_eq!(
-            make_request_init(&req, &cfg)
-                .headers
-                .get(header::ACCEPT_ENCODING)
-                .map(|v| v.to_str().unwrap()),
-            Some("zstd")
-        );
     }
 
     #[test]

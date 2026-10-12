@@ -7,20 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.13.0] - 2026-10-12
-
 ### Added
 
-- `mixed_content::evaluate_for`: the mixed content check for a request with a known
-  destination. `evaluate` keeps its signature and judges a request of no particular kind
-- `CorsPreflightCache::clear`, which drops the grants for one origin and URL. It has a default
-  that does nothing, so existing implementations keep compiling
-- `CredentialStore::accepted_at` and `CredentialStore::upfront_for`, for sending credentials
-  before a challenge. Both have defaults that do nothing, so existing stores keep compiling and
-  keep the challenge-first behaviour
+- `RequestChange::HeadersRemoved`: headers the caller set that were not sent, reported once on
+  the first hop. `RequestChange` is `#[non_exhaustive]`, so this needs no new `match` arm
 
 ### Changed
 
+- **Breaking:** `BlockReason` gained `ForbiddenMethod`, so an exhaustive `match` on it outside
+  this crate needs an arm for it. `cors::is_forbidden_method` exposes the rule
+
+- The default `Accept` is the value Fetch §4.1 gives for each destination. Images send
+  `image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5` instead of a list naming AVIF first, a
+  format the engine does not decode, so a server negotiating on it sent images that could not
+  be shown. `json` sends `application/json,*/*;q=0.5` instead of `*/*`, and `object` and
+  `embed` send `*/*` instead of the document value
+- The fetcher always resolves through a `DnsResolver`: the one configured, or `SystemResolver`,
+  which looks names up as before. `NetEvent::DnsResolved` is now emitted without a resolver of
+  the embedder's too
 - **Breaking:** `CacheEntry::updated_by_304` takes the revalidating request's headers, for the
   `Vary` a `304` may bring
 - **Breaking:** `ResponseDirectives` gained the field `must_understand`, so building one with
@@ -29,31 +33,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   response without asking the server. Both always revalidate now, as Fetch's `no-cache` mode
   and RFC 8246 §2.1 say and the `NoCache` docs promised ("a forced reload"). A normal request
   still uses a fresh response without asking
-- **Breaking:** the minimum supported Rust version is 1.92, up from 1.88, the same as
-  gosub-engine's. Dependencies have started to need newer compilers (`uuid` 1.27 needs 1.89),
-  and one floor across the gosub crates is one toolchain to test
-- Mixed content: the default `MixedContentPolicy::Block` follows Mixed Content Level 2. An
-  `http` image, audio or video request from a secure document is fetched over `https` instead
-  of being blocked, unless its host is an IP address; everything else is still blocked. Before,
-  every such request was blocked and an embedder had to classify images itself, which
-  `ResourceKind` could not
-- CORS: a preflight grant made with credentials also covers the same request without them, as
-  Fetch's preflight cache matches, so a page mixing both is not asked twice. It is judged by
-  the credentialed rules it was made under, where `*` is not a wildcard
-- Auth: `InMemoryCredentialStore` sends a `Basic` server password upfront, to the origin it was
-  accepted on, for paths at or below the directory where it was accepted (RFC 7617 §2.2), as
-  browsers do. A protected site no longer costs a `401` round trip on every request, nor a
-  request body sent twice
-- `FetcherContext::on_ref_done` for a streamed fetch fires when the stream ends (read to its
-  end, failed, or given up), not when its headers arrive. It tracks outstanding work, and a
-  download still under way is that: before, a loading indicator driven by it cleared while the
-  body was still coming
-- **Breaking:** `RequestDestination` and `RequestMode` are `#[non_exhaustive]`. Fetch adds to
-  both (`webidentity`, `webtransport`), and adding a value should not break a `match`
-  downstream again; a `match` on either needs a `_` arm once
 
 ### Fixed
 
+- A request with an initiating origin carried the caller's forbidden request-headers (Fetch
+  §2.2.2): a hand-set `Cookie` under `credentials: omit`, a `Host` naming another site,
+  `Sec-*` and `Proxy-*` headers, an `X-HTTP-Method-Override: TRACE`. The CORS rules skip these
+  names as the fetcher's own, so they reached cross-origin servers without a preflight. They
+  are removed before the first hop now and reported as `RequestChange::HeadersRemoved`;
+  `cors::is_forbidden_request_header_value` exposes the rule. A request without an origin is
+  the embedder's own and keeps them
+- A `101 Switching Protocols` to a request that asked for no upgrade was handed on as the
+  final response, with a connection that now spoke something else. It is a network error now
+  (`NetError::Other`), as Fetch §4.7 makes it; a WebSocket handshake or a request with its own
+  `Upgrade` still gets its `101`
+- A request with `Range` advertised `gzip, br, deflate`, so a server could answer with a
+  range of the compressed bytes. It asks for `identity` now (Fetch §4.6), appended to an
+  `Accept-Encoding` the caller set
+- Header values went out with the spaces and tabs a caller left around them. A field value has
+  none (RFC 9110 §5.5), and over HTTP/2 a value with any is a malformed request (RFC 9113
+  §8.2.1) that a strict server resets. Every value is trimmed now, as Fetch normalizes one
+- A request with an initiating origin could use `CONNECT`, `TRACE` or `TRACK`, which Fetch
+  forbids web content (§2.2.1); `TRACE` echoes the request back, cookies included. Such a
+  request is refused with `BlockReason::ForbiddenMethod` before anything is sent. A request
+  without an origin is the embedder's own and still goes out
+- A caller's `Content-Length` was sent instead of the body's: a smaller one cut the body short
+  (the rest of it was lost and the fetch reported success), a larger one left the server
+  waiting for bytes that never came. `Content-Length` and `Transfer-Encoding` are now always
+  worked out from the body (RFC 9112 §6), and a caller's are dropped with a
+  `RequestChange::HeadersRemoved`
+- A POST or PUT without a body went out without `Content-Length`, which strict servers answer
+  with `411`. It sends `Content-Length: 0` now (Fetch §4.6, RFC 9110 §8.6)
+- Methods were sent as written: `get` went out as `get`, and every check that compares against
+  `GET`, `POST` and the rest missed it, the cache key and cache invalidation, the CORS
+  safelist and the redirect rules among them. `DELETE`, `GET`, `HEAD`, `OPTIONS`, `POST` and
+  `PUT` in any case are uppercased now (Fetch §2.2.1); other methods are left as they are
+- `FetcherConfig::connect_timeout` said it timed the TCP and TLS handshakes. It also covers
+  name resolution, and is split evenly across the addresses of one family, which are tried in
+  turn. The docs say so now, along with the deviation from RFC 8305 that follows: an address
+  that never answers holds the next one back for its share of the budget, not for 250 ms
+- The `PublicOnly` resolver in the `dns` module docs, the SSRF policy an embedder would start
+  from, let `[::ffff:127.0.0.1]` through: Rust's IPv6 checks do not look inside an
+  IPv4-mapped address. It judges one as the IPv4 address it is (RFC 4291 §2.5.5.2) now, and
+  refuses the unspecified address and IPv6 link-local too
+- `localhost` and the names under it (`app.localhost`, with or without a trailing dot) were
+  looked up through the configured resolver or the system's, which could answer with any
+  address, while the mixed content and referrer rules already took them for loopback. They
+  connect to `::1` and `127.0.0.1` now without a lookup (Fetch, resolve an origin). A
+  configured resolver is asked about each of the two addresses and can still refuse them
 - The comment on `is_storable` said a status outside the heuristically cacheable ones is
   stored "when the response says so itself"; the code needs explicit freshness. The comment
   says that now
@@ -98,6 +125,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A response with both `no-cache` and `immutable` was used from the cache without asking the
   server while fresh. `no-cache` means never use it unvalidated (RFC 9111 §5.2.2.4), and
   `immutable` cannot lift that
+
+## [0.13.0] - 2026-10-12
+
+### Added
+
+- `NetEvent::Accepted { url, joined }`: the first event of every request the `Fetcher` takes,
+  before any check or wait. Every request that reports it ends with exactly one `Finished`,
+  `Failed` or `Cancelled` and reports nothing after that, so an observer can open a row on
+  `Accepted` and close it on the end. `url` is the one the caller asked for, before an upgrade
+  to `https`
+- `mixed_content::evaluate_for`: the mixed content check for a request with a known
+  destination. `evaluate` keeps its signature and judges a request of no particular kind
+- `CorsPreflightCache::clear`, which drops the grants for one origin and URL. It has a default
+  that does nothing, so existing implementations keep compiling
+- `CredentialStore::accepted_at` and `CredentialStore::upfront_for`, for sending credentials
+  before a challenge. Both have defaults that do nothing, so existing stores keep compiling and
+  keep the challenge-first behaviour
+
+### Changed
+
+- **Breaking:** `spawn_pump` ends in `Err` whenever the transfer fails: a read error, the idle
+  or total timeout, a cancel, or for a file target its setup, write or rename. A file-only pump
+  that failed used to resolve to `Ok(None)` with no event, the same as one that was asked for
+  no file, so a download that died looked like nothing at all. `Ok(None)` now only means no
+  file was asked for. A write error at the end of the stream is a `Warning` naming the URL,
+  like the others, instead of an `Io` event
+- **Breaking:** `FetcherContext::on_ref_active` and `on_ref_done` are called for every request,
+  not once per fetch for the request that started it. A tab whose request joined another tab's
+  fetch was never counted as busy, and the tab that started the fetch stayed busy until every
+  joined request had its result, however long ago it had cancelled. Each request now counts
+  for its own reference from `Accepted` to its end
+- **Breaking:** a request that joins another's fetch (coalescing) reports its own lifecycle. It
+  used to get no events at all: no start, no end, and an engine that tracks requests from
+  their events kept it open for good. Now each request gets an observer from
+  `FetcherContext::observer_for`, opens with `Accepted { joined: true }`, gets the shared
+  `Progress` and its own end. A caller that cancels ends its request with `Cancelled` at
+  once, whether it started the fetch or joined it, while the fetch goes on for the others; a
+  cancelled leader used to report `Finished` once the fetch it no longer wanted ended
+- `NetEvent::Started` means an attempt went out: once per attempt, after the request got its
+  connection slot. A request refused before it was sent reports `Accepted`, `Blocked` and
+  `Failed`, and one cancelled while it waited `Accepted` and `Cancelled`, neither with a
+  `Started`. A second end the fetch stack reports for a request is dropped
+- **Breaking:** a retried request ends once. Before, every attempt reported its own
+  `Finished`, `Failed` or `Cancelled`, so a consumer that takes the first end as the request's
+  (the engine's network process does) saw a `503` that was then retried into a `200` as the
+  end. Now each attempt still reports its `Started`, request and headers, `Retrying` comes
+  between attempts with the reason, and only the last attempt's end is reported.
+  `NetEvent::is_terminal` names the three ending events
+- **Breaking:** the minimum supported Rust version is 1.92, up from 1.88, the same as
+  gosub-engine's. Dependencies have started to need newer compilers (`uuid` 1.27 needs 1.89),
+  and one floor across the gosub crates is one toolchain to test
+- Mixed content: the default `MixedContentPolicy::Block` follows Mixed Content Level 2. An
+  `http` image, audio or video request from a secure document is fetched over `https` instead
+  of being blocked, unless its host is an IP address; everything else is still blocked. Before,
+  every such request was blocked and an embedder had to classify images itself, which
+  `ResourceKind` could not
+- CORS: a preflight grant made with credentials also covers the same request without them, as
+  Fetch's preflight cache matches, so a page mixing both is not asked twice. It is judged by
+  the credentialed rules it was made under, where `*` is not a wildcard
+- Auth: `InMemoryCredentialStore` sends a `Basic` server password upfront, to the origin it was
+  accepted on, for paths at or below the directory where it was accepted (RFC 7617 §2.2), as
+  browsers do. A protected site no longer costs a `401` round trip on every request, nor a
+  request body sent twice
+- `FetcherContext::on_ref_done` for a streamed fetch fires when the stream ends (read to its
+  end, failed, or given up), not when its headers arrive. It tracks outstanding work, and a
+  download still under way is that: before, a loading indicator driven by it cleared while the
+  body was still coming
+- **Breaking:** `RequestDestination` and `RequestMode` are `#[non_exhaustive]`. Fetch adds to
+  both (`webidentity`, `webtransport`), and adding a value should not break a `match`
+  downstream again; a `match` on either needs a `_` arm once
+
+### Fixed
+
+- A body read to its end that was then cancelled reported `Cancelled` after its `Finished`.
+  The reader reports one end now. A `Fetcher` request was already held to one end by its
+  lifecycle; this is the reader underneath it
+- Two requests that send different `Sec-Fetch-User` headers could share one fetch: the
+  coalescing key decided by the request's mode, the header by its destination. A request
+  initiated by the user to a navigation destination (`object`, `embed`) in another mode got
+  the response to one that sent `?1`, or the other way round. Both use the destination now,
+  through `RequestDestination::is_navigation`
+- `Progress` went back where the first bytes of a body, read to sniff it, ended and the rest
+  began: the whole first chunk was counted, and then the part past the sniffed bytes again
+  (8131, then 5376). It counts what reached the caller now, so it only goes up
+- After a redirect, `Finished`, and a `Failed` or `Cancelled` while the body was read, named the
+  URL first asked for instead of the one the body came from. They name the last hop now, as a
+  response served from the cache already did
+- An HSTS upgrade of a request's first hop was not reported: the fetcher rewrote the URL
+  before the request had an observer, so `SecurityUpgraded` never came and the request looked
+  as if the caller had asked for `https`. It is reported right after `Accepted` now
+  (RFC 6797 §8.3)
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued
   by priority but spawned every request straight away, and the spawned tasks then waited on
   the global and per-origin semaphores in whatever order they happened to reach them: a `High`

@@ -49,10 +49,14 @@ pub trait FetcherContext: Send + Sync {
         initiator: Initiator,
     ) -> Arc<dyn NetObserver + Send + Sync>;
 
-    /// Called once when the Fetcher becomes the leader for a new unique fetch.
+    /// Called once per request the fetcher takes, with its reference, as the request is
+    /// accepted: that reference has outstanding work. A request that joins another's fetch
+    /// counts too, under its own reference.
     fn on_ref_active(&self, reference: RequestReference);
 
-    /// Called once when all subscribers for a fetch are done and the entry can be cleaned up.
+    /// Called once per request when it ends, the moment it reports its `Finished`, `Failed` or
+    /// `Cancelled`: for a stream when its body ends, for a caller that cancels when it does,
+    /// even while the fetch goes on for others. Pairs with [`on_ref_active`](Self::on_ref_active).
     fn on_ref_done(&self, reference: RequestReference);
 
     /// Return `false` to block a URL before it is fetched.

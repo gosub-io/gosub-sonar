@@ -68,8 +68,9 @@ pub enum ResourceKind {
 /// Who or what triggered the fetch.
 ///
 /// Passed back through [`crate::net::fetcher_context::FetcherContext::observer_for`], and
-/// [`User`](Initiator::User) marks a [`RequestMode::Navigate`] request as user-activated,
-/// which sends `Sec-Fetch-User: ?1` — see [`fetch_metadata`](crate::net::fetch_metadata).
+/// [`User`](Initiator::User) marks a navigation request (see
+/// [`RequestDestination::is_navigation`]) as user-activated, which sends `Sec-Fetch-User: ?1` —
+/// see [`fetch_metadata`](crate::net::fetch_metadata).
 /// The net crate does not alter scheduling based on this value.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, Default)]
 pub enum Initiator {
@@ -199,6 +200,9 @@ pub enum BlockReason {
     /// The URL's port is one the Fetch standard refuses (SMTP, IRC, FTP, ...).
     /// See [`port_blocking`](crate::net::port_blocking).
     BadPort,
+    /// A request with an initiating origin used `CONNECT`, `TRACE` or `TRACK`, which web
+    /// content may not send. See [`is_forbidden_method`](crate::net::cors::is_forbidden_method).
+    ForbiddenMethod,
 }
 
 impl Display for BlockReason {
@@ -209,6 +213,7 @@ impl Display for BlockReason {
             BlockReason::UnsupportedScheme => "unsupported URL scheme",
             BlockReason::NotCached => "not in the cache",
             BlockReason::BadPort => "bad port",
+            BlockReason::ForbiddenMethod => "forbidden method",
             BlockReason::Cors(err) => return write!(f, "CORS: {err}"),
         };
         f.write_str(s)
@@ -284,6 +289,17 @@ pub enum RequestChange {
         /// The removed headers.
         headers: Vec<HeaderName>,
     },
+    /// Headers the caller set were not sent. `Content-Length` and `Transfer-Encoding` frame the
+    /// message and are worked out from the body (RFC 9112 section 6), so a caller's value is
+    /// never sent. On a request with an initiating origin, every forbidden request-header
+    /// (Fetch section 2.2.2, see
+    /// [`is_forbidden_request_header_value`](crate::net::cors::is_forbidden_request_header_value))
+    /// is removed too: those are the user agent's to set, not web content's. Reported once, on
+    /// the first hop.
+    HeadersRemoved {
+        /// The removed headers.
+        headers: Vec<HeaderName>,
+    },
     /// A redirect changed the method, and any request body was dropped with it
     /// (RFC 9110 section 15.4).
     MethodDowngraded {
@@ -317,6 +333,13 @@ impl Display for RequestChange {
             }
             RequestChange::SensitiveHeadersStripped { headers } => {
                 f.write_str("stripped headers on a cross-origin redirect:")?;
+                for h in headers {
+                    write!(f, " {h}")?;
+                }
+                Ok(())
+            }
+            RequestChange::HeadersRemoved { headers } => {
+                f.write_str("removed headers the caller set:")?;
                 for h in headers {
                     write!(f, " {h}")?;
                 }
@@ -673,8 +696,9 @@ fn regular_file(meta: &std::fs::Metadata) -> std::io::Result<u64> {
 /// ([Fetch §2.2.5], *credentials mode*).
 ///
 /// This gates only what the fetcher itself attaches; headers set by hand in
-/// [`FetchRequest::headers`] (e.g. `Authorization`) are the embedder's own decision and go out
-/// regardless. Beyond cookies, the mode also drives the CORS rules: a credentialed cross-origin
+/// [`FetchRequest::headers`] (e.g. `Authorization`) go out regardless. A hand-set `Cookie` is a
+/// forbidden request-header, and is removed from a request with an initiating origin
+/// ([`RequestChange::HeadersRemoved`]). Beyond cookies, the mode also drives the CORS rules: a credentialed cross-origin
 /// request needs `Access-Control-Allow-Credentials` and cannot be authorized by a wildcard.
 ///
 /// [Fetch §2.2.5]: https://fetch.spec.whatwg.org/#concept-request-credentials-mode
@@ -787,6 +811,10 @@ pub struct FetchRequest {
     /// budget for this request, `Some(Some(d))` sets it to `d`.
     pub redirect_timeout: Option<Option<Duration>>,
     /// HTTP Headers (unified).
+    ///
+    /// `Accept-Language` is not added by the fetcher. Fetch §4.1 leaves "an appropriate value"
+    /// to the user agent, and the language preference belongs to the embedder, per profile or
+    /// tab, so it sets the header here on every request.
     pub headers: HeaderMap,
     /// Optional request body (for POST, PUT, PATCH, DELETE, etc.).
     /// `None` for GET and HEAD requests.
@@ -969,7 +997,9 @@ impl FetchRequest {
                     None => "n".to_string(),
                 },
             };
-            let user = if self.mode == RequestMode::Navigate && self.initiator == Initiator::User {
+            // By the rule `Sec-Fetch-User` is sent by, so requests that send different ones
+            // never share a response.
+            let user = if self.destination.is_navigation() && self.initiator == Initiator::User {
                 "u"
             } else {
                 "-"
@@ -1409,6 +1439,44 @@ mod tests {
     use super::*;
     use cow_utils::CowUtils;
     use tokio::io::AsyncReadExt;
+
+    /// The key splits exactly where `Sec-Fetch-User` does: a user-initiated request to a
+    /// navigation destination sends `?1` whatever its mode, so it never shares a response with
+    /// one that does not; anywhere else the initiator changes nothing that goes out.
+    #[test]
+    fn the_key_splits_where_sec_fetch_user_does() {
+        let url = Url::parse("https://example.test/").unwrap();
+        let key = |destination, mode, initiator| {
+            FetchRequest::builder(Method::GET, url.clone())
+                .with_destination(destination)
+                .with_mode(mode)
+                .with_initiator(initiator)
+                .build()
+                .generate_request_key()
+                .unwrap()
+        };
+        for destination in [RequestDestination::Document, RequestDestination::Embed] {
+            for mode in [RequestMode::Navigate, RequestMode::NoCors] {
+                assert_ne!(
+                    key(destination, mode, Initiator::User),
+                    key(destination, mode, Initiator::Other),
+                    "{destination:?} {mode:?}"
+                );
+            }
+        }
+        assert_eq!(
+            key(
+                RequestDestination::Image,
+                RequestMode::Navigate,
+                Initiator::User
+            ),
+            key(
+                RequestDestination::Image,
+                RequestMode::Navigate,
+                Initiator::Other
+            )
+        );
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
