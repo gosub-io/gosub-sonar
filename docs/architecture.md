@@ -653,8 +653,8 @@ Two traits decouple the net stack from the host's event system:
 ### NetObserver
 
 `NetObserver::on_event(&self, ev: NetEvent)` receives lifecycle events. `NetEvent` variants:
-`Started`, `RequestSent`, `Redirected`, `ResponseHeaders`, `Progress`, `BodyPreview`,
-`Finished`, `Failed`, `Cancelled`, `Blocked`, `TlsFailed`, `SecurityUpgraded`,
+`Accepted`, `Started`, `RequestSent`, `Redirected`, `ResponseHeaders`, `Progress`, `BodyPreview`,
+`Finished`, `Failed`, `Cancelled`, `Retrying`, `Blocked`, `TlsFailed`, `SecurityUpgraded`,
 `RequestModified`, `CorsPreflight`, `CorsPreflightDone`, `AuthRequired`, `Cache`, `DnsResolved`,
 `Connected`, `Warning`, `Io`. `NullEmitter` is a no-op implementation for callers that don't care.
 
@@ -674,6 +674,13 @@ fetch reports everything the fetch does; a follower gets only the shared `Progre
 
 `NetEvent` is `#[non_exhaustive]`: a `match` over it needs a catch-all arm, and new events can
 be added without a breaking release.
+
+**Lifecycle.** A request taken by the `Fetcher` opens with `Accepted` and ends once
+(`net::lifecycle`), whatever path it takes. One refused before it was sent is `Accepted`,
+`Blocked`, `Failed`; one cancelled while it waited for a slot is `Accepted`, `Cancelled`. Each
+attempt that goes out reports `Started`, so a retried request has one per attempt, with
+`Retrying` between them; only the last attempt's end is reported. `FetcherContext::on_ref_active`
+and `on_ref_done` bracket the same span, per request.
 
 **Terminal events.** Every request ends in exactly one of `Finished`, `Failed`, or `Cancelled`,
 including one whose body reader is dropped before end-of-stream. Which of the two that reports
