@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `RequestChange::HeadersRemoved`: headers the caller set that were not sent, reported once on
   the first hop. `RequestChange` is `#[non_exhaustive]`, so this needs no new `match` arm
+- `NetEvent::Accepted { url, joined }`: the first event of every request the `Fetcher` takes,
+  before any check or wait. Every request that reports it ends with exactly one `Finished`,
+  `Failed` or `Cancelled` and reports nothing after that, so an observer can open a row on
+  `Accepted` and close it on the end. `url` is the one the caller asked for, before an upgrade
+  to `https`
 
 ### Changed
 
@@ -30,6 +35,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The fetcher always resolves through a `DnsResolver`: the one configured, or `SystemResolver`,
   which looks names up as before. `NetEvent::DnsResolved` is now emitted without a resolver of
   the embedder's too
+- **Breaking:** `CacheEntry::updated_by_304` takes the revalidating request's headers, for the
+  `Vary` a `304` may bring
+- **Breaking:** `ResponseDirectives` gained the field `must_understand`, so building one with
+  a struct literal needs it, or `..Default::default()`
+- `CacheMode::NoCache`, and a request's `Cache-Control: no-cache`, used a fresh `immutable`
+  response without asking the server. Both always revalidate now, as Fetch's `no-cache` mode
+  and RFC 8246 §2.1 say and the `NoCache` docs promised ("a forced reload"). A normal request
+  still uses a fresh response without asking
+- **Breaking:** `spawn_pump` ends in `Err` whenever the transfer fails: a read error, the idle
+  or total timeout, a cancel, or for a file target its setup, write or rename. A file-only pump
+  that failed used to resolve to `Ok(None)` with no event, the same as one that was asked for
+  no file, so a download that died looked like nothing at all. `Ok(None)` now only means no
+  file was asked for. A write error at the end of the stream is a `Warning` naming the URL,
+  like the others, instead of an `Io` event
+- **Breaking:** `FetcherContext::on_ref_active` and `on_ref_done` are called for every request,
+  not once per fetch for the request that started it. A tab whose request joined another tab's
+  fetch was never counted as busy, and the tab that started the fetch stayed busy until every
+  joined request had its result, however long ago it had cancelled. Each request now counts
+  for its own reference from `Accepted` to its end
+- **Breaking:** a request that joins another's fetch (coalescing) reports its own lifecycle. It
+  used to get no events at all: no start, no end, and an engine that tracks requests from
+  their events kept it open for good. Now each request gets an observer from
+  `FetcherContext::observer_for`, opens with `Accepted { joined: true }`, gets the shared
+  `Progress` and its own end. A caller that cancels ends its request with `Cancelled` at
+  once, whether it started the fetch or joined it, while the fetch goes on for the others; a
+  cancelled leader used to report `Finished` once the fetch it no longer wanted ended
+- `NetEvent::Started` means an attempt went out: once per attempt, after the request got its
+  connection slot. A request refused before it was sent reports `Accepted`, `Blocked` and
+  `Failed`, and one cancelled while it waited `Accepted` and `Cancelled`, neither with a
+  `Started`. A second end the fetch stack reports for a request is dropped
+- **Breaking:** a retried request ends once. Before, every attempt reported its own
+  `Finished`, `Failed` or `Cancelled`, so a consumer that takes the first end as the request's
+  (the engine's network process does) saw a `503` that was then retried into a `200` as the
+  end. Now each attempt still reports its `Started`, request and headers, `Retrying` comes
+  between attempts with the reason, and only the last attempt's end is reported.
+  `NetEvent::is_terminal` names the three ending events
 
 ### Fixed
 
@@ -104,16 +145,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address, while the mixed content and referrer rules already took them for loopback. They
   connect to `::1` and `127.0.0.1` now without a lookup (Fetch, resolve an origin). A
   configured resolver is asked about each of the two addresses and can still refuse them
+- The comment on `is_storable` said a status outside the heuristically cacheable ones is
+  stored "when the response says so itself"; the code needs explicit freshness. The comment
+  says that now
+- A `200` to a `HEAD` with another `ETag`, `Last-Modified` or length than the stored `GET`
+  response left that response in the cache to be served while fresh. It is dropped now
+  (RFC 9111 §4.3.5), so the next `GET` asks the server; `CacheEntry::changed_per_head` says
+  when
+- HTTP dates were matched case-sensitively, so a lowercase `Expires` counted as already expired
+  and a lowercase `Last-Modified` gave no heuristic freshness. They match case-insensitively
+  now (RFC 9111 §4.2)
+- An `Age` that came as a list (`Age: 100, 200`) was ignored, so the response counted as new.
+  Its first member counts now (RFC 9111 §5.1)
+- A response without `Date` was stored without one, so a cache hit carried no `Date` at all.
+  It is stored with the time it arrived (RFC 9110 §6.6.1)
+- A `304` that brought a `Vary` left the stored response selected by its old one: a
+  `Vary: *`, after which nothing may match (RFC 9111 §4.1), still matched every request.
+  The `304`'s `Vary` replaces the stored one now (RFC 9110 §15.4.5)
+- A `304` without any validator freshened a stored response that had one. Such a `304`
+  selects only a response without validators (RFC 9111 §4.3.4), so it refetches now, as does
+  one whose only validator is a `Last-Modified` the stored response lacks. A server sending
+  that `304` already breaks RFC 9110 §15.4.5; the cost is one full request
+- A `304` that brought an `ETag` the stored response did not have, as when a server starts
+  sending them, freshened the stored response and stored the tag with it. Nothing showed the
+  stored body was the one the tag names, and every later revalidation confirmed it again. Such
+  a `304` refetches now (RFC 9111 §4.3.4)
+- A `304` that named another version than the stored one by a weak `ETag` or a
+  `Last-Modified` still freshened the stored response, and the old body was then served under
+  the new validator. Only a strong `ETag` was compared. Each validator now has to correspond
+  to the stored response (RFC 9111 §4.3.4); a `304` that does not confirm it refetches
+- With several stored variants that all matched a request, the first one stored was used. The
+  most recent one by `Date` is now (RFC 9111 §4)
+- A `Set-Cookie` on the `304` that confirmed a stored response never reached the cookie jar:
+  the stored headers, which keep no cookies, were reported instead. A session rotated on a
+  revalidation was lost. The `304`'s cookies go to the jar now (RFC 6265 §3)
+- A response served from the cache kept the `Age` it arrived with, however long it had been
+  stored since. It carries the cache's own `Age` now (RFC 9111 §4), the stored response's
+  current age
+- A response with `must-understand` was stored whatever its status, and never when it also
+  said `no-store`. It is stored only for a status whose caching rules this cache implements,
+  and then despite the `no-store` sent along for caches that do not understand
+  (RFC 9111 §3, §5.2.2.3). `ResponseDirectives::must_understand` records it
+- A response with both `no-cache` and `immutable` was used from the cache without asking the
+  server while fresh. `no-cache` means never use it unvalidated (RFC 9111 §5.2.2.4), and
+  `immutable` cannot lift that
+- A body read to its end that was then cancelled reported `Cancelled` after its `Finished`.
+  The reader reports one end now. A `Fetcher` request was already held to one end by its
+  lifecycle; this is the reader underneath it
+- Two requests that send different `Sec-Fetch-User` headers could share one fetch: the
+  coalescing key decided by the request's mode, the header by its destination. A request
+  initiated by the user to a navigation destination (`object`, `embed`) in another mode got
+  the response to one that sent `?1`, or the other way round. Both use the destination now,
+  through `RequestDestination::is_navigation`
+- `Progress` went back where the first bytes of a body, read to sniff it, ended and the rest
+  began: the whole first chunk was counted, and then the part past the sniffed bytes again
+  (8131, then 5376). It counts what reached the caller now, so it only goes up
+- After a redirect, `Finished`, and a `Failed` or `Cancelled` while the body was read, named the
+  URL first asked for instead of the one the body came from. They name the last hop now, as a
+  response served from the cache already did
+- An HSTS upgrade of a request's first hop was not reported: the fetcher rewrote the URL
+  before the request had an observer, so `SecurityUpgraded` never came and the request looked
+  as if the caller had asked for `https`. It is reported right after `Accepted` now
+  (RFC 6797 §8.3)
 
 ## [0.13.0] - 2026-10-12
 
 ### Added
 
-- `NetEvent::Accepted { url, joined }`: the first event of every request the `Fetcher` takes,
-  before any check or wait. Every request that reports it ends with exactly one `Finished`,
-  `Failed` or `Cancelled` and reports nothing after that, so an observer can open a row on
-  `Accepted` and close it on the end. `url` is the one the caller asked for, before an upgrade
-  to `https`
 - `mixed_content::evaluate_for`: the mixed content check for a request with a known
   destination. `evaluate` keeps its signature and judges a request of no particular kind
 - `CorsPreflightCache::clear`, which drops the grants for one origin and URL. It has a default
@@ -124,34 +222,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking:** `spawn_pump` ends in `Err` whenever the transfer fails: a read error, the idle
-  or total timeout, a cancel, or for a file target its setup, write or rename. A file-only pump
-  that failed used to resolve to `Ok(None)` with no event, the same as one that was asked for
-  no file, so a download that died looked like nothing at all. `Ok(None)` now only means no
-  file was asked for. A write error at the end of the stream is a `Warning` naming the URL,
-  like the others, instead of an `Io` event
-- **Breaking:** `FetcherContext::on_ref_active` and `on_ref_done` are called for every request,
-  not once per fetch for the request that started it. A tab whose request joined another tab's
-  fetch was never counted as busy, and the tab that started the fetch stayed busy until every
-  joined request had its result, however long ago it had cancelled. Each request now counts
-  for its own reference from `Accepted` to its end
-- **Breaking:** a request that joins another's fetch (coalescing) reports its own lifecycle. It
-  used to get no events at all: no start, no end, and an engine that tracks requests from
-  their events kept it open for good. Now each request gets an observer from
-  `FetcherContext::observer_for`, opens with `Accepted { joined: true }`, gets the shared
-  `Progress` and its own end. A caller that cancels ends its request with `Cancelled` at
-  once, whether it started the fetch or joined it, while the fetch goes on for the others; a
-  cancelled leader used to report `Finished` once the fetch it no longer wanted ended
-- `NetEvent::Started` means an attempt went out: once per attempt, after the request got its
-  connection slot. A request refused before it was sent reports `Accepted`, `Blocked` and
-  `Failed`, and one cancelled while it waited `Accepted` and `Cancelled`, neither with a
-  `Started`. A second end the fetch stack reports for a request is dropped
-- **Breaking:** a retried request ends once. Before, every attempt reported its own
-  `Finished`, `Failed` or `Cancelled`, so a consumer that takes the first end as the request's
-  (the engine's network process does) saw a `503` that was then retried into a `200` as the
-  end. Now each attempt still reports its `Started`, request and headers, `Retrying` comes
-  between attempts with the reason, and only the last attempt's end is reported.
-  `NetEvent::is_terminal` names the three ending events
 - **Breaking:** the minimum supported Rust version is 1.92, up from 1.88, the same as
   gosub-engine's. Dependencies have started to need newer compilers (`uuid` 1.27 needs 1.89),
   and one floor across the gosub crates is one toolchain to test
@@ -177,24 +247,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A body read to its end that was then cancelled reported `Cancelled` after its `Finished`.
-  The reader reports one end now. A `Fetcher` request was already held to one end by its
-  lifecycle; this is the reader underneath it
-- Two requests that send different `Sec-Fetch-User` headers could share one fetch: the
-  coalescing key decided by the request's mode, the header by its destination. A request
-  initiated by the user to a navigation destination (`object`, `embed`) in another mode got
-  the response to one that sent `?1`, or the other way round. Both use the destination now,
-  through `RequestDestination::is_navigation`
-- `Progress` went back where the first bytes of a body, read to sniff it, ended and the rest
-  began: the whole first chunk was counted, and then the part past the sniffed bytes again
-  (8131, then 5376). It counts what reached the caller now, so it only goes up
-- After a redirect, `Finished`, and a `Failed` or `Cancelled` while the body was read, named the
-  URL first asked for instead of the one the body came from. They name the last hop now, as a
-  response served from the cache already did
-- An HSTS upgrade of a request's first hop was not reported: the fetcher rewrote the URL
-  before the request had an observer, so `SecurityUpgraded` never came and the request looked
-  as if the caller had asked for `https`. It is reported right after `Accepted` now
-  (RFC 6797 §8.3)
 - Priority was lost as soon as the connection slots were the bottleneck. The run loop dequeued
   by priority but spawned every request straight away, and the spawned tasks then waited on
   the global and per-origin semaphores in whatever order they happened to reach them: a `High`

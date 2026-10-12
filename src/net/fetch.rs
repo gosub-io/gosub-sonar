@@ -993,7 +993,14 @@ async fn fetch_response_top_inner(
                     .and_then(|s| s.canonical_reason())
                     .unwrap_or("")
                     .to_string(),
-                headers: entry.headers.clone(),
+                headers: {
+                    // A stored response says how old it is (RFC 9111 §4): the cache's own
+                    // `Age`, replacing the one it arrived with.
+                    let mut headers = entry.headers.clone();
+                    let age = entry.current_age(chrono::Utc::now()).num_seconds().max(0);
+                    headers.insert(header::AGE, header::HeaderValue::from(age));
+                    headers
+                },
                 content_length: Some(entry.body.len() as u64),
                 content_type: entry
                     .headers
@@ -2606,8 +2613,12 @@ async fn get_with_redirects(
                         continue;
                     }
                     if resp.status().as_u16() == 304 {
-                        let mut updated =
-                            entry.updated_by_304(resp.headers(), requested_at, received_at);
+                        let mut updated = entry.updated_by_304(
+                            resp.headers(),
+                            requested_at,
+                            received_at,
+                            &current_headers,
+                        );
                         // The connection that confirmed the entry is where it now comes from.
                         updated.peer_addr = origin_peer(&resp, &url, &policy);
                         let updated = Arc::new(updated);
@@ -2621,6 +2632,11 @@ async fn get_with_redirects(
                             url: url.clone(),
                             outcome: CacheOutcome::Validated,
                         });
+                        // The stored copy keeps no cookies, but the jar gets what the `304`
+                        // set (RFC 6265 §3): a session rotated on a revalidation is not lost.
+                        if attach_credentials {
+                            report_set_cookie(&policy, &url, resp.headers());
+                        }
                         break HopResponse::Cached(updated);
                     }
                 }
@@ -2732,6 +2748,23 @@ async fn get_with_redirects(
                     url: url.clone(),
                     outcome: CacheOutcome::Invalidated,
                 });
+            }
+        }
+
+        // A `HEAD` that shows the resource changed makes the stored `GET` stale (RFC 9111
+        // §4.3.5); it is dropped, in every partition, like a write would drop it.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(cache), HopResponse::Network(resp)) = (policy.cache.as_ref(), &hop) {
+            if current_method == Method::HEAD && resp.status().as_u16() == 200 {
+                let get = CacheKey::new(&Method::GET, &url);
+                let stored = cache.get(&get.clone().in_partition(cache_partition));
+                if stored.iter().any(|e| e.changed_per_head(resp.headers())) {
+                    cache.invalidate(&get);
+                    observer.on_event(NetEvent::Cache {
+                        url: url.clone(),
+                        outcome: CacheOutcome::Invalidated,
+                    });
+                }
             }
         }
 
@@ -6390,6 +6423,147 @@ mod tests {
     /// A policy that knows the test client connects straight to the host.
     fn direct() -> NetPolicy {
         NetPolicy::default().with_proxied(Box::new(|_| false))
+    }
+
+    /// A response from the cache carries an `Age` the cache generated (RFC 9111 §4): here the
+    /// fifty seconds its `Date` already put on it, not the `Age: 7` it arrived with.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cache_hit_carries_a_generated_age() {
+        let date = (chrono::Utc::now() - chrono::TimeDelta::seconds(50))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let srv = TestServer::new()
+            .route(
+                "/aged",
+                RouteConfig::Cacheable(CacheRouteOptions {
+                    extra_headers: vec![("date".into(), date), ("age".into(), "7".into())],
+                    ..CacheRouteOptions::max_age(600, b"x".to_vec())
+                }),
+            )
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+        let _ = cache_fetch(&srv, "/aged", RequestInit::default(), policy, observer()).await;
+        let (meta, _) = cache_fetch(
+            &srv,
+            "/aged",
+            RequestInit::default(),
+            NetPolicy::default().with_cache(Some(cache)),
+            observer(),
+        )
+        .await;
+        assert!(meta.from_cache);
+        let age: i64 = meta.headers[header::AGE].to_str().unwrap().parse().unwrap();
+        assert!((50..60).contains(&age), "Age: {age}");
+        assert_eq!(meta.headers.get_all(header::AGE).iter().count(), 1);
+    }
+
+    /// A `HEAD` whose `ETag` is not the stored `GET`'s drops the stored `GET` (RFC 9111 §4.3.5),
+    /// so the next `GET` goes to the server.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_head_with_another_etag_drops_the_stored_get() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!("http://{}/r", listener.local_addr().unwrap())).unwrap();
+        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = gets.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let counted = counted.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let response = if head.starts_with("HEAD ") {
+                        "HTTP/1.1 200 OK\r\nETag: \"v2\"\r\nContent-Length: 4\r\n\
+                         Connection: close\r\n\r\n"
+                    } else {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\nCache-Control: max-age=600\r\n\
+                         Content-Length: 4\r\nConnection: close\r\n\r\nbody"
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let send = |method: Method| {
+            super::fetch_response_complete(
+                client(),
+                base.clone(),
+                RequestInit::new(method, HeaderMap::new(), None),
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(10)),
+                NetPolicy::default().with_cache(Some(cache.clone())),
+            )
+        };
+        send(Method::GET).await.unwrap();
+        send(Method::GET).await.unwrap();
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second GET is a hit"
+        );
+        send(Method::HEAD).await.unwrap();
+        send(Method::GET).await.unwrap();
+        assert_eq!(
+            gets.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the HEAD dropped it"
+        );
+    }
+
+    /// A `Set-Cookie` on the `304` that confirms a stored response reaches the jar
+    /// (RFC 6265 §3), like one on any other response.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_cookie_on_a_revalidation_304_reaches_the_jar() {
+        let srv = TestServer::new()
+            .route(
+                "/session",
+                RouteConfig::Cacheable(CacheRouteOptions {
+                    cache_control: Some("max-age=0".into()),
+                    extra_headers: vec![("set-cookie".into(), "sid=rotated".into())],
+                    ..CacheRouteOptions::default().with_etag("\"v1\"")
+                }),
+            )
+            .start()
+            .await;
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let seen = Arc::new(std::sync::Mutex::new(0usize));
+        let policy = || {
+            let seen = seen.clone();
+            NetPolicy {
+                on_cookies: Box::new(move |_, values| {
+                    *seen.lock().unwrap() += values.len();
+                }),
+                ..NetPolicy::default()
+            }
+            .with_cache(Some(cache.clone()))
+        };
+        let obs = Arc::new(RecordingObserver::new());
+        let _ = cache_fetch(
+            &srv,
+            "/session",
+            RequestInit::default(),
+            policy(),
+            obs.clone(),
+        )
+        .await;
+        let (meta, _) = cache_fetch(
+            &srv,
+            "/session",
+            RequestInit::default(),
+            policy(),
+            obs.clone(),
+        )
+        .await;
+        assert!(meta.from_cache, "the second fetch is a revalidation");
+        assert_eq!(*seen.lock().unwrap(), 2, "the 304's cookie reached the jar");
     }
 
     /// Fetch `path` through the policy, returning the metadata and body.
