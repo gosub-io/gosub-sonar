@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are removed before the first hop now and reported as `RequestChange::HeadersRemoved`;
   `cors::is_forbidden_request_header_value` exposes the rule. A request without an origin is
   the embedder's own and keeps them
+- A request with `Range` advertised `gzip, br, deflate`, so a server could answer with a
+  range of the compressed bytes. It asks for `identity` now (Fetch §4.6), appended to an
+  `Accept-Encoding` the caller set
 - Header values went out with the spaces and tabs a caller left around them. A field value has
   none (RFC 9110 §5.5), and over HTTP/2 a value with any is a malformed request (RFC 9113
   §8.2.1) that a strict server resets. Every value is trimmed now, as Fetch normalizes one

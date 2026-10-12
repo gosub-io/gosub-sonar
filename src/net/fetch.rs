@@ -1820,7 +1820,15 @@ async fn get_with_redirects(
     // Set here rather than left to the client, which would add it while executing the request,
     // after `RequestSent` was reported. Matches what `build_client` enables for a decoding
     // client; a caller that asked for raw bytes advertises nothing it cannot decode.
-    if !current_headers.contains_key(header::ACCEPT_ENCODING) {
+    //
+    // A range counts bytes of the representation as it is sent, so a ranged request asks for
+    // it unencoded (Fetch §4.6), appended to a value the caller set itself.
+    if current_headers.contains_key(header::RANGE) {
+        current_headers.append(
+            header::ACCEPT_ENCODING,
+            header::HeaderValue::from_static("identity"),
+        );
+    } else if !current_headers.contains_key(header::ACCEPT_ENCODING) {
         current_headers.insert(
             header::ACCEPT_ENCODING,
             header::HeaderValue::from_static(if init.auto_decode {
@@ -7246,6 +7254,40 @@ mod tests {
                 sent_header(&rec, "accept-encoding").as_deref(),
                 Some("zstd")
             );
+        }
+
+        /// A request with `Range` asks for the representation unencoded (Fetch §4.6), and a
+        /// caller's own `Accept-Encoding` gets `identity` appended.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_range_request_asks_for_identity() {
+            let srv = TestServer::new()
+                .default_route(RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let mut ranged = HeaderMap::new();
+            ranged.insert(header::RANGE, "bytes=0-9".parse().unwrap());
+            let rec = recorded(
+                client(),
+                srv.url("/"),
+                RequestInit::get(ranged.clone()),
+                NetPolicy::default(),
+            )
+            .await;
+            let sent = rec.requests_sent().pop().unwrap().2;
+            let values: Vec<_> = sent.get_all(header::ACCEPT_ENCODING).iter().collect();
+            assert_eq!(values, ["identity"]);
+
+            ranged.insert(header::ACCEPT_ENCODING, "zstd".parse().unwrap());
+            let rec = recorded(
+                client(),
+                srv.url("/"),
+                RequestInit::get(ranged),
+                NetPolicy::default(),
+            )
+            .await;
+            let sent = rec.requests_sent().pop().unwrap().2;
+            let values: Vec<_> = sent.get_all(header::ACCEPT_ENCODING).iter().collect();
+            assert_eq!(values, ["zstd", "identity"]);
         }
 
         /// Web content may not set a forbidden request-header (Fetch §2.2.2): on a request with
