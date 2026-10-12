@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `Set-Cookie` on the `304` that confirmed a stored response never reached the cookie jar:
+  the stored headers, which keep no cookies, were reported instead. A session rotated on a
+  revalidation was lost. The `304`'s cookies go to the jar now (RFC 6265 §3)
 - A response served from the cache kept the `Age` it arrived with, however long it had been
   stored since. It carries the cache's own `Age` now (RFC 9111 §4), the stored response's
   current age

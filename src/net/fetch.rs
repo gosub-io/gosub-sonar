@@ -2488,6 +2488,11 @@ async fn get_with_redirects(
                             url: url.clone(),
                             outcome: CacheOutcome::Validated,
                         });
+                        // The stored copy keeps no cookies, but the jar gets what the `304`
+                        // set (RFC 6265 §3): a session rotated on a revalidation is not lost.
+                        if attach_credentials {
+                            report_set_cookie(&policy, &url, resp.headers());
+                        }
                         break HopResponse::Cached(updated);
                     }
                 }
@@ -6288,6 +6293,54 @@ mod tests {
         let age: i64 = meta.headers[header::AGE].to_str().unwrap().parse().unwrap();
         assert!((50..60).contains(&age), "Age: {age}");
         assert_eq!(meta.headers.get_all(header::AGE).iter().count(), 1);
+    }
+
+    /// A `Set-Cookie` on the `304` that confirms a stored response reaches the jar
+    /// (RFC 6265 §3), like one on any other response.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_cookie_on_a_revalidation_304_reaches_the_jar() {
+        let srv = TestServer::new()
+            .route(
+                "/session",
+                RouteConfig::Cacheable(CacheRouteOptions {
+                    cache_control: Some("max-age=0".into()),
+                    extra_headers: vec![("set-cookie".into(), "sid=rotated".into())],
+                    ..CacheRouteOptions::default().with_etag("\"v1\"")
+                }),
+            )
+            .start()
+            .await;
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let seen = Arc::new(std::sync::Mutex::new(0usize));
+        let policy = || {
+            let seen = seen.clone();
+            NetPolicy {
+                on_cookies: Box::new(move |_, values| {
+                    *seen.lock().unwrap() += values.len();
+                }),
+                ..NetPolicy::default()
+            }
+            .with_cache(Some(cache.clone()))
+        };
+        let obs = Arc::new(RecordingObserver::new());
+        let _ = cache_fetch(
+            &srv,
+            "/session",
+            RequestInit::default(),
+            policy(),
+            obs.clone(),
+        )
+        .await;
+        let (meta, _) = cache_fetch(
+            &srv,
+            "/session",
+            RequestInit::default(),
+            policy(),
+            obs.clone(),
+        )
+        .await;
+        assert!(meta.from_cache, "the second fetch is a revalidation");
+        assert_eq!(*seen.lock().unwrap(), 2, "the 304's cookie reached the jar");
     }
 
     /// Fetch `path` through the policy, returning the metadata and body.
