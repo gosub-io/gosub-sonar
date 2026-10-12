@@ -73,6 +73,40 @@ pub(crate) fn blocked(
     NetError::Blocked { reason, url }
 }
 
+/// `headers` with leading and trailing whitespace taken off every value (Fetch, normalize a
+/// header value). A field value has none (RFC 9110 §5.5), and over HTTP/2 a value with any is
+/// a malformed request (RFC 9113 §8.2.1) that a server resets.
+fn trimmed_values(headers: HeaderMap) -> HeaderMap {
+    let is_ws = |b: &u8| matches!(b, b' ' | b'\t');
+    let mut out = HeaderMap::with_capacity(headers.len());
+    let mut name = None;
+    for (n, value) in headers {
+        if let Some(n) = n {
+            name = Some(n);
+        }
+        let Some(ref name) = name else { continue };
+        let bytes = value.as_bytes();
+        let start = bytes.iter().position(|b| !is_ws(b)).unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !is_ws(b))
+            .map_or(start, |i| i + 1);
+        let value = if start == 0 && end == bytes.len() {
+            value
+        } else {
+            match header::HeaderValue::from_bytes(&bytes[start..end]) {
+                Ok(mut trimmed) => {
+                    trimmed.set_sensitive(value.is_sensitive());
+                    trimmed
+                }
+                Err(_) => value,
+            }
+        };
+        out.append(name.clone(), value);
+    }
+    out
+}
+
 /// `method` normalized (Fetch §2.2.1): a byte-case-insensitive `DELETE`, `GET`, `HEAD`,
 /// `OPTIONS`, `POST` or `PUT` is uppercased, any other method is left as it is. Every check in
 /// this crate that compares against [`Method::GET`] and the rest relies on it.
@@ -1753,7 +1787,7 @@ async fn get_with_redirects(
     // Where the chain has been: every hop's URL before the current one (Fetch, request's URL
     // list), for the cookie hook to judge `SameSite` across the chain.
     let mut url_list: Vec<Url> = Vec::new();
-    let mut current_headers = init.headers;
+    let mut current_headers = trimmed_values(init.headers);
     let mut current_body = init.body;
     let origin = init.origin;
     // The message framing is the body's (RFC 9112 §6): a caller's `Content-Length` that does
@@ -7134,6 +7168,31 @@ mod tests {
 
         fn changes(rec: &RecordingObserver) -> Vec<RequestChange> {
             rec.modifications().into_iter().map(|(_, c)| c).collect()
+        }
+
+        /// Leading and trailing whitespace is taken off every header value (Fetch, normalize);
+        /// whitespace inside a value stays, and so does every value of a repeated header.
+        #[tokio::test(flavor = "current_thread")]
+        async fn header_values_are_trimmed() {
+            let srv = TestServer::new()
+                .default_route(RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let mut headers = HeaderMap::new();
+            headers.insert("x-a", "\t v w \t".parse().unwrap());
+            headers.append("x-b", " one".parse().unwrap());
+            headers.append("x-b", "two ".parse().unwrap());
+            let rec = recorded(
+                client(),
+                srv.url("/"),
+                RequestInit::get(headers),
+                NetPolicy::default(),
+            )
+            .await;
+            let sent = rec.requests_sent().pop().unwrap().2;
+            assert_eq!(sent.get("x-a").unwrap(), "v w");
+            let b: Vec<_> = sent.get_all("x-b").iter().collect();
+            assert_eq!(b, ["one", "two"]);
         }
 
         /// The header a hop sent under `name`, as a string.

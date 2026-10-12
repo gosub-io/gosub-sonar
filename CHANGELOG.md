@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are removed before the first hop now and reported as `RequestChange::HeadersRemoved`;
   `cors::is_forbidden_request_header_value` exposes the rule. A request without an origin is
   the embedder's own and keeps them
+- Header values went out with the spaces and tabs a caller left around them. A field value has
+  none (RFC 9110 §5.5), and over HTTP/2 a value with any is a malformed request (RFC 9113
+  §8.2.1) that a strict server resets. Every value is trimmed now, as Fetch normalizes one
 - A request with an initiating origin could use `CONNECT`, `TRACE` or `TRACK`, which Fetch
   forbids web content (§2.2.1); `TRACE` echoes the request back, cookies included. Such a
   request is refused with `BlockReason::ForbiddenMethod` before anything is sent. A request
