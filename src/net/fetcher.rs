@@ -209,6 +209,13 @@ pub struct FetcherConfig {
     /// returning an error) and for address pinning against DNS rebinding. See
     /// [`dns`](mod@crate::net::dns).
     ///
+    /// Through an HTTP proxy, or a `socks4a`/`socks5h` one, the proxy resolves the target name
+    /// and this resolver only sees the proxy's host. An IP-literal target is still put to it.
+    /// A policy on names has to go in [`FetcherContext::is_url_allowed`] as well when a proxy
+    /// may be configured.
+    ///
+    /// [`FetcherContext::is_url_allowed`]: crate::net::fetcher_context::FetcherContext::is_url_allowed
+    ///
     /// Native-only: on wasm32 the browser's `fetch()` owns name resolution.
     #[cfg(not(target_arch = "wasm32"))]
     pub dns_resolver: Option<Arc<dyn DnsResolver>>,
