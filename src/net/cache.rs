@@ -863,7 +863,17 @@ pub fn invalidates(method: &Method) -> bool {
 /// Parse an HTTP-date (RFC 9110 §5.6.7). Accepts the preferred IMF-fixdate as well as the two
 /// obsolete formats servers still emit.
 pub fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
+    // Matched case-insensitively (RFC 9111 §4.2). chrono reads day and month names in any
+    // case already; the `GMT` in the formats below is a literal.
     let value = value.trim();
+    let upper;
+    let value = match value.len().checked_sub(3).and_then(|i| value.get(i..)) {
+        Some(zone) if zone.eq_ignore_ascii_case("gmt") => {
+            upper = format!("{}GMT", &value[..value.len() - 3]);
+            upper.as_str()
+        }
+        _ => value,
+    };
     for format in [
         // Sun, 06 Nov 1994 08:49:37 GMT
         "%a, %d %b %Y %H:%M:%S GMT",
@@ -1166,6 +1176,20 @@ mod tests {
 
     fn key() -> CacheKey {
         CacheKey::new(&Method::GET, &Url::parse("https://example.com/a").unwrap())
+    }
+
+    /// HTTP dates match case-insensitively (RFC 9111 §4.2), in each of the three formats.
+    #[test]
+    fn http_dates_match_case_insensitively() {
+        let expected = parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").unwrap();
+        for value in [
+            "sun, 06 nov 1994 08:49:37 gmt",
+            "SUN, 06 NOV 1994 08:49:37 GMT",
+            "sunday, 06-nov-94 08:49:37 gmt",
+            "SUN NOV  6 08:49:37 1994",
+        ] {
+            assert_eq!(parse_http_date(value), Some(expected), "{value}");
+        }
     }
 
     /// An `Age` that is a list counts by its first member (RFC 9111 §5.1).
