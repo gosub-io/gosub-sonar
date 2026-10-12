@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A request with an initiating origin carried the caller's forbidden request-headers (Fetch
+  §2.2.2): a hand-set `Cookie` under `credentials: omit`, a `Host` naming another site,
+  `Sec-*` and `Proxy-*` headers, an `X-HTTP-Method-Override: TRACE`. The CORS rules skip these
+  names as the fetcher's own, so they reached cross-origin servers without a preflight. They
+  are removed before the first hop now and reported as `RequestChange::HeadersRemoved`;
+  `cors::is_forbidden_request_header_value` exposes the rule. A request without an origin is
+  the embedder's own and keeps them
 - A request with an initiating origin could use `CONNECT`, `TRACE` or `TRACK`, which Fetch
   forbids web content (§2.2.1); `TRACE` echoes the request back, cookies included. Such a
   request is refused with `BlockReason::ForbiddenMethod` before anything is sent. A request

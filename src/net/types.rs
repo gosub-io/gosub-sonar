@@ -290,7 +290,11 @@ pub enum RequestChange {
     },
     /// Headers the caller set were not sent. `Content-Length` and `Transfer-Encoding` frame the
     /// message and are worked out from the body (RFC 9112 section 6), so a caller's value is
-    /// never sent. Reported once, on the first hop.
+    /// never sent. On a request with an initiating origin, every forbidden request-header
+    /// (Fetch section 2.2.2, see
+    /// [`is_forbidden_request_header_value`](crate::net::cors::is_forbidden_request_header_value))
+    /// is removed too: those are the user agent's to set, not web content's. Reported once, on
+    /// the first hop.
     HeadersRemoved {
         /// The removed headers.
         headers: Vec<HeaderName>,
@@ -691,8 +695,9 @@ fn regular_file(meta: &std::fs::Metadata) -> std::io::Result<u64> {
 /// ([Fetch §2.2.5], *credentials mode*).
 ///
 /// This gates only what the fetcher itself attaches; headers set by hand in
-/// [`FetchRequest::headers`] (e.g. `Authorization`) are the embedder's own decision and go out
-/// regardless. Beyond cookies, the mode also drives the CORS rules: a credentialed cross-origin
+/// [`FetchRequest::headers`] (e.g. `Authorization`) go out regardless. A hand-set `Cookie` is a
+/// forbidden request-header, and is removed from a request with an initiating origin
+/// ([`RequestChange::HeadersRemoved`]). Beyond cookies, the mode also drives the CORS rules: a credentialed cross-origin
 /// request needs `Access-Control-Allow-Credentials` and cannot be authorized by a wildcard.
 ///
 /// [Fetch §2.2.5]: https://fetch.spec.whatwg.org/#concept-request-credentials-mode

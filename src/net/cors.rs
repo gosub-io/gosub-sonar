@@ -209,6 +209,9 @@ fn decimal_greater(a: &str, b: &str) -> bool {
 /// Forbidden request header ([Fetch] §2.2.2): controlled by the user agent — here, by the
 /// fetcher itself (`Referer`, `Origin`, `Cookie`, `Sec-Fetch-*`, …). These never count toward
 /// the preflight decision: a browser sets them on cross-origin requests without asking either.
+/// A request with an initiating origin has the caller's removed before it is sent
+/// ([`RequestChange::HeadersRemoved`](crate::net::types::RequestChange::HeadersRemoved)), so
+/// none can go out unasked.
 ///
 /// [Fetch]: https://fetch.spec.whatwg.org/#forbidden-request-header
 pub fn is_forbidden_request_header(name: &HeaderName) -> bool {
@@ -239,6 +242,25 @@ pub fn is_forbidden_request_header(name: &HeaderName) -> bool {
                 | "upgrade"
                 | "via"
         )
+}
+
+/// Forbidden request-header ([Fetch] §2.2.2) by name and value: a forbidden header name, or
+/// `X-HTTP-Method`, `X-HTTP-Method-Override` or `X-Method-Override` naming a forbidden method
+/// among its comma-separated values, which would smuggle one past
+/// [`is_forbidden_method`].
+///
+/// [Fetch]: https://fetch.spec.whatwg.org/#forbidden-request-header
+pub fn is_forbidden_request_header_value(name: &HeaderName, value: &http::HeaderValue) -> bool {
+    if is_forbidden_request_header(name) {
+        return true;
+    }
+    matches!(
+        name.as_str(),
+        "x-http-method" | "x-http-method-override" | "x-method-override"
+    ) && String::from_utf8_lossy(value.as_bytes())
+        .split(',')
+        .filter_map(|token| http::Method::from_bytes(token.trim().as_bytes()).ok())
+        .any(|method| is_forbidden_method(&method))
 }
 
 /// Forbidden method ([Fetch] §2.2.1): `CONNECT`, `TRACE` or `TRACK` in any case. Web content

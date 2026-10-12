@@ -940,19 +940,8 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
             headers.insert(header::ACCEPT, value);
         }
     }
-    if !headers.contains_key(header::ACCEPT_ENCODING) {
-        // Matches what `build_client` enables for a decoding client, so responses are still
-        // decoded exactly as before; a caller that asked for raw bytes advertises nothing it
-        // cannot decode and gets the bytes untouched.
-        let advertised = if req.auto_decode {
-            "gzip, br, deflate"
-        } else {
-            "identity"
-        };
-        if let Ok(value) = advertised.parse() {
-            headers.insert(header::ACCEPT_ENCODING, value);
-        }
-    }
+    // `accept-encoding` is set with the other headers the fetcher owns, once a caller's
+    // forbidden headers are gone (`get_with_redirects`).
 
     let body = req.body.as_ref().map(|b| {
         if let Some(ref ct) = b.content_type {
@@ -4424,53 +4413,6 @@ mod tests {
                 "{destination:?} accept value forces a preflight"
             );
         }
-    }
-
-    #[test]
-    fn accept_encoding_is_set_here_so_it_can_be_reported() {
-        let cfg = FetcherConfig::default();
-
-        // A decoding request advertises what build_client can actually decode.
-        let req = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
-            .with_auto_decode(true)
-            .build();
-        assert_eq!(
-            make_request_init(&req, &cfg)
-                .headers
-                .get(header::ACCEPT_ENCODING)
-                .map(|v| v.to_str().unwrap()),
-            Some("gzip, br, deflate")
-        );
-
-        // A caller that wants the bytes untouched advertises nothing.
-        let raw = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
-            .with_auto_decode(false)
-            .build();
-        assert_eq!(
-            make_request_init(&raw, &cfg)
-                .headers
-                .get(header::ACCEPT_ENCODING)
-                .map(|v| v.to_str().unwrap()),
-            Some("identity")
-        );
-    }
-
-    #[test]
-    fn a_caller_s_own_accept_encoding_is_left_alone() {
-        let cfg = FetcherConfig::default();
-        let mut headers = HeaderMap::new();
-        headers.insert(header::ACCEPT_ENCODING, "zstd".parse().unwrap());
-        let req = FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
-            .with_headers(headers)
-            .with_auto_decode(true)
-            .build();
-        assert_eq!(
-            make_request_init(&req, &cfg)
-                .headers
-                .get(header::ACCEPT_ENCODING)
-                .map(|v| v.to_str().unwrap()),
-            Some("zstd")
-        );
     }
 
     #[test]

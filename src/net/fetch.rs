@@ -1755,13 +1755,27 @@ async fn get_with_redirects(
     let mut url_list: Vec<Url> = Vec::new();
     let mut current_headers = init.headers;
     let mut current_body = init.body;
+    let origin = init.origin;
     // The message framing is the body's (RFC 9112 §6): a caller's `Content-Length` that does
     // not match it cuts the body short or leaves the server waiting for bytes that never come,
-    // and a `Transfer-Encoding` would contradict the one the connection picks.
-    let removed: Vec<header::HeaderName> = [header::CONTENT_LENGTH, header::TRANSFER_ENCODING]
-        .into_iter()
-        .filter(|name| current_headers.remove(name).is_some())
-        .collect();
+    // and a `Transfer-Encoding` would contradict the one the connection picks. Web content
+    // may not set any forbidden request-header (Fetch §2.2.2): those are the user agent's,
+    // and the CORS rules below take that for granted.
+    let mut removed: Vec<header::HeaderName> = Vec::new();
+    for name in current_headers.keys() {
+        let forbidden = origin.is_some()
+            && current_headers
+                .get_all(name)
+                .iter()
+                .any(|value| cors::is_forbidden_request_header_value(name, value));
+        let framing = *name == header::CONTENT_LENGTH || *name == header::TRANSFER_ENCODING;
+        if forbidden || framing {
+            removed.push(name.clone());
+        }
+    }
+    for name in &removed {
+        current_headers.remove(name);
+    }
     if !removed.is_empty() {
         modified(
             &observer,
@@ -1769,7 +1783,19 @@ async fn get_with_redirects(
             RequestChange::HeadersRemoved { headers: removed },
         );
     }
-    let origin = init.origin;
+    // Set here rather than left to the client, which would add it while executing the request,
+    // after `RequestSent` was reported. Matches what `build_client` enables for a decoding
+    // client; a caller that asked for raw bytes advertises nothing it cannot decode.
+    if !current_headers.contains_key(header::ACCEPT_ENCODING) {
+        current_headers.insert(
+            header::ACCEPT_ENCODING,
+            header::HeaderValue::from_static(if init.auto_decode {
+                "gzip, br, deflate"
+            } else {
+                "identity"
+            }),
+        );
+    }
     // Web content may not send these (Fetch §2.2.1). A request without an origin is the
     // embedder's own and may.
     if origin.is_some() && cors::is_forbidden_method(&current_method) {
@@ -7108,6 +7134,155 @@ mod tests {
 
         fn changes(rec: &RecordingObserver) -> Vec<RequestChange> {
             rec.modifications().into_iter().map(|(_, c)| c).collect()
+        }
+
+        /// The header a hop sent under `name`, as a string.
+        fn sent_header(rec: &RecordingObserver, name: &str) -> Option<String> {
+            rec.requests_sent()
+                .pop()
+                .unwrap()
+                .2
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+        }
+
+        /// `Accept-Encoding` is the fetcher's: what a decoding client can decode, `identity`
+        /// for a caller that wants the bytes as they come, and a caller's own value left alone
+        /// when the request is not web content.
+        #[tokio::test(flavor = "current_thread")]
+        async fn accept_encoding_is_set_by_the_fetcher() {
+            let srv = TestServer::new()
+                .default_route(RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let rec = recorded(
+                client(),
+                srv.url("/"),
+                RequestInit::get(HeaderMap::new()),
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(
+                sent_header(&rec, "accept-encoding").as_deref(),
+                Some("gzip, br, deflate")
+            );
+
+            let raw = RequestInit::get(HeaderMap::new()).with_cache(CacheMode::Default, false);
+            let rec = recorded(client(), srv.url("/"), raw, NetPolicy::default()).await;
+            assert_eq!(
+                sent_header(&rec, "accept-encoding").as_deref(),
+                Some("identity")
+            );
+
+            let mut own = HeaderMap::new();
+            own.insert(header::ACCEPT_ENCODING, "zstd".parse().unwrap());
+            let rec = recorded(
+                client(),
+                srv.url("/"),
+                RequestInit::get(own),
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(
+                sent_header(&rec, "accept-encoding").as_deref(),
+                Some("zstd")
+            );
+        }
+
+        /// Web content may not set a forbidden request-header (Fetch §2.2.2): on a request with
+        /// an initiating origin they are removed and reported, a method override naming a
+        /// forbidden method included. Other headers stay. Without an origin the request is the
+        /// embedder's, and its headers go out.
+        #[tokio::test(flavor = "current_thread")]
+        async fn forbidden_headers_are_removed_from_web_content() {
+            let srv = TestServer::new()
+                .route("/headers", RouteConfig::echo_request_headers())
+                .start()
+                .await;
+            let headers = |override_method: &str| {
+                let mut h = HeaderMap::new();
+                h.insert(header::COOKIE, "session=stolen".parse().unwrap());
+                h.insert(header::HOST, "evil.example".parse().unwrap());
+                h.insert(header::ACCEPT_ENCODING, "zstd".parse().unwrap());
+                h.insert("sec-purpose", "prefetch".parse().unwrap());
+                h.insert("proxy-x", "1".parse().unwrap());
+                h.insert("x-http-method-override", override_method.parse().unwrap());
+                h.insert(header::AUTHORIZATION, "Bearer t".parse().unwrap());
+                h
+            };
+            let origin = Some(srv.url("/").origin());
+
+            let init = RequestInit::get(headers("GET, trace"))
+                .with_mixed_content(origin.clone(), MixedContentPolicy::default());
+            let rec = Arc::new(RecordingObserver::new());
+            let (_, echoed) = super::super::fetch_response_complete(
+                client(),
+                srv.url("/headers"),
+                init,
+                CancellationToken::new(),
+                rec.clone(),
+                None,
+                Duration::from_secs(3),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            let mut removed = match changes(&rec).as_slice() {
+                [RequestChange::HeadersRemoved { headers }] => headers.clone(),
+                other => panic!("{other:?}"),
+            };
+            removed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            assert_eq!(
+                removed,
+                vec![
+                    header::ACCEPT_ENCODING,
+                    header::COOKIE,
+                    header::HOST,
+                    header::HeaderName::from_static("proxy-x"),
+                    header::HeaderName::from_static("sec-purpose"),
+                    header::HeaderName::from_static("x-http-method-override"),
+                ]
+            );
+            let echoed = String::from_utf8_lossy(&echoed).to_ascii_lowercase();
+            for gone in [
+                "session=stolen",
+                "evil.example",
+                "zstd",
+                "sec-purpose",
+                "proxy-x",
+                "x-http-method-override",
+            ] {
+                assert!(!echoed.contains(gone), "{gone} was sent: {echoed}");
+            }
+            assert!(echoed.contains("authorization: bearer t"), "{echoed}");
+            assert!(
+                echoed.contains("accept-encoding: gzip, br, deflate"),
+                "{echoed}"
+            );
+
+            // An override naming an allowed method is not forbidden.
+            let init = RequestInit::get(headers("PATCH"))
+                .with_mixed_content(origin, MixedContentPolicy::default());
+            let rec = recorded(client(), srv.url("/headers"), init, NetPolicy::default()).await;
+            assert_eq!(
+                sent_header(&rec, "x-http-method-override").as_deref(),
+                Some("PATCH")
+            );
+
+            // No origin: the embedder's own request, sent as set.
+            let rec = recorded(
+                client(),
+                srv.url("/headers"),
+                RequestInit::get(headers("TRACE")),
+                NetPolicy::default(),
+            )
+            .await;
+            assert!(changes(&rec).is_empty(), "{:?}", changes(&rec));
+            assert_eq!(
+                sent_header(&rec, "cookie").as_deref(),
+                Some("session=stolen")
+            );
         }
 
         /// `CONNECT`, `TRACE` and `TRACK`, in any case, are refused for a request with an
