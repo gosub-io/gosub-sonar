@@ -1398,6 +1398,19 @@ impl RecordingObserver {
             .count()
     }
 
+    /// The URL of every `Finished` event.
+    pub fn finished_urls(&self) -> Vec<url::Url> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                NetEvent::Finished { url, .. } => Some(url.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Every `Finished` event, as `(received_bytes, elapsed)`.
     pub fn finished(&self) -> Vec<(u64, std::time::Duration)> {
         self.events

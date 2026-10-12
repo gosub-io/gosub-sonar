@@ -73,6 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- After a redirect, `Finished`, and a `Failed` or `Cancelled` while the body was read, named the
+  URL first asked for instead of the one the body came from. They name the last hop now, as a
+  response served from the cache already did
 - An HSTS upgrade of a request's first hop was not reported: the fetcher rewrote the URL
   before the request had an observer, so `SecurityUpgraded` never came and the request looked
   as if the caller had asked for `https`. It is reported right after `Accepted` now

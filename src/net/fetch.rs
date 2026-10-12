@@ -1015,7 +1015,7 @@ async fn fetch_response_top_inner(
         let next = tokio::select! {
             // Stream cancelled
             _ = cancel.cancelled() => {
-                observer_clone.on_event(NetEvent::Cancelled { url: url.clone(), reason: "peek stream cancelled" });
+                observer_clone.on_event(NetEvent::Cancelled { url: meta.final_url.clone(), reason: "peek stream cancelled" });
                 return Err(NetError::Cancelled("peek stream cancelled".into()));
             }
             // Read bytes from stream
@@ -1133,11 +1133,12 @@ async fn fetch_response_top_inner(
     // decrease in bytes read in the progress events?)
     let already_delivered = received_net - excess_len;
 
+    // The body's end names the URL it came from, the last hop of the chain.
     let progress_reader = ProgressReader::new(
         inner_reader,
         cancel.clone(),
         observer.clone(),
-        url.clone(),
+        meta.final_url.clone(),
         started,
         meta.content_length,
         already_delivered,
@@ -7066,6 +7067,24 @@ mod tests {
             )
             .await;
             rec
+        }
+
+        /// `Finished` names the URL that finished loading: after a redirect, the last hop.
+        #[tokio::test(flavor = "current_thread")]
+        async fn finished_names_the_final_url() {
+            let srv = TestServer::new()
+                .route("/a", RouteConfig::redirect_to("/c"))
+                .route("/c", RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let rec = recorded(
+                client(),
+                srv.url("/a"),
+                RequestInit::default(),
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(rec.finished_urls(), [srv.url("/c")]);
         }
 
         fn changes(rec: &RecordingObserver) -> Vec<RequestChange> {
