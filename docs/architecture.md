@@ -336,7 +336,9 @@ only, honouring `Retry-After`. Streams are retried until the start of the body (
 in, since nothing has reached the caller before that; a stream that breaks later is not re-sent.
 
 Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enforced by `reqwest`
-(`req_timeout` is reqwest's total request timeout, so it covers the body as well as the headers);
+(`connect_timeout` covers name resolution, TCP and TLS together, and is split evenly across the
+addresses of one family, which are tried in turn; `req_timeout` is reqwest's total request
+timeout, so it covers the body as well as the headers);
 `read_idle_timeout` (max gap between reads) and `total_body_timeout` (whole-body budget) are
 enforced in the read loops of `fetch_response_complete` and the `ProgressReader`/`SharedBody` path;
 `redirect_timeout` (budget for the redirect chain, armed by the first redirect) is enforced in

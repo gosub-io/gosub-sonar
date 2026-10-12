@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `FetcherConfig::connect_timeout` said it timed the TCP and TLS handshakes. It also covers
+  name resolution, and is split evenly across the addresses of one family, which are tried in
+  turn. The docs say so now, along with the deviation from RFC 8305 that follows: an address
+  that never answers holds the next one back for its share of the budget, not for 250 ms
 - The `PublicOnly` resolver in the `dns` module docs, the SSRF policy an embedder would start
   from, let `[::ffff:127.0.0.1]` through: Rust's IPv6 checks do not look inside an
   IPv4-mapped address. It judges one as the IPv4 address it is (RFC 4291 §2.5.5.2) now, and
