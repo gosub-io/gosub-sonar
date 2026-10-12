@@ -52,6 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `304` that named another version than the stored one by a weak `ETag` or a
+  `Last-Modified` still freshened the stored response, and the old body was then served under
+  the new validator. Only a strong `ETag` was compared. Each validator now has to correspond
+  to the stored response (RFC 9111 §4.3.4); a `304` that does not confirm it refetches
 - With several stored variants that all matched a request, the first one stored was used. The
   most recent one by `Date` is now (RFC 9111 §4)
 - A `Set-Cookie` on the `304` that confirmed a stored response never reached the cookie jar:
