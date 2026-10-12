@@ -357,9 +357,11 @@ pub struct NetPolicy {
     /// [`NetPolicy::with_proxy_authorization`].
     #[cfg(not(target_arch = "wasm32"))]
     pub proxy_authorization: Option<ProxyAuthorizationFn>,
-    /// The http(s) proxy a plain-`http` request goes through, without credentials. A `407` is
-    /// only treated as a proxy challenge on a hop this names; any other `407` is returned as
-    /// is. `None` (default): no hop is proxied. Set via [`NetPolicy::with_proxy_for`].
+    /// The http(s) proxy a request goes through, without credentials. A `407` is only treated
+    /// as a proxy challenge on a plain-`http` hop this names; any other `407` is returned as
+    /// is. On an `https` hop it names the proxy in
+    /// [`NetError::ProxyAuthRequired`].
+    /// `None` (default): no hop is proxied. Set via [`NetPolicy::with_proxy_for`].
     #[cfg(not(target_arch = "wasm32"))]
     pub proxy_for: Option<ProxyForFn>,
     /// Whether a request goes through a proxy (http, https or socks). A proxied response's
@@ -1525,6 +1527,7 @@ fn send_error(
     url: &Url,
     what: &str,
     observer: &Arc<dyn NetObserver + Send + Sync>,
+    policy: &NetPolicy,
 ) -> NetError {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(tls) = crate::net::tls::classify(&e, url) {
@@ -1534,8 +1537,18 @@ fn send_error(
         });
         return NetError::Tls(tls);
     }
+    // Without a proxy to name, the tunnel failure stays a connect failure.
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::net::transport::is_proxy_auth_required(&e) {
+        if let Some(proxy) = policy.proxy_for.as_ref().and_then(|f| f(url)) {
+            return NetError::ProxyAuthRequired {
+                proxy: Arc::new(proxy),
+                url: url.clone(),
+            };
+        }
+    }
     #[cfg(target_arch = "wasm32")]
-    let _ = (url, observer);
+    let _ = (url, observer, policy);
     let mut err = TransportError::from_client(&e);
     err.message = format!("{what}: {}", err.message);
     NetError::Transport(err)
@@ -2069,7 +2082,7 @@ async fn get_with_redirects(
                                 observer.on_event(NetEvent::Cancelled { url: url.clone(), reason: "cancelled during CORS preflight" });
                                 return Err(NetError::Cancelled("cancelled during CORS preflight".into()));
                             }
-                            r = &mut fut => r.map_err(|e| send_error(e, &url, "CORS preflight request failed", &observer))?
+                            r = &mut fut => r.map_err(|e| send_error(e, &url, "CORS preflight request failed", &observer, &policy))?
                         };
                         // Reported before validation: a preflight the server answered cost
                         // this round-trip whether or not the answer turns out to permit the
@@ -2351,6 +2364,7 @@ async fn get_with_redirects(
                         &url,
                         "net.get_with_redirects request build failed",
                         &observer,
+                        &policy,
                     )
                 })?;
                 #[cfg(not(target_arch = "wasm32"))]
@@ -2401,7 +2415,7 @@ async fn get_with_redirects(
                             redirects
                         )));
                     }
-                    r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer))?
+                    r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer, &policy))?
                 };
                 #[cfg(not(target_arch = "wasm32"))]
                 {
@@ -2513,7 +2527,9 @@ async fn get_with_redirects(
                 // answering it would leak the proxy credentials (or the password dialog) to
                 // any server that sends the status. wasm32: the browser owns the proxy.
                 #[cfg(not(target_arch = "wasm32"))]
-                let proxy = policy.proxy_for.as_ref().and_then(|f| f(&url));
+                let proxy = (url.scheme() == "http")
+                    .then(|| policy.proxy_for.as_ref().and_then(|f| f(&url)))
+                    .flatten();
                 #[cfg(target_arch = "wasm32")]
                 let proxy: Option<Url> = None;
                 let may_answer = match target {

@@ -1133,7 +1133,7 @@ fn build_policy(
         let proxied = built.clone();
         let policy = policy
             .with_proxy_authorization(Box::new(move |url| proxy.proxy.proxy_authorization(url)))
-            .with_proxy_for(Box::new(move |url| proxy_for.proxy.plain_http_proxy(url)))
+            .with_proxy_for(Box::new(move |url| proxy_for.proxy.http_proxy(url)))
             .with_proxied(Box::new(move |url| proxied.proxy.routes_through_proxy(url)))
             .with_dns_resolver(cfg.dns_resolver.clone())
             .with_hsts(cfg.hsts.clone())
@@ -4370,6 +4370,14 @@ mod tests {
     /// The head of the first request a raw listener receives, answered with a `403` so an
     /// https request stops at its `CONNECT`.
     async fn first_proxy_request_head() -> (std::net::SocketAddr, oneshot::Receiver<String>) {
+        proxy_answering(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n").await
+    }
+
+    /// A raw listener that answers its first request with `response`, and the head of that
+    /// request.
+    async fn proxy_answering(
+        response: &'static [u8],
+    ) -> (std::net::SocketAddr, oneshot::Receiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -4387,9 +4395,7 @@ mod tests {
                 }
                 head.extend_from_slice(&chunk[..n]);
             }
-            let _ = stream
-                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
-                .await;
+            let _ = stream.write_all(response).await;
             let _ = tx.send(String::from_utf8_lossy(&head).into_owned());
         });
         (addr, rx)
@@ -4437,6 +4443,59 @@ mod tests {
             "{head}"
         );
         shutdown.cancel();
+    }
+
+    /// What fetching `url` through a proxy at `addr` ends in.
+    async fn fetch_through(addr: std::net::SocketAddr, url: &str) -> FetchResult {
+        let cfg = FetcherConfig {
+            proxy: ProxyConfig::single(format!("http://{addr}")),
+            retry: None,
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+        let (req, cancel) = make_req(Url::parse(url).unwrap(), Priority::Normal);
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, cancel, tx).await;
+        let result = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.cancel();
+        result
+    }
+
+    /// A proxy answering the `CONNECT` with `407` (RFC 9110 §15.5.8) is told apart from a
+    /// failed connection, with the proxy named, so an embedder can ask for its credentials.
+    /// Also pins the message hyper-util reports it with, which is how it is recognised.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_407_on_connect_is_proxy_auth_required() {
+        let (addr, _head) = proxy_answering(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+              Proxy-Authenticate: Basic realm=\"corp\"\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        match fetch_through(addr, "https://unroutable.invalid/page").await {
+            FetchResult::Error(NetError::ProxyAuthRequired { proxy, url }) => {
+                assert_eq!(proxy.as_str(), format!("http://{addr}/"));
+                assert_eq!(url.as_str(), "https://unroutable.invalid/page");
+            }
+            other => panic!("expected ProxyAuthRequired, got {other:?}"),
+        }
+    }
+
+    /// Any other refusal of the tunnel is a connection that failed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn another_refused_connect_is_a_connect_failure() {
+        let (addr, _head) = first_proxy_request_head().await;
+        match fetch_through(addr, "https://unroutable.invalid/").await {
+            FetchResult::Error(NetError::Transport(t)) => {
+                assert_eq!(t.kind, TransportErrorKind::Connect)
+            }
+            other => panic!("expected a connect failure, got {other:?}"),
+        }
     }
 
     #[test]

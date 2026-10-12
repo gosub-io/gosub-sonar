@@ -795,6 +795,7 @@ error can fan out to many listeners:
 |---------|---------|
 | `Blocked` | Hop refused by policy. Carries a `BlockReason` (mixed content, URL policy, unsupported scheme, not cached, CORS) and the URL of the hop that was refused. |
 | `Transport` | The HTTP client failed. Carries a `TransportError`: a `kind` (`Connect`, `Timeout`, `Redirect`, `Body`, `Decode`, `Request`, `Builder`, `Other`) and the client's own message with its source chain flattened into it. |
+| `ProxyAuthRequired` | A proxy answered the `CONNECT` for an `https` request with `407`. Carries the proxy (without credentials) and the hop's URL. Not retried. Native-only. |
 | `Tls` | TLS handshake failed. Carries a `TlsError` (kind, host, message, and with overrides enabled the certificate and fingerprint); also emitted as `NetEvent::TlsFailed`. Native-only. |
 | `Redirect` | Redirect resolution failed (missing `Location`, bad scheme, too many hops, blocked). |
 | `Io` | I/O error reading the body. |

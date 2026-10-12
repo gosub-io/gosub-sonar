@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `NetError` gained `ProxyAuthRequired { proxy, url }`, for a proxy that answers
+  the `CONNECT` of an `https` request with `407`. It was a `Transport` error of kind `Connect`,
+  told apart only by its message, and retried like a connection that failed. An embedder can
+  now recognise it, name the proxy to the user, and build a fetcher with the credentials. A
+  `match` on `NetError` needs an arm for it
+
 ### Fixed
 
 - Proxy credentials went to the wrong proxy. With several `ProxyRule`s, a plain-`http`

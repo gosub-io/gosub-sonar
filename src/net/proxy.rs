@@ -603,15 +603,12 @@ impl ProxyRoutes {
             .non_tunnel_authorization(&dst)
     }
 
-    /// The http(s) proxy a plain-`http` request to `url` goes through, without credentials;
-    /// `None` for https (tunnelled via CONNECT, so no 407 response can come from the proxy),
-    /// direct, or socks. Decides whether a 407 counts as a proxy challenge. Only the first rule
-    /// that routes the request counts, as for the client: when it is a socks proxy, the 407
-    /// came from the origin server behind it.
-    pub(crate) fn plain_http_proxy(&self, url: &Url) -> Option<Url> {
-        if url.scheme() != "http" {
-            return None;
-        }
+    /// The http(s) proxy a request to `url` goes through, without credentials; `None` when it
+    /// goes direct or through a socks proxy. For plain `http` it decides whether a 407 counts
+    /// as a proxy challenge; for `https` it names the proxy that refused a tunnel. Only the
+    /// first rule that routes the request counts, as for the client: when it is a socks proxy,
+    /// a 407 came from the origin server behind it.
+    pub(crate) fn http_proxy(&self, url: &Url) -> Option<Url> {
         let dst: http::Uri = url.as_str().parse().ok()?;
         match *self {
             ProxyRoutes::Rules(ref rules) => rules
@@ -741,14 +738,14 @@ mod tests {
         assert!(!routes.routes_through_proxy(&url("http://intranet.test/")));
         assert_eq!(
             routes
-                .plain_http_proxy(&url("http://example.com/"))
+                .http_proxy(&url("http://example.com/"))
                 .map(|u| u.to_string()),
             Some("http://127.0.0.1:3128/".to_string())
         );
 
         let direct = ProxyRoutes::System(Box::new(proxy_matcher::Matcher::builder().build()));
         assert!(!direct.routes_through_proxy(&url("https://example.com/")));
-        assert_eq!(direct.plain_http_proxy(&url("http://example.com/")), None);
+        assert_eq!(direct.http_proxy(&url("http://example.com/")), None);
     }
 
     #[test]
@@ -920,7 +917,7 @@ mod tests {
     /// The proxy a plain-http request to `target` goes through under `routes`, as a string.
     fn via(routes: &ProxyRoutes, target: &str) -> Option<String> {
         routes
-            .plain_http_proxy(&Url::parse(target).unwrap())
+            .http_proxy(&Url::parse(target).unwrap())
             .map(|u| u.to_string())
     }
 
@@ -1116,26 +1113,26 @@ mod tests {
     }
 
     #[test]
-    fn plain_http_proxy_names_the_proxy_for_http_only() {
+    fn http_proxy_names_the_proxy_without_credentials() {
         let cfg = ProxyRoutes::Rules(vec![
             ProxyRule::all("http://user:pw@proxy.test:3128").bypassing("internal.test")
         ]);
-        let proxy = |u: &str| cfg.plain_http_proxy(&Url::parse(u).unwrap());
+        let proxy = |u: &str| cfg.http_proxy(&Url::parse(u).unwrap());
         assert_eq!(
             proxy("http://example.test/").map(|u| u.to_string()),
             Some("http://proxy.test:3128/".to_string()),
             "credentials are left out"
         );
         assert_eq!(
-            proxy("https://example.test/"),
-            None,
-            "an https request tunnels"
+            proxy("https://example.test/").map(|u| u.to_string()),
+            Some("http://proxy.test:3128/".to_string()),
+            "an https request tunnels through it"
         );
         assert_eq!(proxy("http://internal.test/"), None, "no_proxy is honoured");
 
         let socks = ProxyRoutes::Rules(vec![ProxyRule::all("socks5://proxy.test:1080")]);
         assert_eq!(
-            socks.plain_http_proxy(&Url::parse("http://example.test/").unwrap()),
+            socks.http_proxy(&Url::parse("http://example.test/").unwrap()),
             None
         );
 
@@ -1146,11 +1143,11 @@ mod tests {
             ProxyRule::all("http://proxy.test:3128"),
         ]);
         assert_eq!(
-            socks_first.plain_http_proxy(&Url::parse("http://example.test/").unwrap()),
+            socks_first.http_proxy(&Url::parse("http://example.test/").unwrap()),
             None
         );
         assert_eq!(
-            ProxyRoutes::Disabled.plain_http_proxy(&Url::parse("http://example.test/").unwrap()),
+            ProxyRoutes::Disabled.http_proxy(&Url::parse("http://example.test/").unwrap()),
             None
         );
     }
