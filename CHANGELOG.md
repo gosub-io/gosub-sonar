@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   format the engine does not decode, so a server negotiating on it sent images that could not
   be shown. `json` sends `application/json,*/*;q=0.5` instead of `*/*`, and `object` and
   `embed` send `*/*` instead of the document value
+- The fetcher always resolves through a `DnsResolver`: the one configured, or `SystemResolver`,
+  which looks names up as before. `NetEvent::DnsResolved` is now emitted without a resolver of
+  the embedder's too
 
 ### Fixed
 
@@ -57,6 +60,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GET`, `POST` and the rest missed it, the cache key and cache invalidation, the CORS
   safelist and the redirect rules among them. `DELETE`, `GET`, `HEAD`, `OPTIONS`, `POST` and
   `PUT` in any case are uppercased now (Fetch §2.2.1); other methods are left as they are
+- `FetcherConfig::connect_timeout` said it timed the TCP and TLS handshakes. It also covers
+  name resolution, and is split evenly across the addresses of one family, which are tried in
+  turn. The docs say so now, along with the deviation from RFC 8305 that follows: an address
+  that never answers holds the next one back for its share of the budget, not for 250 ms
+- The `PublicOnly` resolver in the `dns` module docs, the SSRF policy an embedder would start
+  from, let `[::ffff:127.0.0.1]` through: Rust's IPv6 checks do not look inside an
+  IPv4-mapped address. It judges one as the IPv4 address it is (RFC 4291 §2.5.5.2) now, and
+  refuses the unspecified address and IPv6 link-local too
+- `localhost` and the names under it (`app.localhost`, with or without a trailing dot) were
+  looked up through the configured resolver or the system's, which could answer with any
+  address, while the mixed content and referrer rules already took them for loopback. They
+  connect to `::1` and `127.0.0.1` now without a lookup (Fetch, resolve an origin). A
+  configured resolver is asked about each of the two addresses and can still refuse them
 
 ## [0.13.0] - 2026-10-12
 

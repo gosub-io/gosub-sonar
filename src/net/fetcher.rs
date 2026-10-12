@@ -61,7 +61,15 @@ pub struct FetcherConfig {
     pub h1_per_origin: usize,
     /// Maximum concurrent streams **per origin** for HTTP/2 and HTTP/3 (multiplexed).
     pub h2_per_origin: usize,
-    /// Timeout for the TCP + TLS handshake.  Applies before any bytes are sent.
+    /// Budget for opening a connection: name resolution, the TCP connect and, for https, the
+    /// TLS handshake, all within this one deadline. Applies before any bytes are sent.
+    ///
+    /// When a name has several addresses, those of the first address's family are tried one
+    /// after another, each with an equal share of this budget, and the other family starts
+    /// 300 ms after the first attempt (hyper-util's connector). An address that refuses
+    /// fails over at once; one that never answers holds the next back for its whole share.
+    /// That is a known deviation from RFC 8305 (Happy Eyeballs), which starts the next
+    /// attempt after 250 ms and races them.
     pub connect_timeout: Duration,
     /// Deadline for one hop, from sending its first byte until its body has been read. The
     /// client enforces it, and it covers the body as well as the wait for headers, so a
@@ -1037,9 +1045,13 @@ fn build_client(
         if let Some(ref ua) = cfg.user_agent {
             b = b.user_agent(ua);
         }
-        if let Some(ref resolver) = cfg.dns_resolver {
-            b = b.dns_resolver(Arc::new(crate::net::dns::ReqwestResolver(resolver.clone())));
-        }
+        // Always installed, the system's resolver when none is configured, so that
+        // `localhost` is answered with loopback rather than looked up.
+        let resolver = cfg
+            .dns_resolver
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::net::dns::SystemResolver));
+        b = b.dns_resolver(Arc::new(crate::net::dns::ReqwestResolver(resolver)));
         // Observation only - forwards the request and returns the connector's own result
         // unchanged - so it is installed for every client rather than gated on config.
         b = b.connector_layer(crate::net::connect_timing::ConnectTimingLayer);
