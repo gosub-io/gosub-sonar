@@ -100,6 +100,15 @@ pub enum RequestDestination {
 }
 
 impl RequestDestination {
+    /// Whether a request to this destination is a navigation request (Fetch §2.2.5):
+    /// `document`, `embed`, `frame`, `iframe` or `object`. Only those send `Sec-Fetch-User`.
+    pub fn is_navigation(self) -> bool {
+        matches!(
+            self,
+            Self::Document | Self::Embed | Self::Frame | Self::Iframe | Self::Object
+        )
+    }
+
     /// The token sent in `Sec-Fetch-Dest`. The empty destination is sent as `empty`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -275,15 +284,7 @@ pub(crate) fn apply_sec_fetch_headers(
     );
     headers.insert(&SEC_FETCH_MODE, HeaderValue::from_static(mode.as_str()));
     headers.insert(&SEC_FETCH_SITE, HeaderValue::from_static(site.as_str()));
-    let navigation = matches!(
-        destination,
-        RequestDestination::Document
-            | RequestDestination::Embed
-            | RequestDestination::Frame
-            | RequestDestination::Iframe
-            | RequestDestination::Object
-    );
-    if navigation && user_activated {
+    if destination.is_navigation() && user_activated {
         headers.insert(&SEC_FETCH_USER, HeaderValue::from_static("?1"));
     } else {
         headers.remove(&SEC_FETCH_USER);

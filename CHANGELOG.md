@@ -79,6 +79,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Two requests that send different `Sec-Fetch-User` headers could share one fetch: the
+  coalescing key decided by the request's mode, the header by its destination. A request
+  initiated by the user to a navigation destination (`object`, `embed`) in another mode got
+  the response to one that sent `?1`, or the other way round. Both use the destination now,
+  through `RequestDestination::is_navigation`
 - `Progress` went back where the first bytes of a body, read to sniff it, ended and the rest
   began: the whole first chunk was counted, and then the part past the sniffed bytes again
   (8131, then 5376). It counts what reached the caller now, so it only goes up
