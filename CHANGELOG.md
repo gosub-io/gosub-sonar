@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   http rule's credentials went through the socks tunnel to the origin server itself. The
   first rule that routes the request now decides, with its own credentials or none
   (RFC 9110 §11.7.2)
+- With a socks rule first, a `407` from the origin server behind it was taken for a proxy
+  challenge, because an http rule further down the list was taken for the proxy. Only the
+  first rule that routes a request is its proxy now
 
 ## [0.13.0] - 2026-10-12
 

@@ -506,16 +506,19 @@ impl ProxyRoutes {
 
     /// The http(s) proxy a plain-`http` request to `url` goes through, without credentials;
     /// `None` for https (tunnelled via CONNECT, so no 407 response can come from the proxy),
-    /// direct, or socks. Decides whether a 407 counts as a proxy challenge.
+    /// direct, or socks. Decides whether a 407 counts as a proxy challenge. Only the first rule
+    /// that routes the request counts, as for the client: when it is a socks proxy, the 407
+    /// came from the origin server behind it.
     pub(crate) fn plain_http_proxy(&self, url: &Url) -> Option<Url> {
         if url.scheme() != "http" {
             return None;
         }
         let dst: http::Uri = url.as_str().parse().ok()?;
         match *self {
-            ProxyRoutes::Rules(ref rules) => {
-                rules.iter().find_map(|rule| rule.non_tunnel_proxy(&dst))
-            }
+            ProxyRoutes::Rules(ref rules) => rules
+                .iter()
+                .find(|rule| rule.routes(&dst))?
+                .non_tunnel_proxy(&dst),
             ProxyRoutes::System(ref matcher) => {
                 let intercept = matcher.intercept(&dst)?;
                 if !matches!(intercept.uri().scheme_str(), Some("http") | Some("https")) {
@@ -884,6 +887,17 @@ mod tests {
         let socks = ProxyRoutes::Rules(vec![ProxyRule::all("socks5://proxy.test:1080")]);
         assert_eq!(
             socks.plain_http_proxy(&Url::parse("http://example.test/").unwrap()),
+            None
+        );
+
+        // A socks rule first: the client connects through it, so the http rule after it is
+        // not the proxy, and a 407 is the origin's.
+        let socks_first = ProxyRoutes::Rules(vec![
+            ProxyRule::all("socks5h://proxy.test:1080"),
+            ProxyRule::all("http://proxy.test:3128"),
+        ]);
+        assert_eq!(
+            socks_first.plain_http_proxy(&Url::parse("http://example.test/").unwrap()),
             None
         );
         assert_eq!(
