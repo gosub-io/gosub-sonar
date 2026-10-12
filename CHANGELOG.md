@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `RequestChange::HeadersRemoved`: headers the caller set that were not sent, reported once on
+  the first hop. `RequestChange` is `#[non_exhaustive]`, so this needs no new `match` arm
+
+### Changed
+
+- **Breaking:** `BlockReason` gained `ForbiddenMethod`, so an exhaustive `match` on it outside
+  this crate needs an arm for it. `cors::is_forbidden_method` exposes the rule
+
+- The default `Accept` is the value Fetch §4.1 gives for each destination. Images send
+  `image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5` instead of a list naming AVIF first, a
+  format the engine does not decode, so a server negotiating on it sent images that could not
+  be shown. `json` sends `application/json,*/*;q=0.5` instead of `*/*`, and `object` and
+  `embed` send `*/*` instead of the document value
+- The fetcher always resolves through a `DnsResolver`: the one configured, or `SystemResolver`,
+  which looks names up as before. `NetEvent::DnsResolved` is now emitted without a resolver of
+  the embedder's too
+
+### Fixed
+
+- A request with an initiating origin carried the caller's forbidden request-headers (Fetch
+  §2.2.2): a hand-set `Cookie` under `credentials: omit`, a `Host` naming another site,
+  `Sec-*` and `Proxy-*` headers, an `X-HTTP-Method-Override: TRACE`. The CORS rules skip these
+  names as the fetcher's own, so they reached cross-origin servers without a preflight. They
+  are removed before the first hop now and reported as `RequestChange::HeadersRemoved`;
+  `cors::is_forbidden_request_header_value` exposes the rule. A request without an origin is
+  the embedder's own and keeps them
+- A `101 Switching Protocols` to a request that asked for no upgrade was handed on as the
+  final response, with a connection that now spoke something else. It is a network error now
+  (`NetError::Other`), as Fetch §4.7 makes it; a WebSocket handshake or a request with its own
+  `Upgrade` still gets its `101`
+- A request with `Range` advertised `gzip, br, deflate`, so a server could answer with a
+  range of the compressed bytes. It asks for `identity` now (Fetch §4.6), appended to an
+  `Accept-Encoding` the caller set
+- Header values went out with the spaces and tabs a caller left around them. A field value has
+  none (RFC 9110 §5.5), and over HTTP/2 a value with any is a malformed request (RFC 9113
+  §8.2.1) that a strict server resets. Every value is trimmed now, as Fetch normalizes one
+- A request with an initiating origin could use `CONNECT`, `TRACE` or `TRACK`, which Fetch
+  forbids web content (§2.2.1); `TRACE` echoes the request back, cookies included. Such a
+  request is refused with `BlockReason::ForbiddenMethod` before anything is sent. A request
+  without an origin is the embedder's own and still goes out
+- A caller's `Content-Length` was sent instead of the body's: a smaller one cut the body short
+  (the rest of it was lost and the fetch reported success), a larger one left the server
+  waiting for bytes that never came. `Content-Length` and `Transfer-Encoding` are now always
+  worked out from the body (RFC 9112 §6), and a caller's are dropped with a
+  `RequestChange::HeadersRemoved`
+- A POST or PUT without a body went out without `Content-Length`, which strict servers answer
+  with `411`. It sends `Content-Length: 0` now (Fetch §4.6, RFC 9110 §8.6)
+- Methods were sent as written: `get` went out as `get`, and every check that compares against
+  `GET`, `POST` and the rest missed it, the cache key and cache invalidation, the CORS
+  safelist and the redirect rules among them. `DELETE`, `GET`, `HEAD`, `OPTIONS`, `POST` and
+  `PUT` in any case are uppercased now (Fetch §2.2.1); other methods are left as they are
+- `FetcherConfig::connect_timeout` said it timed the TCP and TLS handshakes. It also covers
+  name resolution, and is split evenly across the addresses of one family, which are tried in
+  turn. The docs say so now, along with the deviation from RFC 8305 that follows: an address
+  that never answers holds the next one back for its share of the budget, not for 250 ms
+- The `PublicOnly` resolver in the `dns` module docs, the SSRF policy an embedder would start
+  from, let `[::ffff:127.0.0.1]` through: Rust's IPv6 checks do not look inside an
+  IPv4-mapped address. It judges one as the IPv4 address it is (RFC 4291 §2.5.5.2) now, and
+  refuses the unspecified address and IPv6 link-local too
+- `localhost` and the names under it (`app.localhost`, with or without a trailing dot) were
+  looked up through the configured resolver or the system's, which could answer with any
+  address, while the mixed content and referrer rules already took them for loopback. They
+  connect to `::1` and `127.0.0.1` now without a lookup (Fetch, resolve an origin). A
+  configured resolver is asked about each of the two addresses and can still refuse them
+
 ## [0.13.0] - 2026-10-12
 
 ### Added

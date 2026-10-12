@@ -73,6 +73,57 @@ pub(crate) fn blocked(
     NetError::Blocked { reason, url }
 }
 
+/// `headers` with leading and trailing whitespace taken off every value (Fetch, normalize a
+/// header value). A field value has none (RFC 9110 §5.5), and over HTTP/2 a value with any is
+/// a malformed request (RFC 9113 §8.2.1) that a server resets.
+fn trimmed_values(headers: HeaderMap) -> HeaderMap {
+    let is_ws = |b: &u8| matches!(b, b' ' | b'\t');
+    let mut out = HeaderMap::with_capacity(headers.len());
+    let mut name = None;
+    for (n, value) in headers {
+        if let Some(n) = n {
+            name = Some(n);
+        }
+        let Some(ref name) = name else { continue };
+        let bytes = value.as_bytes();
+        let start = bytes.iter().position(|b| !is_ws(b)).unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !is_ws(b))
+            .map_or(start, |i| i + 1);
+        let value = if start == 0 && end == bytes.len() {
+            value
+        } else {
+            match header::HeaderValue::from_bytes(&bytes[start..end]) {
+                Ok(mut trimmed) => {
+                    trimmed.set_sensitive(value.is_sensitive());
+                    trimmed
+                }
+                Err(_) => value,
+            }
+        };
+        out.append(name.clone(), value);
+    }
+    out
+}
+
+/// `method` normalized (Fetch §2.2.1): a byte-case-insensitive `DELETE`, `GET`, `HEAD`,
+/// `OPTIONS`, `POST` or `PUT` is uppercased, any other method is left as it is. Every check in
+/// this crate that compares against [`Method::GET`] and the rest relies on it.
+pub(crate) fn normalize_method(method: Method) -> Method {
+    [
+        Method::DELETE,
+        Method::GET,
+        Method::HEAD,
+        Method::OPTIONS,
+        Method::POST,
+        Method::PUT,
+    ]
+    .into_iter()
+    .find(|m| m.as_str().eq_ignore_ascii_case(method.as_str()))
+    .unwrap_or(method)
+}
+
 /// Remove the `user:password@` from `url`. Returns whether there was one, so the caller can
 /// report [`RequestChange::UrlCredentialsRemoved`]. The client would turn embedded credentials
 /// into an `Authorization` header, which lets a page or a redirect send credentials of its
@@ -1737,13 +1788,66 @@ async fn get_with_redirects(
     policy: NetPolicy,
 ) -> Result<ChainOutcome, NetError> {
     let mut url = url;
-    let mut current_method = init.method;
+    let mut current_method = normalize_method(init.method);
     // Where the chain has been: every hop's URL before the current one (Fetch, request's URL
     // list), for the cookie hook to judge `SameSite` across the chain.
     let mut url_list: Vec<Url> = Vec::new();
-    let mut current_headers = init.headers;
+    let mut current_headers = trimmed_values(init.headers);
     let mut current_body = init.body;
     let origin = init.origin;
+    // The message framing is the body's (RFC 9112 §6): a caller's `Content-Length` that does
+    // not match it cuts the body short or leaves the server waiting for bytes that never come,
+    // and a `Transfer-Encoding` would contradict the one the connection picks. Web content
+    // may not set any forbidden request-header (Fetch §2.2.2): those are the user agent's,
+    // and the CORS rules below take that for granted.
+    let mut removed: Vec<header::HeaderName> = Vec::new();
+    for name in current_headers.keys() {
+        let forbidden = origin.is_some()
+            && current_headers
+                .get_all(name)
+                .iter()
+                .any(|value| cors::is_forbidden_request_header_value(name, value));
+        let framing = *name == header::CONTENT_LENGTH || *name == header::TRANSFER_ENCODING;
+        if forbidden || framing {
+            removed.push(name.clone());
+        }
+    }
+    for name in &removed {
+        current_headers.remove(name);
+    }
+    if !removed.is_empty() {
+        modified(
+            &observer,
+            &url,
+            RequestChange::HeadersRemoved { headers: removed },
+        );
+    }
+    // Set here rather than left to the client, which would add it while executing the request,
+    // after `RequestSent` was reported. Matches what `build_client` enables for a decoding
+    // client; a caller that asked for raw bytes advertises nothing it cannot decode.
+    //
+    // A range counts bytes of the representation as it is sent, so a ranged request asks for
+    // it unencoded (Fetch §4.6), appended to a value the caller set itself.
+    if current_headers.contains_key(header::RANGE) {
+        current_headers.append(
+            header::ACCEPT_ENCODING,
+            header::HeaderValue::from_static("identity"),
+        );
+    } else if !current_headers.contains_key(header::ACCEPT_ENCODING) {
+        current_headers.insert(
+            header::ACCEPT_ENCODING,
+            header::HeaderValue::from_static(if init.auto_decode {
+                "gzip, br, deflate"
+            } else {
+                "identity"
+            }),
+        );
+    }
+    // Web content may not send these (Fetch §2.2.1). A request without an origin is the
+    // embedder's own and may.
+    if origin.is_some() && cors::is_forbidden_method(&current_method) {
+        return Err(blocked(&observer, url, BlockReason::ForbiddenMethod));
+    }
     // A redirect may replace this for the remaining hops (Fetch, HTTP-redirect fetch).
     let mut referrer_policy = init.referrer_policy;
     // The request's referrer as the chain has left it (Fetch, main fetch step 9): each hop
@@ -2322,11 +2426,13 @@ async fn get_with_redirects(
                     // holding a header map, and so below anything that could report it. A
                     // stream needs it regardless, being unsized as far as the client knows.
                     if let Some(len) = explicit_len {
-                        if !current_headers.contains_key(header::CONTENT_LENGTH) {
-                            req_builder = req_builder.header(header::CONTENT_LENGTH, len);
-                        }
+                        req_builder = req_builder.header(header::CONTENT_LENGTH, len);
                     }
                     req_builder = req_builder.body(hop_body);
+                } else if current_method == Method::POST || current_method == Method::PUT {
+                    // Fetch §4.6: a POST or PUT without a body says so, which strict servers
+                    // require (RFC 9110 §8.6) and the connection would not add.
+                    req_builder = req_builder.header(header::CONTENT_LENGTH, 0);
                 }
                 // Built rather than sent straight away, so what is reported is the request the
                 // client assembled rather than the arguments it was handed.
@@ -2425,6 +2531,18 @@ async fn get_with_redirects(
                     status: resp.status().as_u16(),
                     headers: resp.headers().clone(),
                 });
+
+                // A `101` is a final response only to a WebSocket handshake (Fetch §4.7,
+                // HTTP-network fetch) or a request that asked for an upgrade itself. Any other is
+                // a protocol switch nothing here speaks, not a response to hand on.
+                if resp.status() == http::StatusCode::SWITCHING_PROTOCOLS
+                    && init.mode != RequestMode::Websocket
+                    && !current_headers.contains_key(header::UPGRADE)
+                {
+                    return Err(NetError::Other(Arc::new(anyhow!(
+                        "{url}: 101 Switching Protocols to a request that asked for no upgrade"
+                    ))));
+                }
 
                 // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
                 // a site first arms it, and that response is consumed below.
@@ -7154,6 +7272,396 @@ mod tests {
 
         fn changes(rec: &RecordingObserver) -> Vec<RequestChange> {
             rec.modifications().into_iter().map(|(_, c)| c).collect()
+        }
+
+        /// Leading and trailing whitespace is taken off every header value (Fetch, normalize);
+        /// whitespace inside a value stays, and so does every value of a repeated header.
+        #[tokio::test(flavor = "current_thread")]
+        async fn header_values_are_trimmed() {
+            let srv = TestServer::new()
+                .default_route(RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let mut headers = HeaderMap::new();
+            headers.insert("x-a", "\t v w \t".parse().unwrap());
+            headers.append("x-b", " one".parse().unwrap());
+            headers.append("x-b", "two ".parse().unwrap());
+            let rec = recorded(
+                client(),
+                srv.url("/"),
+                RequestInit::get(headers),
+                NetPolicy::default(),
+            )
+            .await;
+            let sent = rec.requests_sent().pop().unwrap().2;
+            assert_eq!(sent.get("x-a").unwrap(), "v w");
+            let b: Vec<_> = sent.get_all("x-b").iter().collect();
+            assert_eq!(b, ["one", "two"]);
+        }
+
+        /// The header a hop sent under `name`, as a string.
+        fn sent_header(rec: &RecordingObserver, name: &str) -> Option<String> {
+            rec.requests_sent()
+                .pop()
+                .unwrap()
+                .2
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+        }
+
+        /// `Accept-Encoding` is the fetcher's: what a decoding client can decode, `identity`
+        /// for a caller that wants the bytes as they come, and a caller's own value left alone
+        /// when the request is not web content.
+        #[tokio::test(flavor = "current_thread")]
+        async fn accept_encoding_is_set_by_the_fetcher() {
+            let srv = TestServer::new()
+                .default_route(RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let rec = recorded(
+                client(),
+                srv.url("/"),
+                RequestInit::get(HeaderMap::new()),
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(
+                sent_header(&rec, "accept-encoding").as_deref(),
+                Some("gzip, br, deflate")
+            );
+
+            let raw = RequestInit::get(HeaderMap::new()).with_cache(CacheMode::Default, false);
+            let rec = recorded(client(), srv.url("/"), raw, NetPolicy::default()).await;
+            assert_eq!(
+                sent_header(&rec, "accept-encoding").as_deref(),
+                Some("identity")
+            );
+
+            let mut own = HeaderMap::new();
+            own.insert(header::ACCEPT_ENCODING, "zstd".parse().unwrap());
+            let rec = recorded(
+                client(),
+                srv.url("/"),
+                RequestInit::get(own),
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(
+                sent_header(&rec, "accept-encoding").as_deref(),
+                Some("zstd")
+            );
+        }
+
+        /// A `101` nobody asked for is a network error, not the response (Fetch §4.7).
+        #[tokio::test(flavor = "current_thread")]
+        async fn an_unsolicited_101_is_a_network_error() {
+            let srv = TestServer::new()
+                .route("/switch", RouteConfig::status(101, b""))
+                .start()
+                .await;
+            let res = super::super::fetch_response_complete(
+                client(),
+                srv.url("/switch"),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(3),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await;
+            assert!(matches!(res, Err(NetError::Other(_))), "{res:?}");
+        }
+
+        /// A request with `Range` asks for the representation unencoded (Fetch §4.6), and a
+        /// caller's own `Accept-Encoding` gets `identity` appended.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_range_request_asks_for_identity() {
+            let srv = TestServer::new()
+                .default_route(RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let mut ranged = HeaderMap::new();
+            ranged.insert(header::RANGE, "bytes=0-9".parse().unwrap());
+            let rec = recorded(
+                client(),
+                srv.url("/"),
+                RequestInit::get(ranged.clone()),
+                NetPolicy::default(),
+            )
+            .await;
+            let sent = rec.requests_sent().pop().unwrap().2;
+            let values: Vec<_> = sent.get_all(header::ACCEPT_ENCODING).iter().collect();
+            assert_eq!(values, ["identity"]);
+
+            ranged.insert(header::ACCEPT_ENCODING, "zstd".parse().unwrap());
+            let rec = recorded(
+                client(),
+                srv.url("/"),
+                RequestInit::get(ranged),
+                NetPolicy::default(),
+            )
+            .await;
+            let sent = rec.requests_sent().pop().unwrap().2;
+            let values: Vec<_> = sent.get_all(header::ACCEPT_ENCODING).iter().collect();
+            assert_eq!(values, ["zstd", "identity"]);
+        }
+
+        /// Web content may not set a forbidden request-header (Fetch §2.2.2): on a request with
+        /// an initiating origin they are removed and reported, a method override naming a
+        /// forbidden method included. Other headers stay. Without an origin the request is the
+        /// embedder's, and its headers go out.
+        #[tokio::test(flavor = "current_thread")]
+        async fn forbidden_headers_are_removed_from_web_content() {
+            let srv = TestServer::new()
+                .route("/headers", RouteConfig::echo_request_headers())
+                .start()
+                .await;
+            let headers = |override_method: &str| {
+                let mut h = HeaderMap::new();
+                h.insert(header::COOKIE, "session=stolen".parse().unwrap());
+                h.insert(header::HOST, "evil.example".parse().unwrap());
+                h.insert(header::ACCEPT_ENCODING, "zstd".parse().unwrap());
+                h.insert("sec-purpose", "prefetch".parse().unwrap());
+                h.insert("proxy-x", "1".parse().unwrap());
+                h.insert("x-http-method-override", override_method.parse().unwrap());
+                h.insert(header::AUTHORIZATION, "Bearer t".parse().unwrap());
+                h
+            };
+            let origin = Some(srv.url("/").origin());
+
+            let init = RequestInit::get(headers("GET, trace"))
+                .with_mixed_content(origin.clone(), MixedContentPolicy::default());
+            let rec = Arc::new(RecordingObserver::new());
+            let (_, echoed) = super::super::fetch_response_complete(
+                client(),
+                srv.url("/headers"),
+                init,
+                CancellationToken::new(),
+                rec.clone(),
+                None,
+                Duration::from_secs(3),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            let mut removed = match changes(&rec).as_slice() {
+                [RequestChange::HeadersRemoved { headers }] => headers.clone(),
+                other => panic!("{other:?}"),
+            };
+            removed.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            assert_eq!(
+                removed,
+                vec![
+                    header::ACCEPT_ENCODING,
+                    header::COOKIE,
+                    header::HOST,
+                    header::HeaderName::from_static("proxy-x"),
+                    header::HeaderName::from_static("sec-purpose"),
+                    header::HeaderName::from_static("x-http-method-override"),
+                ]
+            );
+            let echoed = String::from_utf8_lossy(&echoed).to_ascii_lowercase();
+            for gone in [
+                "session=stolen",
+                "evil.example",
+                "zstd",
+                "sec-purpose",
+                "proxy-x",
+                "x-http-method-override",
+            ] {
+                assert!(!echoed.contains(gone), "{gone} was sent: {echoed}");
+            }
+            assert!(echoed.contains("authorization: bearer t"), "{echoed}");
+            assert!(
+                echoed.contains("accept-encoding: gzip, br, deflate"),
+                "{echoed}"
+            );
+
+            // An override naming an allowed method is not forbidden.
+            let init = RequestInit::get(headers("PATCH"))
+                .with_mixed_content(origin, MixedContentPolicy::default());
+            let rec = recorded(client(), srv.url("/headers"), init, NetPolicy::default()).await;
+            assert_eq!(
+                sent_header(&rec, "x-http-method-override").as_deref(),
+                Some("PATCH")
+            );
+
+            // No origin: the embedder's own request, sent as set.
+            let rec = recorded(
+                client(),
+                srv.url("/headers"),
+                RequestInit::get(headers("TRACE")),
+                NetPolicy::default(),
+            )
+            .await;
+            assert!(changes(&rec).is_empty(), "{:?}", changes(&rec));
+            assert_eq!(
+                sent_header(&rec, "cookie").as_deref(),
+                Some("session=stolen")
+            );
+        }
+
+        /// `CONNECT`, `TRACE` and `TRACK`, in any case, are refused for a request with an
+        /// initiating origin before anything is sent (Fetch §2.2.1). Without an origin the
+        /// request is the embedder's and goes out.
+        #[tokio::test(flavor = "current_thread")]
+        async fn forbidden_methods_are_refused_for_web_content() {
+            let srv = TestServer::new()
+                .default_route(RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            let origin = Some(srv.url("/").origin());
+            for written in ["TRACE", "track", "Connect"] {
+                let method = Method::from_bytes(written.as_bytes()).unwrap();
+                let init = RequestInit::new(method, HeaderMap::new(), None)
+                    .with_mixed_content(origin.clone(), MixedContentPolicy::default());
+                let res = super::super::fetch_response_complete(
+                    client(),
+                    srv.url("/x"),
+                    init,
+                    CancellationToken::new(),
+                    observer(),
+                    None,
+                    Duration::from_secs(3),
+                    Some(Duration::from_secs(5)),
+                    NetPolicy::default(),
+                )
+                .await;
+                assert!(
+                    matches!(
+                        res,
+                        Err(NetError::Blocked {
+                            reason: BlockReason::ForbiddenMethod,
+                            ..
+                        })
+                    ),
+                    "{written}: {res:?}"
+                );
+            }
+            assert_eq!(srv.hit_count("/x"), 0);
+
+            let rec = recorded(
+                client(),
+                srv.url("/y"),
+                RequestInit::new(Method::TRACE, HeaderMap::new(), None),
+                NetPolicy::default(),
+            )
+            .await;
+            assert_eq!(rec.requests_sent().len(), 1);
+            assert_eq!(srv.hit_count("/y"), 1);
+        }
+
+        /// The six methods Fetch normalizes go out uppercased, whatever case the caller wrote
+        /// them in (Fetch §2.2.1); any other method is left alone.
+        #[tokio::test(flavor = "current_thread")]
+        async fn methods_are_normalized() {
+            let srv = TestServer::new()
+                .default_route(RouteConfig::ok(b"x"))
+                .start()
+                .await;
+            for (written, sent) in [
+                ("get", "GET"),
+                ("pOsT", "POST"),
+                ("Delete", "DELETE"),
+                ("patch", "patch"),
+            ] {
+                let method = Method::from_bytes(written.as_bytes()).unwrap();
+                let rec = recorded(
+                    client(),
+                    srv.url("/"),
+                    RequestInit::new(method, HeaderMap::new(), None),
+                    NetPolicy::default(),
+                )
+                .await;
+                assert_eq!(rec.requests_sent().pop().unwrap().0.as_str(), sent);
+            }
+        }
+
+        /// POST and PUT without a body send `Content-Length: 0` (Fetch §4.6); GET sends none.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_post_or_put_without_a_body_sends_content_length_zero() {
+            let srv = TestServer::new()
+                .route("/headers", RouteConfig::echo_request_headers())
+                .start()
+                .await;
+            for (method, expected) in [
+                (Method::POST, Some("0")),
+                (Method::PUT, Some("0")),
+                (Method::GET, None),
+            ] {
+                let rec = recorded(
+                    client(),
+                    srv.url("/headers"),
+                    RequestInit::new(method.clone(), HeaderMap::new(), None),
+                    NetPolicy::default(),
+                )
+                .await;
+                let sent = rec.requests_sent().pop().unwrap().2;
+                assert_eq!(
+                    sent.get(header::CONTENT_LENGTH)
+                        .map(|v| v.to_str().unwrap().to_string())
+                        .as_deref(),
+                    expected,
+                    "{method}"
+                );
+            }
+        }
+
+        /// A caller's `Content-Length` and `Transfer-Encoding` are not sent: the body frames
+        /// the message (RFC 9112 §6). A shorter `Content-Length` would cut the body, so the
+        /// server echoing what it read gets all of it.
+        #[tokio::test(flavor = "current_thread")]
+        async fn framing_headers_come_from_the_body() {
+            let srv = TestServer::new()
+                .route("/echo", RouteConfig::echo_body())
+                .route("/headers", RouteConfig::echo_request_headers())
+                .start()
+                .await;
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_LENGTH, "3".parse().unwrap());
+            let rec = Arc::new(RecordingObserver::new());
+            let (_, echoed) = super::super::fetch_response_complete(
+                client(),
+                srv.url("/echo"),
+                RequestInit::post(headers, b"0123456789".to_vec()),
+                CancellationToken::new(),
+                rec.clone(),
+                None,
+                Duration::from_secs(3),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(&echoed[..], b"0123456789");
+            assert_eq!(
+                changes(&rec),
+                vec![RequestChange::HeadersRemoved {
+                    headers: vec![header::CONTENT_LENGTH],
+                }]
+            );
+
+            let mut headers = HeaderMap::new();
+            headers.insert(header::TRANSFER_ENCODING, "chunked".parse().unwrap());
+            let (_, echoed) = super::super::fetch_response_complete(
+                client(),
+                srv.url("/headers"),
+                RequestInit::post(headers, b"0123456789".to_vec()),
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(3),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            let echoed = String::from_utf8_lossy(&echoed).to_ascii_lowercase();
+            assert!(!echoed.contains("transfer-encoding"), "{echoed}");
+            assert!(echoed.contains("content-length: 10"), "{echoed}");
         }
 
         /// The names of the events from `first` on, with the ones no test here is about

@@ -336,7 +336,9 @@ only, honouring `Retry-After`. Streams are retried until the start of the body (
 in, since nothing has reached the caller before that; a stream that breaks later is not re-sent.
 
 Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enforced by `reqwest`
-(`req_timeout` is reqwest's total request timeout, so it covers the body as well as the headers);
+(`connect_timeout` covers name resolution, TCP and TLS together, and is split evenly across the
+addresses of one family, which are tried in turn; `req_timeout` is reqwest's total request
+timeout, so it covers the body as well as the headers);
 `read_idle_timeout` (max gap between reads) and `total_body_timeout` (whole-body budget) are
 enforced in the read loops of `fetch_response_complete` and the `ProgressReader`/`SharedBody` path;
 `redirect_timeout` (budget for the redirect chain, armed by the first redirect) is enforced in
@@ -460,7 +462,11 @@ set from `FetchRequest::destination`, `::mode` and `Initiator::User`; `Origin` i
 non-GET/HEAD and cross-origin CORS requests. `Sec-Fetch-Site` compares registrable domains (public
 suffix list, `psl` crate) and can only degrade across a chain; `Origin` becomes `null` after a
 tainting cross-origin redirect. The fetcher overwrites hand-set values for these headers, like
-browsers do for forbidden header names.
+browsers do for forbidden header names. On a request with an `origin`, every forbidden
+request-header the caller set (`Cookie`, `Host`, `Accept-Encoding`, `Sec-*`, `Proxy-*`, a method
+override naming `TRACE`, ...) is removed before the first hop and reported as
+`RequestChange::HeadersRemoved`. `Content-Length` and `Transfer-Encoding` always come from the
+body.
 
 On wasm32 all three are inert: the browser follows redirects itself and applies its own policies.
 
