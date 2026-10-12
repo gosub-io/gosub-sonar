@@ -79,6 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A body read to its end that was then cancelled reported `Cancelled` after its `Finished`.
+  The reader reports one end now. A `Fetcher` request was already held to one end by its
+  lifecycle; this is the reader underneath it
 - Two requests that send different `Sec-Fetch-User` headers could share one fetch: the
   coalescing key decided by the request's mode, the header by its destination. A request
   initiated by the user to a navigation destination (`object`, `embed`) in another mode got

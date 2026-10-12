@@ -1336,8 +1336,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
     ) -> std::task::Poll<std::io::Result<()>> {
         // When cancelled, we are directly done
         if self.cancel.is_cancelled() {
-            // Maybe it's already cancelled? Then don't send another cancelled event
-            if !self.cancel_emitted {
+            // Only if the read has not ended already: one end per request.
+            if !self.cancel_emitted && !self.finished_emitted && !self.failed_emitted {
                 self.observer.on_event(NetEvent::Cancelled {
                     url: self.url.clone(),
                     reason: "progress reader cancelled",
@@ -7071,6 +7071,38 @@ mod tests {
             )
             .await;
             rec
+        }
+
+        /// A body read to its end has ended: a cancel that comes after adds no second end.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_cancel_after_the_end_adds_no_second_end() {
+            let srv = TestServer::new()
+                .route("/", RouteConfig::ok(vec![b'y'; 20 * 1024]))
+                .start()
+                .await;
+            let rec = Arc::new(RecordingObserver::new());
+            let cancel = CancellationToken::new();
+            let mut top = super::super::fetch_response_top(
+                client(),
+                srv.url("/"),
+                RequestInit::default(),
+                cancel.clone(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            let mut sink = Vec::new();
+            top.reader.read_to_end(&mut sink).await.unwrap();
+            cancel.cancel();
+            let _ = top.reader.read(&mut [0u8; 16]).await;
+            drop(top);
+            let ends: Vec<_> = rec
+                .event_names()
+                .into_iter()
+                .filter(|n| matches!(n.as_str(), "Finished" | "Failed" | "Cancelled"))
+                .collect();
+            assert_eq!(ends, ["Finished"]);
         }
 
         /// `Progress` counts what reached the caller and never goes back, also where the
