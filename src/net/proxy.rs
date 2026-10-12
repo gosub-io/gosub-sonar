@@ -434,9 +434,10 @@ pub enum ProxyConfig {
     /// one, an empty value counts as unset, and a value without a scheme is an `http` proxy. An
     /// unusable value is skipped with a warning rather than failing the fetcher.
     ///
-    /// Under CGI (`REQUEST_METHOD` is set) the environment is ignored and every request goes
-    /// direct: a CGI server passes a request's `Proxy` header to its program as `HTTP_PROXY`,
-    /// so the client of that server would choose it (httpoxy, CVE-2016-5385).
+    /// Under CGI (`REQUEST_METHOD` is set) `HTTP_PROXY` is ignored: a CGI server passes a
+    /// request's `Proxy` header to its program as `HTTP_PROXY`, so the client of that server
+    /// would choose it (httpoxy, CVE-2016-5385). The others cannot be set that way and still
+    /// count, `http_proxy` included.
     ///
     /// When no variable names a proxy, the operating system's settings are used where there
     /// are any (macOS, Windows), as reqwest reads them.
@@ -479,10 +480,12 @@ fn env_rules(var: &dyn Fn(&str) -> Option<String>) -> Option<Vec<ProxyRule>> {
             .map(|value| value.trim().to_string())
             .find(|value| !value.is_empty())
     };
-    if var("REQUEST_METHOD").is_some() {
-        return Some(Vec::new());
-    }
-    let http = first(&["HTTP_PROXY", "http_proxy"]);
+    let cgi = var("REQUEST_METHOD").is_some();
+    let http = if cgi {
+        first(&["http_proxy"])
+    } else {
+        first(&["HTTP_PROXY", "http_proxy"])
+    };
     let https = first(&["HTTPS_PROXY", "https_proxy"]);
     let all = first(&["ALL_PROXY", "all_proxy"]);
     if http.is_none() && https.is_none() && all.is_none() {
@@ -999,15 +1002,39 @@ mod tests {
     }
 
     /// httpoxy (CVE-2016-5385): under CGI a request's `Proxy` header arrives as `HTTP_PROXY`,
-    /// so the environment is not trusted for a proxy at all.
+    /// so that one is ignored. The other variables cannot be set by a request and still count.
     #[test]
-    fn under_cgi_the_environment_names_no_proxy() {
+    fn under_cgi_only_uppercase_http_proxy_is_ignored() {
+        let url = |s: &str| Url::parse(s).unwrap();
         let cgi = env(&[
             ("REQUEST_METHOD", "GET"),
             ("HTTP_PROXY", "http://evil.test:3128"),
+            ("HTTPS_PROXY", "http://corp.test:3128"),
         ])
         .unwrap();
-        assert!(!cgi.routes_through_proxy(&Url::parse("http://example.com/").unwrap()));
+        assert!(!cgi.routes_through_proxy(&url("http://example.com/")));
+        assert!(cgi.routes_through_proxy(&url("https://example.com/")));
+
+        let lower = env(&[
+            ("REQUEST_METHOD", "GET"),
+            ("HTTP_PROXY", "http://evil.test:3128"),
+            ("http_proxy", "http://corp.test:3128"),
+        ])
+        .unwrap();
+        assert_eq!(
+            via(&lower, "http://example.com/").as_deref(),
+            Some("http://corp.test:3128/")
+        );
+
+        let all = env(&[
+            ("REQUEST_METHOD", "GET"),
+            ("ALL_PROXY", "http://corp.test:3128"),
+        ])
+        .unwrap();
+        assert_eq!(
+            via(&all, "http://example.com/").as_deref(),
+            Some("http://corp.test:3128/")
+        );
     }
 
     #[test]

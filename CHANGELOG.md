@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   would hold, so one `NO_PROXY` string means one thing. The environment is read once per
   `Fetcher`, and the client, the reported `Proxy-Authorization` and the 407 handling all go by
   that one reading; with no proxy variable set, the operating system's settings apply as before
+- Under CGI (`REQUEST_METHOD` set) every proxy variable was ignored. Only `HTTP_PROXY` is now:
+  it is the one a request can set through a CGI server (httpoxy, CVE-2016-5385).
+  `HTTPS_PROXY`, `ALL_PROXY` and `http_proxy` count again, as in Go
 
 ## [0.13.0] - 2026-10-12
 
