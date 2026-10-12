@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waiting for bytes that never came. `Content-Length` and `Transfer-Encoding` are now always
   worked out from the body (RFC 9112 §6), and a caller's are dropped with a
   `RequestChange::HeadersRemoved`
+- A POST or PUT without a body went out without `Content-Length`, which strict servers answer
+  with `411`. It sends `Content-Length: 0` now (Fetch §4.6, RFC 9110 §8.6)
 
 ## [0.13.0] - 2026-10-12
 

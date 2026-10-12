@@ -2334,6 +2334,10 @@ async fn get_with_redirects(
                         req_builder = req_builder.header(header::CONTENT_LENGTH, len);
                     }
                     req_builder = req_builder.body(hop_body);
+                } else if current_method == Method::POST || current_method == Method::PUT {
+                    // Fetch §4.6: a POST or PUT without a body says so, which strict servers
+                    // require (RFC 9110 §8.6) and the connection would not add.
+                    req_builder = req_builder.header(header::CONTENT_LENGTH, 0);
                 }
                 // Built rather than sent straight away, so what is reported is the request the
                 // client assembled rather than the arguments it was handed.
@@ -7082,6 +7086,36 @@ mod tests {
 
         fn changes(rec: &RecordingObserver) -> Vec<RequestChange> {
             rec.modifications().into_iter().map(|(_, c)| c).collect()
+        }
+
+        /// POST and PUT without a body send `Content-Length: 0` (Fetch §4.6); GET sends none.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_post_or_put_without_a_body_sends_content_length_zero() {
+            let srv = TestServer::new()
+                .route("/headers", RouteConfig::echo_request_headers())
+                .start()
+                .await;
+            for (method, expected) in [
+                (Method::POST, Some("0")),
+                (Method::PUT, Some("0")),
+                (Method::GET, None),
+            ] {
+                let rec = recorded(
+                    client(),
+                    srv.url("/headers"),
+                    RequestInit::new(method.clone(), HeaderMap::new(), None),
+                    NetPolicy::default(),
+                )
+                .await;
+                let sent = rec.requests_sent().pop().unwrap().2;
+                assert_eq!(
+                    sent.get(header::CONTENT_LENGTH)
+                        .map(|v| v.to_str().unwrap().to_string())
+                        .as_deref(),
+                    expected,
+                    "{method}"
+                );
+            }
         }
 
         /// A caller's `Content-Length` and `Transfer-Encoding` are not sent: the body frames
