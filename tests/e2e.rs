@@ -850,7 +850,7 @@ async fn accept_is_shaped_by_the_destination() {
         ),
         (
             RequestDestination::Image,
-            "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8",
+            "image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5",
         ),
         (RequestDestination::Style, "text/css,*/*;q=0.1"),
         (RequestDestination::Script, "*/*"),

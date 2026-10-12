@@ -78,8 +78,9 @@ The `FetcherContext` trait (`src/net/fetcher_context.rs`) is how the fetcher rea
 environment without depending on any particular engine. It provides:
 
 - `observer_for(...)` — hands back a `NetObserver` used to emit `NetEvent`s for a request.
-- `on_ref_active` / `on_ref_done` — lifecycle callbacks fired when a unique fetch becomes active
-  and when its last subscriber is done, so the embedder can track outstanding work.
+- `on_ref_active` / `on_ref_done` — lifecycle callbacks fired for every request as it is
+  accepted and as it ends, a coalesced one included, so the embedder can track outstanding work
+  per reference.
 - `is_url_allowed(url)` — a policy hook (SSRF guards, allow/block lists) consulted for the initial
   URL and every redirect target.
 

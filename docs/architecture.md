@@ -194,11 +194,11 @@ End to end, a fetch through the scheduler goes:
    buffer for buffered listeners (see [coalescing](#coalescing--fan-out)).
 
 7. **Cleanup.** The entry's `done` token fires and it is removed from `inflight_map`. A
-   buffered fetch then calls `FetcherContext::on_ref_done`, and its slots are released as the
-   spawned task ends. A streamed fetch hands both to the body reader instead: the slots come
-   back and `on_ref_done` is called when the body ends, fails, or nobody can read it any more
-   (every handle to the `SharedBody` and every stream from it dropped), which can be well
-   after the task ended.
+   buffered fetch's slots are released as the spawned task ends. A streamed fetch hands them to
+   the body reader instead, and they come back when the body ends, fails, or nobody can read it
+   any more (every handle to the `SharedBody` and every stream from it dropped), which can be
+   well after the task ended. `FetcherContext::on_ref_done` is per request, not per fetch: each
+   request's lifecycle calls it as the request ends (`net::lifecycle`).
 
 ---
 
@@ -336,7 +336,9 @@ only, honouring `Retry-After`. Streams are retried until the start of the body (
 in, since nothing has reached the caller before that; a stream that breaks later is not re-sent.
 
 Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enforced by `reqwest`
-(`req_timeout` is reqwest's total request timeout, so it covers the body as well as the headers);
+(`connect_timeout` covers name resolution, TCP and TLS together, and is split evenly across the
+addresses of one family, which are tried in turn; `req_timeout` is reqwest's total request
+timeout, so it covers the body as well as the headers);
 `read_idle_timeout` (max gap between reads) and `total_body_timeout` (whole-body budget) are
 enforced in the read loops of `fetch_response_complete` and the `ProgressReader`/`SharedBody` path;
 `redirect_timeout` (budget for the redirect chain, armed by the first redirect) is enforced in
@@ -461,7 +463,11 @@ set from `FetchRequest::destination`, `::mode` and `Initiator::User`; `Origin` i
 non-GET/HEAD and cross-origin CORS requests. `Sec-Fetch-Site` compares registrable domains (public
 suffix list, `psl` crate) and can only degrade across a chain; `Origin` becomes `null` after a
 tainting cross-origin redirect. The fetcher overwrites hand-set values for these headers, like
-browsers do for forbidden header names.
+browsers do for forbidden header names. On a request with an `origin`, every forbidden
+request-header the caller set (`Cookie`, `Host`, `Accept-Encoding`, `Sec-*`, `Proxy-*`, a method
+override naming `TRACE`, ...) is removed before the first hop and reported as
+`RequestChange::HeadersRemoved`. `Content-Length` and `Transfer-Encoding` always come from the
+body.
 
 On wasm32 all three are inert: the browser follows redirects itself and applies its own policies.
 
@@ -654,8 +660,8 @@ Two traits decouple the net stack from the host's event system:
 ### NetObserver
 
 `NetObserver::on_event(&self, ev: NetEvent)` receives lifecycle events. `NetEvent` variants:
-`Started`, `RequestSent`, `Redirected`, `ResponseHeaders`, `Progress`, `BodyPreview`,
-`Finished`, `Failed`, `Cancelled`, `Blocked`, `TlsFailed`, `SecurityUpgraded`,
+`Accepted`, `Started`, `RequestSent`, `Redirected`, `ResponseHeaders`, `Progress`, `BodyPreview`,
+`Finished`, `Failed`, `Cancelled`, `Retrying`, `Blocked`, `TlsFailed`, `SecurityUpgraded`,
 `RequestModified`, `CorsPreflight`, `CorsPreflightDone`, `AuthRequired`, `Cache`, `DnsResolved`,
 `Connected`, `Warning`, `Io`. `NullEmitter` is a no-op implementation for callers that don't care.
 
@@ -668,11 +674,20 @@ stripped on a cross-origin redirect, and a method changed by a redirect. `Upgrad
 `RequestChange` are `#[non_exhaustive]`. A hop's changes come before its `RequestSent`. Changes
 made while following a redirect come right after its `Redirected`. A hop nothing changed reports
 nothing. A refused hop is `Blocked`, never one of these. The `Sec-Fetch-*` headers are always
-computed rather than changed, so they only show in `RequestSent`. Only the observer of the request
-that leads a coalesced fetch gets events. Followers get its result and no events.
+computed rather than changed, so they only show in `RequestSent`. Coalesced requests each report
+their own lifecycle (`net::lifecycle`): every one opens with `Accepted` (`joined` for a follower)
+and ends once, with its own `Cancelled` when its caller cancels. The request that started the
+fetch reports everything the fetch does; a follower gets only the shared `Progress` and the end.
 
 `NetEvent` is `#[non_exhaustive]`: a `match` over it needs a catch-all arm, and new events can
 be added without a breaking release.
+
+**Lifecycle.** A request taken by the `Fetcher` opens with `Accepted` and ends once
+(`net::lifecycle`), whatever path it takes. One refused before it was sent is `Accepted`,
+`Blocked`, `Failed`; one cancelled while it waited for a slot is `Accepted`, `Cancelled`. Each
+attempt that goes out reports `Started`, so a retried request has one per attempt, with
+`Retrying` between them; only the last attempt's end is reported. `FetcherContext::on_ref_active`
+and `on_ref_done` bracket the same span, per request.
 
 **Terminal events.** Every request ends in exactly one of `Finished`, `Failed`, or `Cancelled`,
 including one whose body reader is dropped before end-of-stream. Which of the two that reports
@@ -759,8 +774,8 @@ Implemented by the host and passed to `Fetcher::new`. The bridge between schedul
 
 - `observer_for(reference, req_id, kind, initiator)` — returns the `NetObserver` for a given
   request (lets the host route events per tab/resource).
-- `on_ref_active` / `on_ref_done` — fired when a unique fetch becomes active and when its last
-  subscriber finishes (outstanding-work tracking).
+- `on_ref_active` / `on_ref_done` — fired for every request, a coalesced one included, as it
+  is accepted and as it ends (outstanding-work tracking per reference).
 - `is_url_allowed(url)` — URL policy hook (default: allow all).
 - `cookies_for(reference, url)` — returns the `Cookie` header value for a request hop (default:
   none), wired into `NetPolicy::cookies_for`. `reference` is the request's, so a host with a jar

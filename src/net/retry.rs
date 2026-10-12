@@ -8,14 +8,20 @@
 //! A streamed response is retried until the start of its body is in: the headers and the first
 //! few kilobytes read to sniff the content (the peek). Nothing has reached the caller before
 //! that, so a connection that breaks there is still recovered; after it the body belongs to the
-//! caller. A buffered fetch is retried as a whole. Each attempt emits its own events, plus
-//! [`NetEvent::Retrying`] before every wait, so a stream retried during its peek shows its
-//! headers once per attempt with a `Retrying` in between.
+//! caller. A buffered fetch is retried as a whole.
+//!
+//! The request still ends once: an attempt that is retried does not report its end. Each
+//! attempt reports its own `Started`, `RequestSent`, headers and progress, and
+//! [`NetEvent::Retrying`] comes before every wait, naming why the attempt before it failed. Only
+//! the last attempt's `Finished`, `Failed` or `Cancelled` is reported.
 use crate::net::events::NetEvent;
+use crate::net::observer::NetObserver;
 use crate::net::transport::TransportErrorKind;
 use crate::net::types::NetError;
 use http::{header, HeaderMap};
 use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// When and how often a failed request is re-sent.
@@ -117,43 +123,109 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 
 /// Runs `attempt` until its result is not retryable or the policy is exhausted. `meta` gives
 /// the status and headers of a completed attempt (a 503 is a success to the transport).
+/// One attempt's view of the request's observer: everything passes, except the attempt's end,
+/// which is held until [`with_retries`] knows whether the attempt is the last one. A retried
+/// attempt's end is dropped with the view; the last attempt's is passed on, and so is anything
+/// it reports later (the end of a streamed body).
+struct AttemptView {
+    inner: Arc<dyn NetObserver + Send + Sync>,
+    held: Mutex<Option<NetEvent>>,
+    last: AtomicBool,
+}
+
+impl AttemptView {
+    fn new(inner: Arc<dyn NetObserver + Send + Sync>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            held: Mutex::new(None),
+            last: AtomicBool::new(false),
+        })
+    }
+
+    /// This attempt is the last: pass on its end, now or when it comes.
+    fn release(&self) {
+        let held = {
+            let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+            self.last.store(true, Ordering::Release);
+            held.take()
+        };
+        if let Some(ev) = held {
+            self.inner.on_event(ev);
+        }
+    }
+}
+
+impl NetObserver for AttemptView {
+    fn on_event(&self, ev: NetEvent) {
+        if ev.is_terminal() && !self.last.load(Ordering::Acquire) {
+            let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+            if !self.last.load(Ordering::Acquire) {
+                *held = Some(ev);
+                return;
+            }
+        }
+        self.inner.on_event(ev);
+    }
+
+    fn body_capture_limit(
+        &self,
+        headers: &HeaderMap,
+        content_length: Option<u64>,
+    ) -> Option<usize> {
+        self.inner.body_capture_limit(headers, content_length)
+    }
+}
+
+/// Run `attempt` until it succeeds, fails for good, or the policy runs out, handing each try
+/// an observer that reports only the last attempt's end (see the module docs).
 pub(crate) async fn with_retries<T, F, Fut>(
     policy: Option<&RetryPolicy>,
     method: &http::Method,
     url: &url::Url,
     cancel: &tokio_util::sync::CancellationToken,
-    observer: &std::sync::Arc<dyn crate::net::observer::NetObserver + Send + Sync>,
+    observer: &Arc<dyn NetObserver + Send + Sync>,
     mut attempt: F,
     meta: impl Fn(&T) -> (u16, &HeaderMap),
 ) -> Result<T, NetError>
 where
-    F: FnMut() -> Fut,
+    F: FnMut(Arc<dyn NetObserver + Send + Sync>) -> Fut,
     Fut: std::future::Future<Output = Result<T, NetError>>,
 {
     let Some(policy) = policy.filter(|_| method.is_idempotent()) else {
-        return attempt().await;
+        return attempt(observer.clone()).await;
     };
     let mut retries = 0;
     loop {
-        let result = attempt().await;
+        let view = AttemptView::new(observer.clone());
+        let result = attempt(view.clone()).await;
         let (reason, asked) = match &result {
             Ok(t) => {
                 let (status, headers) = meta(t);
                 if !policy.retries_status(status) {
+                    view.release();
                     return result;
                 }
                 (format!("status {status}"), retry_after(headers))
             }
             Err(e) if policy.retries_error(e) => (e.to_string(), None),
-            Err(_) => return result,
+            Err(_) => {
+                view.release();
+                return result;
+            }
         };
         if retries >= policy.max_retries {
+            view.release();
             return result;
         }
         retries += 1;
         let Some(delay) = policy.backoff(retries, asked) else {
+            view.release();
             return result;
         };
+        // The attempt is over and retried: its end is not the request's. A streamed response
+        // being dropped here reports its cancel to the view, which drops it too.
+        drop(result);
+        drop(view);
         observer.on_event(NetEvent::Retrying {
             url: url.clone(),
             attempt: retries,

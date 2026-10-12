@@ -17,13 +17,21 @@
 //! Through an HTTP proxy, or a `socks4a`/`socks5h` one, the proxy resolves the target and
 //! the resolver only sees the proxy's host.
 //!
+//! `localhost` and every name under it (`app.localhost`, with or without a trailing dot) are
+//! never looked up: they are `::1` and `127.0.0.1` (Fetch, resolve an origin, step 2), which
+//! the fetcher's mixed content and referrer rules already take them for. The resolver is
+//! still asked about each of those two literals, as for an IP-literal host: `Err` refuses the
+//! hop, and the returned addresses are ignored, so a policy that refuses loopback keeps
+//! refusing `localhost` while no lookup can send it elsewhere.
+//!
 //! ```no_run
 //! use std::net::SocketAddr;
 //! use std::sync::Arc;
 //! use gosub_sonar::net::dns::{DnsResolver, Resolving};
 //! use gosub_sonar::FetcherConfig;
 //!
-//! /// Resolves through the system resolver but refuses loopback and private ranges.
+//! /// Resolves through the system resolver but refuses loopback, private and link-local
+//! /// ranges, and the unspecified address, which reaches the local host too.
 //! struct PublicOnly;
 //!
 //! impl DnsResolver for PublicOnly {
@@ -32,11 +40,21 @@
 //!         Box::pin(async move {
 //!             let addrs: Vec<SocketAddr> =
 //!                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+//!             let v4_internal = |v4: std::net::Ipv4Addr| {
+//!                 v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+//!             };
 //!             let internal = |ip: std::net::IpAddr| match ip {
-//!                 std::net::IpAddr::V4(v4) => {
-//!                     v4.is_loopback() || v4.is_private() || v4.is_link_local()
-//!                 }
-//!                 std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
+//!                 std::net::IpAddr::V4(v4) => v4_internal(v4),
+//!                 // `::ffff:127.0.0.1` is 127.0.0.1 (RFC 4291 §2.5.5.2): judge it as one.
+//!                 std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+//!                     Some(v4) => v4_internal(v4),
+//!                     None => {
+//!                         v6.is_loopback()
+//!                             || v6.is_unique_local()
+//!                             || v6.is_unicast_link_local()
+//!                             || v6.is_unspecified()
+//!                     }
+//!                 },
 //!             };
 //!             if addrs.iter().any(|a| internal(a.ip())) {
 //!                 return Err(format!("{host} resolves to an internal address").into());
@@ -93,8 +111,16 @@ pub trait DnsResolver: Send + Sync {
     fn resolve(&self, host: &str) -> Resolving;
 }
 
+/// Whether `host` is `localhost` or a name under it, with or without one trailing dot.
+pub(crate) fn is_localhost(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let host = host.to_ascii_lowercase();
+    host == "localhost" || host.ends_with(".localhost")
+}
+
 /// Adapts a [`DnsResolver`] to reqwest's `Resolve` trait so the fetcher's client builder
-/// can hand it to `ClientBuilder::dns_resolver`.
+/// can hand it to `ClientBuilder::dns_resolver`. Installed with [`SystemResolver`] when the
+/// embedder configured none, so `localhost` is answered here either way.
 pub(crate) struct ReqwestResolver(pub(crate) Arc<dyn DnsResolver>);
 
 impl reqwest::dns::Resolve for ReqwestResolver {
@@ -102,7 +128,20 @@ impl reqwest::dns::Resolve for ReqwestResolver {
         let resolver = self.0.clone();
         Box::pin(async move {
             let started = std::time::Instant::now();
-            let addrs = resolver.resolve(name.as_str()).await?;
+            let addrs = if is_localhost(name.as_str()) {
+                // Fetch, resolve an origin, step 2: loopback, whatever a lookup would say.
+                // The resolver may still refuse each address, as for an IP-literal host.
+                let loopback: Vec<SocketAddr> = vec![
+                    (std::net::Ipv6Addr::LOCALHOST, 0).into(),
+                    (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                ];
+                for addr in &loopback {
+                    resolver.resolve(&addr.ip().to_string()).await?;
+                }
+                loopback
+            } else {
+                resolver.resolve(name.as_str()).await?
+            };
 
             // Report to whichever request caused this lookup. A pooled connection resolves
             // nothing, so no event is emitted for it and the absence is the answer: that
@@ -210,6 +249,107 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), fetcher.fetch(req))
             .await
             .unwrap()
+    }
+
+    /// Allows every host and records what it was asked.
+    #[derive(Default)]
+    struct Recording {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl DnsResolver for Recording {
+        fn resolve(&self, host: &str) -> Resolving {
+            self.seen.lock().push(host.to_string());
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// `localhost` and the names under it connect to loopback without a lookup (Fetch,
+    /// resolve an origin, step 2); the resolver is only asked about the loopback literals.
+    #[tokio::test(flavor = "current_thread")]
+    async fn localhost_names_are_loopback_without_a_lookup() {
+        let srv = TestServer::new()
+            .route("/x", RouteConfig::ok(b"x"))
+            .start()
+            .await;
+        let port = srv.socket_addr().port();
+        let resolver = Arc::new(Recording::default());
+        let (fetcher, shutdown) = spawn_fetcher(FetcherConfig {
+            dns_resolver: Some(resolver.clone()),
+            retry: None,
+            ..FetcherConfig::default()
+        });
+        for host in ["localhost", "app.localhost", "a.b.LOCALHOST."] {
+            let url = Url::parse(&format!("http://{host}:{port}/x")).unwrap();
+            match fetch(&fetcher, url).await {
+                FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 200, "{host}"),
+                other => panic!("{host}: expected Buffered, got {other:?}"),
+            }
+        }
+        let seen = resolver.seen.lock().clone();
+        assert!(!seen.iter().any(|h| h.contains("localhost")), "{seen:?}");
+        assert!(
+            seen.iter().all(|h| h == "::1" || h == "127.0.0.1"),
+            "{seen:?}"
+        );
+        shutdown.cancel();
+    }
+
+    /// A resolver that refuses loopback refuses `localhost` too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resolver_refusing_loopback_refuses_localhost() {
+        let srv = TestServer::new()
+            .route("/x", RouteConfig::ok(b"x"))
+            .start()
+            .await;
+        let resolver = MapResolver::new(&[]);
+        let (fetcher, shutdown) = spawn_fetcher(config_with(resolver.clone()));
+        let url = Url::parse(&format!("http://localhost:{}/x", srv.socket_addr().port())).unwrap();
+        assert!(
+            matches!(fetch(&fetcher, url).await, FetchResult::Error(_)),
+            "a refused loopback address must refuse localhost"
+        );
+        assert_eq!(srv.hit_count("/x"), 0);
+        shutdown.cancel();
+    }
+
+    /// Without a resolver of the embedder's, a name under `localhost` still reaches loopback,
+    /// whatever the system's resolver knows about it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_localhost_subdomain_is_loopback_without_a_configured_resolver() {
+        let srv = TestServer::new()
+            .route("/x", RouteConfig::ok(b"x"))
+            .start()
+            .await;
+        let (fetcher, shutdown) = spawn_fetcher(FetcherConfig {
+            retry: None,
+            ..FetcherConfig::default()
+        });
+        let url = Url::parse(&format!(
+            "http://sonar-test.localhost:{}/x",
+            srv.socket_addr().port()
+        ))
+        .unwrap();
+        match fetch(&fetcher, url).await {
+            FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 200),
+            other => panic!("expected Buffered, got {other:?}"),
+        }
+        shutdown.cancel();
+    }
+
+    #[test]
+    fn localhost_names() {
+        for host in ["localhost", "localhost.", "a.localhost", "A.LocalHost."] {
+            assert!(is_localhost(host), "{host}");
+        }
+        for host in [
+            "notlocalhost",
+            "localhost.example",
+            "localhost..",
+            "example.com",
+        ] {
+            assert!(!is_localhost(host), "{host}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
