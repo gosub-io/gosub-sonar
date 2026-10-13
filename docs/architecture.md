@@ -208,11 +208,11 @@ Defined in `src/net/types.rs` (and `src/types.rs`):
 
 | Type | Role |
 |------|------|
-| `FetchRequest` | Everything about a request: `url`, `method`, `headers`, `priority`, `streaming`, `auto_decode`, `body`, `max_bytes`, `header_order`, plus correlation fields (`reference`, `req_id`, `kind`, `initiator`). Build via `FetchRequest::builder(method, url)`. `generate_request_key()` derives the **coalescing key** from url/method/headers; it returns `None` for methods other than GET/HEAD, which are never coalesced. |
+| `FetchRequest` | Everything about a request: `url`, `method`, `headers`, `body`, `priority`, `streaming`, `auto_decode`, `max_bytes`, `header_order`; the Fetch fields (`origin`, `mixed_content`, `referrer`, `referrer_policy`, `destination`, `mode`, `credentials`, `cache_mode`); the per-request timeouts and `retry`; plus correlation fields (`reference`, `req_id`, `kind`, `initiator`). Build via `FetchRequest::builder(method, url)`. `generate_request_key()` derives the **coalescing key** from the method, URL, headers and body and every field that changes what a hop sends or accepts, but `header_order`: the order headers go out in does not split the key; it returns `None` for methods other than GET/HEAD and for a streamed body, which are never coalesced. |
 | `FetchResult` | The outcome sent back: `Stream { meta, peek_buf, shared }`, `Buffered { meta, body }`, or `Error(NetError)`. |
-| `FetchResultMeta` | Response metadata: `final_url`, `status`, `status_text`, `headers`, `content_length`, `content_type`, `has_body`. |
+| `FetchResultMeta` | Response metadata: `final_url`, `status`, `status_text`, `headers`, `content_length`, `content_type`, `has_body`, `from_cache`, `tainting` (how much the initiating document may read), `peer_addr` (the address the response came from). |
 | `Priority` | `High` / `Normal` (default) / `Low` / `Idle`. |
-| `ResourceKind`, `Initiator` | Classification tags used only for logging/observers — they do **not** affect scheduling. |
+| `ResourceKind`, `Initiator` | Classification tags handed to `FetcherContext::observer_for`; neither affects scheduling. `Initiator::User` also marks a navigation request as user-activated, which sends `Sec-Fetch-User: ?1` to a potentially trustworthy target and is part of the coalescing key. |
 | `RequestReference` | Opaque host correlation id (`Background(u64)` / `Tagged(u64)`) — lets the host group requests (e.g. per tab) without the net layer knowing what a tab is. |
 | `RequestId` | UUID identifying one logical request chain, stable across redirects. |
 | `RequestBody` | Request payload with a content-type hint (`bytes`/`json`/`form`/`text` constructors). |
@@ -771,10 +771,10 @@ deliberately do not add up to the elapsed total.
 They also report only work that actually happened: a request served from the connection pool
 emits no `DnsResolved` and no `Connected`, and a hop covered by a cached CORS grant emits no
 preflight events — the absence is the answer, rather than a zero that would read as "instant".
-`DnsResolved` further requires a `FetcherConfig::dns_resolver`, because reqwest's built-in
-resolution sits below this crate and cannot be timed; `dns::SystemResolver` is the policy-free
-resolver for embedders that only want the timing. All three are native-only: on wasm32 the browser owns resolution,
-connection setup, and preflighting alike.
+`DnsResolved` comes from the fetcher's resolver: the `FetcherConfig::dns_resolver` set, or
+`dns::SystemResolver` when none is, so every lookup the client makes is timed. A lookup that
+fails reports nothing: the request fails with the error instead. All three are
+native-only: on wasm32 the browser owns resolution, connection setup, and preflighting alike.
 
 `Connected` is produced by a tower `connector_layer` (`net::connect_timing`) wrapped around
 reqwest's connector, and `DnsResolved` from inside the resolver. Both sit below the request
@@ -824,7 +824,7 @@ error can fan out to many listeners:
 
 | Variant | Meaning |
 |---------|---------|
-| `Blocked` | Hop refused by policy. Carries a `BlockReason` (mixed content, URL policy, unsupported scheme, not cached, CORS) and the URL of the hop that was refused. |
+| `Blocked` | Hop refused by policy. Carries a `BlockReason` (mixed content, URL policy, unsupported scheme, CORS, not cached, bad port, forbidden method) and the URL of the hop that was refused. |
 | `Transport` | The HTTP client failed. Carries a `TransportError`: a `kind` (`Connect`, `Timeout`, `Redirect`, `Body`, `Decode`, `Request`, `Builder`, `Other`) and the client's own message with its source chain flattened into it. |
 | `ProxyAuthRequired` | A proxy answered the `CONNECT` for an `https` request with `407`. Carries the proxy (without credentials) and the hop's URL. Not retried. Native-only. |
 | `Tls` | TLS handshake failed. Carries a `TlsError` (kind, host, message, and with overrides enabled the certificate and fingerprint); also emitted as `NetEvent::TlsFailed`. Native-only. |

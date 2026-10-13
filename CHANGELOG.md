@@ -84,6 +84,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The README's examples missed imports: `Arc`, `Url` and `Method`, and `TlsOverrideStore`,
+  without which `overrides.accept(..)` does not compile
+- The `timings` example, `SystemResolver` and `docs/architecture.md` still said
+  `DnsResolved` needs a configured `FetcherConfig::dns_resolver`. The fetcher resolves
+  through `SystemResolver` when none is set, and reports those lookups too
+- `docs/architecture.md` listed fewer fields and reasons than there are: `FetchResultMeta`
+  without `from_cache`, `tainting` and `peer_addr`, `BlockReason` without `BadPort` and
+  `ForbiddenMethod`, and a coalescing key made of the URL, method and headers alone
+- `RequestInit::with_timeout` said it bounds the wait for response headers. Like the
+  `timeout` field it sets, it bounds the whole hop, the body included. Both, and
+  `FetcherConfig::req_timeout`, said the deadline starts at the first byte sent; it starts
+  when the hop starts connecting
+- `RequestInit::user_activated` said it sends `Sec-Fetch-User` for the `navigate` mode. It
+  goes by the destination, as Fetch does: `document`, `embed`, `frame`, `iframe` or `object`
+- `docs/architecture.md` called `Initiator` a tag for logging only. `Initiator::User` also
+  sends `Sec-Fetch-User: ?1` on a navigation request, and is part of the coalescing key
 - A `Strict-Transport-Security` `max-age` of `+100` armed HSTS for 100 seconds, while one too
   large for a `u64` had the header ignored. `max-age` is digits only (RFC 6797 §6.1.1), and an
   oversized value is capped like any long one now

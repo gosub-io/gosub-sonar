@@ -653,8 +653,10 @@ pub struct RequestInit {
     /// The request's mode, sent in `Sec-Fetch-Mode` and selecting the CORS regime.
     /// See [`cors`](mod@crate::net::cors).
     pub mode: RequestMode,
-    /// Whether the request stems from a user action. Sends `Sec-Fetch-User: ?1` when the mode
-    /// is [`RequestMode::Navigate`]; ignored for other modes.
+    /// Whether the request stems from a user action. Sends `Sec-Fetch-User: ?1` when the
+    /// destination is a navigation one ([`RequestDestination::is_navigation`]), whatever the
+    /// mode, to a potentially trustworthy target, the only kind sent `Sec-Fetch-*` headers at
+    /// all; ignored otherwise.
     pub user_activated: bool,
     /// Whether cookies from the policy's jar ride along, and how strict the credentialed CORS
     /// rules are. See [`RequestCredentials`].
@@ -668,8 +670,9 @@ pub struct RequestInit {
     /// Order in which headers are sent, applied per hop; `None` keeps insertion order. See
     /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
     pub header_order: Option<Vec<HeaderName>>,
-    /// Deadline for each hop, from its first byte sent until its body is read. `None` leaves
-    /// it to the client's own request timeout.
+    /// Deadline for each hop, from the moment it starts connecting until its body has been
+    /// read. `None` leaves it to the client's own request timeout. On wasm32 it aborts the
+    /// browser's `fetch()`, from when the fetch starts until its body has been read.
     pub timeout: Option<Duration>,
     /// Wall-clock budget for following redirects. Starts when the first redirect response
     /// arrives and must cover every later hop up to the final response headers. `None` sets
@@ -783,8 +786,9 @@ impl RequestInit {
         self
     }
 
-    /// Bounds each hop's wait for response headers, overriding the client's request timeout.
-    /// `None` leaves the client's own timeout in force.
+    /// Bounds each hop, from the moment it starts connecting until its body has been read,
+    /// overriding the client's request timeout. `None` leaves the client's own timeout in force.
+    /// On wasm32, where the client has none, it aborts the browser's `fetch()` instead.
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
         self
