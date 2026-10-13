@@ -1114,6 +1114,8 @@ async fn fetch_response_top_inner(
     let mut received_net: u64 = 0;
     let mut peek_buf_vec: Vec<u8> = Vec::with_capacity(PEEK_MAX);
     let mut excess: Option<Bytes> = None;
+    // Whether the body ended inside the peek window, so all of it is in hand.
+    let mut ended = false;
 
     let observer_clone = observer.clone();
 
@@ -1183,6 +1185,7 @@ async fn fetch_response_top_inner(
             }
             None => {
                 // Stream ended successfully
+                ended = true;
                 break;
             }
         }
@@ -1270,6 +1273,13 @@ async fn fetch_response_top_inner(
     // The progress count so far: the peek, which is what reached the caller.
     let already_delivered = received_net - excess_len;
 
+    // A body that ended inside the peek window is known whole, whatever the headers said of
+    // its length: a chunked or decoded one has no `Content-Length` to go by.
+    let expected_length = if ended {
+        Some(already_delivered)
+    } else {
+        meta.content_length
+    };
     // The body's end names the URL it came from, the last hop of the chain.
     let progress_reader = ProgressReader::new(
         inner_reader,
@@ -1277,7 +1287,7 @@ async fn fetch_response_top_inner(
         observer.clone(),
         meta.final_url.clone(),
         started,
-        meta.content_length,
+        expected_length,
         already_delivered,
     );
     // A response the cache accepted is copied as the caller reads it, and written when the body
@@ -3634,6 +3644,53 @@ mod tests {
             finished[0].1
         );
         assert!(rec.cancellations().is_empty());
+    }
+
+    /// The same for a body with no `Content-Length` to go by, chunked or decoded: it ended
+    /// inside the peek window, so it is whole, and dropping its reader is not giving up on it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_without_a_length_that_arrived_whole_reports_finished_when_dropped() {
+        let body = pattern(64);
+        let srv = TestServer::new()
+            .route(
+                "/chunked",
+                RouteConfig::chunked(vec![&body[..32], &body[32..]]),
+            )
+            .route("/gzip", RouteConfig::gzip_ok(body.clone()))
+            .start()
+            .await;
+        let decoding = Arc::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .gzip(true)
+                .build()
+                .unwrap(),
+        );
+        for path in ["/chunked", "/gzip"] {
+            let rec = Arc::new(RecordingObserver::new());
+            let top = fetch_response_top(
+                decoding.clone(),
+                srv.url(path),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await
+            .expect("fetch");
+            assert_eq!(top.meta.content_length, None, "{path}");
+            assert_eq!(top.peek_buf.as_slice(), &body[..], "{path}");
+            drop(top);
+
+            assert!(
+                rec.cancellations().is_empty(),
+                "{path}: {:?}",
+                rec.cancellations()
+            );
+            let finished = rec.finished();
+            assert_eq!(finished.len(), 1, "{path}");
+            assert_eq!(finished[0].0, body.len() as u64, "{path}");
+        }
     }
 
     /// A body refused for its size before the result is handed over is a failed request: the

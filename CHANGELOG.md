@@ -237,6 +237,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   buffered body say `Read`. Both are as documented now. To that end `From<std::io::Error> for
   NetError` gives back the `NetError` carried by an `io::Error` from `NetError::to_io`, instead
   of wrapping it in `Io` a second time
+- Events: a body with no `Content-Length`, chunked or decompressed, that arrived whole in its
+  first 5 KiB reported `Cancelled` when its reader was dropped unread, though nothing was
+  missing. It reports `Finished`, as a body with a length already did
 
 ## [0.13.0] - 2026-10-12
 
