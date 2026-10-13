@@ -653,7 +653,7 @@ impl SharedBody {
                     }
                 };
                 let read_res = tokio::select! {
-                    r = reader.read(&mut buf[..read_cap]) => r.map_err(|e| NetError::Io(Arc::new(e))),
+                    r = reader.read(&mut buf[..read_cap]) => r.map_err(NetError::from),
                     _ = abandoned.cancelled() => return,
                     _ = cancel.cancelled() => Err(NetError::Cancelled("read cancelled".to_string())),
                     _ = idle_sleep => Err(NetError::Timeout("read idle timeout".to_string())),
@@ -670,8 +670,8 @@ impl SharedBody {
                     }
                     Ok(_) if probing => {
                         // The reader produced data beyond the max-size budget
-                        fail(NetError::Io(Arc::new(std::io::Error::other(
-                            "max size exceeded during read",
+                        fail(NetError::Read(Arc::new(anyhow::anyhow!(
+                            "max size exceeded during read"
                         ))));
                         return;
                     }

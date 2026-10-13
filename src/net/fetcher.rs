@@ -1014,6 +1014,11 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
         )
         .with_timeout(req.req_timeout)
         .with_redirect_timeout(req.redirect_timeout.unwrap_or(cfg.redirect_timeout))
+        .with_body_timeouts(
+            Some(effective_read_idle_timeout(req, cfg)),
+            effective_total_body_timeout(req, cfg),
+        )
+        .with_max_bytes(req.max_bytes)
 }
 
 /// The read idle timeout in force for `req`: its own override, else the fetcher's.
@@ -1195,6 +1200,7 @@ async fn perform_streaming(
     let ResponseTop {
         meta,
         peek_buf,
+        body_deadline,
         reader,
     } = retry::with_retries(
         effective_retry(req, cfg),
@@ -1221,7 +1227,9 @@ async fn perform_streaming(
         buf_size: 16 * 1024,
         cancel: Some(cancel.clone()),
         idle_timeout: Some(effective_read_idle_timeout(req, cfg)),
-        total_timeout: effective_total_body_timeout(req, cfg),
+        // What is left of the body's budget: the peek window already spent some of it.
+        total_timeout: body_deadline
+            .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now())),
         // The reader counts only post-peek bytes — the peek was already read off the stream —
         // so subtract it from the budget. A body of exactly max_bytes is delivered in full.
         max_size: req
@@ -1340,10 +1348,41 @@ mod tests {
                     Duration::from_millis(30),
                 ),
             )
+            // 6 KiB at once, then 20 KiB dribbled in 1 KiB chunks: the stream is handed over
+            // after ~30 ms and the body takes ~630 ms.
+            .route(
+                "/dribble-late",
+                RouteConfig::chunked_with_delay(
+                    std::iter::once(&[b'Y'; 6 * 1024][..])
+                        .chain(std::iter::repeat_n(&[b'Y'; 1024][..], 20))
+                        .collect(),
+                    Duration::from_millis(30),
+                ),
+            )
             .route(
                 "/timed",
                 RouteConfig::delay(Duration::from_millis(60), b"ok".to_vec()),
             )
+            .route(
+                "/slow-headers",
+                RouteConfig::delay(Duration::from_millis(300), b"ok".to_vec()),
+            )
+            .route(
+                "/stall-early",
+                RouteConfig::stall_mid_body(100, Duration::from_secs(30)),
+            )
+            .route(
+                "/stall-late",
+                RouteConfig::stall_mid_body(8 * 1024, Duration::from_secs(30)),
+            )
+            // 1000 bytes, chunked: no Content-Length to refuse it by up front.
+            .route("/chunked-1k", RouteConfig::chunked(vec![&[b'x'; 1000][..]]))
+            .route(
+                "/chunked-20k",
+                RouteConfig::chunked(vec![&[b'x'; 20_000][..]]),
+            )
+            // 6000 of an announced 10 000 bytes, so the body breaks off after the peek window.
+            .route("/drop-late", RouteConfig::drop_mid_body(6000, 10_000))
             .route("/not-found", RouteConfig::status(404, b"not found"))
             .route("/drop", RouteConfig::drop_mid_body(100, 10_000))
             .route("/flaky", RouteConfig::status_then_ok(503, 2, b"recovered"))
@@ -2827,6 +2866,163 @@ mod tests {
         );
     }
 
+    /// A body that goes silent inside its first 5 KiB, the part read before the result is
+    /// handed over, is cut off by the idle timeout like one that stalls later; it does not
+    /// wait for the request timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_that_stalls_inside_the_peek_window_hits_the_idle_timeout() {
+        let srv = start_server().await;
+        // `/stall-early` sends 100 bytes of an announced 8 KiB and goes silent.
+        for streaming in [false, true] {
+            let req = FetchRequest::builder(Method::GET, srv.url("/stall-early"))
+                .with_streaming(streaming)
+                .with_read_idle_timeout(Duration::from_millis(100))
+                .build();
+            let (result, elapsed) = fetch_one(test_config(), req).await;
+            assert!(
+                matches!(result, FetchResult::Error(NetError::Timeout(_))),
+                "streaming {streaming}: {result:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "streaming {streaming}: the 100 ms idle timeout should have fired (took {elapsed:?})"
+            );
+        }
+    }
+
+    /// `total_body_timeout` budgets the body only: headers that are slow to come do not use
+    /// it up.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_total_body_timeout_starts_after_the_headers() {
+        let srv = start_server().await;
+        // `/slow-headers` takes 300 ms to answer, then sends its body at once.
+        let req = FetchRequest::builder(Method::GET, srv.url("/slow-headers"))
+            .with_total_body_timeout(Duration::from_millis(100))
+            .build();
+        let (result, _) = fetch_one(test_config(), req).await;
+        match result {
+            FetchResult::Buffered { body, .. } => assert_eq!(&body[..], b"ok"),
+            other => panic!("expected the buffered body, got {other:?}"),
+        }
+
+        let req = FetchRequest::builder(Method::GET, srv.url("/slow-headers"))
+            .with_streaming(true)
+            .with_total_body_timeout(Duration::from_millis(100))
+            .build();
+        let (result, _) = fetch_one(test_config(), req).await;
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = result
+        else {
+            panic!("expected a stream, got {result:?}");
+        };
+        let body = crate::net::utils::stream_to_bytes(peek_buf, shared, None)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"ok");
+    }
+
+    /// `total_body_timeout` is a deadline: a buffered read that is blocked when it passes is
+    /// cut off then, not when the idle timeout ends the read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_total_body_timeout_cuts_off_a_blocked_read() {
+        let srv = start_server().await;
+        // `/stall-late` sends 8 KiB and goes silent; 3 s of silence is allowed.
+        let req = FetchRequest::builder(Method::GET, srv.url("/stall-late"))
+            .with_read_idle_timeout(Duration::from_secs(3))
+            .with_total_body_timeout(Duration::from_millis(300))
+            .build();
+        let (result, elapsed) = fetch_one(test_config(), req).await;
+        assert!(
+            matches!(result, FetchResult::Error(NetError::Timeout(_))),
+            "{result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the 300 ms deadline should have fired (took {elapsed:?})"
+        );
+    }
+
+    /// `max_bytes` holds for a body short enough to fit in the first 5 KiB, the part read
+    /// before the result is handed over, buffered or streamed; one of exactly the cap passes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn max_bytes_holds_for_a_body_inside_the_peek_window() {
+        let srv = start_server().await;
+        for streaming in [false, true] {
+            let req = FetchRequest::builder(Method::GET, srv.url("/chunked-1k"))
+                .with_streaming(streaming)
+                .with_max_bytes(100)
+                .build();
+            let (result, _) = fetch_one(test_config(), req).await;
+            assert!(
+                matches!(result, FetchResult::Error(NetError::Read(_))),
+                "streaming {streaming}: a 1000-byte body passed a 100-byte cap: {result:?}"
+            );
+
+            let req = FetchRequest::builder(Method::GET, srv.url("/chunked-1k"))
+                .with_streaming(streaming)
+                .with_max_bytes(1000)
+                .build();
+            let (result, _) = fetch_one(test_config(), req).await;
+            assert!(!result.is_error(), "streaming {streaming}: {result:?}");
+        }
+    }
+
+    /// A body that breaks off is a `Transport` error of kind `Body` wherever it breaks off:
+    /// inside the first 5 KiB or after them, buffered or streamed. After the first 5 KiB it
+    /// used to come back as `Io`, with the transport error buried in it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_that_breaks_off_is_a_transport_body_error() {
+        let srv = start_server().await;
+        for path in ["/drop", "/drop-late"] {
+            let (result, _) = fetch_one(
+                test_config(),
+                FetchRequest::builder(Method::GET, srv.url(path)).build(),
+            )
+            .await;
+            match result {
+                FetchResult::Error(NetError::Transport(t)) => {
+                    assert_eq!(t.kind, TransportErrorKind::Body, "{path}: {t:?}")
+                }
+                other => panic!("{path}: expected Transport(Body), got {other:?}"),
+            }
+        }
+
+        let req = FetchRequest::builder(Method::GET, srv.url("/drop-late"))
+            .with_streaming(true)
+            .build();
+        let (result, _) = fetch_one(test_config(), req).await;
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = result
+        else {
+            panic!("expected a stream, got {result:?}");
+        };
+        match crate::net::utils::stream_to_bytes(peek_buf, shared, None).await {
+            Err(NetError::Transport(t)) => assert_eq!(t.kind, TransportErrorKind::Body, "{t:?}"),
+            other => panic!("expected Transport(Body), got {other:?}"),
+        }
+    }
+
+    /// A stream over `max_bytes` ends with `NetError::Read`, as a buffered body over it does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stream_over_max_bytes_ends_with_a_read_error() {
+        let srv = start_server().await;
+        let req = FetchRequest::builder(Method::GET, srv.url("/chunked-20k"))
+            .with_streaming(true)
+            .with_max_bytes(10_000)
+            .build();
+        let (result, _) = fetch_one(test_config(), req).await;
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = result
+        else {
+            panic!("expected a stream, got {result:?}");
+        };
+        let res = crate::net::utils::stream_to_bytes(peek_buf, shared, None).await;
+        assert!(matches!(res, Err(NetError::Read(_))), "{res:?}");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn per_request_total_body_timeout_overrides_the_fetcher_timeout() {
         let srv = start_server().await;
@@ -2879,9 +3075,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn per_request_total_body_timeout_applies_to_a_stream() {
         let srv = start_server().await;
-        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
+        // `/dribble-late` hands the stream over after ~30 ms and ends at ~630 ms, so a 200 ms
+        // budget runs out while the stream is being read.
+        let req = FetchRequest::builder(Method::GET, srv.url("/dribble-late"))
             .with_streaming(true)
-            .with_total_body_timeout(Duration::from_millis(50))
+            .with_total_body_timeout(Duration::from_millis(200))
             .build();
         let (result, _) = fetch_one(test_config(), req).await;
         let FetchResult::Stream {
