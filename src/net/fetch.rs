@@ -2879,9 +2879,15 @@ async fn get_with_redirects(
             })?;
         let loc = loc.as_str();
 
-        let to = from.join(loc).map_err(|e| {
+        let mut to = from.join(loc).map_err(|e| {
             NetError::Redirect(Arc::new(anyhow!("invalid redirect URL '{}': {}", loc, e)))
         })?;
+        // A `Location` without a fragment keeps the request's (Fetch §2.2.6 location URL,
+        // RFC 9110 §10.2.2): a redirect of `/a#top` to `/b` leads to `/b#top`. From `url`, the
+        // request's current URL: the response's has no fragment.
+        if to.fragment().is_none() {
+            to.set_fragment(url.fragment());
+        }
 
         // A `Location` with embedded `user:password` is refused for a cors-mode request, and
         // for any request when it points at another origin than the hop it came from: following
@@ -2902,7 +2908,6 @@ async fn get_with_redirects(
                 BlockReason::Cors(CorsError::CredentialedRedirect),
             ));
         }
-        let mut to = to;
         let location_credentials_removed = strip_url_credentials(&mut to);
 
         // Fetch §4.5 step 12: a 301 or 302 turns a `POST` into a `GET`, and a 303 every method
@@ -7583,6 +7588,38 @@ mod tests {
             headers.insert(header::COOKIE, "mine=1".parse().unwrap());
             let (end, _) = follow(302, Method::GET, headers, None).await;
             assert_eq!(end.header("cookie"), Some("mine=1"));
+        }
+
+        /// Fetch §2.2.6: a `Location` without a fragment keeps the request's, and one with a
+        /// fragment of its own replaces it. `Redirected` and the final URL say so.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_location_without_a_fragment_keeps_the_requests() {
+            for (location, expected) in [
+                ("Location: /end\r\n", "frag"),
+                ("Location: /end#own\r\n", "own"),
+            ] {
+                let (base, _) = server(302, location).await;
+                let rec = Arc::new(RecordingObserver::new());
+                let (meta, _) = super::super::fetch_response_complete(
+                    client(),
+                    base.join("/start#frag").unwrap(),
+                    RequestInit::get(HeaderMap::new()),
+                    CancellationToken::new(),
+                    rec.clone(),
+                    None,
+                    Duration::from_secs(5),
+                    None,
+                    NetPolicy::default(),
+                )
+                .await
+                .expect("fetch");
+                assert_eq!(meta.final_url.fragment(), Some(expected), "{location}");
+                assert!(
+                    rec.event_names().iter().any(|n| n == "Redirected"),
+                    "{:?}",
+                    rec.event_names()
+                );
+            }
         }
 
         /// Fetch §4.5 step 12: a 303 turns every method into a `GET` but `GET` and `HEAD`.

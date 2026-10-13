@@ -74,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A redirect lost the fragment of the URL asked for when its `Location` had none: `/a#top`
+  redirected to `/b` ended at `/b`, not `/b#top`. The `Location` inherits it now (Fetch §2.2.6,
+  RFC 9110 §10.2.2), in `Redirected` and in the final URL
 - A redirect within one origin sent the next hop the cookies the jar had given the first:
   `cookies_for` was only asked again after a `Set-Cookie` or a change of origin. A redirect from
   `/login` to `/app` sent `/login`'s cookies, and a `POST` turned into a `GET` was not asked
