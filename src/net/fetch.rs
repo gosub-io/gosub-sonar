@@ -2805,8 +2805,17 @@ async fn get_with_redirects(
             _ => None,
         };
 
-        // Fetch §4.5 step 4: a redirect without a `Location` is the response, returned as it is.
+        // Fetch §4.5 steps 3-5, the location URL: a redirect without a `Location` is the
+        // response, returned as it is, and one with more than one is a network error. The field
+        // lines are counted, not split on commas: a URL may hold a comma.
         let locations = hop.headers().get_all(header::LOCATION).iter().count();
+        if hop.is_redirection() && locations > 1 {
+            return Err(NetError::Redirect(Arc::new(anyhow!(
+                "redirect status {} with {} Location headers",
+                hop.status(),
+                locations
+            ))));
+        }
         if !hop.is_redirection() || locations == 0 {
             if attach_credentials {
                 report_set_cookie(&policy, &url, hop.headers());
@@ -7624,6 +7633,31 @@ mod tests {
                     rec.event_names()
                 );
             }
+        }
+
+        /// Fetch §2.2.6 location URL: a redirect with two `Location` field lines has no one
+        /// target, and is a network error rather than a guess at one of them.
+        #[tokio::test(flavor = "current_thread")]
+        async fn two_locations_are_a_network_error() {
+            let (base, seen) = server(302, "Location: /a\r\nLocation: /b\r\n").await;
+            let result = super::super::fetch_response_complete(
+                client(),
+                base.join("/start").unwrap(),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                Arc::new(RecordingObserver::new()),
+                None,
+                Duration::from_secs(5),
+                None,
+                NetPolicy::default(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(NetError::Redirect(_))),
+                "{:?}",
+                result.map(|(meta, _)| meta.status)
+            );
+            assert_eq!(seen.lock().unwrap().len(), 1, "no hop after the redirect");
         }
 
         /// Fetch §4.5 step 12: a 303 turns every method into a `GET` but `GET` and `HEAD`.

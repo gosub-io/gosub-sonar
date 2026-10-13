@@ -74,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A redirect with two `Location` headers was followed to the first. It is a network error now
+  (`NetError::Redirect`), as Fetch's location URL makes it
 - A 301, 302, 303, 307 or 308 without a `Location` failed with a redirect error. It is the
   response now, returned to the caller as it is (Fetch §4.5)
 - A redirect lost the fragment of the URL asked for when its `Location` had none: `/a#top`
