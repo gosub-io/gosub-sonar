@@ -36,7 +36,11 @@ tempfile = "3.21.0"
 tokio = { version = "1.52.3", features = ["rt", "io-util", "sync", "time", "macros", "net", "fs"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
-reqwest = { version = "0.13.3", features = ["rustls", "stream", "blocking", "gzip", "brotli", "deflate"] }
+# No `gzip`, `brotli` or `deflate`: response bodies are decoded in `net::decode`, not by the
+# client, which reads only the first `Content-Encoding` line and matches it case-sensitively.
+reqwest = { version = "0.13.3", features = ["rustls", "stream", "blocking"] }
+# The decoders behind `net::decode`. Already in the tree via reqwest (tower-http).
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli"] }
 # Just the two trait crates, not all of tower: the connect-timing layer needs `Layer` and
 # `Service` and nothing else. Both are already in the tree via reqwest.
 tower-layer = "0.3.3"

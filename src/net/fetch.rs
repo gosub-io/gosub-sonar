@@ -664,8 +664,8 @@ pub struct RequestInit {
     /// How this request uses the HTTP cache. Inert without [`NetPolicy::cache`].
     /// See [`cache`](mod@crate::net::cache).
     pub cache_mode: CacheMode,
-    /// Whether the HTTP client decompresses the body. A cache entry records it, since a decoded
-    /// body is not the bytes a raw caller asked for.
+    /// Whether the body is decoded from its content codings (`gzip`, `br`, `deflate`). A cache
+    /// entry records it, since a decoded body is not the bytes a raw caller asked for.
     pub auto_decode: bool,
     /// Order in which headers are sent, applied per hop; `None` keeps insertion order. See
     /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
@@ -983,6 +983,9 @@ async fn fetch_response_top_inner(
     let started = Instant::now();
     let (read_idle_timeout, total_body_timeout) = (init.read_idle_timeout, init.total_body_timeout);
     let max_bytes = init.max_bytes;
+    // On wasm32 the browser decodes bodies before they get here.
+    #[cfg(not(target_arch = "wasm32"))]
+    let auto_decode = init.auto_decode;
     observer.on_event(NetEvent::Started { url: url.clone() });
     if url_credentials_removed {
         modified(&observer, &url, RequestChange::UrlCredentialsRemoved);
@@ -1096,6 +1099,29 @@ async fn fetch_response_top_inner(
     } else {
         resp.content_length() // More often than not, this is None
     };
+    let headers = resp.headers().clone();
+
+    // A body the caller wants decoded is decoded here, not by the client (see
+    // [`decode`](crate::net::decode)). Like a client that decodes, this takes away the
+    // `Content-Encoding` and `Content-Length` that described the coded bytes: the caller gets
+    // the decoded ones, of a length not known until they are read. A body with a coding that
+    // cannot be undone keeps both, and its bytes.
+    #[cfg(not(target_arch = "wasm32"))]
+    let codings = if auto_decode && !bodiless {
+        crate::net::decode::codings(&headers).filter(|c| !c.is_empty())
+    } else {
+        None
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let (headers, content_length) = match codings {
+        Some(_) => {
+            let mut headers = headers;
+            headers.remove(header::CONTENT_ENCODING);
+            headers.remove(header::CONTENT_LENGTH);
+            (headers, None)
+        }
+        None => (headers, content_length),
+    };
 
     // Response is received, setup our meta structure
     let mut meta = FetchResultMeta {
@@ -1103,13 +1129,12 @@ async fn fetch_response_top_inner(
         final_url,
         status,
         status_text: resp.status().canonical_reason().unwrap_or("").to_string(),
-        headers: resp.headers().clone(),
         content_length,
-        content_type: resp
-            .headers()
+        content_type: headers
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string()),
+        headers,
         has_body: true, // Don't know yet
         from_cache: false,
         peer_addr,
@@ -1127,9 +1152,16 @@ async fn fetch_response_top_inner(
 
     // Peek the stream up to PEEK_MAX bytes. A body that stops part way is a transport failure,
     // so it is classified here rather than left as an opaque read error.
-    let mut body_stream = resp
+    let body_stream = resp
         .bytes_stream()
         .map_err(|e| NetError::Transport(TransportError::from_client(&e)));
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut body_stream = match codings {
+        Some(codings) => crate::net::decode::decode(body_stream.boxed(), codings),
+        None => body_stream.boxed(),
+    };
+    #[cfg(target_arch = "wasm32")]
+    let mut body_stream = body_stream;
     let mut received_net: u64 = 0;
     let mut peek_buf_vec: Vec<u8> = Vec::with_capacity(PEEK_MAX);
     let mut excess: Option<Bytes> = None;
@@ -1955,8 +1987,8 @@ async fn get_with_redirects(
         );
     }
     // Set here rather than left to the client, which would add it while executing the request,
-    // after `RequestSent` was reported. Matches what `build_client` enables for a decoding
-    // client; a caller that asked for raw bytes advertises nothing it cannot decode.
+    // after `RequestSent` was reported. Exactly the codings `net::decode` undoes; a caller that
+    // asked for raw bytes advertises nothing it cannot decode.
     //
     // A range counts bytes of the representation as it is sent, so a ranged request asks for
     // it unencoded (Fetch §4.6), appended to a value the caller set itself.
@@ -3715,13 +3747,7 @@ mod tests {
             .route("/gzip", RouteConfig::gzip_ok(body.clone()))
             .start()
             .await;
-        let decoding = Arc::new(
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .gzip(true)
-                .build()
-                .unwrap(),
-        );
+        let decoding = client();
         for path in ["/chunked", "/gzip"] {
             let rec = Arc::new(RecordingObserver::new());
             let top = fetch_response_top(
@@ -7631,6 +7657,101 @@ mod tests {
 
     /// `NetEvent::SecurityUpgraded` and `NetEvent::RequestModified`: one event per change, in
     /// the right place in the stream, and nothing when nothing changed.
+    /// Content codings (RFC 9110 §8.4), undone by the fetch rather than the client.
+    mod content_codings {
+        use super::*;
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        use tokio::io::AsyncWriteExt;
+
+        fn gz(data: &[u8]) -> Vec<u8> {
+            let mut e = GzEncoder::new(Vec::new(), Compression::default());
+            e.write_all(data).unwrap();
+            e.finish().unwrap()
+        }
+
+        /// A server that answers every request with `200`, the header lines in `head` (each
+        /// ending in `\r\n`) and `body`.
+        async fn server(head: String, body: Vec<u8>) -> Url {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let url = Url::parse(&format!(
+                "http://127.0.0.1:{}/",
+                listener.local_addr().unwrap().port()
+            ))
+            .unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let mut response = format!(
+                        "HTTP/1.1 200 OK\r\n{head}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    response.extend_from_slice(&body);
+                    let _ = stream.write_all(&response).await;
+                }
+            });
+            url
+        }
+
+        async fn fetch(url: Url, auto_decode: bool) -> (FetchResultMeta, Bytes) {
+            let mut init = RequestInit::get(HeaderMap::new());
+            init.auto_decode = auto_decode;
+            super::super::fetch_response_complete(
+                client(),
+                url,
+                init,
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(5),
+                None,
+                NetPolicy::default(),
+            )
+            .await
+            .expect("fetch")
+        }
+
+        /// RFC 9110 §5.3, §8.4: codings on two field lines are one list, in the order applied.
+        /// Both layers are undone, and the headers that described the coded bytes go.
+        #[tokio::test(flavor = "current_thread")]
+        async fn codings_on_two_lines_are_both_undone() {
+            let plain = b"gzipped twice".to_vec();
+            let url = server(
+                "Content-Encoding: gzip\r\nContent-Encoding: gzip\r\n".into(),
+                gz(&gz(&plain)),
+            )
+            .await;
+            let (meta, body) = fetch(url, true).await;
+            assert_eq!(&body[..], &plain[..]);
+            assert!(!meta.headers.contains_key(header::CONTENT_ENCODING));
+            assert!(!meta.headers.contains_key(header::CONTENT_LENGTH));
+            assert_eq!(meta.content_length, None);
+        }
+
+        /// RFC 9110 §8.4.1: "All content codings are case-insensitive".
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_coding_in_capitals_is_undone() {
+            let plain = b"shouted".to_vec();
+            let url = server("Content-Encoding: GZIP\r\n".into(), gz(&plain)).await;
+            assert_eq!(&fetch(url, true).await.1[..], &plain[..]);
+        }
+
+        /// A caller that asked for the raw bytes gets them, with the headers describing them.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_raw_request_is_not_decoded() {
+            let coded = gz(b"left alone");
+            let url = server("Content-Encoding: gzip\r\n".into(), coded.clone()).await;
+            let (meta, body) = fetch(url, false).await;
+            assert_eq!(&body[..], &coded[..]);
+            assert_eq!(meta.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
+            assert_eq!(meta.content_length, Some(coded.len() as u64));
+        }
+    }
+
     /// Fetch's HTTP-redirect fetch, against a server that answers `/start` with any status.
     mod redirect_rules {
         use super::*;

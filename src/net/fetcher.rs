@@ -369,10 +369,9 @@ struct QueueItem {
 /// submit requests with [`Fetcher::fetch`], [`Fetcher::fetch_with_cancel`], or
 /// [`Fetcher::submit`]. See the crate-level docs for a complete example.
 pub struct Fetcher {
-    /// Client with automatic content-decoding (gzip, brotli, deflate). Used when `auto_decode: true`.
+    /// The HTTP client. It decodes no bodies: a request that wants its body decoded has it
+    /// decoded by `net::decode`, so raw and decoded requests share the client and its pool.
     client: reqwest::Client,
-    /// Client without any content-decoding. Used when `auto_decode: false` (raw bytes requested).
-    client_raw: reqwest::Client,
     cfg: FetcherConfig,
 
     // The global and per-origin connection slots, handed out by priority. Shared with the
@@ -400,10 +399,10 @@ pub struct Fetcher {
     built: Arc<ClientsBuilt>,
 }
 
-/// What the clients were built with that a request's policy has to agree with, taken when
-/// they were built rather than looked up again per request.
+/// What the client was built with that a request's policy has to agree with, taken when
+/// it was built rather than looked up again per request.
 struct ClientsBuilt {
-    /// The proxies the clients route by; see [`ProxyRoutes`].
+    /// The proxies the client routes by; see [`ProxyRoutes`].
     #[cfg(not(target_arch = "wasm32"))]
     proxy: ProxyRoutes,
 }
@@ -438,14 +437,12 @@ impl Fetcher {
             "FetcherConfig.h2_per_origin must be >= 1"
         );
 
-        // The environment's proxies are read once, here, and both clients are built from that.
+        // The environment's proxies are read once, here, and the client is built from that.
         let built = Arc::new(ClientsBuilt::new(&config));
-        let client = build_client(&config, true, &ctx, &built)?;
-        let client_raw = build_client(&config, false, &ctx, &built)?;
+        let client = build_client(&config, &ctx, &built)?;
 
         Ok(Self {
             client,
-            client_raw,
             cfg: config.clone(),
             slots: SlotPool::new(&config),
             q_high: tokio::sync::Mutex::new(VecDeque::new()),
@@ -832,11 +829,7 @@ impl Fetcher {
                 continue;
             }
 
-            let client = if req.auto_decode {
-                self.client.clone()
-            } else {
-                self.client_raw.clone()
-            };
+            let client = self.client.clone();
             let pool = self.slots.clone();
             // Join the line for slots here, in dequeue order, rather than in the spawned task:
             // tasks start in no particular order, which would shuffle requests of one lane.
@@ -1039,12 +1032,10 @@ fn effective_total_body_timeout(req: &FetchRequest, cfg: &FetcherConfig) -> Opti
 
 /// Build a reqwest client from `FetcherConfig`.
 ///
-/// When `decode` is `true` the client automatically decompresses `gzip`, `brotli`, and `deflate`
-/// response bodies and sends the corresponding `Accept-Encoding` request header.
-/// When `false` neither header is added nor is any decompression performed.
+/// The client decodes no response bodies and adds no `Accept-Encoding`: both are the fetch's,
+/// in `get_with_redirects` and [`decode`](crate::net::decode).
 fn build_client(
     cfg: &FetcherConfig,
-    decode: bool,
     ctx: &Arc<dyn FetcherContext>,
     built: &ClientsBuilt,
 ) -> anyhow::Result<reqwest::Client> {
@@ -1057,7 +1048,7 @@ fn build_client(
     // cannot see, so this is a loss of reporting rather than of enforcement.
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (decode, ctx, built);
+        let _ = (ctx, built);
         let mut b = reqwest::Client::builder();
         if let Some(ref ua) = cfg.user_agent {
             b = b.user_agent(ua);
@@ -1080,9 +1071,12 @@ fn build_client(
             .pool_max_idle_per_host(cfg.pool_max_idle_per_host)
             .pool_idle_timeout(cfg.pool_idle_timeout)
             .tcp_keepalive(cfg.tcp_keepalive)
-            .gzip(decode)
-            .brotli(decode)
-            .deflate(decode);
+            // Bodies are decoded by `net::decode`, never by the client. Off explicitly too: a
+            // crate that enables reqwest's decompression features would turn it on by default.
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd();
         // overrides need our own verifier, so we build the rustls config ourselves
         b = match &cfg.tls_overrides {
             // tls_info: responses carry their peer certificate, for the HSTS check

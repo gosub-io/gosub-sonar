@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The simple API (`simple_get`, `sync_get`, `sync_fetch` and their `_with` forms) decodes
+  `gzip`, `br` and `deflate` bodies through `net::decode`, as the fetcher does, and sends the
+  `Accept-Encoding` for them itself. What it returns is unchanged
+- Response bodies are decoded by the fetch (`net::decode`), not by reqwest, which is built
+  without its `gzip`, `brotli` and `deflate` features. What a caller sees is unchanged: a decoded body comes without `Content-Encoding` and `Content-Length`, and
+  `content_length` is `None`. The fetcher now uses one client for decoded and raw requests
 - **Breaking:** `NetError` gained `ProxyAuthRequired { proxy, url }`, for a proxy that answers
   the `CONNECT` of an `https` request with `407`. It was a `Transport` error of kind `Connect`,
   told apart only by its message, and retried like a connection that failed. An embedder can
@@ -84,6 +90,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A body with its `Content-Encoding` on two field lines (`gzip`, then `gzip`) was decoded
+  once and handed over with both lines gone, gzip bytes labelled as plain ones. A coding in
+  capitals (`GZIP`) was not decoded at all. Both are read as RFC 9110 §8.4 says now: every
+  line, in order, case-insensitively, and every coding in the list is undone
 - The README's examples missed imports: `Arc`, `Url` and `Method`, and `TlsOverrideStore`,
   without which `overrides.accept(..)` does not compile
 - The `timings` example, `SystemResolver` and `docs/architecture.md` still said

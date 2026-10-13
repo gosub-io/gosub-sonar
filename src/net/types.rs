@@ -1192,7 +1192,9 @@ impl FetchRequestBuilder {
         self
     }
 
-    /// Sets whether to transparently decode compressed responses (default: true).
+    /// Sets whether to decode a body in `gzip`, `br` or `deflate` (default: true). A decoded
+    /// body comes without the `Content-Encoding` and `Content-Length` of the coded bytes; one in
+    /// a coding that cannot be undone comes as it is, header and all.
     ///
     /// With decoding on, [`with_max_bytes`](Self::with_max_bytes) caps the decompressed
     /// size; set `false` to cap bytes as they arrive on the wire.

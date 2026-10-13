@@ -27,6 +27,10 @@ use crate::net::fetcher::DEFAULT_USER_AGENT;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::proxy::ProxyConfig;
 #[cfg(not(target_arch = "wasm32"))]
+use crate::net::transport::TransportError;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::net::types::NetError;
+#[cfg(not(target_arch = "wasm32"))]
 use cookie::Cookie;
 #[cfg(not(target_arch = "wasm32"))]
 use cow_utils::CowUtils;
@@ -208,6 +212,15 @@ impl SimpleOptions {
                 headers.insert(header::USER_AGENT, value);
             }
         }
+        // The codings `decoded` undoes; the client is built without a decoder of its own. On
+        // wasm32 the browser sets it, and decodes.
+        #[cfg(not(target_arch = "wasm32"))]
+        if !headers.contains_key(header::ACCEPT_ENCODING) {
+            headers.insert(
+                header::ACCEPT_ENCODING,
+                header::HeaderValue::from_static("gzip, br, deflate"),
+            );
+        }
         if let Some(ref cookies) = self.cookies {
             if !headers.contains_key(header::COOKIE) {
                 let value = cookies
@@ -231,6 +244,12 @@ impl SimpleOptions {
         #[cfg(not(target_arch = "wasm32"))]
         let b = self.proxy.apply(
             b.use_rustls_tls()
+                // Bodies are decoded by `decoded`, never by the client; off explicitly, as a
+                // crate that enables reqwest's decompression features would turn it on.
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
                 .connect_timeout(self.connect_timeout)
                 .timeout(self.timeout)
                 .redirect(reqwest::redirect::Policy::custom(
@@ -327,13 +346,16 @@ pub async fn simple_get_with(url: &Url, opts: &SimpleOptions) -> Result<Bytes> {
             if !status.is_success() {
                 anyhow::bail!("HTTP {status} fetching {url}");
             }
-            if let Some(len) = resp.content_length() {
+            #[cfg(not(target_arch = "wasm32"))]
+            let (headers, mut stream) = decoded(resp);
+            #[cfg(target_arch = "wasm32")]
+            let (headers, mut stream) = (resp.headers().clone(), resp.bytes_stream());
+            if let Some(len) = content_length(&headers) {
                 if len > max_body {
                     anyhow::bail!("response too large ({len} bytes, limit {max_body} bytes)");
                 }
             }
             let mut body = Vec::new();
-            let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
                 body.extend_from_slice(&chunk);
@@ -344,6 +366,42 @@ pub async fn simple_get_with(url: &Url, opts: &SimpleOptions) -> Result<Bytes> {
             Ok(Bytes::from(body))
         }
         scheme => anyhow::bail!("Unsupported URL scheme: {scheme}"),
+    }
+}
+
+/// The `Content-Length` in `headers`, if one is there and readable.
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// The headers and body of `resp` as the caller gets them: a body in content codings decoded
+/// by [`decode`](crate::net::decode), without the `Content-Encoding` and `Content-Length` that
+/// described the coded bytes, the way the fetcher hands one on.
+#[cfg(not(target_arch = "wasm32"))]
+fn decoded(
+    resp: reqwest::Response,
+) -> (
+    HeaderMap,
+    futures_util::stream::BoxStream<'static, std::result::Result<Bytes, NetError>>,
+) {
+    use futures_util::TryStreamExt;
+    let mut headers = resp.headers().clone();
+    let body = resp
+        .bytes_stream()
+        .map_err(|e| NetError::Transport(TransportError::from_client(&e)))
+        .boxed();
+    match crate::net::decode::codings(&headers).filter(|c| !c.is_empty()) {
+        Some(codings) => {
+            headers.remove(header::CONTENT_ENCODING);
+            headers.remove(header::CONTENT_LENGTH);
+            (headers, crate::net::decode::decode(body, codings))
+        }
+        None => (headers, body),
     }
 }
 
@@ -451,16 +509,14 @@ fn do_sync_fetch(url: Url, opts: SimpleOptions) -> Result<Response> {
         }
         .to_string();
 
-        if let Some(cl) = resp.headers().get("content-length") {
-            if let Ok(size) = cl.to_str().unwrap_or("").parse::<u64>() {
-                if size > max_body {
-                    anyhow::bail!("Response body exceeds maximum size of {} bytes", max_body);
-                }
+        let (response_headers, mut stream) = decoded(resp);
+        if let Some(size) = content_length(&response_headers) {
+            if size > max_body {
+                anyhow::bail!("Response body exceeds maximum size of {} bytes", max_body);
             }
         }
 
-        let headers: HashMap<String, String> = resp
-            .headers()
+        let headers: HashMap<String, String> = response_headers
             .iter()
             .filter_map(|(k, v)| {
                 v.to_str()
@@ -469,8 +525,7 @@ fn do_sync_fetch(url: Url, opts: SimpleOptions) -> Result<Response> {
             })
             .collect();
 
-        let cookies: HashMap<String, String> = resp
-            .headers()
+        let cookies: HashMap<String, String> = response_headers
             .get_all("set-cookie")
             .iter()
             .filter_map(|v| {
@@ -482,7 +537,6 @@ fn do_sync_fetch(url: Url, opts: SimpleOptions) -> Result<Response> {
             .collect();
 
         let mut body = Vec::new();
-        let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             body.extend_from_slice(&chunk);
@@ -741,6 +795,46 @@ mod tests {
                 .await
                 .is_err(),
             "one redirect over the limit"
+        );
+    }
+
+    /// A gzip body comes back decoded, and the request says which codings it takes. The
+    /// client decodes nothing itself: `decoded` does, as the fetcher does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn simple_get_decodes_a_gzip_body() {
+        let srv = TestServer::new()
+            .route("/gz", RouteConfig::gzip_ok(b"plain text".to_vec()))
+            .route("/ae", RouteConfig::echo_request_header("Accept-Encoding"))
+            .start()
+            .await;
+        let body = simple_get(&srv.url("/gz")).await.unwrap();
+        assert_eq!(&body[..], b"plain text");
+        let body = simple_get(&srv.url("/ae")).await.unwrap();
+        assert_eq!(&body[..], b"gzip, br, deflate");
+    }
+
+    /// `sync_fetch` decodes too, and its headers describe the body it returns.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn sync_fetch_decodes_a_gzip_body() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let srv = rt.block_on(async {
+            TestServer::new()
+                .route("/gz", RouteConfig::gzip_ok(b"plain text".to_vec()))
+                .start()
+                .await
+        });
+        let resp = sync_fetch(&srv.url("/gz")).unwrap();
+        assert_eq!(&resp.body[..], b"plain text");
+        assert!(
+            !resp.headers.contains_key("content-encoding"),
+            "{:?}",
+            resp.headers
+        );
+        assert!(
+            !resp.headers.contains_key("content-length"),
+            "{:?}",
+            resp.headers
         );
     }
 

@@ -245,9 +245,12 @@ or failed fetch cannot leak one.
 placed; `host` is skipped for origins the `SlotPool` has seen on HTTP/2, via
 `NetPolicy::speaks_h2`), and a `proxy`
 (`proxy.rs`) that defaults to reading `HTTP_PROXY` and friends from the environment. The fetcher
-builds **two** `reqwest` clients: one with automatic gzip/brotli/deflate decoding (`auto_decode:
-true`) and one that returns raw bytes (`auto_decode: false`); the flag is part of the coalescing
-key so decoded and raw requests never merge.
+builds one `reqwest` client, which decodes no bodies. A request with `auto_decode: true` has its
+body decoded by `net::decode` (gzip, br and deflate, the codings its `Accept-Encoding` names):
+every `Content-Encoding` line is read, in order and case-insensitively (RFC 9110 §8.4), and a
+list with a coding it cannot undo is passed on as it came. A decoded body loses the
+`Content-Encoding` and `Content-Length` that described the coded bytes. The flag is part of the
+coalescing key, so decoded and raw requests never merge. The simple API decodes the same way.
 
 ---
 
@@ -606,7 +609,7 @@ condition of the caller's own (`If-None-Match`, `If-Modified-Since`, `If-Match`,
 the server, so neither sonar's cache nor one on the way answers for it.
 
 `Set-Cookie` is removed before a response is stored, so a cache hit cannot re-apply a cookie, and
-so are the hop-by-hop headers. A body the HTTP client decompressed is stored
+so are the hop-by-hop headers. A body the fetch decoded is stored
 without its `Content-Encoding`, and only answers requests that also decode, since the raw caller
 asked for different bytes.
 
