@@ -2431,12 +2431,17 @@ async fn get_with_redirects(
                     init.auto_decode,
                     cache_mode,
                     chrono::Utc::now(),
-                ) {
+                )
+                .revalidated()
+                {
                     CacheDecision::Use(entry) => (Some(entry), None, HeaderMap::new()),
                     CacheDecision::Revalidate(entry, conditional) => {
                         (None, Some(entry), conditional)
                     }
-                    CacheDecision::Send => (None, None, HeaderMap::new()),
+                    // `revalidated` leaves no `UseStale`.
+                    CacheDecision::Send | CacheDecision::UseStale(_) => {
+                        (None, None, HeaderMap::new())
+                    }
                     // `only-if-cached`, with nothing stored to answer it.
                     CacheDecision::NotCached => {
                         return Err(blocked(&observer, url, BlockReason::NotCached))
