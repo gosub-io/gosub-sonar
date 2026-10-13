@@ -384,8 +384,10 @@ browser-matching semantics:
   body going with the method (Fetch §4.5). Every other method keeps its body, as does every
   method on a 307 or 308.
 - `Authorization`, `Cookie`, `Referer`, `Origin` and `Proxy-Authorization`
-  (`SENSITIVE_REDIRECT_HEADERS`) are stripped on cross-origin redirects (RFC 9110 §15.4), and
-  the cookie jar is re-queried for the new origin.
+  (`SENSITIVE_REDIRECT_HEADERS`) are stripped on cross-origin redirects (RFC 9110 §15.4).
+- The cookie jar is asked again for every hop, with the hop's URL and method.
+- A `Location` without a fragment inherits the request's. A redirect without a `Location` is
+  returned as the response; one with two is a network error (Fetch §2.2.6, §4.5).
 - Only `http`/`https` targets are followed.
 - Each hop is upgraded to `https` if HSTS applies, *before* `url_allowed` is consulted, so the
   hook sees the URL that will actually be requested and no plaintext request is ever opened.
@@ -504,7 +506,12 @@ Semantics, each covered by a test in `hsts.rs`:
 - `includeSubDomains` gates inherited matches only; an exact match ignores it. Per §8.2 a host is
   a Known HSTS Host given a congruent match *or* any superdomain match asserting the flag, so a
   nearer non-matching entry does not shadow a permissive ancestor.
-- A header received over plaintext is ignored (§8.1).
+- A header received over plaintext is ignored (§8.1), and of several fields only the first is
+  read.
+- The value is parsed by the grammar of §6.1: directives separated by `;`, a value a token or a
+  quoted-string (unescaped, so a `;` inside one does not split it). A value off the grammar, a
+  directive given twice, a value on `includeSubDomains` or a `max-age` that is not all digits
+  has the header ignored whole. A `max-age` too large for a `u64` is capped like any long one.
 - `max-age=0` deletes the entry rather than storing an expired one (§6.1.1).
 - An implicit port or `:80` becomes 443; any other explicit port is preserved (§8.3), so
   `http://x:8080/` upgrades to `https://x:8080/`.
