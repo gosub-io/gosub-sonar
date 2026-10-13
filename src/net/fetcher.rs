@@ -1377,6 +1377,12 @@ mod tests {
             )
             // 1000 bytes, chunked: no Content-Length to refuse it by up front.
             .route("/chunked-1k", RouteConfig::chunked(vec![&[b'x'; 1000][..]]))
+            .route(
+                "/chunked-20k",
+                RouteConfig::chunked(vec![&[b'x'; 20_000][..]]),
+            )
+            // 6000 of an announced 10 000 bytes, so the body breaks off after the peek window.
+            .route("/drop-late", RouteConfig::drop_mid_body(6000, 10_000))
             .route("/not-found", RouteConfig::status(404, b"not found"))
             .route("/drop", RouteConfig::drop_mid_body(100, 10_000))
             .route("/flaky", RouteConfig::status_then_ok(503, 2, b"recovered"))
@@ -2960,6 +2966,61 @@ mod tests {
             let (result, _) = fetch_one(test_config(), req).await;
             assert!(!result.is_error(), "streaming {streaming}: {result:?}");
         }
+    }
+
+    /// A body that breaks off is a `Transport` error of kind `Body` wherever it breaks off:
+    /// inside the first 5 KiB or after them, buffered or streamed. After the first 5 KiB it
+    /// used to come back as `Io`, with the transport error buried in it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_that_breaks_off_is_a_transport_body_error() {
+        let srv = start_server().await;
+        for path in ["/drop", "/drop-late"] {
+            let (result, _) = fetch_one(
+                test_config(),
+                FetchRequest::builder(Method::GET, srv.url(path)).build(),
+            )
+            .await;
+            match result {
+                FetchResult::Error(NetError::Transport(t)) => {
+                    assert_eq!(t.kind, TransportErrorKind::Body, "{path}: {t:?}")
+                }
+                other => panic!("{path}: expected Transport(Body), got {other:?}"),
+            }
+        }
+
+        let req = FetchRequest::builder(Method::GET, srv.url("/drop-late"))
+            .with_streaming(true)
+            .build();
+        let (result, _) = fetch_one(test_config(), req).await;
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = result
+        else {
+            panic!("expected a stream, got {result:?}");
+        };
+        match crate::net::utils::stream_to_bytes(peek_buf, shared, None).await {
+            Err(NetError::Transport(t)) => assert_eq!(t.kind, TransportErrorKind::Body, "{t:?}"),
+            other => panic!("expected Transport(Body), got {other:?}"),
+        }
+    }
+
+    /// A stream over `max_bytes` ends with `NetError::Read`, as a buffered body over it does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stream_over_max_bytes_ends_with_a_read_error() {
+        let srv = start_server().await;
+        let req = FetchRequest::builder(Method::GET, srv.url("/chunked-20k"))
+            .with_streaming(true)
+            .with_max_bytes(10_000)
+            .build();
+        let (result, _) = fetch_one(test_config(), req).await;
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = result
+        else {
+            panic!("expected a stream, got {result:?}");
+        };
+        let res = crate::net::utils::stream_to_bytes(peek_buf, shared, None).await;
+        assert!(matches!(res, Err(NetError::Read(_))), "{res:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]

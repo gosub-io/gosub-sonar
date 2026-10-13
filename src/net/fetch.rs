@@ -1615,7 +1615,7 @@ pub(crate) async fn fetch_response_complete(
             r = timeout(read_idle_timeout, reader.read_buf(&mut body_buf)) => {
                 match r {
                     Err(_) => return Err(NetError::Timeout("fetch_request_complete timeout".into())),
-                    Ok(Err(e)) => return Err(NetError::Io(Arc::new(e))),
+                    Ok(Err(e)) => return Err(e.into()),
                     Ok(Ok(n)) => n,
                 }
             }

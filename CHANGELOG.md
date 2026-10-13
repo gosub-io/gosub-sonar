@@ -231,6 +231,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream whose `Content-Length` is over the cap is refused before any of it is read, as a
   buffered fetch already was; and a fetch refused that way reported `Cancelled` to the
   observer, though it had failed. It reports `Failed` now
+- Errors: a body that broke off after its first 5 KiB came back as `NetError::Io`, with the
+  `Transport` error of kind `Body` buried inside it, where one that broke off earlier was that
+  `Transport` error itself; and a stream over `max_bytes` ended with `Io`, where the docs and a
+  buffered body say `Read`. Both are as documented now. To that end `From<std::io::Error> for
+  NetError` gives back the `NetError` carried by an `io::Error` from `NetError::to_io`, instead
+  of wrapping it in `Io` a second time
 
 ## [0.13.0] - 2026-10-12
 
