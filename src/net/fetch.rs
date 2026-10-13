@@ -671,7 +671,8 @@ pub struct RequestInit {
     /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
     pub header_order: Option<Vec<HeaderName>>,
     /// Deadline for each hop, from the moment it starts connecting until its body has been
-    /// read. `None` leaves it to the client's own request timeout.
+    /// read. `None` leaves it to the client's own request timeout. On wasm32 it aborts the
+    /// browser's `fetch()`, from when the fetch starts until its body has been read.
     pub timeout: Option<Duration>,
     /// Wall-clock budget for following redirects. Starts when the first redirect response
     /// arrives and must cover every later hop up to the final response headers. `None` sets
@@ -775,6 +776,7 @@ impl RequestInit {
 
     /// Bounds each hop, from the moment it starts connecting until its body has been read,
     /// overriding the client's request timeout. `None` leaves the client's own timeout in force.
+    /// On wasm32, where the client has none, it aborts the browser's `fetch()` instead.
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
         self
