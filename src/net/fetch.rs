@@ -669,8 +669,8 @@ pub struct RequestInit {
     /// Order in which headers are sent, applied per hop; `None` keeps insertion order. See
     /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
     pub header_order: Option<Vec<HeaderName>>,
-    /// Deadline for each hop, from its first byte sent until its body is read. `None` leaves
-    /// it to the client's own request timeout.
+    /// Deadline for each hop, from the moment it starts connecting until its body has been
+    /// read. `None` leaves it to the client's own request timeout.
     pub timeout: Option<Duration>,
     /// Wall-clock budget for following redirects. Starts when the first redirect response
     /// arrives and must cover every later hop up to the final response headers. `None` sets
@@ -772,8 +772,8 @@ impl RequestInit {
         self
     }
 
-    /// Bounds each hop's wait for response headers, overriding the client's request timeout.
-    /// `None` leaves the client's own timeout in force.
+    /// Bounds each hop, from the moment it starts connecting until its body has been read,
+    /// overriding the client's request timeout. `None` leaves the client's own timeout in force.
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
         self

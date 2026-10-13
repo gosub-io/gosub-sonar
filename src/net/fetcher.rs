@@ -71,9 +71,9 @@ pub struct FetcherConfig {
     /// That is a known deviation from RFC 8305 (Happy Eyeballs), which starts the next
     /// attempt after 250 ms and races them.
     pub connect_timeout: Duration,
-    /// Deadline for one hop, from sending its first byte until its body has been read. The
-    /// client enforces it, and it covers the body as well as the wait for headers, so a
-    /// download longer than this fails whatever `total_body_timeout` says.
+    /// Deadline for one hop, from the moment it starts connecting until its body has been
+    /// read. The client enforces it, and it covers the body as well as the wait for headers,
+    /// so a download longer than this fails whatever `total_body_timeout` says.
     pub req_timeout: Duration,
     /// Maximum silence between consecutive body chunks before the read is aborted.
     pub read_idle_timeout: Duration,

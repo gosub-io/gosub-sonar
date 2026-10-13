@@ -74,6 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `RequestInit::with_timeout` said it bounds the wait for response headers. Like the
+  `timeout` field it sets, it bounds the whole hop, the body included. Both, and
+  `FetcherConfig::req_timeout`, said the deadline starts at the first byte sent; it starts
+  when the hop starts connecting
 - `RequestInit::user_activated` said it sends `Sec-Fetch-User` for the `navigate` mode. It
   goes by the destination, as Fetch does: `document`, `embed`, `frame`, `iframe` or `object`
 - `docs/architecture.md` called `Initiator` a tag for logging only. `Initiator::User` also
