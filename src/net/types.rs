@@ -300,8 +300,8 @@ pub enum RequestChange {
         /// The removed headers.
         headers: Vec<HeaderName>,
     },
-    /// A redirect changed the method, and any request body was dropped with it
-    /// (RFC 9110 section 15.4).
+    /// A redirect changed the method, and any request body was dropped with it: a `POST` on a
+    /// 301 or 302, any method but `GET` and `HEAD` on a 303 (Fetch §4.5).
     MethodDowngraded {
         /// The method of the hop that answered with the redirect.
         from: Method,

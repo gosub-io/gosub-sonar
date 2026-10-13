@@ -84,6 +84,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `Strict-Transport-Security` `max-age` of `+100` armed HSTS for 100 seconds, while one too
+  large for a `u64` had the header ignored. `max-age` is digits only (RFC 6797 §6.1.1), and an
+  oversized value is capped like any long one now
+- A `Strict-Transport-Security` value with an unknown directive given twice (`preload;
+  preload`), or with a value on `includeSubDomains`, armed HSTS. Both are non-conforming
+  (RFC 6797 §6.1, §6.1.2), and the header is ignored now
+- A `Strict-Transport-Security` value was split at every `;`, quoted-string or not, and any
+  text between the `;`s was taken as a directive: `max-age=100; fo o` or `foo=a,b` armed HSTS,
+  while `foo="a;b"` was cut in two and a quoted-pair was left escaped. The value is parsed by
+  the grammar of RFC 6797 §6.1 now, and one that does not follow it is ignored whole, as the
+  RFC requires
+- A redirect with two `Location` headers was followed to the first. It is a network error now
+  (`NetError::Redirect`), as Fetch's location URL makes it
+- A 301, 302, 303, 307 or 308 without a `Location` failed with a redirect error. It is the
+  response now, returned to the caller as it is (Fetch §4.5)
+- A redirect lost the fragment of the URL asked for when its `Location` had none: `/a#top`
+  redirected to `/b` ended at `/b`, not `/b#top`. The `Location` inherits it now (Fetch §2.2.6,
+  RFC 9110 §10.2.2), in `Redirected` and in the final URL
+- A redirect within one origin sent the next hop the cookies the jar had given the first:
+  `cookies_for` was only asked again after a `Set-Cookie` or a change of origin. A redirect from
+  `/login` to `/app` sent `/login`'s cookies, and a `POST` turned into a `GET` was not asked
+  about as a `GET` for `SameSite`. The jar is asked for every hop now, with its URL and method
+- A redirect that turned a request into a `GET` dropped its `Content-Type` but went on
+  sending `Content-Encoding`, `Content-Language` and `Content-Location`, which described a body
+  no longer there. All four request-body headers go with the body now (Fetch §4.5)
+- A 301 or 302 turned every method but `HEAD` into `GET` and dropped the body, and a 303 turned
+  `HEAD` into `GET` too. Fetch §4.5 changes only a `POST` on a 301 or 302, and every method but
+  `GET` and `HEAD` on a 303: a `PUT`, `DELETE` or `PATCH` redirected by a 301 or 302 now goes on
+  with its method and body, as browsers send it, and reports no `MethodDowngraded`
 - Proxy credentials went to the wrong proxy. With several `ProxyRule`s, a plain-`http`
   request took its `Proxy-Authorization` from the first rule that matched *and* had
   credentials, while the client connected through the first rule that matched. Rules

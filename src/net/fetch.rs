@@ -2910,7 +2910,18 @@ async fn get_with_redirects(
             _ => None,
         };
 
-        if !hop.is_redirection() {
+        // Fetch §4.5 steps 3-5, the location URL: a redirect without a `Location` is the
+        // response, returned as it is, and one with more than one is a network error. The field
+        // lines are counted, not split on commas: a URL may hold a comma.
+        let locations = hop.headers().get_all(header::LOCATION).iter().count();
+        if hop.is_redirection() && locations > 1 {
+            return Err(NetError::Redirect(Arc::new(anyhow!(
+                "redirect status {} with {} Location headers",
+                hop.status(),
+                locations
+            ))));
+        }
+        if !hop.is_redirection() || locations == 0 {
             if attach_credentials {
                 report_set_cookie(&policy, &url, hop.headers());
             }
@@ -2962,9 +2973,13 @@ async fn get_with_redirects(
         }
 
         // Report Set-Cookie values on this hop to the jar before following the redirect —
-        // login flows commonly set the session cookie on a 302. Dropping our Cookie header
-        // makes the next hop re-query the now-updated jar instead of resending a stale value.
-        if attach_credentials && report_set_cookie(&policy, &from, hop.headers()) {
+        // login flows commonly set the session cookie on a 302.
+        let cookies_set = attach_credentials && report_set_cookie(&policy, &from, hop.headers());
+        // The jar's cookies answered for this hop's URL and method. The next hop asks again for
+        // its own (Fetch appends `Cookie` per request): another path can match other cookies,
+        // and a method changed to `GET` other `SameSite` ones. A caller's own `Cookie` stays,
+        // unless the hop set cookies, which the jar now has, or the redirect leaves the origin.
+        if cookie_from_jar || cookies_set {
             current_headers.remove(header::COOKIE);
             cookie_from_jar = false;
         }
@@ -2981,9 +2996,15 @@ async fn get_with_redirects(
             })?;
         let loc = loc.as_str();
 
-        let to = from.join(loc).map_err(|e| {
+        let mut to = from.join(loc).map_err(|e| {
             NetError::Redirect(Arc::new(anyhow!("invalid redirect URL '{}': {}", loc, e)))
         })?;
+        // A `Location` without a fragment keeps the request's (Fetch §2.2.6 location URL,
+        // RFC 9110 §10.2.2): a redirect of `/a#top` to `/b` leads to `/b#top`. From `url`, the
+        // request's current URL: the response's has no fragment.
+        if to.fragment().is_none() {
+            to.set_fragment(url.fragment());
+        }
 
         // A `Location` with embedded `user:password` is refused for a cors-mode request, and
         // for any request when it points at another origin than the hop it came from: following
@@ -3004,33 +3025,31 @@ async fn get_with_redirects(
                 BlockReason::Cors(CorsError::CredentialedRedirect),
             ));
         }
-        let mut to = to;
         let location_credentials_removed = strip_url_credentials(&mut to);
 
-        // Method and body semantics per RFC 7231 §6.4
+        // Fetch §4.5 step 12: a 301 or 302 turns a `POST` into a `GET`, and a 303 every method
+        // but `GET` and `HEAD`; the body goes with the method. Any other method, and every one
+        // on a 307 or 308, goes on as it was, body included.
         let method_before = current_method.clone();
-        match status {
-            // 301/302: browsers always downgrade POST to GET (§6.4.2–3); we follow suit.
-            // HEAD stays HEAD (no body involved); all other methods become GET.
-            301 | 302 => {
-                if current_method != Method::HEAD {
-                    current_method = Method::GET;
-                }
-                current_body = None;
-                current_headers.remove(header::CONTENT_TYPE);
-                current_headers.remove(header::CONTENT_LENGTH);
-                current_headers.remove(header::TRANSFER_ENCODING);
+        let to_get = match status {
+            301 | 302 => current_method == Method::POST,
+            303 => current_method != Method::GET && current_method != Method::HEAD,
+            _ => false,
+        };
+        if to_get {
+            current_method = Method::GET;
+            current_body = None;
+            // The request-body-header names (Fetch §2.2.2), with the framing of the body gone.
+            for name in [
+                header::CONTENT_ENCODING,
+                header::CONTENT_LANGUAGE,
+                header::CONTENT_LOCATION,
+                header::CONTENT_TYPE,
+                header::CONTENT_LENGTH,
+                header::TRANSFER_ENCODING,
+            ] {
+                current_headers.remove(name);
             }
-            // 303 See Other: always GET, always drop body.
-            303 => {
-                current_method = Method::GET;
-                current_body = None;
-                current_headers.remove(header::CONTENT_TYPE);
-                current_headers.remove(header::CONTENT_LENGTH);
-                current_headers.remove(header::TRANSFER_ENCODING);
-            }
-            // 307/308, the only redirects left: preserve method and body.
-            _ => {}
         }
 
         // Strip credential headers when redirecting to a different origin (RFC 9110 §15.4).
@@ -4691,10 +4710,11 @@ mod tests {
         assert_eq!(&body[..], b"hello world");
     }
 
+    /// Fetch §4.5 step 4: a redirect status without a `Location` is the response.
     #[tokio::test(flavor = "current_thread")]
-    async fn redirect_without_location_header_errors() {
+    async fn redirect_without_location_header_is_returned() {
         let srv = server().await;
-        let res = super::fetch_response_top(
+        let ResponseTop { meta, .. } = super::fetch_response_top(
             client(),
             srv.url("/nohead"),
             RequestInit::get(HeaderMap::new()),
@@ -4702,8 +4722,9 @@ mod tests {
             observer(),
             NetPolicy::default(),
         )
-        .await;
-        assert!(res.is_err());
+        .await
+        .expect("returned, not an error");
+        assert_eq!(meta.status, 302);
     }
 
     /// Only 301/302/303/307/308 are redirects. A 300 is returned even with a `Location`, and a
@@ -7606,6 +7627,303 @@ mod tests {
 
     /// `NetEvent::SecurityUpgraded` and `NetEvent::RequestModified`: one event per change, in
     /// the right place in the stream, and nothing when nothing changed.
+    /// Fetch's HTTP-redirect fetch, against a server that answers `/start` with any status.
+    mod redirect_rules {
+        use super::*;
+        use tokio::io::AsyncWriteExt;
+
+        /// One request as the server saw it.
+        #[derive(Debug, Clone)]
+        struct Seen {
+            method: String,
+            path: String,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        }
+
+        impl Seen {
+            fn header(&self, name: &str) -> Option<&str> {
+                self.headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.as_str())
+            }
+        }
+
+        /// A server that answers `/start` with `status` and the header lines in `head` (each
+        /// ending in `\r\n`), and anything else with `200 ok`. It records every request.
+        async fn server(status: u16, head: &'static str) -> (Url, Arc<Mutex<Vec<Seen>>>) {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let base = Url::parse(&format!(
+                "http://127.0.0.1:{}/",
+                listener.local_addr().unwrap().port()
+            ))
+            .unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let log = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let end = loop {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break None;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(p + 4);
+                        }
+                    };
+                    let Some(end) = end else { continue };
+                    let text = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let mut lines = text.split("\r\n");
+                    let mut first = lines.next().unwrap_or("").split(' ');
+                    let method = first.next().unwrap_or("").to_string();
+                    let path = first.next().unwrap_or("").to_string();
+                    let headers: Vec<(String, String)> = lines
+                        .filter_map(|l| l.split_once(':'))
+                        .map(|(n, v)| (n.to_string(), v.trim().to_string()))
+                        .collect();
+                    let length = headers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, v)| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let mut body = buf[end..].to_vec();
+                    while body.len() < length {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&chunk[..n]);
+                    }
+                    let response = if path == "/start" {
+                        format!(
+                            "HTTP/1.1 {status} Redirect\r\n{head}Content-Length: 0\r\n\
+                             Connection: close\r\n\r\n"
+                        )
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                            .to_string()
+                    };
+                    log.lock().unwrap().push(Seen {
+                        method,
+                        path,
+                        headers,
+                        body,
+                    });
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            });
+            (base, seen)
+        }
+
+        /// Fetch `/start` on `base` with `method`, `headers` and `body`, and return the request
+        /// that reached `/end`, with what the observer saw.
+        async fn follow(
+            status: u16,
+            method: Method,
+            headers: HeaderMap,
+            body: Option<&'static [u8]>,
+        ) -> (Seen, Arc<RecordingObserver>) {
+            follow_with(status, method, headers, body, NetPolicy::default()).await
+        }
+
+        /// [`follow`] under `policy`.
+        async fn follow_with(
+            status: u16,
+            method: Method,
+            headers: HeaderMap,
+            body: Option<&'static [u8]>,
+            policy: NetPolicy,
+        ) -> (Seen, Arc<RecordingObserver>) {
+            let (base, seen) = server(status, "Location: /end\r\n").await;
+            let rec = Arc::new(RecordingObserver::new());
+            super::super::fetch_response_complete(
+                client(),
+                base.join("/start").unwrap(),
+                RequestInit::new(method, headers, body.map(RequestBody::bytes)),
+                CancellationToken::new(),
+                rec.clone(),
+                None,
+                Duration::from_secs(5),
+                None,
+                policy,
+            )
+            .await
+            .expect("fetch");
+            let end = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|s| s.path == "/end")
+                .cloned()
+                .expect("the redirect was followed");
+            (end, rec)
+        }
+
+        /// Fetch §4.5 step 12: a 301 or 302 turns a `POST` into a `GET` and nothing else. Any
+        /// other method goes on with its body and the body's type, and nothing is reported as
+        /// changed.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_301_or_302_changes_only_a_post() {
+            for status in [301, 302] {
+                let (end, rec) = follow(status, Method::POST, HeaderMap::new(), Some(b"a=1")).await;
+                assert_eq!(
+                    (end.method.as_str(), end.body.as_slice()),
+                    ("GET", &b""[..])
+                );
+                assert_eq!(rec.modifications().len(), 1, "{status} POST");
+                for method in [Method::PUT, Method::DELETE, Method::PATCH] {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+                    let (end, rec) = follow(status, method.clone(), headers, Some(b"a=1")).await;
+                    assert_eq!(
+                        (end.method.as_str(), end.body.as_slice()),
+                        (method.as_str(), &b"a=1"[..]),
+                        "{status} {method}"
+                    );
+                    assert_eq!(
+                        end.header("content-type"),
+                        Some("text/plain"),
+                        "{status} {method}"
+                    );
+                    assert!(
+                        rec.modifications().is_empty(),
+                        "{status} {method}: {:?}",
+                        rec.modifications()
+                    );
+                }
+            }
+        }
+
+        /// Fetch §4.5 step 12: a method changed to `GET` loses its body and every
+        /// request-body-header (§2.2.2). One that is kept keeps them all.
+        #[tokio::test(flavor = "current_thread")]
+        async fn the_body_headers_go_with_the_body() {
+            let names = [
+                "content-encoding",
+                "content-language",
+                "content-location",
+                "content-type",
+            ];
+            let headers = || {
+                let mut h = HeaderMap::new();
+                for (name, value) in names.iter().zip(["gzip", "nl", "/form", "text/plain"]) {
+                    h.insert(*name, value.parse().unwrap());
+                }
+                h
+            };
+            let (end, _) = follow(302, Method::POST, headers(), Some(b"a=1")).await;
+            let kept: Vec<_> = names.iter().filter(|n| end.header(n).is_some()).collect();
+            assert!(kept.is_empty(), "302 POST to GET still sends {kept:?}");
+            let (end, _) = follow(307, Method::POST, headers(), Some(b"a=1")).await;
+            let lost: Vec<_> = names.iter().filter(|n| end.header(n).is_none()).collect();
+            assert!(lost.is_empty(), "307 POST lost {lost:?}");
+        }
+
+        /// The jar is asked for every hop, with the hop's URL and method: a same-origin redirect
+        /// to another path gets that path's cookies, and a `POST` turned into a `GET` is asked
+        /// about as a `GET` (Fetch appends `Cookie` per request). No `Set-Cookie` needed.
+        #[tokio::test(flavor = "current_thread")]
+        async fn the_jar_answers_for_every_hop() {
+            let jar = || NetPolicy {
+                cookies_for: Box::new(|hop| {
+                    Some(format!("at={}&m={}", hop.url.path(), hop.method))
+                }),
+                ..NetPolicy::default()
+            };
+            let (end, _) = follow_with(302, Method::GET, HeaderMap::new(), None, jar()).await;
+            assert_eq!(end.header("cookie"), Some("at=/end&m=GET"));
+            let (end, _) =
+                follow_with(303, Method::POST, HeaderMap::new(), Some(b"a=1"), jar()).await;
+            assert_eq!(end.header("cookie"), Some("at=/end&m=GET"));
+        }
+
+        /// A caller's own `Cookie` is not the jar's: it goes on to the same origin, until a hop
+        /// sets cookies (see `redirect_set_cookie_drops_stale_cookie_header`).
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_callers_cookie_stays_on_the_origin() {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, "mine=1".parse().unwrap());
+            let (end, _) = follow(302, Method::GET, headers, None).await;
+            assert_eq!(end.header("cookie"), Some("mine=1"));
+        }
+
+        /// Fetch §2.2.6: a `Location` without a fragment keeps the request's, and one with a
+        /// fragment of its own replaces it. `Redirected` and the final URL say so.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_location_without_a_fragment_keeps_the_requests() {
+            for (location, expected) in [
+                ("Location: /end\r\n", "frag"),
+                ("Location: /end#own\r\n", "own"),
+            ] {
+                let (base, _) = server(302, location).await;
+                let rec = Arc::new(RecordingObserver::new());
+                let (meta, _) = super::super::fetch_response_complete(
+                    client(),
+                    base.join("/start#frag").unwrap(),
+                    RequestInit::get(HeaderMap::new()),
+                    CancellationToken::new(),
+                    rec.clone(),
+                    None,
+                    Duration::from_secs(5),
+                    None,
+                    NetPolicy::default(),
+                )
+                .await
+                .expect("fetch");
+                assert_eq!(meta.final_url.fragment(), Some(expected), "{location}");
+                assert!(
+                    rec.event_names().iter().any(|n| n == "Redirected"),
+                    "{:?}",
+                    rec.event_names()
+                );
+            }
+        }
+
+        /// Fetch §2.2.6 location URL: a redirect with two `Location` field lines has no one
+        /// target, and is a network error rather than a guess at one of them.
+        #[tokio::test(flavor = "current_thread")]
+        async fn two_locations_are_a_network_error() {
+            let (base, seen) = server(302, "Location: /a\r\nLocation: /b\r\n").await;
+            let result = super::super::fetch_response_complete(
+                client(),
+                base.join("/start").unwrap(),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                Arc::new(RecordingObserver::new()),
+                None,
+                Duration::from_secs(5),
+                None,
+                NetPolicy::default(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(NetError::Redirect(_))),
+                "{:?}",
+                result.map(|(meta, _)| meta.status)
+            );
+            assert_eq!(seen.lock().unwrap().len(), 1, "no hop after the redirect");
+        }
+
+        /// Fetch §4.5 step 12: a 303 turns every method into a `GET` but `GET` and `HEAD`.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_303_keeps_a_head() {
+            let (end, rec) = follow(303, Method::HEAD, HeaderMap::new(), None).await;
+            assert_eq!(end.method, "HEAD");
+            assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
+            let (end, _) = follow(303, Method::PUT, HeaderMap::new(), Some(b"a=1")).await;
+            assert_eq!(
+                (end.method.as_str(), end.body.as_slice()),
+                ("GET", &b""[..])
+            );
+        }
+    }
+
     mod security_events {
         use super::*;
         use crate::net::types::{RequestChange, UpgradeReason};
