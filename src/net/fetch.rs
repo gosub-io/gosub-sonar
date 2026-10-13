@@ -1569,22 +1569,26 @@ pub(crate) async fn fetch_response_complete(
     body_buf.extend_from_slice(peek_buf.as_slice());
 
     loop {
-        // Check if we hit the total body timeout
-        if body_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            return Err(NetError::Timeout("total body timeout".into()));
-        }
-
         // Ensure there is spare capacity so `read_buf` reads directly into the buffer (single copy
         // from the stream) rather than returning 0 for lack of room.
         if body_buf.capacity() - body_buf.len() < READ_CHUNK {
             body_buf.reserve(READ_CHUNK);
         }
 
+        // The total budget is a deadline: a read that blocks is cut off when it passes, not
+        // only checked between reads.
+        let deadline = async {
+            match body_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         let n = tokio::select! {
             // Stream cancelled
             _ = cancel.cancelled() => {
                 return Err(NetError::Cancelled("fetch_request_complete cancelled".into()));
             }
+            _ = deadline => return Err(NetError::Timeout("total body timeout".into())),
             // Read bytes, or timeout when not read something in time. `read_buf` reads directly into
             // the spare capacity of `body_buf`, so there is no intermediate scratch buffer.
             r = timeout(read_idle_timeout, reader.read_buf(&mut body_buf)) => {

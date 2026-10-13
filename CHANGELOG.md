@@ -220,6 +220,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the request until the request timeout (60 s by default) instead of the idle timeout (15 s).
   And `total_body_timeout`, documented as the budget for the body after the headers, was
   counted from before the request was sent, so slow headers used up the body's time
+- Bodies: a buffered fetch checked `total_body_timeout` only between reads, so a read that
+  was blocked when the deadline passed overran it by up to `read_idle_timeout`. The deadline
+  now cuts the read off, as it already did for a stream
 
 ## [0.13.0] - 2026-10-12
 

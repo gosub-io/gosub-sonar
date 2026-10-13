@@ -1370,6 +1370,10 @@ mod tests {
                 "/stall-early",
                 RouteConfig::stall_mid_body(100, Duration::from_secs(30)),
             )
+            .route(
+                "/stall-late",
+                RouteConfig::stall_mid_body(8 * 1024, Duration::from_secs(30)),
+            )
             .route("/not-found", RouteConfig::status(404, b"not found"))
             .route("/drop", RouteConfig::drop_mid_body(100, 10_000))
             .route("/flaky", RouteConfig::status_then_ok(503, 2, b"recovered"))
@@ -2907,6 +2911,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"ok");
+    }
+
+    /// `total_body_timeout` is a deadline: a buffered read that is blocked when it passes is
+    /// cut off then, not when the idle timeout ends the read.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_total_body_timeout_cuts_off_a_blocked_read() {
+        let srv = start_server().await;
+        // `/stall-late` sends 8 KiB and goes silent; 3 s of silence is allowed.
+        let req = FetchRequest::builder(Method::GET, srv.url("/stall-late"))
+            .with_read_idle_timeout(Duration::from_secs(3))
+            .with_total_body_timeout(Duration::from_millis(300))
+            .build();
+        let (result, elapsed) = fetch_one(test_config(), req).await;
+        assert!(
+            matches!(result, FetchResult::Error(NetError::Timeout(_))),
+            "{result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the 300 ms deadline should have fired (took {elapsed:?})"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
