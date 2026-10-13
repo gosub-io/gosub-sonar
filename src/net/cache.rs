@@ -22,17 +22,24 @@
 //! - `Vary`: one entry per combination of the request headers the response varies on (§4.1)
 //! - invalidation of the target URI (and a same-origin `Location`/`Content-Location`) by an
 //!   unsafe method (§4.4)
+//! - `stale-while-revalidate` (RFC 5861 §3): a stale response it covers answers a request with
+//!   a client (one with an origin) in the default mode at once, on the request's first hop, and
+//!   is revalidated in the background ([`CacheDecision::UseStale`], [`CacheOutcome::Stale`]).
+//!   The [`Fetcher`] does that with a request of its own; see
+//!   [`NetPolicy::revalidate_in_background`].
 //!
 //! Not implemented: shared-cache rules (`s-maxage`, the `Authorization` restriction of §3.5, since
-//! this is a private cache), range requests and `206` responses, and serving stale content while
-//! revalidating (`stale-while-revalidate`). A request that carries a `Range` or a condition of
-//! its own goes past the cache in both directions, since only the server can answer it.
+//! this is a private cache), and range requests and `206` responses. A request that carries a
+//! `Range` or a condition of its own goes past the cache in both directions, since only the
+//! server can answer it.
 //!
 //! `Set-Cookie` is stripped before a response is stored, so that a cache hit cannot re-apply a
 //! cookie the jar already has, and so are the hop-by-hop headers, which describe the connection
 //! rather than the response.
 //!
 //! [`FetcherConfig::cache`]: crate::net::fetcher::FetcherConfig::cache
+//! [`Fetcher`]: crate::net::fetcher::Fetcher
+//! [`NetPolicy::revalidate_in_background`]: crate::net::fetch::NetPolicy::revalidate_in_background
 //! [`FetchRequest::cache_mode`]: crate::net::types::FetchRequest::cache_mode
 
 use crate::net::utils::split_outside_quotes;
@@ -120,6 +127,10 @@ pub enum CacheMode {
 pub enum CacheOutcome {
     /// A stored response was used without contacting the server.
     Hit,
+    /// A stale stored response was used without contacting the server, as its
+    /// `stale-while-revalidate` allows (RFC 5861 §3), and a revalidation of it was started in the
+    /// background.
+    Stale,
     /// A stored response was revalidated and the server answered `304`; the stored body was
     /// used and its headers updated.
     Validated,
@@ -133,6 +144,7 @@ impl std::fmt::Display for CacheOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Hit => "hit",
+            Self::Stale => "stale",
             Self::Validated => "validated",
             Self::Stored => "stored",
             Self::Invalidated => "invalidated",
@@ -148,10 +160,39 @@ pub enum CacheDecision {
     /// Send the request with these conditional headers added. A `304` means the stored response
     /// is still good.
     Revalidate(Arc<CacheEntry>, HeaderMap),
+    /// Use this stored response although it is stale, and revalidate it in the background: its
+    /// `stale-while-revalidate` (RFC 5861 §3) still covers it. Only for [`CacheMode::Default`].
+    ///
+    /// Fetch serves it so only to a request with a client (HTTP-network-or-cache fetch), whose
+    /// revalidation can run on after the request itself is answered. Any other request
+    /// revalidates it before using it, as for [`Revalidate`](Self::Revalidate) or
+    /// [`Send`](Self::Send) by whether it has validators; see [`CacheDecision::revalidated`].
+    UseStale(Arc<CacheEntry>),
     /// Send the request; there is nothing usable stored.
     Send,
     /// The request insisted on a stored response ([`CacheMode::OnlyIfCached`]) and there is none.
     NotCached,
+}
+
+impl CacheDecision {
+    /// The decision for a request that cannot revalidate in the background: a
+    /// [`UseStale`](Self::UseStale) becomes a revalidation now, and anything else stays as it is.
+    pub fn revalidated(self) -> Self {
+        match self {
+            Self::UseStale(entry) => revalidate(&entry),
+            other => other,
+        }
+    }
+}
+
+/// Revalidate `entry`, or fetch afresh when it has no validators to send.
+fn revalidate(entry: &Arc<CacheEntry>) -> CacheDecision {
+    let conditional = entry.conditional_headers();
+    if conditional.is_empty() {
+        CacheDecision::Send
+    } else {
+        CacheDecision::Revalidate(entry.clone(), conditional)
+    }
 }
 
 /// The URL and method a cache entry is stored under, and whose cookies fetched it.
@@ -468,6 +509,9 @@ pub struct ResponseDirectives {
     pub must_understand: bool,
     /// `max-age`, in seconds.
     pub max_age: Option<i64>,
+    /// `stale-while-revalidate` (RFC 5861 §3), in seconds: how long past its freshness the
+    /// response may still be used while it is revalidated in the background.
+    pub stale_while_revalidate: Option<i64>,
 }
 
 impl ResponseDirectives {
@@ -481,6 +525,7 @@ impl ResponseDirectives {
     pub fn parse(headers: &HeaderMap) -> Self {
         let mut out = Self::default();
         let mut max_age_seen = false;
+        let mut swr_seen = false;
         for (name, value) in directives(headers) {
             match name.as_str() {
                 "no-store" => out.no_store = true,
@@ -492,6 +537,12 @@ impl ResponseDirectives {
                 "private" => out.private = true,
                 "public" => out.public = true,
                 "must-understand" => out.must_understand = true,
+                // The first one counts, as for `max-age`, and only a number of seconds: anything
+                // else grants nothing (RFC 5861 §3).
+                "stale-while-revalidate" if !swr_seen => {
+                    swr_seen = true;
+                    out.stale_while_revalidate = value.and_then(|v| delta_seconds(&v));
+                }
                 "max-age" if !max_age_seen => {
                     max_age_seen = true;
                     out.max_age = Some(value.and_then(|v| delta_seconds(&v)).unwrap_or(0));
@@ -768,14 +819,6 @@ pub fn decide(
     };
 
     let stored = ResponseDirectives::parse(&entry.headers);
-    let revalidate = |entry: &Arc<CacheEntry>| {
-        let conditional = entry.conditional_headers();
-        if conditional.is_empty() {
-            CacheDecision::Send
-        } else {
-            CacheDecision::Revalidate(entry.clone(), conditional)
-        }
-    };
 
     // A stale entry may be served when the caller says so, unless the response forbade it.
     if mode == CacheMode::ForceCache || only_if_cached {
@@ -814,15 +857,32 @@ pub fn decide(
             };
         }
     }
+    // Stale, but within what the response's `stale-while-revalidate` grants: used now and
+    // revalidated behind it (RFC 5861 §3), unless `must-revalidate` forbids any stale use
+    // (RFC 9111 §5.2.2.2). Fetch serves it so in the default mode alone; a forced revalidation
+    // and `no-cache` already returned above.
+    let mut stale_usable = false;
+    if !usable && mode == CacheMode::Default && !stored.must_revalidate {
+        if let Some(window) = stored.stale_while_revalidate {
+            stale_usable = age - lifetime <= TimeDelta::seconds(window);
+        }
+    }
+    // The request's own limits hold either way: a stale response is never young enough for its
+    // `max-age` past that, and never fresh enough for any `min-fresh`.
     if let Some(max_age) = asked.max_age {
-        usable &= age <= TimeDelta::seconds(max_age);
+        let young = age <= TimeDelta::seconds(max_age);
+        usable &= young;
+        stale_usable &= young;
     }
     if let Some(min_fresh) = asked.min_fresh {
         usable &= lifetime - age >= TimeDelta::seconds(min_fresh);
+        stale_usable = false;
     }
 
     if usable {
         CacheDecision::Use(entry.clone())
+    } else if stale_usable {
+        CacheDecision::UseStale(entry.clone())
     } else {
         revalidate(entry)
     }
@@ -1430,6 +1490,128 @@ mod tests {
             at(30),
         );
         assert!(matches!(decision, CacheDecision::Send), "{decision:?}");
+    }
+
+    /// RFC 5861 §3: a stale response is used while it is revalidated for as long past its
+    /// freshness as `stale-while-revalidate` says, and revalidated first after that.
+    #[test]
+    fn stale_while_revalidate_covers_its_window_only() {
+        let stored = [entry(&[
+            ("cache-control", "max-age=10, stale-while-revalidate=20"),
+            ("etag", "\"v1\""),
+        ])];
+        let at_age = |secs| {
+            decide(
+                &stored,
+                &HeaderMap::new(),
+                false,
+                CacheMode::Default,
+                at(secs),
+            )
+        };
+        assert!(matches!(at_age(5), CacheDecision::Use(_)));
+        assert!(matches!(at_age(25), CacheDecision::UseStale(_)));
+        assert!(matches!(at_age(30), CacheDecision::UseStale(_)));
+        assert!(matches!(at_age(31), CacheDecision::Revalidate(..)));
+    }
+
+    /// A request that cannot revalidate in the background revalidates first: with its
+    /// validators when it has them, afresh when it has none.
+    #[test]
+    fn a_stale_response_is_revalidated_without_a_background() {
+        let swr = "max-age=0, stale-while-revalidate=60";
+        let with_tag = [entry(&[("cache-control", swr), ("etag", "\"v1\"")])];
+        let without = [entry(&[("cache-control", swr)])];
+        let decide_at = |stored: &[Arc<CacheEntry>]| {
+            decide(stored, &HeaderMap::new(), false, CacheMode::Default, at(5))
+        };
+        assert!(matches!(decide_at(&with_tag), CacheDecision::UseStale(_)));
+        assert!(matches!(
+            decide_at(&with_tag).revalidated(),
+            CacheDecision::Revalidate(..)
+        ));
+        assert!(matches!(decide_at(&without), CacheDecision::UseStale(_)));
+        assert!(matches!(
+            decide_at(&without).revalidated(),
+            CacheDecision::Send
+        ));
+    }
+
+    /// What `stale-while-revalidate` grants gives way to anything that forbids stale use: the
+    /// response's `must-revalidate`, a mode other than the default, and the request's own
+    /// `max-age`, `min-fresh` and `no-cache`.
+    #[test]
+    fn stale_while_revalidate_yields_to_stricter_rules() {
+        let swr = "max-age=10, stale-while-revalidate=600";
+        let stored = [entry(&[("cache-control", swr), ("etag", "\"v1\"")])];
+        let strict = [entry(&[
+            (
+                "cache-control",
+                "max-age=10, must-revalidate, stale-while-revalidate=600",
+            ),
+            ("etag", "\"v1\""),
+        ])];
+        let stale = |stored: &[Arc<CacheEntry>], asked: &[(&str, &str)], mode| {
+            matches!(
+                decide(stored, &headers(asked), false, mode, at(30)),
+                CacheDecision::UseStale(_)
+            )
+        };
+        assert!(stale(&stored, &[], CacheMode::Default));
+        assert!(!stale(&strict, &[], CacheMode::Default));
+        assert!(!stale(&stored, &[], CacheMode::NoCache));
+        assert!(!stale(
+            &stored,
+            &[("cache-control", "max-age=20")],
+            CacheMode::Default
+        ));
+        assert!(stale(
+            &stored,
+            &[("cache-control", "max-age=40")],
+            CacheMode::Default
+        ));
+        assert!(!stale(
+            &stored,
+            &[("cache-control", "min-fresh=0")],
+            CacheMode::Default
+        ));
+        assert!(!stale(
+            &stored,
+            &[("cache-control", "no-cache")],
+            CacheMode::Default
+        ));
+        // Stale use the caller asked for is no reason to revalidate.
+        assert!(matches!(
+            decide(
+                &stored,
+                &headers(&[("cache-control", "max-stale")]),
+                false,
+                CacheMode::Default,
+                at(30)
+            ),
+            CacheDecision::Use(_)
+        ));
+    }
+
+    /// The first `stale-while-revalidate` counts, and one that is not a number of seconds
+    /// grants nothing.
+    #[test]
+    fn stale_while_revalidate_parsing() {
+        let parse = |value: &str| {
+            ResponseDirectives::parse(&headers(&[("cache-control", value)])).stale_while_revalidate
+        };
+        assert_eq!(parse("stale-while-revalidate=30"), Some(30));
+        assert_eq!(parse("Stale-While-Revalidate=\"30\""), Some(30));
+        assert_eq!(
+            parse("stale-while-revalidate=30, stale-while-revalidate=90"),
+            Some(30)
+        );
+        assert_eq!(
+            parse("stale-while-revalidate=abc, stale-while-revalidate=90"),
+            None
+        );
+        assert_eq!(parse("stale-while-revalidate"), None);
+        assert_eq!(parse("stale-while-revalidate=-1"), None);
     }
 
     #[test]

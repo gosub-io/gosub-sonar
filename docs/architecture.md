@@ -608,15 +608,31 @@ condition of the caller's own (`If-None-Match`, `If-Modified-Since`, `If-Match`,
 `If-Unmodified-Since`, `If-Range`) is handled as `NoStore`, as Fetch does: the caller is asking
 the server, so neither sonar's cache nor one on the way answers for it.
 
+A stale response its `stale-while-revalidate` still covers (RFC 5861 §3) is used without asking
+the server by a request with a client, as Fetch puts it: in sonar, one with an `origin`, in the
+`Default` mode, on its first hop. `NetEvent::Cache` reports it as `CacheOutcome::Stale`, and the
+hop hands the URL to `NetPolicy::revalidate_in_background`. The `Fetcher` turns that into a
+request of its own, queued by the run loop: the request again, in `NoCache` mode but without the
+`Cache-Control: max-age=0` that mode sends (Fetch's "prevent no-cache cache-control header
+modification flag"), at `Priority::Low`, buffered so the cache gets the whole response. It
+reports to the observer `FetcherContext::observer_for` gives it under a request id of its own,
+and is no work of the reference's: `on_ref_active` and `on_ref_done` are not called for it. Two
+for the same stored response share one fetch, as any two alike requests do; the coalescing key
+keeps them apart from a caller's own `NoCache` request, which does send `max-age=0`. A request
+without an origin, a `must-revalidate` response, and a request whose own `max-age` or
+`min-fresh` the stale response does not meet revalidate before using it. So does a redirect hop:
+its revalidation would start from the hop's URL without the chain's state (the tainted origin,
+the `SameSite` context, `Sec-Fetch-Site`), and could send what the chain withholds.
+
 `Set-Cookie` is removed before a response is stored, so a cache hit cannot re-apply a cookie, and
 so are the hop-by-hop headers. A body the fetch decoded is stored
 without its `Content-Encoding`, and only answers requests that also decode, since the raw caller
 asked for different bytes.
 
 Known limits: shared-cache rules (`s-maxage`, the `Authorization` restriction of §3.5) do not
-apply to a private cache; range requests and `206` are not stored; there is no
-`stale-while-revalidate`; and a cors-mode request that needs a preflight still sends it before a
-cache hit is considered.
+apply to a private cache; range requests and `206` are not stored; `stale-while-revalidate`
+applies on the first hop only; and a cors-mode request that needs a preflight still sends it
+before a cache hit is considered.
 
 ---
 

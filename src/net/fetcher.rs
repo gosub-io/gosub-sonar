@@ -400,11 +400,15 @@ pub struct Fetcher {
 }
 
 /// What the client was built with that a request's policy has to agree with, taken when
-/// it was built rather than looked up again per request.
+/// it was built rather than looked up again per request, and where a request's policy leaves
+/// the background revalidations it starts.
 struct ClientsBuilt {
     /// The proxies the client routes by; see [`ProxyRoutes`].
     #[cfg(not(target_arch = "wasm32"))]
     proxy: ProxyRoutes,
+    /// Background revalidations on their way to the run loop.
+    #[cfg(not(target_arch = "wasm32"))]
+    revalidations: Revalidations,
 }
 
 impl ClientsBuilt {
@@ -414,8 +418,22 @@ impl ClientsBuilt {
         Self {
             #[cfg(not(target_arch = "wasm32"))]
             proxy: ProxyRoutes::resolve(&cfg.proxy),
+            #[cfg(not(target_arch = "wasm32"))]
+            revalidations: Revalidations::default(),
         }
     }
+}
+
+/// The background revalidations of stale responses that requests were answered with (see
+/// [`cache`](mod@crate::net::cache)), handed from a request's policy to the run loop, which
+/// queues them as requests of the fetcher's own.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct Revalidations {
+    /// Started and not yet queued.
+    started: std::sync::Mutex<Vec<FetchRequest>>,
+    /// Wakes the run loop for a revalidation started while it waits.
+    ready: Notify,
 }
 
 impl Fetcher {
@@ -511,6 +529,26 @@ impl Fetcher {
                     "fetcher shut down before the request was sent".into(),
                 )));
             }
+        }
+    }
+
+    /// Queue the background revalidations requests have started since the last look. Nobody
+    /// waits for their result: what they bring back goes to the cache. Two for the same stored
+    /// response share one fetch, as any two requests alike do, so it is revalidated once
+    /// however many requests it answers meanwhile.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn queue_revalidations(&self) {
+        let started = std::mem::take(
+            &mut *self
+                .built
+                .revalidations
+                .started
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for req in started {
+            let (reply, _) = oneshot::channel();
+            self.submit(req, CancellationToken::new(), reply).await;
         }
     }
 
@@ -618,6 +656,8 @@ impl Fetcher {
                 self.stop_queue().await;
                 break;
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            self.queue_revalidations().await;
 
             let next = {
                 let mut high = self.q_high.lock().await;
@@ -635,6 +675,13 @@ impl Fetcher {
                 reply: reply_tx,
             }) = next
             else {
+                #[cfg(not(target_arch = "wasm32"))]
+                tokio::select! {
+                    _ = self.wake.notified() => {},
+                    _ = self.built.revalidations.ready.notified() => {},
+                    _ = shutdown.cancelled() => {},
+                }
+                #[cfg(target_arch = "wasm32")]
                 tokio::select! {
                     _ = self.wake.notified() => {},
                     _ = shutdown.cancelled() => {},
@@ -723,13 +770,14 @@ impl Fetcher {
 
             // Every request has its own lifecycle, a follower's included: it reports from
             // `Accepted` to its own end (see `lifecycle`), and is its reference's outstanding
-            // work for as long.
+            // work for as long. A background revalidation is no work of the reference's: the
+            // request it refreshes a response for has already been answered.
             let lifecycle = Lifecycle::accept(
                 self.ctx
                     .observer_for(req.reference, req.req_id, req.kind, req.initiator),
                 requested.clone(),
                 !is_leader,
-                Some((self.ctx.clone(), req.reference)),
+                (!req.background_revalidation).then(|| (self.ctx.clone(), req.reference)),
             );
             if let Some(ref to) = upgraded {
                 lifecycle.on_event(NetEvent::SecurityUpgraded {
@@ -999,7 +1047,7 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
         }
         b.clone()
     });
-    RequestInit::new(req.method.clone(), headers, body)
+    let init = RequestInit::new(req.method.clone(), headers, body)
         .with_mixed_content(req.origin.clone(), effective_mixed_content(req, cfg))
         .with_referrer(req.referrer.clone(), req.referrer_policy)
         .with_fetch_metadata(req.destination, req.mode, req.initiator == Initiator::User)
@@ -1016,7 +1064,12 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
             Some(effective_read_idle_timeout(req, cfg)),
             effective_total_body_timeout(req, cfg),
         )
-        .with_max_bytes(req.max_bytes)
+        .with_max_bytes(req.max_bytes);
+    if req.background_revalidation {
+        init.as_background_revalidation()
+    } else {
+        init
+    }
 }
 
 /// The read idle timeout in force for `req`: its own override, else the fetcher's.
@@ -1166,12 +1219,48 @@ fn build_policy(
             .with_hsts(cfg.hsts.clone())
             .with_tls_overrides(cfg.tls_overrides.clone())
             .with_cache(cfg.cache.clone());
+        let policy = match cfg.cache {
+            Some(_) => policy.with_background_revalidation(revalidate_later(req, built)),
+            None => policy,
+        };
         match cfg.cors_preflight_cache.clone() {
             Some(cache) => policy.with_cors_preflight_cache(cache),
             None => policy,
         }
     };
     policy
+}
+
+/// What starts the background revalidation of a stale response `req` was answered with: a
+/// request of the fetcher's own, `req` again (Fetch: a clone of the request) in
+/// [`CacheMode::NoCache`](crate::net::cache::CacheMode::NoCache) and at [`Priority::Low`],
+/// queued by the run loop. It reports to an observer of its own, under a request id of its
+/// own, and the stored response it brings back answers the requests after it.
+#[cfg(not(target_arch = "wasm32"))]
+fn revalidate_later(
+    req: &FetchRequest,
+    built: &Arc<ClientsBuilt>,
+) -> crate::net::fetch::BackgroundRevalidationFn {
+    let req = req.clone();
+    let built = built.clone();
+    Box::new(move |url, method| {
+        let mut revalidation = req.clone();
+        revalidation.req_id = crate::types::RequestId::new();
+        revalidation.url = url.clone();
+        revalidation.method = method.clone();
+        revalidation.cache_mode = crate::net::cache::CacheMode::NoCache;
+        revalidation.background_revalidation = true;
+        revalidation.priority = Priority::Low;
+        // Read to its end, so the cache gets the whole response.
+        revalidation.streaming = false;
+        let revalidations = &built.revalidations;
+        revalidations
+            .started
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(revalidation);
+        revalidations.ready.notify_one();
+    })
 }
 
 /// Request override if set, else the fetcher's.
@@ -1428,6 +1517,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            background_revalidation: false,
             header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
@@ -1465,6 +1555,7 @@ mod tests {
                 mode: Default::default(),
                 credentials: Default::default(),
                 cache_mode: Default::default(),
+                background_revalidation: false,
                 header_order: None,
                 req_timeout: None,
                 read_idle_timeout: None,
@@ -1705,6 +1796,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            background_revalidation: false,
             header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
@@ -1980,6 +2072,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            background_revalidation: false,
             header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
@@ -3569,6 +3662,172 @@ mod tests {
         assert_eq!(log.event_names(), vec!["Accepted", "Blocked", "Failed"]);
     }
 
+    /// A context that records each request's events apart, by request id, and how much work
+    /// its references were given.
+    #[derive(Default)]
+    struct Revalidating {
+        observers: parking_lot::Mutex<Vec<(RequestId, Arc<RecordingObserver>)>>,
+        active: AtomicUsize,
+        done: AtomicUsize,
+    }
+
+    impl FetcherContext for Revalidating {
+        fn observer_for(
+            &self,
+            _: RequestReference,
+            id: RequestId,
+            _: ResourceKind,
+            _: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            let rec = Arc::new(RecordingObserver::new());
+            self.observers.lock().push((id, rec.clone()));
+            rec
+        }
+        fn on_ref_active(&self, _: RequestReference) {
+            self.active.fetch_add(1, Ordering::SeqCst);
+        }
+        fn on_ref_done(&self, _: RequestReference) {
+            self.done.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A route that is stale at once and may be used stale for ten minutes, a fetcher with a
+    /// cache on `ctx`, and a request for it from a page on the server's origin.
+    async fn swr_fetcher(
+        ctx: Arc<Revalidating>,
+        delay: Duration,
+    ) -> (
+        crate::net::test_support::TestServerHandle,
+        Arc<Fetcher>,
+        CancellationToken,
+        impl Fn() -> FetchRequest,
+    ) {
+        use crate::net::test_support::CacheRouteOptions;
+        let srv = TestServer::new()
+            .route(
+                "/swr",
+                RouteConfig::Cacheable(
+                    CacheRouteOptions::default()
+                        .with_cache_control("max-age=0, stale-while-revalidate=600")
+                        .counting()
+                        .delayed(delay),
+                ),
+            )
+            .start()
+            .await;
+        let fetcher = Arc::new(Fetcher::new(test_config(), ctx).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+        let url = srv.url("/swr");
+        let request = move || {
+            FetchRequest::builder(Method::GET, url.clone())
+                .with_origin(url.origin())
+                .build()
+        };
+        (srv, fetcher, shutdown, request)
+    }
+
+    fn body_of(result: FetchResult) -> (bool, bytes::Bytes) {
+        match result {
+            FetchResult::Buffered { meta, body } => (meta.from_cache, body),
+            other => panic!("expected a buffered result, got {other:?}"),
+        }
+    }
+
+    /// RFC 5861 §3 through the fetcher: the stale response answers at once, and the fetcher's
+    /// own revalidation brings the next one in. That revalidation reports as a request of its
+    /// own, asks without a `Cache-Control` of its own, and is no work of the page's.
+    #[tokio::test]
+    async fn a_stale_response_is_refreshed_in_the_background() {
+        let ctx = Arc::new(Revalidating::default());
+        let (srv, fetcher, shutdown, request) = swr_fetcher(ctx.clone(), Duration::ZERO).await;
+        let mut ours = Vec::new();
+        let mut fetch = || {
+            let req = request();
+            ours.push(req.req_id);
+            fetcher.fetch(req)
+        };
+        assert_eq!(body_of(fetch().await), (false, "hit-1".into()));
+        assert_eq!(body_of(fetch().await), (true, "hit-1".into()));
+
+        // Answered stale until the revalidation has stored what it brought back.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (from_cache, body) = body_of(fetch().await);
+            assert!(from_cache);
+            if body == "hit-2" {
+                break;
+            }
+            assert_eq!(body, "hit-1");
+            assert!(tokio::time::Instant::now() < deadline, "never refreshed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown.cancel();
+
+        // Every request the page made, and nothing else, was its work.
+        assert_eq!(ctx.active.load(Ordering::SeqCst), ours.len());
+        let observers = ctx.observers.lock();
+        let (_, revalidation) = observers
+            .iter()
+            .find(|(id, _)| !ours.contains(id))
+            .expect("the revalidation reported as a request of its own");
+        assert_eq!(
+            revalidation.cache_outcomes(),
+            vec![crate::net::cache::CacheOutcome::Stored]
+        );
+        assert_eq!(revalidation.finished_urls(), vec![srv.url("/swr")]);
+        let sent = revalidation.requests_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].2.get(header::CACHE_CONTROL), None);
+    }
+
+    /// A stored response is revalidated once at a time, however many requests it answers
+    /// while that runs.
+    #[tokio::test]
+    async fn a_stale_response_is_revalidated_once_at_a_time() {
+        let ctx = Arc::new(Revalidating::default());
+        let (srv, fetcher, shutdown, request) = swr_fetcher(ctx, Duration::from_millis(300)).await;
+        assert_eq!(
+            body_of(fetcher.fetch(request()).await),
+            (false, "hit-1".into())
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                body_of(fetcher.fetch(request()).await),
+                (true, "hit-1".into())
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(srv.hit_count("/swr"), 2);
+        shutdown.cancel();
+    }
+
+    /// A forced revalidation from a caller does not share the fetch of a background one: it
+    /// tells every cache on the way to revalidate (`Cache-Control: max-age=0`), and the
+    /// background one does not.
+    #[tokio::test]
+    async fn a_forced_revalidation_does_not_join_a_background_one() {
+        let ctx = Arc::new(Revalidating::default());
+        let (srv, fetcher, shutdown, request) = swr_fetcher(ctx, Duration::from_millis(300)).await;
+        assert_eq!(
+            body_of(fetcher.fetch(request()).await),
+            (false, "hit-1".into())
+        );
+        assert_eq!(
+            body_of(fetcher.fetch(request()).await),
+            (true, "hit-1".into())
+        );
+        // The background revalidation is under way, waiting on the server.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut forced = request();
+        forced.cache_mode = crate::net::cache::CacheMode::NoCache;
+        let (from_cache, _) = body_of(fetcher.fetch(forced).await);
+        assert!(!from_cache);
+        assert_eq!(srv.hit_count("/swr"), 3);
+        shutdown.cancel();
+    }
+
     /// A context that records each request's events apart, by request id.
     #[derive(Default)]
     struct PerRequest(
@@ -4277,6 +4536,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            background_revalidation: false,
             header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
@@ -4647,6 +4907,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
+            background_revalidation: false,
             header_order: None,
             req_timeout: None,
             read_idle_timeout: None,

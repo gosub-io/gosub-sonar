@@ -41,6 +41,10 @@ impl<'a> CookieHop<'a> {
 /// engine-specific types like TabId or EventChannel.
 pub trait FetcherContext: Send + Sync {
     /// Return an observer to emit NetEvents for this specific request.
+    ///
+    /// Also asked for the background revalidations the fetcher starts itself, to refresh a
+    /// stale response a request was answered with (see [`cache`](mod@crate::net::cache)):
+    /// with that request's reference, kind and initiator, under a request id of their own.
     fn observer_for(
         &self,
         reference: RequestReference,
@@ -51,7 +55,8 @@ pub trait FetcherContext: Send + Sync {
 
     /// Called once per request the fetcher takes, with its reference, as the request is
     /// accepted: that reference has outstanding work. A request that joins another's fetch
-    /// counts too, under its own reference.
+    /// counts too, under its own reference. A background revalidation the fetcher starts itself
+    /// does not: the request it refreshes a response for has already been answered.
     fn on_ref_active(&self, reference: RequestReference);
 
     /// Called once per request when it ends, the moment it reports its `Finished`, `Failed` or

@@ -801,6 +801,9 @@ pub struct FetchRequest {
     /// or no cache at all. Inert when the fetcher has no
     /// [`cache`](crate::net::fetcher::FetcherConfig::cache). See [`cache`](mod@crate::net::cache).
     pub cache_mode: CacheMode,
+    /// Set on a background revalidation the fetcher queues itself, to refresh a stale response
+    /// another request was answered with; see [`cache`](mod@crate::net::cache).
+    pub(crate) background_revalidation: bool,
     /// Overrides [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order)
     /// for this one request; `None` uses the fetcher-wide setting.
     pub header_order: Option<Vec<HeaderName>>,
@@ -1055,7 +1058,10 @@ impl FetchRequest {
         // A reload and a normal fetch of the same URL are not interchangeable: one must reach
         // the server, and the other may be answered from the cache. Two requests can only share
         // a response when they would use the cache the same way.
+        // A background revalidation asks the server as `no-cache` does, but with other headers,
+        // and only ever shares a fetch with another revalidation.
         let cache_mode = match self.cache_mode {
+            _ if self.background_revalidation => "revalidate",
             CacheMode::Default => "default",
             CacheMode::NoStore => "no-store",
             CacheMode::Reload => "reload",
@@ -1393,6 +1399,7 @@ impl FetchRequestBuilder {
             mode: self.mode,
             credentials: self.credentials,
             cache_mode: self.cache_mode,
+            background_revalidation: false,
             header_order: self.header_order,
             req_timeout: self.req_timeout,
             read_idle_timeout: self.read_idle_timeout,
