@@ -74,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `Strict-Transport-Security` value with an unknown directive given twice (`preload;
+  preload`), or with a value on `includeSubDomains`, armed HSTS. Both are non-conforming
+  (RFC 6797 §6.1, §6.1.2), and the header is ignored now
 - A `Strict-Transport-Security` value was split at every `;`, quoted-string or not, and any
   text between the `;`s was taken as a directive: `max-age=100; fo o` or `foo=a,b` armed HSTS,
   while `foo="a;b"` was cut in two and a quoted-pair was left escaped. The value is parsed by

@@ -210,23 +210,25 @@ fn directives(value: &str) -> Option<Vec<(&str, Option<String>)>> {
 
 /// Parses a `Strict-Transport-Security` value, or `None` if it does not conform — §6.1 requires
 /// a non-conforming header be ignored whole rather than salvaged in part. `max-age` is required;
-/// a repeated directive invalidates the header; unknown directives are ignored.
+/// any directive given twice, an unknown one too, invalidates the header (§6.1 item 2), as does
+/// a value on the valueless `includeSubDomains` (§6.1.2); unknown directives are otherwise
+/// ignored.
 fn parse_sts(value: &str) -> Option<StsDirectives> {
     let mut max_age: Option<u64> = None;
     let mut include_subdomains = false;
-    let mut seen_include_subdomains = false;
+    let mut seen: Vec<&str> = Vec::new();
 
     for (name, val) in directives(value)? {
+        if seen.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            return None;
+        }
+        seen.push(name);
         if name.eq_ignore_ascii_case("max-age") {
-            if max_age.is_some() {
-                return None;
-            }
             max_age = Some(val?.parse::<u64>().ok()?);
         } else if name.eq_ignore_ascii_case("includeSubDomains") {
-            if seen_include_subdomains {
+            if val.is_some() {
                 return None;
             }
-            seen_include_subdomains = true;
             include_subdomains = true;
         }
     }
@@ -458,6 +460,22 @@ mod tests {
             "max-age=100; fo o",
             r#"max-age=100; foo="open"#,
             "max-age=100; foo=",
+        ] {
+            assert_eq!(parse_sts(value), None, "{value}");
+        }
+    }
+
+    /// §6.1 item 2: every directive appears once, case aside, unknown ones included; and
+    /// §6.1.2: `includeSubDomains` takes no value. Either makes the header non-conforming.
+    #[test]
+    fn parse_rejects_a_repeated_directive_and_a_valued_include_subdomains() {
+        for value in [
+            "max-age=100; preload; preload",
+            "max-age=100; preload; PRELOAD",
+            "max-age=100; max-age=100",
+            "max-age=100; includeSubDomains; includesubdomains",
+            "max-age=100; includeSubDomains=yes",
+            r#"max-age=100; includeSubDomains="""#,
         ] {
             assert_eq!(parse_sts(value), None, "{value}");
         }
