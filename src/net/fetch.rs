@@ -664,8 +664,8 @@ pub struct RequestInit {
     /// How this request uses the HTTP cache. Inert without [`NetPolicy::cache`].
     /// See [`cache`](mod@crate::net::cache).
     pub cache_mode: CacheMode,
-    /// Whether the HTTP client decompresses the body. A cache entry records it, since a decoded
-    /// body is not the bytes a raw caller asked for.
+    /// Whether the body is decoded from its content codings (`gzip`, `br`, `deflate`). A cache
+    /// entry records it, since a decoded body is not the bytes a raw caller asked for.
     pub auto_decode: bool,
     /// Order in which headers are sent, applied per hop; `None` keeps insertion order. See
     /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
