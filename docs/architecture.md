@@ -755,10 +755,9 @@ deliberately do not add up to the elapsed total.
 They also report only work that actually happened: a request served from the connection pool
 emits no `DnsResolved` and no `Connected`, and a hop covered by a cached CORS grant emits no
 preflight events — the absence is the answer, rather than a zero that would read as "instant".
-`DnsResolved` further requires a `FetcherConfig::dns_resolver`, because reqwest's built-in
-resolution sits below this crate and cannot be timed; `dns::SystemResolver` is the policy-free
-resolver for embedders that only want the timing. All three are native-only: on wasm32 the browser owns resolution,
-connection setup, and preflighting alike.
+`DnsResolved` comes from the fetcher's resolver: the `FetcherConfig::dns_resolver` set, or
+`dns::SystemResolver` when none is, so every lookup the client makes is timed. All three are
+native-only: on wasm32 the browser owns resolution, connection setup, and preflighting alike.
 
 `Connected` is produced by a tower `connector_layer` (`net::connect_timing`) wrapped around
 reqwest's connector, and `DnsResolved` from inside the resolver. Both sit below the request

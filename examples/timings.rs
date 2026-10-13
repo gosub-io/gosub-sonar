@@ -5,15 +5,9 @@
 //! connection setup, and the CORS preflight round-trip - as [`NetEvent`]s carrying an
 //! `elapsed`. This example collects them per request and lays them out against the total.
 //!
-//! Two things it makes visible that are easy to misread as bugs:
-//!
-//! - a phase that did not happen reports nothing rather than zero. Fetch the same URL twice
-//!   and the second request shows no dns and no connect - and, if the response was
-//!   cacheable, no request at all. It spent no time on what it did not do.
-//! - `DnsResolved` needs a [`DnsResolver`] to be configured. reqwest's built-in resolution
-//!   happens below this crate and cannot be timed, so this example installs
-//!   [`SystemResolver`], which resolves exactly like reqwest would but through a seam that
-//!   can be measured.
+//! A phase that did not happen reports nothing rather than zero, which is easy to misread as
+//! a bug. Fetch the same URL twice and the second request shows no dns and no connect - and,
+//! if the response was cacheable, no request at all. It spent no time on what it did not do.
 //!
 //! The phases nest rather than tile: resolution happens inside reqwest's connector, and the
 //! connect timing wraps that connector, so `connect` contains `dns`. The bars show the
@@ -25,7 +19,6 @@
 //! cargo run --example timings -- https://example.org https://example.org/  # 2nd is pooled
 //! ```
 
-use gosub_sonar::net::dns::SystemResolver;
 use gosub_sonar::{
     FetchRequest, FetchResult, Fetcher, FetcherConfig, FetcherContext, Initiator, NetEvent,
     NetObserver, RequestId, RequestReference, ResourceKind, SharedBody,
@@ -383,14 +376,7 @@ async fn main() -> anyhow::Result<()> {
         current: Mutex::new(Arc::new(Timeline::new())),
     });
 
-    // `SystemResolver` resolves exactly like reqwest's built-in resolution does, but through
-    // `DnsResolver`, which is the seam the timing is taken at. Without it there is no
-    // `DnsResolved` event at all.
-    let config = FetcherConfig {
-        dns_resolver: Some(Arc::new(SystemResolver)),
-        ..FetcherConfig::default()
-    };
-    let fetcher = Arc::new(Fetcher::new(config, ctx.clone())?);
+    let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), ctx.clone())?);
     let shutdown = CancellationToken::new();
     let run = fetcher.clone();
     let cancel = shutdown.clone();

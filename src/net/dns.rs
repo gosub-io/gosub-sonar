@@ -159,10 +159,11 @@ impl reqwest::dns::Resolve for ReqwestResolver {
 
 /// Resolves through the system resolver, refusing nothing.
 ///
-/// Behaviourally the same as reqwest's built-in resolution, so installing it changes no
-/// policy - but because it goes through [`DnsResolver`], lookups become visible as
-/// [`NetEvent::DnsResolved`]. For embedders that want DNS timing without writing a
-/// resolver of their own.
+/// Behaviourally the same as reqwest's built-in resolution. It is what the fetcher resolves
+/// through when [`FetcherConfig::dns_resolver`] is `None`, and like any [`DnsResolver`] its
+/// lookups are reported as [`NetEvent::DnsResolved`].
+///
+/// [`FetcherConfig::dns_resolver`]: crate::net::fetcher::FetcherConfig::dns_resolver
 ///
 /// It applies no SSRF or rebinding protection whatsoever. Anything facing untrusted URLs
 /// wants a resolver that classifies addresses - see the module docs.

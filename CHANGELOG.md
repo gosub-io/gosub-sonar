@@ -74,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The `timings` example, `SystemResolver` and `docs/architecture.md` still said
+  `DnsResolved` needs a configured `FetcherConfig::dns_resolver`. The fetcher resolves
+  through `SystemResolver` when none is set, and reports those lookups too
 - `docs/architecture.md` listed fewer fields and reasons than there are: `FetchResultMeta`
   without `from_cache`, `tainting` and `peer_addr`, `BlockReason` without `BadPort` and
   `ForbiddenMethod`, and a coalescing key made of the URL, method and headers alone
