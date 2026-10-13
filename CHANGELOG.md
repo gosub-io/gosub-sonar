@@ -74,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `docs/architecture.md` called `Initiator` a tag for logging only. `Initiator::User` also
+  sends `Sec-Fetch-User: ?1` on a navigation request, and is part of the coalescing key
 - Proxy credentials went to the wrong proxy. With several `ProxyRule`s, a plain-`http`
   request took its `Proxy-Authorization` from the first rule that matched *and* had
   credentials, while the client connected through the first rule that matched. Rules
