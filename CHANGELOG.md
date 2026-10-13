@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Failed` or `Cancelled` and reports nothing after that, so an observer can open a row on
   `Accepted` and close it on the end. `url` is the one the caller asked for, before an upgrade
   to `https`
+- `RequestInit::read_idle_timeout` and `RequestInit::total_body_timeout` (`with_body_timeouts`),
+  so direct users of `net::fetch` can bound the first 5 KiB of a body too, and
+  `ResponseTop::body_deadline`, when the rest of it must have arrived. Both timeouts default to
+  no limit
 
 ### Changed
 
@@ -71,6 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end. Now each attempt still reports its `Started`, request and headers, `Retrying` comes
   between attempts with the reason, and only the last attempt's end is reported.
   `NetEvent::is_terminal` names the three ending events
+- **Breaking:** `RequestInit` (`read_idle_timeout`, `total_body_timeout`) and `ResponseTop`
+  (`body_deadline`) gained public fields. A struct literal or pattern that lists every field
+  no longer compiles: end it with `..`, or build a `RequestInit` with `new` and the `with_*`
+  builders
 
 ### Fixed
 
@@ -207,6 +215,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the request had an observer, so `SecurityUpgraded` never came and the request looked
   as if the caller had asked for `https`. It is reported right after `Accepted` now
   (RFC 6797 §8.3)
+- Bodies: `read_idle_timeout` and `total_body_timeout` did not apply to the first 5 KiB of a
+  body, the part read before the result is handed over. A server that went silent there held
+  the request until the request timeout (60 s by default) instead of the idle timeout (15 s).
+  And `total_body_timeout`, documented as the budget for the body after the headers, was
+  counted from before the request was sent, so slow headers used up the body's time
 
 ## [0.13.0] - 2026-10-12
 

@@ -675,6 +675,12 @@ pub struct RequestInit {
     /// arrives and must cover every later hop up to the final response headers. `None` sets
     /// no limit; the hop count is still capped.
     pub redirect_timeout: Option<Duration>,
+    /// Longest silence allowed while the body arrives: from the response headers to its first
+    /// bytes, and between reads after that. `None` sets no limit of its own.
+    pub read_idle_timeout: Option<Duration>,
+    /// Wall-clock budget for the whole body, counted from when the response headers arrive.
+    /// `None` sets no limit.
+    pub total_body_timeout: Option<Duration>,
 }
 
 impl Default for RequestInit {
@@ -716,6 +722,8 @@ impl RequestInit {
             header_order: None,
             timeout: None,
             redirect_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
         }
     }
 
@@ -788,6 +796,14 @@ impl RequestInit {
     /// `None` sets no limit.
     pub fn with_redirect_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.redirect_timeout = timeout;
+        self
+    }
+
+    /// Bounds the body: `idle` is the longest silence allowed while it arrives, `total` the
+    /// budget for all of it, counted from when the response headers arrive. `None` sets no limit.
+    pub fn with_body_timeouts(mut self, idle: Option<Duration>, total: Option<Duration>) -> Self {
+        self.read_idle_timeout = idle;
+        self.total_body_timeout = total;
         self
     }
 }
@@ -877,6 +893,9 @@ pub struct ResponseTop {
     pub meta: FetchResultMeta,
     /// Peek buffer of the first PEEK_MAX of data
     pub peek_buf: PeekBuf,
+    /// When the whole body must have arrived, from [`RequestInit::total_body_timeout`] counted
+    /// from the response headers. `None` for no limit.
+    pub body_deadline: Option<tokio::time::Instant>,
     /// Stream reader to read the REMAINDER of the body (this does NOT include peek buffer read data)
     #[cfg(not(target_arch = "wasm32"))]
     pub reader: Box<dyn AsyncRead + Unpin + Send>,
@@ -948,6 +967,7 @@ async fn fetch_response_top_inner(
     url_credentials_removed: bool,
 ) -> Result<ResponseTop, NetError> {
     let started = Instant::now();
+    let (read_idle_timeout, total_body_timeout) = (init.read_idle_timeout, init.total_body_timeout);
     observer.on_event(NetEvent::Started { url: url.clone() });
     if url_credentials_removed {
         modified(&observer, &url, RequestChange::UrlCredentialsRemoved);
@@ -977,6 +997,8 @@ async fn fetch_response_top_inner(
         #[cfg(not(target_arch = "wasm32"))]
         store,
     } = outcome;
+    // The body's budget starts now that the final response's headers are in.
+    let body_deadline = total_body_timeout.map(|total| tokio::time::Instant::now() + total);
 
     // A stored response has no stream to read: the body is already here, so it is split into the
     // peek window and a reader over the remainder, and handed back in the same shape as a
@@ -1038,6 +1060,7 @@ async fn fetch_response_top_inner(
             return Ok(ResponseTop {
                 meta,
                 peek_buf: PeekBuf::from_vec(entry.body[..peek_len].to_vec()),
+                body_deadline,
                 reader: Box::new(reader),
             });
         }
@@ -1075,6 +1098,20 @@ async fn fetch_response_top_inner(
 
     // We might need more fetches than one. Although it's unlikely unless you set PEEK_MAX to >8KB
     while peek_buf_vec.len() < PEEK_MAX {
+        // The body's timeouts hold from its first byte: a body that stalls inside the peek
+        // window is cut off as it would be after it.
+        let idle = async {
+            match read_idle_timeout {
+                Some(idle) => tokio::time::sleep(idle).await,
+                None => std::future::pending().await,
+            }
+        };
+        let deadline = async {
+            match body_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         let next = tokio::select! {
             // Stream cancelled
             _ = cancel.cancelled() => {
@@ -1083,6 +1120,8 @@ async fn fetch_response_top_inner(
             }
             // Read bytes from stream
             n = body_stream.next() => n,
+            _ = idle => return Err(NetError::Timeout("read idle timeout".into())),
+            _ = deadline => return Err(NetError::Timeout("total body timeout".into())),
         };
 
         match next {
@@ -1223,6 +1262,7 @@ async fn fetch_response_top_inner(
     Ok(ResponseTop {
         meta,
         peek_buf,
+        body_deadline,
         reader: Box::new(progress_reader),
     })
 }
@@ -1498,11 +1538,11 @@ pub(crate) async fn fetch_response_complete(
     total_body_timeout: Option<Duration>,
     policy: NetPolicy,
 ) -> Result<(FetchResultMeta, Bytes), NetError> {
-    let started = Instant::now();
-
+    let init = init.with_body_timeouts(Some(read_idle_timeout), total_body_timeout);
     let ResponseTop {
         meta,
         peek_buf,
+        body_deadline,
         mut reader,
     } = fetch_response_top(client, url, init, cancel.clone(), observer.clone(), policy).await?;
 
@@ -1530,10 +1570,8 @@ pub(crate) async fn fetch_response_complete(
 
     loop {
         // Check if we hit the total body timeout
-        if let Some(total) = total_body_timeout {
-            if started.elapsed() > total {
-                return Err(NetError::Timeout("total body timeout".into()));
-            }
+        if body_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return Err(NetError::Timeout("total body timeout".into()));
         }
 
         // Ensure there is spare capacity so `read_buf` reads directly into the buffer (single copy
@@ -3921,6 +3959,7 @@ mod tests {
             meta,
             peek_buf,
             mut reader,
+            ..
         } = super::fetch_response_top(
             client(),
             srv.url("/big"),
