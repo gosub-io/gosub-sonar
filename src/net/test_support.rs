@@ -221,6 +221,8 @@ pub struct CacheRouteOptions {
     /// Replace `body` with `hit-<n>`, `n` counting this route's requests from 1. Use to tell
     /// which response a caller ended up with.
     pub counting_body: bool,
+    /// Wait this long before answering, when set.
+    pub delay: Option<std::time::Duration>,
 }
 
 impl CacheRouteOptions {
@@ -266,6 +268,13 @@ impl CacheRouteOptions {
     #[must_use]
     pub fn counting(mut self) -> Self {
         self.counting_body = true;
+        self
+    }
+
+    /// Answer every request after `delay`.
+    #[must_use]
+    pub fn delayed(mut self, delay: std::time::Duration) -> Self {
+        self.delay = Some(delay);
         self
     }
 }
@@ -715,6 +724,9 @@ async fn handle_conn<S: AsyncRead + AsyncWrite + Unpin>(
             let _ = stream.write_all(hdr.as_bytes()).await;
         }
         RouteConfig::Cacheable(options) => {
+            if let Some(delay) = options.delay {
+                tokio::time::sleep(delay).await;
+            }
             let header_value = |name: &str| {
                 let needle = format!("{name}:");
                 req.lines()
