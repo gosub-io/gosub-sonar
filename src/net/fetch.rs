@@ -2901,30 +2901,21 @@ async fn get_with_redirects(
         let mut to = to;
         let location_credentials_removed = strip_url_credentials(&mut to);
 
-        // Method and body semantics per RFC 7231 §6.4
+        // Fetch §4.5 step 12: a 301 or 302 turns a `POST` into a `GET`, and a 303 every method
+        // but `GET` and `HEAD`; the body goes with the method. Any other method, and every one
+        // on a 307 or 308, goes on as it was, body included.
         let method_before = current_method.clone();
-        match status {
-            // 301/302: browsers always downgrade POST to GET (§6.4.2–3); we follow suit.
-            // HEAD stays HEAD (no body involved); all other methods become GET.
-            301 | 302 => {
-                if current_method != Method::HEAD {
-                    current_method = Method::GET;
-                }
-                current_body = None;
-                current_headers.remove(header::CONTENT_TYPE);
-                current_headers.remove(header::CONTENT_LENGTH);
-                current_headers.remove(header::TRANSFER_ENCODING);
-            }
-            // 303 See Other: always GET, always drop body.
-            303 => {
-                current_method = Method::GET;
-                current_body = None;
-                current_headers.remove(header::CONTENT_TYPE);
-                current_headers.remove(header::CONTENT_LENGTH);
-                current_headers.remove(header::TRANSFER_ENCODING);
-            }
-            // 307/308, the only redirects left: preserve method and body.
-            _ => {}
+        let to_get = match status {
+            301 | 302 => current_method == Method::POST,
+            303 => current_method != Method::GET && current_method != Method::HEAD,
+            _ => false,
+        };
+        if to_get {
+            current_method = Method::GET;
+            current_body = None;
+            current_headers.remove(header::CONTENT_TYPE);
+            current_headers.remove(header::CONTENT_LENGTH);
+            current_headers.remove(header::TRANSFER_ENCODING);
         }
 
         // Strip credential headers when redirecting to a different origin (RFC 9110 §15.4).
@@ -7356,6 +7347,182 @@ mod tests {
 
     /// `NetEvent::SecurityUpgraded` and `NetEvent::RequestModified`: one event per change, in
     /// the right place in the stream, and nothing when nothing changed.
+    /// Fetch's HTTP-redirect fetch, against a server that answers `/start` with any status.
+    mod redirect_rules {
+        use super::*;
+        use tokio::io::AsyncWriteExt;
+
+        /// One request as the server saw it.
+        #[derive(Debug, Clone)]
+        struct Seen {
+            method: String,
+            path: String,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        }
+
+        impl Seen {
+            fn header(&self, name: &str) -> Option<&str> {
+                self.headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.as_str())
+            }
+        }
+
+        /// A server that answers `/start` with `status` and the header lines in `head` (each
+        /// ending in `\r\n`), and anything else with `200 ok`. It records every request.
+        async fn server(status: u16, head: &'static str) -> (Url, Arc<Mutex<Vec<Seen>>>) {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let base = Url::parse(&format!(
+                "http://127.0.0.1:{}/",
+                listener.local_addr().unwrap().port()
+            ))
+            .unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let log = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let end = loop {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break None;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(p + 4);
+                        }
+                    };
+                    let Some(end) = end else { continue };
+                    let text = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let mut lines = text.split("\r\n");
+                    let mut first = lines.next().unwrap_or("").split(' ');
+                    let method = first.next().unwrap_or("").to_string();
+                    let path = first.next().unwrap_or("").to_string();
+                    let headers: Vec<(String, String)> = lines
+                        .filter_map(|l| l.split_once(':'))
+                        .map(|(n, v)| (n.to_string(), v.trim().to_string()))
+                        .collect();
+                    let length = headers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, v)| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let mut body = buf[end..].to_vec();
+                    while body.len() < length {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&chunk[..n]);
+                    }
+                    let response = if path == "/start" {
+                        format!(
+                            "HTTP/1.1 {status} Redirect\r\n{head}Content-Length: 0\r\n\
+                             Connection: close\r\n\r\n"
+                        )
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                            .to_string()
+                    };
+                    log.lock().unwrap().push(Seen {
+                        method,
+                        path,
+                        headers,
+                        body,
+                    });
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            });
+            (base, seen)
+        }
+
+        /// Fetch `/start` on `base` with `method`, `headers` and `body`, and return the request
+        /// that reached `/end`, with what the observer saw.
+        async fn follow(
+            status: u16,
+            method: Method,
+            headers: HeaderMap,
+            body: Option<&'static [u8]>,
+        ) -> (Seen, Arc<RecordingObserver>) {
+            let (base, seen) = server(status, "Location: /end\r\n").await;
+            let rec = Arc::new(RecordingObserver::new());
+            super::super::fetch_response_complete(
+                client(),
+                base.join("/start").unwrap(),
+                RequestInit::new(method, headers, body.map(RequestBody::bytes)),
+                CancellationToken::new(),
+                rec.clone(),
+                None,
+                Duration::from_secs(5),
+                None,
+                NetPolicy::default(),
+            )
+            .await
+            .expect("fetch");
+            let end = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|s| s.path == "/end")
+                .cloned()
+                .expect("the redirect was followed");
+            (end, rec)
+        }
+
+        /// Fetch §4.5 step 12: a 301 or 302 turns a `POST` into a `GET` and nothing else. Any
+        /// other method goes on with its body and the body's type, and nothing is reported as
+        /// changed.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_301_or_302_changes_only_a_post() {
+            for status in [301, 302] {
+                let (end, rec) = follow(status, Method::POST, HeaderMap::new(), Some(b"a=1")).await;
+                assert_eq!(
+                    (end.method.as_str(), end.body.as_slice()),
+                    ("GET", &b""[..])
+                );
+                assert_eq!(rec.modifications().len(), 1, "{status} POST");
+                for method in [Method::PUT, Method::DELETE, Method::PATCH] {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+                    let (end, rec) = follow(status, method.clone(), headers, Some(b"a=1")).await;
+                    assert_eq!(
+                        (end.method.as_str(), end.body.as_slice()),
+                        (method.as_str(), &b"a=1"[..]),
+                        "{status} {method}"
+                    );
+                    assert_eq!(
+                        end.header("content-type"),
+                        Some("text/plain"),
+                        "{status} {method}"
+                    );
+                    assert!(
+                        rec.modifications().is_empty(),
+                        "{status} {method}: {:?}",
+                        rec.modifications()
+                    );
+                }
+            }
+        }
+
+        /// Fetch §4.5 step 12: a 303 turns every method into a `GET` but `GET` and `HEAD`.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_303_keeps_a_head() {
+            let (end, rec) = follow(303, Method::HEAD, HeaderMap::new(), None).await;
+            assert_eq!(end.method, "HEAD");
+            assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
+            let (end, _) = follow(303, Method::PUT, HeaderMap::new(), Some(b"a=1")).await;
+            assert_eq!(
+                (end.method.as_str(), end.body.as_slice()),
+                ("GET", &b""[..])
+            );
+        }
+    }
+
     mod security_events {
         use super::*;
         use crate::net::types::{RequestChange, UpgradeReason};

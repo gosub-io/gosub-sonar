@@ -74,6 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A 301 or 302 turned every method but `HEAD` into `GET` and dropped the body, and a 303 turned
+  `HEAD` into `GET` too. Fetch §4.5 changes only a `POST` on a 301 or 302, and every method but
+  `GET` and `HEAD` on a 303: a `PUT`, `DELETE` or `PATCH` redirected by a 301 or 302 now goes on
+  with its method and body, as browsers send it, and reports no `MethodDowngraded`
 - Proxy credentials went to the wrong proxy. With several `ProxyRule`s, a plain-`http`
   request took its `Proxy-Authorization` from the first rule that matched *and* had
   credentials, while the client connected through the first rule that matched. Rules
