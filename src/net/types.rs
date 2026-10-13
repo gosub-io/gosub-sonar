@@ -417,8 +417,16 @@ pub enum NetError {
 }
 
 impl From<std::io::Error> for NetError {
+    /// An `io::Error` made by [`NetError::to_io`] gives back the `NetError` it carries, so an
+    /// error that crossed an `AsyncRead` keeps its variant; any other becomes [`NetError::Io`].
     fn from(e: std::io::Error) -> Self {
-        NetError::Io(Arc::new(e))
+        match e
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<NetError>())
+        {
+            Some(carried) => carried.clone(),
+            None => NetError::Io(Arc::new(e)),
+        }
     }
 }
 

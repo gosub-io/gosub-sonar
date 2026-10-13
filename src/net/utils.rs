@@ -274,14 +274,9 @@ pub async fn stream_to_bytes(
     let limit = cap.map_or(u64::MAX, |c| c as u64 + 1);
     let mut reader = reader.take(limit);
     if let Err(e) = reader.read_to_end(&mut out).await {
-        // The reader wraps stream errors in io::Error (see NetError::to_io); recover the
-        // original typed NetError when one is carried, otherwise wrap the io::Error once.
-        let net = e
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<NetError>())
-            .cloned()
-            .unwrap_or_else(|| NetError::Io(Arc::new(e)));
-        return Err(net);
+        // The reader wraps stream errors in io::Error (see NetError::to_io); `From` recovers the
+        // original typed NetError when one is carried, otherwise wraps the io::Error once.
+        return Err(NetError::from(e));
     }
     if let Some(cap) = cap {
         if out.len() > cap {

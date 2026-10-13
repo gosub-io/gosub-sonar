@@ -675,6 +675,15 @@ pub struct RequestInit {
     /// arrives and must cover every later hop up to the final response headers. `None` sets
     /// no limit; the hop count is still capped.
     pub redirect_timeout: Option<Duration>,
+    /// Longest silence allowed while the body arrives: from the response headers to its first
+    /// bytes, and between reads after that. `None` sets no limit of its own.
+    pub read_idle_timeout: Option<Duration>,
+    /// Wall-clock budget for the whole body, counted from when the response headers arrive.
+    /// `None` sets no limit.
+    pub total_body_timeout: Option<Duration>,
+    /// Largest body accepted, in bytes. Checked here only for a body that ends inside the peek
+    /// window; the reader of the rest is the caller's to hold to it. `None` sets no limit.
+    pub max_bytes: Option<usize>,
 }
 
 impl Default for RequestInit {
@@ -716,6 +725,9 @@ impl RequestInit {
             header_order: None,
             timeout: None,
             redirect_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
+            max_bytes: None,
         }
     }
 
@@ -788,6 +800,20 @@ impl RequestInit {
     /// `None` sets no limit.
     pub fn with_redirect_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.redirect_timeout = timeout;
+        self
+    }
+
+    /// Bounds the body: `idle` is the longest silence allowed while it arrives, `total` the
+    /// budget for all of it, counted from when the response headers arrive. `None` sets no limit.
+    pub fn with_body_timeouts(mut self, idle: Option<Duration>, total: Option<Duration>) -> Self {
+        self.read_idle_timeout = idle;
+        self.total_body_timeout = total;
+        self
+    }
+
+    /// The largest body accepted, in bytes. `None` sets no limit.
+    pub fn with_max_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.max_bytes = max_bytes;
         self
     }
 }
@@ -877,6 +903,9 @@ pub struct ResponseTop {
     pub meta: FetchResultMeta,
     /// Peek buffer of the first PEEK_MAX of data
     pub peek_buf: PeekBuf,
+    /// When the whole body must have arrived, from [`RequestInit::total_body_timeout`] counted
+    /// from the response headers. `None` for no limit.
+    pub body_deadline: Option<tokio::time::Instant>,
     /// Stream reader to read the REMAINDER of the body (this does NOT include peek buffer read data)
     #[cfg(not(target_arch = "wasm32"))]
     pub reader: Box<dyn AsyncRead + Unpin + Send>,
@@ -948,6 +977,8 @@ async fn fetch_response_top_inner(
     url_credentials_removed: bool,
 ) -> Result<ResponseTop, NetError> {
     let started = Instant::now();
+    let (read_idle_timeout, total_body_timeout) = (init.read_idle_timeout, init.total_body_timeout);
+    let max_bytes = init.max_bytes;
     observer.on_event(NetEvent::Started { url: url.clone() });
     if url_credentials_removed {
         modified(&observer, &url, RequestChange::UrlCredentialsRemoved);
@@ -972,11 +1003,14 @@ async fn fetch_response_top_inner(
     let ChainOutcome {
         response,
         url: final_url,
+        method,
         tainting,
         peer_addr,
         #[cfg(not(target_arch = "wasm32"))]
         store,
     } = outcome;
+    // The body's budget starts now that the final response's headers are in.
+    let body_deadline = total_body_timeout.map(|total| tokio::time::Instant::now() + total);
 
     // A stored response has no stream to read: the body is already here, so it is split into the
     // peek window and a reader over the remainder, and handed back in the same shape as a
@@ -1038,20 +1072,35 @@ async fn fetch_response_top_inner(
             return Ok(ResponseTop {
                 meta,
                 peek_buf: PeekBuf::from_vec(entry.body[..peek_len].to_vec()),
+                body_deadline,
                 reader: Box::new(reader),
             });
         }
         HopResponse::Network(resp) => resp,
     };
 
+    // A response to HEAD, a 1xx, a 204 and a 304 have no body, whatever their headers say
+    // (RFC 9110 §6.4.1). The `Content-Length` a HEAD's response or a 304 carries is the length
+    // the representation would have had, which is what it reports; the client counts the empty
+    // body it actually has. A 204 must not send one (RFC 9110 §8.6) and has no representation.
+    let status = resp.status().as_u16();
+    let bodiless = method == Method::HEAD || matches!(status, 100..=199 | 204 | 304);
+    let content_length = if status == 204 {
+        None
+    } else if bodiless {
+        declared_content_length(resp.headers())
+    } else {
+        resp.content_length() // More often than not, this is None
+    };
+
     // Response is received, setup our meta structure
     let mut meta = FetchResultMeta {
         tainting,
         final_url,
-        status: resp.status().as_u16(),
+        status,
         status_text: resp.status().canonical_reason().unwrap_or("").to_string(),
         headers: resp.headers().clone(),
-        content_length: resp.content_length(), // More often than not, this is None
+        content_length,
         content_type: resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -1062,6 +1111,16 @@ async fn fetch_response_top_inner(
         peer_addr,
     };
 
+    // A body that declares more than the cap is refused before any of it is read. The checks
+    // on what arrives stay for a body that declares nothing, or less than it sends.
+    if let (Some(max), Some(len), false) = (max_bytes, meta.content_length, bodiless) {
+        if len > max as u64 {
+            return Err(NetError::Read(Arc::new(anyhow!(
+                "content-length {len} exceeds maximum size of {max} bytes"
+            ))));
+        }
+    }
+
     // Peek the stream up to PEEK_MAX bytes. A body that stops part way is a transport failure,
     // so it is classified here rather than left as an opaque read error.
     let mut body_stream = resp
@@ -1070,11 +1129,27 @@ async fn fetch_response_top_inner(
     let mut received_net: u64 = 0;
     let mut peek_buf_vec: Vec<u8> = Vec::with_capacity(PEEK_MAX);
     let mut excess: Option<Bytes> = None;
+    // Whether the body ended inside the peek window, so all of it is in hand.
+    let mut ended = false;
 
     let observer_clone = observer.clone();
 
     // We might need more fetches than one. Although it's unlikely unless you set PEEK_MAX to >8KB
     while peek_buf_vec.len() < PEEK_MAX {
+        // The body's timeouts hold from its first byte: a body that stalls inside the peek
+        // window is cut off as it would be after it.
+        let idle = async {
+            match read_idle_timeout {
+                Some(idle) => tokio::time::sleep(idle).await,
+                None => std::future::pending().await,
+            }
+        };
+        let deadline = async {
+            match body_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         let next = tokio::select! {
             // Stream cancelled
             _ = cancel.cancelled() => {
@@ -1083,6 +1158,8 @@ async fn fetch_response_top_inner(
             }
             // Read bytes from stream
             n = body_stream.next() => n,
+            _ = idle => return Err(NetError::Timeout("read idle timeout".into())),
+            _ = deadline => return Err(NetError::Timeout("total body timeout".into())),
         };
 
         match next {
@@ -1123,8 +1200,19 @@ async fn fetch_response_top_inner(
             }
             None => {
                 // Stream ended successfully
+                ended = true;
                 break;
             }
+        }
+    }
+
+    // The reader of the rest is held to what is left of the cap, which a peek already over it
+    // does not show, so it is refused here, before the request counts as answered.
+    if let Some(max) = max_bytes {
+        if peek_buf_vec.len() > max {
+            return Err(NetError::Read(Arc::new(anyhow!(
+                "body exceeded maximum size of {max} bytes"
+            ))));
         }
     }
 
@@ -1190,7 +1278,7 @@ async fn fetch_response_top_inner(
     // Update last remaining items in meta struct
     let peek_buf = PeekBuf::from_vec(peek_buf_vec);
     let has_body_by_len = meta.content_length.unwrap_or(0) > 0 || !peek_buf.is_empty();
-    meta.has_body = has_body_by_len;
+    meta.has_body = !bodiless && has_body_by_len;
 
     // Wrap our body stream into a progress reader. This way it will emit net events to the observer
     // whenever it is read.
@@ -1200,6 +1288,13 @@ async fn fetch_response_top_inner(
     // The progress count so far: the peek, which is what reached the caller.
     let already_delivered = received_net - excess_len;
 
+    // A body that ended inside the peek window is known whole, whatever the headers said of
+    // its length: a chunked or decoded one has no `Content-Length` to go by.
+    let expected_length = if ended {
+        Some(already_delivered)
+    } else {
+        meta.content_length
+    };
     // The body's end names the URL it came from, the last hop of the chain.
     let progress_reader = ProgressReader::new(
         inner_reader,
@@ -1207,7 +1302,7 @@ async fn fetch_response_top_inner(
         observer.clone(),
         meta.final_url.clone(),
         started,
-        meta.content_length,
+        expected_length,
         already_delivered,
     );
     // A response the cache accepted is copied as the caller reads it, and written when the body
@@ -1223,6 +1318,7 @@ async fn fetch_response_top_inner(
     Ok(ResponseTop {
         meta,
         peek_buf,
+        body_deadline,
         reader: Box::new(progress_reader),
     })
 }
@@ -1470,6 +1566,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
     }
 }
 
+/// The `Content-Length` a response declares, if it gives one valid value.
+fn declared_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Spare capacity kept available for each `read_buf` so it never returns 0 for lack of room
 /// (which the loop would misread as EOF).
 const READ_CHUNK: usize = 16 * 1024;
@@ -1498,61 +1605,57 @@ pub(crate) async fn fetch_response_complete(
     total_body_timeout: Option<Duration>,
     policy: NetPolicy,
 ) -> Result<(FetchResultMeta, Bytes), NetError> {
-    let started = Instant::now();
-
+    let init = init
+        .with_body_timeouts(Some(read_idle_timeout), total_body_timeout)
+        .with_max_bytes(max_bytes);
     let ResponseTop {
         meta,
         peek_buf,
+        body_deadline,
         mut reader,
     } = fetch_response_top(client, url, init, cancel.clone(), observer.clone(), policy).await?;
-
-    // Reject responses that already declare a body larger than max_bytes, before reading any of it.
-    // The in-loop check below remains the backstop for servers that lie or use chunked encoding.
-    if let (Some(max), Some(len)) = (max_bytes, meta.content_length) {
-        if len as usize > max {
-            return Err(NetError::Read(Arc::new(anyhow!(
-                "content-length {} exceeds maximum size of {} bytes",
-                len,
-                max
-            ))));
-        }
-    }
 
     // Pre-size from Content-Length when known to avoid reallocations as the body grows; otherwise
     // start from the peek length. The peek bytes have already been read off the stream, so seed the
     // buffer with them (a one-off copy of the small peek region, not the whole body). Content-Length
     // is untrusted, so the pre-allocation is clamped to MAX_PREALLOC (and max_bytes when set).
-    let advertised = meta.content_length.map(|n| n as usize).unwrap_or(0);
+    let advertised = meta
+        .content_length
+        .filter(|_| meta.has_body)
+        .map(|n| n as usize)
+        .unwrap_or(0);
     let ceiling = max_bytes.unwrap_or(MAX_PREALLOC).min(MAX_PREALLOC);
     let initial_cap = advertised.min(ceiling).max(peek_buf.len());
     let mut body_buf = BytesMut::with_capacity(initial_cap);
     body_buf.extend_from_slice(peek_buf.as_slice());
 
     loop {
-        // Check if we hit the total body timeout
-        if let Some(total) = total_body_timeout {
-            if started.elapsed() > total {
-                return Err(NetError::Timeout("total body timeout".into()));
-            }
-        }
-
         // Ensure there is spare capacity so `read_buf` reads directly into the buffer (single copy
         // from the stream) rather than returning 0 for lack of room.
         if body_buf.capacity() - body_buf.len() < READ_CHUNK {
             body_buf.reserve(READ_CHUNK);
         }
 
+        // The total budget is a deadline: a read that blocks is cut off when it passes, not
+        // only checked between reads.
+        let deadline = async {
+            match body_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         let n = tokio::select! {
             // Stream cancelled
             _ = cancel.cancelled() => {
                 return Err(NetError::Cancelled("fetch_request_complete cancelled".into()));
             }
+            _ = deadline => return Err(NetError::Timeout("total body timeout".into())),
             // Read bytes, or timeout when not read something in time. `read_buf` reads directly into
             // the spare capacity of `body_buf`, so there is no intermediate scratch buffer.
             r = timeout(read_idle_timeout, reader.read_buf(&mut body_buf)) => {
                 match r {
                     Err(_) => return Err(NetError::Timeout("fetch_request_complete timeout".into())),
-                    Ok(Err(e)) => return Err(NetError::Io(Arc::new(e))),
+                    Ok(Err(e)) => return Err(e.into()),
                     Ok(Ok(n)) => n,
                 }
             }
@@ -1728,6 +1831,8 @@ pub(crate) struct ChainOutcome {
     pub(crate) response: HopResponse,
     /// URL of the hop that produced it, i.e. the final URL of the chain.
     pub(crate) url: Url,
+    /// Method of the request that got it, as the redirects left it.
+    pub(crate) method: Method,
     /// Response tainting of the chain — see [`cors`](mod@crate::net::cors).
     pub(crate) tainting: ResponseTainting,
     /// Where that response came from — see [`FetchResultMeta::peer_addr`].
@@ -2823,6 +2928,7 @@ async fn get_with_redirects(
             return Ok(ChainOutcome {
                 response: hop,
                 url: url.clone(),
+                method: current_method.clone(),
                 tainting,
                 peer_addr,
                 #[cfg(not(target_arch = "wasm32"))]
@@ -3592,6 +3698,149 @@ mod tests {
         assert!(rec.cancellations().is_empty());
     }
 
+    /// The same for a body with no `Content-Length` to go by, chunked or decoded: it ended
+    /// inside the peek window, so it is whole, and dropping its reader is not giving up on it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_without_a_length_that_arrived_whole_reports_finished_when_dropped() {
+        let body = pattern(64);
+        let srv = TestServer::new()
+            .route(
+                "/chunked",
+                RouteConfig::chunked(vec![&body[..32], &body[32..]]),
+            )
+            .route("/gzip", RouteConfig::gzip_ok(body.clone()))
+            .start()
+            .await;
+        let decoding = Arc::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .gzip(true)
+                .build()
+                .unwrap(),
+        );
+        for path in ["/chunked", "/gzip"] {
+            let rec = Arc::new(RecordingObserver::new());
+            let top = fetch_response_top(
+                decoding.clone(),
+                srv.url(path),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await
+            .expect("fetch");
+            assert_eq!(top.meta.content_length, None, "{path}");
+            assert_eq!(top.peek_buf.as_slice(), &body[..], "{path}");
+            drop(top);
+
+            assert!(
+                rec.cancellations().is_empty(),
+                "{path}: {:?}",
+                rec.cancellations()
+            );
+            let finished = rec.finished();
+            assert_eq!(finished.len(), 1, "{path}");
+            assert_eq!(finished[0].0, body.len() as u64, "{path}");
+        }
+    }
+
+    /// A body refused for its size before the result is handed over is a failed request: the
+    /// observer hears `Failed`, not the `Finished` of a body that arrived whole.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_refused_inside_the_peek_window_reports_failed() {
+        let srv = TestServer::new()
+            .route("/", RouteConfig::chunked(vec![&[b'x'; 1000][..]]))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+        let res = super::fetch_response_complete(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            Some(100),
+            Duration::from_secs(2),
+            None,
+            NetPolicy::default(),
+        )
+        .await;
+        assert!(matches!(res, Err(NetError::Read(_))), "{res:?}");
+        let events = rec.event_names();
+        assert!(events.contains(&"Failed".to_string()), "{events:?}");
+        assert!(!events.contains(&"Finished".to_string()), "{events:?}");
+    }
+
+    /// A response to HEAD, and a 304, report the `Content-Length` they declare, the length the
+    /// representation would have had, but have no body: a cap below that length does not
+    /// refuse them, and dropping the reader is not giving up on a body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_response_without_a_body_reports_its_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let status = if buf[..n].starts_with(b"HEAD") {
+                    "200 OK"
+                } else {
+                    "304 Not Modified"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        for method in [Method::HEAD, Method::GET] {
+            let (meta, body) = super::fetch_response_complete(
+                client(),
+                base.clone(),
+                RequestInit::new(method.clone(), HeaderMap::new(), None),
+                CancellationToken::new(),
+                observer(),
+                Some(1000),
+                Duration::from_secs(2),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{method}: {e:?}"));
+            assert_eq!(meta.content_length, Some(5000), "{method}");
+            assert!(!meta.has_body, "{method}");
+            assert!(body.is_empty(), "{method}");
+
+            let rec = Arc::new(RecordingObserver::new());
+            let top = fetch_response_top(
+                client(),
+                base.clone(),
+                RequestInit::new(method.clone(), HeaderMap::new(), None),
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            drop(top);
+            assert!(
+                rec.cancellations().is_empty(),
+                "{method}: {:?}",
+                rec.cancellations()
+            );
+            assert_eq!(rec.finished().len(), 1, "{method}");
+        }
+    }
+
     /// Read a response to the end and return the whole body, peek window included. The
     /// capture only fills as the consumer pulls.
     async fn drain(top: ResponseTop) -> Vec<u8> {
@@ -3940,6 +4189,7 @@ mod tests {
             meta,
             peek_buf,
             mut reader,
+            ..
         } = super::fetch_response_top(
             client(),
             srv.url("/big"),
