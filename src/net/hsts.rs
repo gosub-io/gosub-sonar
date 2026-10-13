@@ -134,12 +134,78 @@ fn domain_of(url: &Url) -> Option<&str> {
     }
 }
 
-/// Strips the `quoted-string` form permitted for directive values (§6.1): `max-age="31536000"`.
-fn unquote(value: &str) -> &str {
-    value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .unwrap_or(value)
+/// A `tchar` (RFC 9110 §5.6.2), what a `token` is made of.
+fn is_tchar(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
+}
+
+/// The directives of a `Strict-Transport-Security` value, in order, each a name and the value
+/// if it has one, by the grammar of §6.1:
+///
+/// ```text
+/// [ directive ] *( ";" [ directive ] )
+/// directive       = directive-name [ "=" directive-value ]
+/// directive-name  = token
+/// directive-value = token | quoted-string
+/// ```
+///
+/// with optional whitespace around the separators. A quoted-string value comes unescaped, so a
+/// `;` inside one does not end the directive. `None` when the value does not follow the
+/// grammar: a name or value that is not a token, an unterminated quoted-string, or anything
+/// but a `;` after a directive.
+fn directives(value: &str) -> Option<Vec<(&str, Option<String>)>> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    let skip_ws = |s: &str| s.trim_start_matches([' ', '\t']).len();
+    loop {
+        rest = &rest[rest.len() - skip_ws(rest)..];
+        if rest.is_empty() {
+            return Some(out);
+        }
+        if let Some(after) = rest.strip_prefix(';') {
+            // An empty directive, which the grammar permits (`;;`, a trailing `;`).
+            rest = after;
+            continue;
+        }
+        let name_len = rest.find(|c: char| !is_tchar(c)).unwrap_or(rest.len());
+        if name_len == 0 {
+            return None;
+        }
+        let name = &rest[..name_len];
+        rest = &rest[name_len..];
+        rest = &rest[rest.len() - skip_ws(rest)..];
+        let mut directive_value = None;
+        if let Some(after) = rest.strip_prefix('=') {
+            rest = &after[after.len() - skip_ws(after)..];
+            if let Some(quoted) = rest.strip_prefix('"') {
+                let mut unescaped = String::new();
+                let mut chars = quoted.char_indices();
+                let end = loop {
+                    match chars.next()? {
+                        (i, '"') => break i,
+                        (_, '\\') => unescaped.push(chars.next()?.1),
+                        (_, c) => unescaped.push(c),
+                    }
+                };
+                directive_value = Some(unescaped);
+                rest = &quoted[end + 1..];
+            } else {
+                let len = rest.find(|c: char| !is_tchar(c)).unwrap_or(rest.len());
+                if len == 0 {
+                    return None;
+                }
+                directive_value = Some(rest[..len].to_string());
+                rest = &rest[len..];
+            }
+            rest = &rest[rest.len() - skip_ws(rest)..];
+        }
+        out.push((name, directive_value));
+        match rest.strip_prefix(';') {
+            Some(after) => rest = after,
+            None if rest.is_empty() => return Some(out),
+            None => return None,
+        }
+    }
 }
 
 /// Parses a `Strict-Transport-Security` value, or `None` if it does not conform — §6.1 requires
@@ -150,23 +216,12 @@ fn parse_sts(value: &str) -> Option<StsDirectives> {
     let mut include_subdomains = false;
     let mut seen_include_subdomains = false;
 
-    for raw in value.split(';') {
-        let token = raw.trim();
-        if token.is_empty() {
-            // The grammar permits empty directives, e.g. a trailing ';'.
-            continue;
-        }
-
-        let (name, val) = match token.split_once('=') {
-            Some((n, v)) => (n.trim(), Some(v.trim())),
-            None => (token, None),
-        };
-
+    for (name, val) in directives(value)? {
         if name.eq_ignore_ascii_case("max-age") {
             if max_age.is_some() {
                 return None;
             }
-            max_age = Some(unquote(val?).parse::<u64>().ok()?);
+            max_age = Some(val?.parse::<u64>().ok()?);
         } else if name.eq_ignore_ascii_case("includeSubDomains") {
             if seen_include_subdomains {
                 return None;
@@ -383,6 +438,29 @@ mod tests {
                 include_subdomains: true
             })
         );
+    }
+
+    /// §6.1: a directive value is a token or a quoted-string. A `;` inside a quoted-string is
+    /// part of the value, and a quoted-pair is the character it escapes. A name or value that
+    /// is neither, or anything after a directive but a `;`, makes the header non-conforming,
+    /// and it is ignored whole.
+    #[test]
+    fn parse_follows_the_grammar() {
+        assert_eq!(
+            parse_sts(r#"max-age=100; foo="a;max-age=1""#).map(|d| d.max_age),
+            Some(100)
+        );
+        assert_eq!(parse_sts(r#"max-age="1\00""#).map(|d| d.max_age), Some(100));
+        for value in [
+            "max-age=100; @@@",
+            "max-age=100; foo=bar baz",
+            "max-age=100; foo=a,b",
+            "max-age=100; fo o",
+            r#"max-age=100; foo="open"#,
+            "max-age=100; foo=",
+        ] {
+            assert_eq!(parse_sts(value), None, "{value}");
+        }
     }
 
     #[test]

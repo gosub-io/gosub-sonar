@@ -74,6 +74,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `Strict-Transport-Security` value was split at every `;`, quoted-string or not, and any
+  text between the `;`s was taken as a directive: `max-age=100; fo o` or `foo=a,b` armed HSTS,
+  while `foo="a;b"` was cut in two and a quoted-pair was left escaped. The value is parsed by
+  the grammar of RFC 6797 §6.1 now, and one that does not follow it is ignored whole, as the
+  RFC requires
 - A redirect with two `Location` headers was followed to the first. It is a network error now
   (`NetError::Redirect`), as Fetch's location URL makes it
 - A 301, 302, 303, 307 or 308 without a `Location` failed with a redirect error. It is the
