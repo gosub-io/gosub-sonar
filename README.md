@@ -293,9 +293,13 @@ The cache modes mirror the Fetch standard: `Default`, `Reload`, `NoCache` (alway
 `NoStore` (neither read nor write, for a private session). Implement `HttpCache` yourself to
 persist entries or bound them differently; `FetcherConfig::cache: None` turns caching off.
 
-Not implemented: shared-cache rules (`s-maxage`, the `Authorization` restriction), range requests
-and `206` responses, and `stale-while-revalidate`. Native only: on wasm32 the browser's `fetch()`
-brings its own cache.
+A response with `stale-while-revalidate` is used stale for as long as that grants, by a request
+with an `origin` in the `Default` mode, while the fetcher revalidates it in the background with a
+request of its own. That request reports to `FetcherContext::observer_for` under a request id of
+its own, and is not counted as the reference's work.
+
+Not implemented: shared-cache rules (`s-maxage`, the `Authorization` restriction), and range
+requests and `206` responses. Native only: on wasm32 the browser's `fetch()` brings its own cache.
 
 ### Authentication challenges
 

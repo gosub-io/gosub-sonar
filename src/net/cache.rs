@@ -22,17 +22,24 @@
 //! - `Vary`: one entry per combination of the request headers the response varies on (§4.1)
 //! - invalidation of the target URI (and a same-origin `Location`/`Content-Location`) by an
 //!   unsafe method (§4.4)
+//! - `stale-while-revalidate` (RFC 5861 §3): a stale response it covers answers a request with
+//!   a client (one with an origin) in the default mode at once, on the request's first hop, and
+//!   is revalidated in the background ([`CacheDecision::UseStale`], [`CacheOutcome::Stale`]).
+//!   The [`Fetcher`] does that with a request of its own; see
+//!   [`NetPolicy::revalidate_in_background`].
 //!
 //! Not implemented: shared-cache rules (`s-maxage`, the `Authorization` restriction of §3.5, since
-//! this is a private cache), range requests and `206` responses, and serving stale content while
-//! revalidating (`stale-while-revalidate`). A request that carries a `Range` or a condition of
-//! its own goes past the cache in both directions, since only the server can answer it.
+//! this is a private cache), and range requests and `206` responses. A request that carries a
+//! `Range` or a condition of its own goes past the cache in both directions, since only the
+//! server can answer it.
 //!
 //! `Set-Cookie` is stripped before a response is stored, so that a cache hit cannot re-apply a
 //! cookie the jar already has, and so are the hop-by-hop headers, which describe the connection
 //! rather than the response.
 //!
 //! [`FetcherConfig::cache`]: crate::net::fetcher::FetcherConfig::cache
+//! [`Fetcher`]: crate::net::fetcher::Fetcher
+//! [`NetPolicy::revalidate_in_background`]: crate::net::fetch::NetPolicy::revalidate_in_background
 //! [`FetchRequest::cache_mode`]: crate::net::types::FetchRequest::cache_mode
 
 use crate::net::utils::split_outside_quotes;

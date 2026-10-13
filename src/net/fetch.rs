@@ -391,8 +391,9 @@ pub struct NetPolicy {
     pub cache: Option<Arc<dyn HttpCache>>,
     /// Revalidates a stale response in the background, after the hop it answered has moved on.
     /// With it, a request in the default cache mode that has an origin (Fetch: a client) is
-    /// answered from a stale entry its `stale-while-revalidate` still covers, and this is called
-    /// with the hop's URL and method; without it, such an entry is revalidated first.
+    /// answered from a stale entry its `stale-while-revalidate` still covers, on its first hop,
+    /// and this is called with the hop's URL and method; without it, such an entry is
+    /// revalidated first.
     /// [`Fetcher`](crate::net::fetcher::Fetcher) queues a request of its own for it. Set via
     /// [`NetPolicy::with_background_revalidation`]. See [`cache`](mod@crate::net::cache).
     #[cfg(not(target_arch = "wasm32"))]
