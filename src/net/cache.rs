@@ -23,8 +23,8 @@
 //! - invalidation of the target URI (and a same-origin `Location`/`Content-Location`) by an
 //!   unsafe method (§4.4)
 //! - `stale-while-revalidate` (RFC 5861 §3): a stale response it covers answers a request with
-//!   a client (one with an origin) in the default mode at once, on the request's first hop, and
-//!   is revalidated in the background ([`CacheDecision::UseStale`], [`CacheOutcome::Stale`]).
+//!   a client (one with an origin) in the default mode at once, on any hop, and is revalidated
+//!   in the background, from that hop as the redirect chain had left it ([`CacheDecision::UseStale`], [`CacheOutcome::Stale`]).
 //!   The [`Fetcher`] does that with a request of its own; see
 //!   [`NetPolicy::revalidate_in_background`].
 //!
