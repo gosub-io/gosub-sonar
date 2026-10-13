@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so direct users of `net::fetch` can bound the first 5 KiB of a body too, and
   `ResponseTop::body_deadline`, when the rest of it must have arrived. Both timeouts default to
   no limit
+- `RequestInit::max_bytes` (`with_max_bytes`): a body over it that ends within its first 5 KiB
+  is refused by `fetch_response_top`. Defaults to no limit
 
 ### Changed
 
@@ -75,10 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end. Now each attempt still reports its `Started`, request and headers, `Retrying` comes
   between attempts with the reason, and only the last attempt's end is reported.
   `NetEvent::is_terminal` names the three ending events
-- **Breaking:** `RequestInit` (`read_idle_timeout`, `total_body_timeout`) and `ResponseTop`
-  (`body_deadline`) gained public fields. A struct literal or pattern that lists every field
-  no longer compiles: end it with `..`, or build a `RequestInit` with `new` and the `with_*`
-  builders
+- **Breaking:** `RequestInit` (`read_idle_timeout`, `total_body_timeout`, `max_bytes`) and
+  `ResponseTop` (`body_deadline`) gained public fields. A struct literal or pattern that lists
+  every field no longer compiles: end it with `..`, or build a `RequestInit` with `new` and the
+  `with_*` builders
 
 ### Fixed
 
@@ -223,6 +225,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bodies: a buffered fetch checked `total_body_timeout` only between reads, so a read that
   was blocked when the deadline passed overran it by up to `read_idle_timeout`. The deadline
   now cuts the read off, as it already did for a stream
+- Bodies: `max_bytes` was not enforced on a body shorter than 5 KiB without a
+  `Content-Length`, buffered or streamed: the cap was checked only on reads after the first
+  5 KiB. Such a body over the cap is now refused with `NetError::Read`, like a longer one. A
+  stream whose `Content-Length` is over the cap is refused before any of it is read, as a
+  buffered fetch already was; and a fetch refused that way reported `Cancelled` to the
+  observer, though it had failed. It reports `Failed` now
 
 ## [0.13.0] - 2026-10-12
 

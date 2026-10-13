@@ -1018,6 +1018,7 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
             Some(effective_read_idle_timeout(req, cfg)),
             effective_total_body_timeout(req, cfg),
         )
+        .with_max_bytes(req.max_bytes)
 }
 
 /// The read idle timeout in force for `req`: its own override, else the fetcher's.
@@ -1374,6 +1375,8 @@ mod tests {
                 "/stall-late",
                 RouteConfig::stall_mid_body(8 * 1024, Duration::from_secs(30)),
             )
+            // 1000 bytes, chunked: no Content-Length to refuse it by up front.
+            .route("/chunked-1k", RouteConfig::chunked(vec![&[b'x'; 1000][..]]))
             .route("/not-found", RouteConfig::status(404, b"not found"))
             .route("/drop", RouteConfig::drop_mid_body(100, 10_000))
             .route("/flaky", RouteConfig::status_then_ok(503, 2, b"recovered"))
@@ -2932,6 +2935,31 @@ mod tests {
             elapsed < Duration::from_secs(1),
             "the 300 ms deadline should have fired (took {elapsed:?})"
         );
+    }
+
+    /// `max_bytes` holds for a body short enough to fit in the first 5 KiB, the part read
+    /// before the result is handed over, buffered or streamed; one of exactly the cap passes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn max_bytes_holds_for_a_body_inside_the_peek_window() {
+        let srv = start_server().await;
+        for streaming in [false, true] {
+            let req = FetchRequest::builder(Method::GET, srv.url("/chunked-1k"))
+                .with_streaming(streaming)
+                .with_max_bytes(100)
+                .build();
+            let (result, _) = fetch_one(test_config(), req).await;
+            assert!(
+                matches!(result, FetchResult::Error(NetError::Read(_))),
+                "streaming {streaming}: a 1000-byte body passed a 100-byte cap: {result:?}"
+            );
+
+            let req = FetchRequest::builder(Method::GET, srv.url("/chunked-1k"))
+                .with_streaming(streaming)
+                .with_max_bytes(1000)
+                .build();
+            let (result, _) = fetch_one(test_config(), req).await;
+            assert!(!result.is_error(), "streaming {streaming}: {result:?}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
