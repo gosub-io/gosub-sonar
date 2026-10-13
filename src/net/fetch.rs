@@ -2805,7 +2805,9 @@ async fn get_with_redirects(
             _ => None,
         };
 
-        if !hop.is_redirection() {
+        // Fetch §4.5 step 4: a redirect without a `Location` is the response, returned as it is.
+        let locations = hop.headers().get_all(header::LOCATION).iter().count();
+        if !hop.is_redirection() || locations == 0 {
             if attach_credentials {
                 report_set_cookie(&policy, &url, hop.headers());
             }
@@ -4449,10 +4451,11 @@ mod tests {
         assert_eq!(&body[..], b"hello world");
     }
 
+    /// Fetch §4.5 step 4: a redirect status without a `Location` is the response.
     #[tokio::test(flavor = "current_thread")]
-    async fn redirect_without_location_header_errors() {
+    async fn redirect_without_location_header_is_returned() {
         let srv = server().await;
-        let res = super::fetch_response_top(
+        let ResponseTop { meta, .. } = super::fetch_response_top(
             client(),
             srv.url("/nohead"),
             RequestInit::get(HeaderMap::new()),
@@ -4460,8 +4463,9 @@ mod tests {
             observer(),
             NetPolicy::default(),
         )
-        .await;
-        assert!(res.is_err());
+        .await
+        .expect("returned, not an error");
+        assert_eq!(meta.status, 302);
     }
 
     /// Only 301/302/303/307/308 are redirects. A 300 is returned even with a `Location`, and a

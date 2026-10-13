@@ -74,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A 301, 302, 303, 307 or 308 without a `Location` failed with a redirect error. It is the
+  response now, returned to the caller as it is (Fetch §4.5)
 - A redirect lost the fragment of the URL asked for when its `Location` had none: `/a#top`
   redirected to `/b` ended at `/b`, not `/b#top`. The `Location` inherits it now (Fetch §2.2.6,
   RFC 9110 §10.2.2), in `Redirected` and in the final URL
