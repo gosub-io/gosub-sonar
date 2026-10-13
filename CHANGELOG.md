@@ -240,6 +240,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Events: a body with no `Content-Length`, chunked or decompressed, that arrived whole in its
   first 5 KiB reported `Cancelled` when its reader was dropped unread, though nothing was
   missing. It reports `Finished`, as a body with a length already did
+- Bodies: a response to `HEAD`, and a `304`, reported `content_length` 0, though
+  `FetchResultMeta::content_length` is the length the headers give: it is now their
+  `Content-Length`, the length the representation would have had. Such a response still has
+  no body (`has_body` is false), so a `max_bytes` below that length does not refuse it. A
+  `204`, which may not declare a length, reports none
 
 ## [0.13.0] - 2026-10-12
 

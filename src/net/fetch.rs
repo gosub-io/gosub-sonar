@@ -1003,6 +1003,7 @@ async fn fetch_response_top_inner(
     let ChainOutcome {
         response,
         url: final_url,
+        method,
         tainting,
         peer_addr,
         #[cfg(not(target_arch = "wasm32"))]
@@ -1078,14 +1079,28 @@ async fn fetch_response_top_inner(
         HopResponse::Network(resp) => resp,
     };
 
+    // A response to HEAD, a 1xx, a 204 and a 304 have no body, whatever their headers say
+    // (RFC 9110 §6.4.1). The `Content-Length` a HEAD's response or a 304 carries is the length
+    // the representation would have had, which is what it reports; the client counts the empty
+    // body it actually has. A 204 must not send one (RFC 9110 §8.6) and has no representation.
+    let status = resp.status().as_u16();
+    let bodiless = method == Method::HEAD || matches!(status, 100..=199 | 204 | 304);
+    let content_length = if status == 204 {
+        None
+    } else if bodiless {
+        declared_content_length(resp.headers())
+    } else {
+        resp.content_length() // More often than not, this is None
+    };
+
     // Response is received, setup our meta structure
     let mut meta = FetchResultMeta {
         tainting,
         final_url,
-        status: resp.status().as_u16(),
+        status,
         status_text: resp.status().canonical_reason().unwrap_or("").to_string(),
         headers: resp.headers().clone(),
-        content_length: resp.content_length(), // More often than not, this is None
+        content_length,
         content_type: resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -1098,7 +1113,7 @@ async fn fetch_response_top_inner(
 
     // A body that declares more than the cap is refused before any of it is read. The checks
     // on what arrives stay for a body that declares nothing, or less than it sends.
-    if let (Some(max), Some(len)) = (max_bytes, meta.content_length) {
+    if let (Some(max), Some(len), false) = (max_bytes, meta.content_length, bodiless) {
         if len > max as u64 {
             return Err(NetError::Read(Arc::new(anyhow!(
                 "content-length {len} exceeds maximum size of {max} bytes"
@@ -1263,7 +1278,7 @@ async fn fetch_response_top_inner(
     // Update last remaining items in meta struct
     let peek_buf = PeekBuf::from_vec(peek_buf_vec);
     let has_body_by_len = meta.content_length.unwrap_or(0) > 0 || !peek_buf.is_empty();
-    meta.has_body = has_body_by_len;
+    meta.has_body = !bodiless && has_body_by_len;
 
     // Wrap our body stream into a progress reader. This way it will emit net events to the observer
     // whenever it is read.
@@ -1551,6 +1566,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
     }
 }
 
+/// The `Content-Length` a response declares, if it gives one valid value.
+fn declared_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Spare capacity kept available for each `read_buf` so it never returns 0 for lack of room
 /// (which the loop would misread as EOF).
 const READ_CHUNK: usize = 16 * 1024;
@@ -1593,7 +1619,11 @@ pub(crate) async fn fetch_response_complete(
     // start from the peek length. The peek bytes have already been read off the stream, so seed the
     // buffer with them (a one-off copy of the small peek region, not the whole body). Content-Length
     // is untrusted, so the pre-allocation is clamped to MAX_PREALLOC (and max_bytes when set).
-    let advertised = meta.content_length.map(|n| n as usize).unwrap_or(0);
+    let advertised = meta
+        .content_length
+        .filter(|_| meta.has_body)
+        .map(|n| n as usize)
+        .unwrap_or(0);
     let ceiling = max_bytes.unwrap_or(MAX_PREALLOC).min(MAX_PREALLOC);
     let initial_cap = advertised.min(ceiling).max(peek_buf.len());
     let mut body_buf = BytesMut::with_capacity(initial_cap);
@@ -1801,6 +1831,8 @@ pub(crate) struct ChainOutcome {
     pub(crate) response: HopResponse,
     /// URL of the hop that produced it, i.e. the final URL of the chain.
     pub(crate) url: Url,
+    /// Method of the request that got it, as the redirects left it.
+    pub(crate) method: Method,
     /// Response tainting of the chain — see [`cors`](mod@crate::net::cors).
     pub(crate) tainting: ResponseTainting,
     /// Where that response came from — see [`FetchResultMeta::peer_addr`].
@@ -2885,6 +2917,7 @@ async fn get_with_redirects(
             return Ok(ChainOutcome {
                 response: hop,
                 url: url.clone(),
+                method: current_method.clone(),
                 tainting,
                 peer_addr,
                 #[cfg(not(target_arch = "wasm32"))]
@@ -3718,6 +3751,75 @@ mod tests {
         let events = rec.event_names();
         assert!(events.contains(&"Failed".to_string()), "{events:?}");
         assert!(!events.contains(&"Finished".to_string()), "{events:?}");
+    }
+
+    /// A response to HEAD, and a 304, report the `Content-Length` they declare, the length the
+    /// representation would have had, but have no body: a cap below that length does not
+    /// refuse them, and dropping the reader is not giving up on a body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_response_without_a_body_reports_its_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let status = if buf[..n].starts_with(b"HEAD") {
+                    "200 OK"
+                } else {
+                    "304 Not Modified"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        for method in [Method::HEAD, Method::GET] {
+            let (meta, body) = super::fetch_response_complete(
+                client(),
+                base.clone(),
+                RequestInit::new(method.clone(), HeaderMap::new(), None),
+                CancellationToken::new(),
+                observer(),
+                Some(1000),
+                Duration::from_secs(2),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{method}: {e:?}"));
+            assert_eq!(meta.content_length, Some(5000), "{method}");
+            assert!(!meta.has_body, "{method}");
+            assert!(body.is_empty(), "{method}");
+
+            let rec = Arc::new(RecordingObserver::new());
+            let top = fetch_response_top(
+                client(),
+                base.clone(),
+                RequestInit::new(method.clone(), HeaderMap::new(), None),
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            drop(top);
+            assert!(
+                rec.cancellations().is_empty(),
+                "{method}: {:?}",
+                rec.cancellations()
+            );
+            assert_eq!(rec.finished().len(), 1, "{method}");
+        }
     }
 
     /// Read a response to the end and return the whole body, peek window included. The
