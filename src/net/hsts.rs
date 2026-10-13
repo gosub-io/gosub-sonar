@@ -134,44 +134,111 @@ fn domain_of(url: &Url) -> Option<&str> {
     }
 }
 
-/// Strips the `quoted-string` form permitted for directive values (§6.1): `max-age="31536000"`.
-fn unquote(value: &str) -> &str {
-    value
-        .strip_prefix('"')
-        .and_then(|v| v.strip_suffix('"'))
-        .unwrap_or(value)
+/// A `tchar` (RFC 9110 §5.6.2), what a `token` is made of.
+fn is_tchar(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
+}
+
+/// The directives of a `Strict-Transport-Security` value, in order, each a name and the value
+/// if it has one, by the grammar of §6.1:
+///
+/// ```text
+/// [ directive ] *( ";" [ directive ] )
+/// directive       = directive-name [ "=" directive-value ]
+/// directive-name  = token
+/// directive-value = token | quoted-string
+/// ```
+///
+/// with optional whitespace around the separators. A quoted-string value comes unescaped, so a
+/// `;` inside one does not end the directive. `None` when the value does not follow the
+/// grammar: a name or value that is not a token, an unterminated quoted-string, or anything
+/// but a `;` after a directive.
+fn directives(value: &str) -> Option<Vec<(&str, Option<String>)>> {
+    let mut out = Vec::new();
+    let mut rest = value;
+    let skip_ws = |s: &str| s.trim_start_matches([' ', '\t']).len();
+    loop {
+        rest = &rest[rest.len() - skip_ws(rest)..];
+        if rest.is_empty() {
+            return Some(out);
+        }
+        if let Some(after) = rest.strip_prefix(';') {
+            // An empty directive, which the grammar permits (`;;`, a trailing `;`).
+            rest = after;
+            continue;
+        }
+        let name_len = rest.find(|c: char| !is_tchar(c)).unwrap_or(rest.len());
+        if name_len == 0 {
+            return None;
+        }
+        let name = &rest[..name_len];
+        rest = &rest[name_len..];
+        rest = &rest[rest.len() - skip_ws(rest)..];
+        let mut directive_value = None;
+        if let Some(after) = rest.strip_prefix('=') {
+            rest = &after[after.len() - skip_ws(after)..];
+            if let Some(quoted) = rest.strip_prefix('"') {
+                let mut unescaped = String::new();
+                let mut chars = quoted.char_indices();
+                let end = loop {
+                    match chars.next()? {
+                        (i, '"') => break i,
+                        (_, '\\') => unescaped.push(chars.next()?.1),
+                        (_, c) => unescaped.push(c),
+                    }
+                };
+                directive_value = Some(unescaped);
+                rest = &quoted[end + 1..];
+            } else {
+                let len = rest.find(|c: char| !is_tchar(c)).unwrap_or(rest.len());
+                if len == 0 {
+                    return None;
+                }
+                directive_value = Some(rest[..len].to_string());
+                rest = &rest[len..];
+            }
+            rest = &rest[rest.len() - skip_ws(rest)..];
+        }
+        out.push((name, directive_value));
+        match rest.strip_prefix(';') {
+            Some(after) => rest = after,
+            None if rest.is_empty() => return Some(out),
+            None => return None,
+        }
+    }
+}
+
+/// A `max-age` value: `delta-seconds`, digits only (§6.1.1), so not `+100` or `-1`, which
+/// Rust's integer parsing would take. The grammar sets no bound, so a value past `u64` is the
+/// largest one rather than a reason to ignore the header; [`record`] caps it anyway.
+fn delta_seconds(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(value.parse::<u64>().unwrap_or(u64::MAX))
 }
 
 /// Parses a `Strict-Transport-Security` value, or `None` if it does not conform — §6.1 requires
 /// a non-conforming header be ignored whole rather than salvaged in part. `max-age` is required;
-/// a repeated directive invalidates the header; unknown directives are ignored.
+/// any directive given twice, an unknown one too, invalidates the header (§6.1 item 2), as does
+/// a value on the valueless `includeSubDomains` (§6.1.2); unknown directives are otherwise
+/// ignored.
 fn parse_sts(value: &str) -> Option<StsDirectives> {
     let mut max_age: Option<u64> = None;
     let mut include_subdomains = false;
-    let mut seen_include_subdomains = false;
+    let mut seen: Vec<&str> = Vec::new();
 
-    for raw in value.split(';') {
-        let token = raw.trim();
-        if token.is_empty() {
-            // The grammar permits empty directives, e.g. a trailing ';'.
-            continue;
+    for (name, val) in directives(value)? {
+        if seen.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+            return None;
         }
-
-        let (name, val) = match token.split_once('=') {
-            Some((n, v)) => (n.trim(), Some(v.trim())),
-            None => (token, None),
-        };
-
+        seen.push(name);
         if name.eq_ignore_ascii_case("max-age") {
-            if max_age.is_some() {
-                return None;
-            }
-            max_age = Some(unquote(val?).parse::<u64>().ok()?);
+            max_age = Some(delta_seconds(&val?)?);
         } else if name.eq_ignore_ascii_case("includeSubDomains") {
-            if seen_include_subdomains {
+            if val.is_some() {
                 return None;
             }
-            seen_include_subdomains = true;
             include_subdomains = true;
         }
     }
@@ -382,6 +449,57 @@ mod tests {
                 max_age: 42,
                 include_subdomains: true
             })
+        );
+    }
+
+    /// §6.1: a directive value is a token or a quoted-string. A `;` inside a quoted-string is
+    /// part of the value, and a quoted-pair is the character it escapes. A name or value that
+    /// is neither, or anything after a directive but a `;`, makes the header non-conforming,
+    /// and it is ignored whole.
+    #[test]
+    fn parse_follows_the_grammar() {
+        assert_eq!(
+            parse_sts(r#"max-age=100; foo="a;max-age=1""#).map(|d| d.max_age),
+            Some(100)
+        );
+        assert_eq!(parse_sts(r#"max-age="1\00""#).map(|d| d.max_age), Some(100));
+        for value in [
+            "max-age=100; @@@",
+            "max-age=100; foo=bar baz",
+            "max-age=100; foo=a,b",
+            "max-age=100; fo o",
+            r#"max-age=100; foo="open"#,
+            "max-age=100; foo=",
+        ] {
+            assert_eq!(parse_sts(value), None, "{value}");
+        }
+    }
+
+    /// §6.1 item 2: every directive appears once, case aside, unknown ones included; and
+    /// §6.1.2: `includeSubDomains` takes no value. Either makes the header non-conforming.
+    #[test]
+    fn parse_rejects_a_repeated_directive_and_a_valued_include_subdomains() {
+        for value in [
+            "max-age=100; preload; preload",
+            "max-age=100; preload; PRELOAD",
+            "max-age=100; max-age=100",
+            "max-age=100; includeSubDomains; includesubdomains",
+            "max-age=100; includeSubDomains=yes",
+            r#"max-age=100; includeSubDomains="""#,
+        ] {
+            assert_eq!(parse_sts(value), None, "{value}");
+        }
+    }
+
+    /// §6.1.1: `max-age` is `delta-seconds`, digits only and unbounded. A sign makes it
+    /// non-conforming; a value past `u64` is taken as the largest, and capped when recorded.
+    #[test]
+    fn max_age_is_digits_and_saturates() {
+        assert_eq!(parse_sts("max-age=+100"), None);
+        assert_eq!(parse_sts(r#"max-age="+100""#), None);
+        assert_eq!(
+            parse_sts("max-age=99999999999999999999999").map(|d| d.max_age),
+            Some(u64::MAX)
         );
     }
 

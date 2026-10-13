@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Failed` or `Cancelled` and reports nothing after that, so an observer can open a row on
   `Accepted` and close it on the end. `url` is the one the caller asked for, before an upgrade
   to `https`
+- `RequestInit::read_idle_timeout` and `RequestInit::total_body_timeout` (`with_body_timeouts`),
+  so direct users of `net::fetch` can bound the first 5 KiB of a body too, and
+  `ResponseTop::body_deadline`, when the rest of it must have arrived. Both timeouts default to
+  no limit
+- `RequestInit::max_bytes` (`with_max_bytes`): a body over it that ends within its first 5 KiB
+  is refused by `fetch_response_top`. Defaults to no limit
 
 ### Changed
 
@@ -71,6 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   end. Now each attempt still reports its `Started`, request and headers, `Retrying` comes
   between attempts with the reason, and only the last attempt's end is reported.
   `NetEvent::is_terminal` names the three ending events
+- **Breaking:** `RequestInit` (`read_idle_timeout`, `total_body_timeout`, `max_bytes`) and
+  `ResponseTop` (`body_deadline`) gained public fields. A struct literal or pattern that lists
+  every field no longer compiles: end it with `..`, or build a `RequestInit` with `new` and the
+  `with_*` builders
 
 ### Fixed
 
@@ -90,6 +100,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   goes by the destination, as Fetch does: `document`, `embed`, `frame`, `iframe` or `object`
 - `docs/architecture.md` called `Initiator` a tag for logging only. `Initiator::User` also
   sends `Sec-Fetch-User: ?1` on a navigation request, and is part of the coalescing key
+- A `Strict-Transport-Security` `max-age` of `+100` armed HSTS for 100 seconds, while one too
+  large for a `u64` had the header ignored. `max-age` is digits only (RFC 6797 §6.1.1), and an
+  oversized value is capped like any long one now
+- A `Strict-Transport-Security` value with an unknown directive given twice (`preload;
+  preload`), or with a value on `includeSubDomains`, armed HSTS. Both are non-conforming
+  (RFC 6797 §6.1, §6.1.2), and the header is ignored now
+- A `Strict-Transport-Security` value was split at every `;`, quoted-string or not, and any
+  text between the `;`s was taken as a directive: `max-age=100; fo o` or `foo=a,b` armed HSTS,
+  while `foo="a;b"` was cut in two and a quoted-pair was left escaped. The value is parsed by
+  the grammar of RFC 6797 §6.1 now, and one that does not follow it is ignored whole, as the
+  RFC requires
+- A redirect with two `Location` headers was followed to the first. It is a network error now
+  (`NetError::Redirect`), as Fetch's location URL makes it
+- A 301, 302, 303, 307 or 308 without a `Location` failed with a redirect error. It is the
+  response now, returned to the caller as it is (Fetch §4.5)
+- A redirect lost the fragment of the URL asked for when its `Location` had none: `/a#top`
+  redirected to `/b` ended at `/b`, not `/b#top`. The `Location` inherits it now (Fetch §2.2.6,
+  RFC 9110 §10.2.2), in `Redirected` and in the final URL
+- A redirect within one origin sent the next hop the cookies the jar had given the first:
+  `cookies_for` was only asked again after a `Set-Cookie` or a change of origin. A redirect from
+  `/login` to `/app` sent `/login`'s cookies, and a `POST` turned into a `GET` was not asked
+  about as a `GET` for `SameSite`. The jar is asked for every hop now, with its URL and method
+- A redirect that turned a request into a `GET` dropped its `Content-Type` but went on
+  sending `Content-Encoding`, `Content-Language` and `Content-Location`, which described a body
+  no longer there. All four request-body headers go with the body now (Fetch §4.5)
+- A 301 or 302 turned every method but `HEAD` into `GET` and dropped the body, and a 303 turned
+  `HEAD` into `GET` too. Fetch §4.5 changes only a `POST` on a 301 or 302, and every method but
+  `GET` and `HEAD` on a 303: a `PUT`, `DELETE` or `PATCH` redirected by a 301 or 302 now goes on
+  with its method and body, as browsers send it, and reports no `MethodDowngraded`
 - Proxy credentials went to the wrong proxy. With several `ProxyRule`s, a plain-`http`
   request took its `Proxy-Authorization` from the first rule that matched *and* had
   credentials, while the client connected through the first rule that matched. Rules
@@ -223,6 +262,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before the request had an observer, so `SecurityUpgraded` never came and the request looked
   as if the caller had asked for `https`. It is reported right after `Accepted` now
   (RFC 6797 §8.3)
+- Bodies: `read_idle_timeout` and `total_body_timeout` did not apply to the first 5 KiB of a
+  body, the part read before the result is handed over. A server that went silent there held
+  the request until the request timeout (60 s by default) instead of the idle timeout (15 s).
+  And `total_body_timeout`, documented as the budget for the body after the headers, was
+  counted from before the request was sent, so slow headers used up the body's time
+- Bodies: a buffered fetch checked `total_body_timeout` only between reads, so a read that
+  was blocked when the deadline passed overran it by up to `read_idle_timeout`. The deadline
+  now cuts the read off, as it already did for a stream
+- Bodies: `max_bytes` was not enforced on a body shorter than 5 KiB without a
+  `Content-Length`, buffered or streamed: the cap was checked only on reads after the first
+  5 KiB. Such a body over the cap is now refused with `NetError::Read`, like a longer one. A
+  stream whose `Content-Length` is over the cap is refused before any of it is read, as a
+  buffered fetch already was; and a fetch refused that way reported `Cancelled` to the
+  observer, though it had failed. It reports `Failed` now
+- Errors: a body that broke off after its first 5 KiB came back as `NetError::Io`, with the
+  `Transport` error of kind `Body` buried inside it, where one that broke off earlier was that
+  `Transport` error itself; and a stream over `max_bytes` ended with `Io`, where the docs and a
+  buffered body say `Read`. Both are as documented now. To that end `From<std::io::Error> for
+  NetError` gives back the `NetError` carried by an `io::Error` from `NetError::to_io`, instead
+  of wrapping it in `Io` a second time
+- Events: a body with no `Content-Length`, chunked or decompressed, that arrived whole in its
+  first 5 KiB reported `Cancelled` when its reader was dropped unread, though nothing was
+  missing. It reports `Finished`, as a body with a length already did
+- Bodies: a response to `HEAD`, and a `304`, reported `content_length` 0, though
+  `FetchResultMeta::content_length` is the length the headers give: it is now their
+  `Content-Length`, the length the representation would have had. Such a response still has
+  no body (`has_body` is false), so a `max_bytes` below that length does not refuse it. A
+  `204`, which may not declare a length, reports none
 
 ## [0.13.0] - 2026-10-12
 

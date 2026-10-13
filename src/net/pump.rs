@@ -203,7 +203,7 @@ where
                         write_to_file(&mut writer, &mut file_error, &chunk, &observer, &url).await;
                     }
                 }
-                Ok(Err(e)) => break Err(NetError::Io(Arc::new(e))),
+                Ok(Err(e)) => break Err(NetError::from(e)),
             }
         };
 
@@ -585,6 +585,46 @@ mod tests {
             std::fs::read_dir(dir.path()).unwrap().count(),
             0,
             "no temp file left"
+        );
+    }
+
+    /// A reader error that carries a `NetError` (the body over its cap, the total timeout) is
+    /// that error to the subscribers and the pump task, not an `Io` wrapping it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_carried_read_error_keeps_its_variant() {
+        struct CarryingReader;
+        impl AsyncRead for CarryingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(NetError::Timeout("total".into()).to_io()))
+            }
+        }
+        let shared = Arc::new(SharedBody::new(32));
+        let mut sub = shared.subscribe_stream();
+        let handle = spawn_pump(
+            CarryingReader,
+            PumpTargets {
+                shared: Some(shared.clone()),
+                file_dest: None,
+                peek_buf: PeekBuf::empty(),
+            },
+            long_timeout(),
+            CancellationToken::new(),
+            observer(),
+            url(),
+        );
+        let err = sub.next().await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, NetError::Timeout(_)),
+            "subscriber got {err:?}"
+        );
+        let result = handle.await.unwrap();
+        assert!(
+            matches!(result, Err(NetError::Timeout(_))),
+            "pump got {result:?}"
         );
     }
 

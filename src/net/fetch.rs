@@ -678,6 +678,15 @@ pub struct RequestInit {
     /// arrives and must cover every later hop up to the final response headers. `None` sets
     /// no limit; the hop count is still capped.
     pub redirect_timeout: Option<Duration>,
+    /// Longest silence allowed while the body arrives: from the response headers to its first
+    /// bytes, and between reads after that. `None` sets no limit of its own.
+    pub read_idle_timeout: Option<Duration>,
+    /// Wall-clock budget for the whole body, counted from when the response headers arrive.
+    /// `None` sets no limit.
+    pub total_body_timeout: Option<Duration>,
+    /// Largest body accepted, in bytes. Checked here only for a body that ends inside the peek
+    /// window; the reader of the rest is the caller's to hold to it. `None` sets no limit.
+    pub max_bytes: Option<usize>,
 }
 
 impl Default for RequestInit {
@@ -719,6 +728,9 @@ impl RequestInit {
             header_order: None,
             timeout: None,
             redirect_timeout: None,
+            read_idle_timeout: None,
+            total_body_timeout: None,
+            max_bytes: None,
         }
     }
 
@@ -792,6 +804,20 @@ impl RequestInit {
     /// `None` sets no limit.
     pub fn with_redirect_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.redirect_timeout = timeout;
+        self
+    }
+
+    /// Bounds the body: `idle` is the longest silence allowed while it arrives, `total` the
+    /// budget for all of it, counted from when the response headers arrive. `None` sets no limit.
+    pub fn with_body_timeouts(mut self, idle: Option<Duration>, total: Option<Duration>) -> Self {
+        self.read_idle_timeout = idle;
+        self.total_body_timeout = total;
+        self
+    }
+
+    /// The largest body accepted, in bytes. `None` sets no limit.
+    pub fn with_max_bytes(mut self, max_bytes: Option<usize>) -> Self {
+        self.max_bytes = max_bytes;
         self
     }
 }
@@ -881,6 +907,9 @@ pub struct ResponseTop {
     pub meta: FetchResultMeta,
     /// Peek buffer of the first PEEK_MAX of data
     pub peek_buf: PeekBuf,
+    /// When the whole body must have arrived, from [`RequestInit::total_body_timeout`] counted
+    /// from the response headers. `None` for no limit.
+    pub body_deadline: Option<tokio::time::Instant>,
     /// Stream reader to read the REMAINDER of the body (this does NOT include peek buffer read data)
     #[cfg(not(target_arch = "wasm32"))]
     pub reader: Box<dyn AsyncRead + Unpin + Send>,
@@ -952,6 +981,8 @@ async fn fetch_response_top_inner(
     url_credentials_removed: bool,
 ) -> Result<ResponseTop, NetError> {
     let started = Instant::now();
+    let (read_idle_timeout, total_body_timeout) = (init.read_idle_timeout, init.total_body_timeout);
+    let max_bytes = init.max_bytes;
     observer.on_event(NetEvent::Started { url: url.clone() });
     if url_credentials_removed {
         modified(&observer, &url, RequestChange::UrlCredentialsRemoved);
@@ -976,11 +1007,14 @@ async fn fetch_response_top_inner(
     let ChainOutcome {
         response,
         url: final_url,
+        method,
         tainting,
         peer_addr,
         #[cfg(not(target_arch = "wasm32"))]
         store,
     } = outcome;
+    // The body's budget starts now that the final response's headers are in.
+    let body_deadline = total_body_timeout.map(|total| tokio::time::Instant::now() + total);
 
     // A stored response has no stream to read: the body is already here, so it is split into the
     // peek window and a reader over the remainder, and handed back in the same shape as a
@@ -1042,20 +1076,35 @@ async fn fetch_response_top_inner(
             return Ok(ResponseTop {
                 meta,
                 peek_buf: PeekBuf::from_vec(entry.body[..peek_len].to_vec()),
+                body_deadline,
                 reader: Box::new(reader),
             });
         }
         HopResponse::Network(resp) => resp,
     };
 
+    // A response to HEAD, a 1xx, a 204 and a 304 have no body, whatever their headers say
+    // (RFC 9110 §6.4.1). The `Content-Length` a HEAD's response or a 304 carries is the length
+    // the representation would have had, which is what it reports; the client counts the empty
+    // body it actually has. A 204 must not send one (RFC 9110 §8.6) and has no representation.
+    let status = resp.status().as_u16();
+    let bodiless = method == Method::HEAD || matches!(status, 100..=199 | 204 | 304);
+    let content_length = if status == 204 {
+        None
+    } else if bodiless {
+        declared_content_length(resp.headers())
+    } else {
+        resp.content_length() // More often than not, this is None
+    };
+
     // Response is received, setup our meta structure
     let mut meta = FetchResultMeta {
         tainting,
         final_url,
-        status: resp.status().as_u16(),
+        status,
         status_text: resp.status().canonical_reason().unwrap_or("").to_string(),
         headers: resp.headers().clone(),
-        content_length: resp.content_length(), // More often than not, this is None
+        content_length,
         content_type: resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -1066,6 +1115,16 @@ async fn fetch_response_top_inner(
         peer_addr,
     };
 
+    // A body that declares more than the cap is refused before any of it is read. The checks
+    // on what arrives stay for a body that declares nothing, or less than it sends.
+    if let (Some(max), Some(len), false) = (max_bytes, meta.content_length, bodiless) {
+        if len > max as u64 {
+            return Err(NetError::Read(Arc::new(anyhow!(
+                "content-length {len} exceeds maximum size of {max} bytes"
+            ))));
+        }
+    }
+
     // Peek the stream up to PEEK_MAX bytes. A body that stops part way is a transport failure,
     // so it is classified here rather than left as an opaque read error.
     let mut body_stream = resp
@@ -1074,11 +1133,27 @@ async fn fetch_response_top_inner(
     let mut received_net: u64 = 0;
     let mut peek_buf_vec: Vec<u8> = Vec::with_capacity(PEEK_MAX);
     let mut excess: Option<Bytes> = None;
+    // Whether the body ended inside the peek window, so all of it is in hand.
+    let mut ended = false;
 
     let observer_clone = observer.clone();
 
     // We might need more fetches than one. Although it's unlikely unless you set PEEK_MAX to >8KB
     while peek_buf_vec.len() < PEEK_MAX {
+        // The body's timeouts hold from its first byte: a body that stalls inside the peek
+        // window is cut off as it would be after it.
+        let idle = async {
+            match read_idle_timeout {
+                Some(idle) => tokio::time::sleep(idle).await,
+                None => std::future::pending().await,
+            }
+        };
+        let deadline = async {
+            match body_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         let next = tokio::select! {
             // Stream cancelled
             _ = cancel.cancelled() => {
@@ -1087,6 +1162,8 @@ async fn fetch_response_top_inner(
             }
             // Read bytes from stream
             n = body_stream.next() => n,
+            _ = idle => return Err(NetError::Timeout("read idle timeout".into())),
+            _ = deadline => return Err(NetError::Timeout("total body timeout".into())),
         };
 
         match next {
@@ -1127,8 +1204,19 @@ async fn fetch_response_top_inner(
             }
             None => {
                 // Stream ended successfully
+                ended = true;
                 break;
             }
+        }
+    }
+
+    // The reader of the rest is held to what is left of the cap, which a peek already over it
+    // does not show, so it is refused here, before the request counts as answered.
+    if let Some(max) = max_bytes {
+        if peek_buf_vec.len() > max {
+            return Err(NetError::Read(Arc::new(anyhow!(
+                "body exceeded maximum size of {max} bytes"
+            ))));
         }
     }
 
@@ -1194,7 +1282,7 @@ async fn fetch_response_top_inner(
     // Update last remaining items in meta struct
     let peek_buf = PeekBuf::from_vec(peek_buf_vec);
     let has_body_by_len = meta.content_length.unwrap_or(0) > 0 || !peek_buf.is_empty();
-    meta.has_body = has_body_by_len;
+    meta.has_body = !bodiless && has_body_by_len;
 
     // Wrap our body stream into a progress reader. This way it will emit net events to the observer
     // whenever it is read.
@@ -1204,6 +1292,13 @@ async fn fetch_response_top_inner(
     // The progress count so far: the peek, which is what reached the caller.
     let already_delivered = received_net - excess_len;
 
+    // A body that ended inside the peek window is known whole, whatever the headers said of
+    // its length: a chunked or decoded one has no `Content-Length` to go by.
+    let expected_length = if ended {
+        Some(already_delivered)
+    } else {
+        meta.content_length
+    };
     // The body's end names the URL it came from, the last hop of the chain.
     let progress_reader = ProgressReader::new(
         inner_reader,
@@ -1211,7 +1306,7 @@ async fn fetch_response_top_inner(
         observer.clone(),
         meta.final_url.clone(),
         started,
-        meta.content_length,
+        expected_length,
         already_delivered,
     );
     // A response the cache accepted is copied as the caller reads it, and written when the body
@@ -1227,6 +1322,7 @@ async fn fetch_response_top_inner(
     Ok(ResponseTop {
         meta,
         peek_buf,
+        body_deadline,
         reader: Box::new(progress_reader),
     })
 }
@@ -1474,6 +1570,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
     }
 }
 
+/// The `Content-Length` a response declares, if it gives one valid value.
+fn declared_content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Spare capacity kept available for each `read_buf` so it never returns 0 for lack of room
 /// (which the loop would misread as EOF).
 const READ_CHUNK: usize = 16 * 1024;
@@ -1502,61 +1609,57 @@ pub(crate) async fn fetch_response_complete(
     total_body_timeout: Option<Duration>,
     policy: NetPolicy,
 ) -> Result<(FetchResultMeta, Bytes), NetError> {
-    let started = Instant::now();
-
+    let init = init
+        .with_body_timeouts(Some(read_idle_timeout), total_body_timeout)
+        .with_max_bytes(max_bytes);
     let ResponseTop {
         meta,
         peek_buf,
+        body_deadline,
         mut reader,
     } = fetch_response_top(client, url, init, cancel.clone(), observer.clone(), policy).await?;
-
-    // Reject responses that already declare a body larger than max_bytes, before reading any of it.
-    // The in-loop check below remains the backstop for servers that lie or use chunked encoding.
-    if let (Some(max), Some(len)) = (max_bytes, meta.content_length) {
-        if len as usize > max {
-            return Err(NetError::Read(Arc::new(anyhow!(
-                "content-length {} exceeds maximum size of {} bytes",
-                len,
-                max
-            ))));
-        }
-    }
 
     // Pre-size from Content-Length when known to avoid reallocations as the body grows; otherwise
     // start from the peek length. The peek bytes have already been read off the stream, so seed the
     // buffer with them (a one-off copy of the small peek region, not the whole body). Content-Length
     // is untrusted, so the pre-allocation is clamped to MAX_PREALLOC (and max_bytes when set).
-    let advertised = meta.content_length.map(|n| n as usize).unwrap_or(0);
+    let advertised = meta
+        .content_length
+        .filter(|_| meta.has_body)
+        .map(|n| n as usize)
+        .unwrap_or(0);
     let ceiling = max_bytes.unwrap_or(MAX_PREALLOC).min(MAX_PREALLOC);
     let initial_cap = advertised.min(ceiling).max(peek_buf.len());
     let mut body_buf = BytesMut::with_capacity(initial_cap);
     body_buf.extend_from_slice(peek_buf.as_slice());
 
     loop {
-        // Check if we hit the total body timeout
-        if let Some(total) = total_body_timeout {
-            if started.elapsed() > total {
-                return Err(NetError::Timeout("total body timeout".into()));
-            }
-        }
-
         // Ensure there is spare capacity so `read_buf` reads directly into the buffer (single copy
         // from the stream) rather than returning 0 for lack of room.
         if body_buf.capacity() - body_buf.len() < READ_CHUNK {
             body_buf.reserve(READ_CHUNK);
         }
 
+        // The total budget is a deadline: a read that blocks is cut off when it passes, not
+        // only checked between reads.
+        let deadline = async {
+            match body_deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            }
+        };
         let n = tokio::select! {
             // Stream cancelled
             _ = cancel.cancelled() => {
                 return Err(NetError::Cancelled("fetch_request_complete cancelled".into()));
             }
+            _ = deadline => return Err(NetError::Timeout("total body timeout".into())),
             // Read bytes, or timeout when not read something in time. `read_buf` reads directly into
             // the spare capacity of `body_buf`, so there is no intermediate scratch buffer.
             r = timeout(read_idle_timeout, reader.read_buf(&mut body_buf)) => {
                 match r {
                     Err(_) => return Err(NetError::Timeout("fetch_request_complete timeout".into())),
-                    Ok(Err(e)) => return Err(NetError::Io(Arc::new(e))),
+                    Ok(Err(e)) => return Err(e.into()),
                     Ok(Ok(n)) => n,
                 }
             }
@@ -1732,6 +1835,8 @@ pub(crate) struct ChainOutcome {
     pub(crate) response: HopResponse,
     /// URL of the hop that produced it, i.e. the final URL of the chain.
     pub(crate) url: Url,
+    /// Method of the request that got it, as the redirects left it.
+    pub(crate) method: Method,
     /// Response tainting of the chain — see [`cors`](mod@crate::net::cors).
     pub(crate) tainting: ResponseTainting,
     /// Where that response came from — see [`FetchResultMeta::peer_addr`].
@@ -2809,13 +2914,25 @@ async fn get_with_redirects(
             _ => None,
         };
 
-        if !hop.is_redirection() {
+        // Fetch §4.5 steps 3-5, the location URL: a redirect without a `Location` is the
+        // response, returned as it is, and one with more than one is a network error. The field
+        // lines are counted, not split on commas: a URL may hold a comma.
+        let locations = hop.headers().get_all(header::LOCATION).iter().count();
+        if hop.is_redirection() && locations > 1 {
+            return Err(NetError::Redirect(Arc::new(anyhow!(
+                "redirect status {} with {} Location headers",
+                hop.status(),
+                locations
+            ))));
+        }
+        if !hop.is_redirection() || locations == 0 {
             if attach_credentials {
                 report_set_cookie(&policy, &url, hop.headers());
             }
             return Ok(ChainOutcome {
                 response: hop,
                 url: url.clone(),
+                method: current_method.clone(),
                 tainting,
                 peer_addr,
                 #[cfg(not(target_arch = "wasm32"))]
@@ -2860,9 +2977,13 @@ async fn get_with_redirects(
         }
 
         // Report Set-Cookie values on this hop to the jar before following the redirect —
-        // login flows commonly set the session cookie on a 302. Dropping our Cookie header
-        // makes the next hop re-query the now-updated jar instead of resending a stale value.
-        if attach_credentials && report_set_cookie(&policy, &from, hop.headers()) {
+        // login flows commonly set the session cookie on a 302.
+        let cookies_set = attach_credentials && report_set_cookie(&policy, &from, hop.headers());
+        // The jar's cookies answered for this hop's URL and method. The next hop asks again for
+        // its own (Fetch appends `Cookie` per request): another path can match other cookies,
+        // and a method changed to `GET` other `SameSite` ones. A caller's own `Cookie` stays,
+        // unless the hop set cookies, which the jar now has, or the redirect leaves the origin.
+        if cookie_from_jar || cookies_set {
             current_headers.remove(header::COOKIE);
             cookie_from_jar = false;
         }
@@ -2879,9 +3000,15 @@ async fn get_with_redirects(
             })?;
         let loc = loc.as_str();
 
-        let to = from.join(loc).map_err(|e| {
+        let mut to = from.join(loc).map_err(|e| {
             NetError::Redirect(Arc::new(anyhow!("invalid redirect URL '{}': {}", loc, e)))
         })?;
+        // A `Location` without a fragment keeps the request's (Fetch §2.2.6 location URL,
+        // RFC 9110 §10.2.2): a redirect of `/a#top` to `/b` leads to `/b#top`. From `url`, the
+        // request's current URL: the response's has no fragment.
+        if to.fragment().is_none() {
+            to.set_fragment(url.fragment());
+        }
 
         // A `Location` with embedded `user:password` is refused for a cors-mode request, and
         // for any request when it points at another origin than the hop it came from: following
@@ -2902,33 +3029,31 @@ async fn get_with_redirects(
                 BlockReason::Cors(CorsError::CredentialedRedirect),
             ));
         }
-        let mut to = to;
         let location_credentials_removed = strip_url_credentials(&mut to);
 
-        // Method and body semantics per RFC 7231 §6.4
+        // Fetch §4.5 step 12: a 301 or 302 turns a `POST` into a `GET`, and a 303 every method
+        // but `GET` and `HEAD`; the body goes with the method. Any other method, and every one
+        // on a 307 or 308, goes on as it was, body included.
         let method_before = current_method.clone();
-        match status {
-            // 301/302: browsers always downgrade POST to GET (§6.4.2–3); we follow suit.
-            // HEAD stays HEAD (no body involved); all other methods become GET.
-            301 | 302 => {
-                if current_method != Method::HEAD {
-                    current_method = Method::GET;
-                }
-                current_body = None;
-                current_headers.remove(header::CONTENT_TYPE);
-                current_headers.remove(header::CONTENT_LENGTH);
-                current_headers.remove(header::TRANSFER_ENCODING);
+        let to_get = match status {
+            301 | 302 => current_method == Method::POST,
+            303 => current_method != Method::GET && current_method != Method::HEAD,
+            _ => false,
+        };
+        if to_get {
+            current_method = Method::GET;
+            current_body = None;
+            // The request-body-header names (Fetch §2.2.2), with the framing of the body gone.
+            for name in [
+                header::CONTENT_ENCODING,
+                header::CONTENT_LANGUAGE,
+                header::CONTENT_LOCATION,
+                header::CONTENT_TYPE,
+                header::CONTENT_LENGTH,
+                header::TRANSFER_ENCODING,
+            ] {
+                current_headers.remove(name);
             }
-            // 303 See Other: always GET, always drop body.
-            303 => {
-                current_method = Method::GET;
-                current_body = None;
-                current_headers.remove(header::CONTENT_TYPE);
-                current_headers.remove(header::CONTENT_LENGTH);
-                current_headers.remove(header::TRANSFER_ENCODING);
-            }
-            // 307/308, the only redirects left: preserve method and body.
-            _ => {}
         }
 
         // Strip credential headers when redirecting to a different origin (RFC 9110 §15.4).
@@ -3577,6 +3702,149 @@ mod tests {
         assert!(rec.cancellations().is_empty());
     }
 
+    /// The same for a body with no `Content-Length` to go by, chunked or decoded: it ended
+    /// inside the peek window, so it is whole, and dropping its reader is not giving up on it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_without_a_length_that_arrived_whole_reports_finished_when_dropped() {
+        let body = pattern(64);
+        let srv = TestServer::new()
+            .route(
+                "/chunked",
+                RouteConfig::chunked(vec![&body[..32], &body[32..]]),
+            )
+            .route("/gzip", RouteConfig::gzip_ok(body.clone()))
+            .start()
+            .await;
+        let decoding = Arc::new(
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .gzip(true)
+                .build()
+                .unwrap(),
+        );
+        for path in ["/chunked", "/gzip"] {
+            let rec = Arc::new(RecordingObserver::new());
+            let top = fetch_response_top(
+                decoding.clone(),
+                srv.url(path),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await
+            .expect("fetch");
+            assert_eq!(top.meta.content_length, None, "{path}");
+            assert_eq!(top.peek_buf.as_slice(), &body[..], "{path}");
+            drop(top);
+
+            assert!(
+                rec.cancellations().is_empty(),
+                "{path}: {:?}",
+                rec.cancellations()
+            );
+            let finished = rec.finished();
+            assert_eq!(finished.len(), 1, "{path}");
+            assert_eq!(finished[0].0, body.len() as u64, "{path}");
+        }
+    }
+
+    /// A body refused for its size before the result is handed over is a failed request: the
+    /// observer hears `Failed`, not the `Finished` of a body that arrived whole.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_body_refused_inside_the_peek_window_reports_failed() {
+        let srv = TestServer::new()
+            .route("/", RouteConfig::chunked(vec![&[b'x'; 1000][..]]))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+        let res = super::fetch_response_complete(
+            client(),
+            srv.url("/"),
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            rec.clone(),
+            Some(100),
+            Duration::from_secs(2),
+            None,
+            NetPolicy::default(),
+        )
+        .await;
+        assert!(matches!(res, Err(NetError::Read(_))), "{res:?}");
+        let events = rec.event_names();
+        assert!(events.contains(&"Failed".to_string()), "{events:?}");
+        assert!(!events.contains(&"Finished".to_string()), "{events:?}");
+    }
+
+    /// A response to HEAD, and a 304, report the `Content-Length` they declare, the length the
+    /// representation would have had, but have no body: a cap below that length does not
+    /// refuse them, and dropping the reader is not giving up on a body.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_response_without_a_body_reports_its_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr().unwrap().port()
+        ))
+        .unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let status = if buf[..n].starts_with(b"HEAD") {
+                    "200 OK"
+                } else {
+                    "304 Not Modified"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: 5000\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+
+        for method in [Method::HEAD, Method::GET] {
+            let (meta, body) = super::fetch_response_complete(
+                client(),
+                base.clone(),
+                RequestInit::new(method.clone(), HeaderMap::new(), None),
+                CancellationToken::new(),
+                observer(),
+                Some(1000),
+                Duration::from_secs(2),
+                Some(Duration::from_secs(5)),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{method}: {e:?}"));
+            assert_eq!(meta.content_length, Some(5000), "{method}");
+            assert!(!meta.has_body, "{method}");
+            assert!(body.is_empty(), "{method}");
+
+            let rec = Arc::new(RecordingObserver::new());
+            let top = fetch_response_top(
+                client(),
+                base.clone(),
+                RequestInit::new(method.clone(), HeaderMap::new(), None),
+                CancellationToken::new(),
+                rec.clone(),
+                NetPolicy::default(),
+            )
+            .await
+            .unwrap();
+            drop(top);
+            assert!(
+                rec.cancellations().is_empty(),
+                "{method}: {:?}",
+                rec.cancellations()
+            );
+            assert_eq!(rec.finished().len(), 1, "{method}");
+        }
+    }
+
     /// Read a response to the end and return the whole body, peek window included. The
     /// capture only fills as the consumer pulls.
     async fn drain(top: ResponseTop) -> Vec<u8> {
@@ -3925,6 +4193,7 @@ mod tests {
             meta,
             peek_buf,
             mut reader,
+            ..
         } = super::fetch_response_top(
             client(),
             srv.url("/big"),
@@ -4445,10 +4714,11 @@ mod tests {
         assert_eq!(&body[..], b"hello world");
     }
 
+    /// Fetch §4.5 step 4: a redirect status without a `Location` is the response.
     #[tokio::test(flavor = "current_thread")]
-    async fn redirect_without_location_header_errors() {
+    async fn redirect_without_location_header_is_returned() {
         let srv = server().await;
-        let res = super::fetch_response_top(
+        let ResponseTop { meta, .. } = super::fetch_response_top(
             client(),
             srv.url("/nohead"),
             RequestInit::get(HeaderMap::new()),
@@ -4456,8 +4726,9 @@ mod tests {
             observer(),
             NetPolicy::default(),
         )
-        .await;
-        assert!(res.is_err());
+        .await
+        .expect("returned, not an error");
+        assert_eq!(meta.status, 302);
     }
 
     /// Only 301/302/303/307/308 are redirects. A 300 is returned even with a `Location`, and a
@@ -7360,6 +7631,303 @@ mod tests {
 
     /// `NetEvent::SecurityUpgraded` and `NetEvent::RequestModified`: one event per change, in
     /// the right place in the stream, and nothing when nothing changed.
+    /// Fetch's HTTP-redirect fetch, against a server that answers `/start` with any status.
+    mod redirect_rules {
+        use super::*;
+        use tokio::io::AsyncWriteExt;
+
+        /// One request as the server saw it.
+        #[derive(Debug, Clone)]
+        struct Seen {
+            method: String,
+            path: String,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        }
+
+        impl Seen {
+            fn header(&self, name: &str) -> Option<&str> {
+                self.headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                    .map(|(_, v)| v.as_str())
+            }
+        }
+
+        /// A server that answers `/start` with `status` and the header lines in `head` (each
+        /// ending in `\r\n`), and anything else with `200 ok`. It records every request.
+        async fn server(status: u16, head: &'static str) -> (Url, Arc<Mutex<Vec<Seen>>>) {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let base = Url::parse(&format!(
+                "http://127.0.0.1:{}/",
+                listener.local_addr().unwrap().port()
+            ))
+            .unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let log = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let end = loop {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break None;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(p + 4);
+                        }
+                    };
+                    let Some(end) = end else { continue };
+                    let text = String::from_utf8_lossy(&buf[..end]).to_string();
+                    let mut lines = text.split("\r\n");
+                    let mut first = lines.next().unwrap_or("").split(' ');
+                    let method = first.next().unwrap_or("").to_string();
+                    let path = first.next().unwrap_or("").to_string();
+                    let headers: Vec<(String, String)> = lines
+                        .filter_map(|l| l.split_once(':'))
+                        .map(|(n, v)| (n.to_string(), v.trim().to_string()))
+                        .collect();
+                    let length = headers
+                        .iter()
+                        .find(|(n, _)| n.eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, v)| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let mut body = buf[end..].to_vec();
+                    while body.len() < length {
+                        let n = stream.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&chunk[..n]);
+                    }
+                    let response = if path == "/start" {
+                        format!(
+                            "HTTP/1.1 {status} Redirect\r\n{head}Content-Length: 0\r\n\
+                             Connection: close\r\n\r\n"
+                        )
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                            .to_string()
+                    };
+                    log.lock().unwrap().push(Seen {
+                        method,
+                        path,
+                        headers,
+                        body,
+                    });
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            });
+            (base, seen)
+        }
+
+        /// Fetch `/start` on `base` with `method`, `headers` and `body`, and return the request
+        /// that reached `/end`, with what the observer saw.
+        async fn follow(
+            status: u16,
+            method: Method,
+            headers: HeaderMap,
+            body: Option<&'static [u8]>,
+        ) -> (Seen, Arc<RecordingObserver>) {
+            follow_with(status, method, headers, body, NetPolicy::default()).await
+        }
+
+        /// [`follow`] under `policy`.
+        async fn follow_with(
+            status: u16,
+            method: Method,
+            headers: HeaderMap,
+            body: Option<&'static [u8]>,
+            policy: NetPolicy,
+        ) -> (Seen, Arc<RecordingObserver>) {
+            let (base, seen) = server(status, "Location: /end\r\n").await;
+            let rec = Arc::new(RecordingObserver::new());
+            super::super::fetch_response_complete(
+                client(),
+                base.join("/start").unwrap(),
+                RequestInit::new(method, headers, body.map(RequestBody::bytes)),
+                CancellationToken::new(),
+                rec.clone(),
+                None,
+                Duration::from_secs(5),
+                None,
+                policy,
+            )
+            .await
+            .expect("fetch");
+            let end = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|s| s.path == "/end")
+                .cloned()
+                .expect("the redirect was followed");
+            (end, rec)
+        }
+
+        /// Fetch §4.5 step 12: a 301 or 302 turns a `POST` into a `GET` and nothing else. Any
+        /// other method goes on with its body and the body's type, and nothing is reported as
+        /// changed.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_301_or_302_changes_only_a_post() {
+            for status in [301, 302] {
+                let (end, rec) = follow(status, Method::POST, HeaderMap::new(), Some(b"a=1")).await;
+                assert_eq!(
+                    (end.method.as_str(), end.body.as_slice()),
+                    ("GET", &b""[..])
+                );
+                assert_eq!(rec.modifications().len(), 1, "{status} POST");
+                for method in [Method::PUT, Method::DELETE, Method::PATCH] {
+                    let mut headers = HeaderMap::new();
+                    headers.insert(header::CONTENT_TYPE, "text/plain".parse().unwrap());
+                    let (end, rec) = follow(status, method.clone(), headers, Some(b"a=1")).await;
+                    assert_eq!(
+                        (end.method.as_str(), end.body.as_slice()),
+                        (method.as_str(), &b"a=1"[..]),
+                        "{status} {method}"
+                    );
+                    assert_eq!(
+                        end.header("content-type"),
+                        Some("text/plain"),
+                        "{status} {method}"
+                    );
+                    assert!(
+                        rec.modifications().is_empty(),
+                        "{status} {method}: {:?}",
+                        rec.modifications()
+                    );
+                }
+            }
+        }
+
+        /// Fetch §4.5 step 12: a method changed to `GET` loses its body and every
+        /// request-body-header (§2.2.2). One that is kept keeps them all.
+        #[tokio::test(flavor = "current_thread")]
+        async fn the_body_headers_go_with_the_body() {
+            let names = [
+                "content-encoding",
+                "content-language",
+                "content-location",
+                "content-type",
+            ];
+            let headers = || {
+                let mut h = HeaderMap::new();
+                for (name, value) in names.iter().zip(["gzip", "nl", "/form", "text/plain"]) {
+                    h.insert(*name, value.parse().unwrap());
+                }
+                h
+            };
+            let (end, _) = follow(302, Method::POST, headers(), Some(b"a=1")).await;
+            let kept: Vec<_> = names.iter().filter(|n| end.header(n).is_some()).collect();
+            assert!(kept.is_empty(), "302 POST to GET still sends {kept:?}");
+            let (end, _) = follow(307, Method::POST, headers(), Some(b"a=1")).await;
+            let lost: Vec<_> = names.iter().filter(|n| end.header(n).is_none()).collect();
+            assert!(lost.is_empty(), "307 POST lost {lost:?}");
+        }
+
+        /// The jar is asked for every hop, with the hop's URL and method: a same-origin redirect
+        /// to another path gets that path's cookies, and a `POST` turned into a `GET` is asked
+        /// about as a `GET` (Fetch appends `Cookie` per request). No `Set-Cookie` needed.
+        #[tokio::test(flavor = "current_thread")]
+        async fn the_jar_answers_for_every_hop() {
+            let jar = || NetPolicy {
+                cookies_for: Box::new(|hop| {
+                    Some(format!("at={}&m={}", hop.url.path(), hop.method))
+                }),
+                ..NetPolicy::default()
+            };
+            let (end, _) = follow_with(302, Method::GET, HeaderMap::new(), None, jar()).await;
+            assert_eq!(end.header("cookie"), Some("at=/end&m=GET"));
+            let (end, _) =
+                follow_with(303, Method::POST, HeaderMap::new(), Some(b"a=1"), jar()).await;
+            assert_eq!(end.header("cookie"), Some("at=/end&m=GET"));
+        }
+
+        /// A caller's own `Cookie` is not the jar's: it goes on to the same origin, until a hop
+        /// sets cookies (see `redirect_set_cookie_drops_stale_cookie_header`).
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_callers_cookie_stays_on_the_origin() {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, "mine=1".parse().unwrap());
+            let (end, _) = follow(302, Method::GET, headers, None).await;
+            assert_eq!(end.header("cookie"), Some("mine=1"));
+        }
+
+        /// Fetch §2.2.6: a `Location` without a fragment keeps the request's, and one with a
+        /// fragment of its own replaces it. `Redirected` and the final URL say so.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_location_without_a_fragment_keeps_the_requests() {
+            for (location, expected) in [
+                ("Location: /end\r\n", "frag"),
+                ("Location: /end#own\r\n", "own"),
+            ] {
+                let (base, _) = server(302, location).await;
+                let rec = Arc::new(RecordingObserver::new());
+                let (meta, _) = super::super::fetch_response_complete(
+                    client(),
+                    base.join("/start#frag").unwrap(),
+                    RequestInit::get(HeaderMap::new()),
+                    CancellationToken::new(),
+                    rec.clone(),
+                    None,
+                    Duration::from_secs(5),
+                    None,
+                    NetPolicy::default(),
+                )
+                .await
+                .expect("fetch");
+                assert_eq!(meta.final_url.fragment(), Some(expected), "{location}");
+                assert!(
+                    rec.event_names().iter().any(|n| n == "Redirected"),
+                    "{:?}",
+                    rec.event_names()
+                );
+            }
+        }
+
+        /// Fetch §2.2.6 location URL: a redirect with two `Location` field lines has no one
+        /// target, and is a network error rather than a guess at one of them.
+        #[tokio::test(flavor = "current_thread")]
+        async fn two_locations_are_a_network_error() {
+            let (base, seen) = server(302, "Location: /a\r\nLocation: /b\r\n").await;
+            let result = super::super::fetch_response_complete(
+                client(),
+                base.join("/start").unwrap(),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                Arc::new(RecordingObserver::new()),
+                None,
+                Duration::from_secs(5),
+                None,
+                NetPolicy::default(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(NetError::Redirect(_))),
+                "{:?}",
+                result.map(|(meta, _)| meta.status)
+            );
+            assert_eq!(seen.lock().unwrap().len(), 1, "no hop after the redirect");
+        }
+
+        /// Fetch §4.5 step 12: a 303 turns every method into a `GET` but `GET` and `HEAD`.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_303_keeps_a_head() {
+            let (end, rec) = follow(303, Method::HEAD, HeaderMap::new(), None).await;
+            assert_eq!(end.method, "HEAD");
+            assert!(rec.modifications().is_empty(), "{:?}", rec.modifications());
+            let (end, _) = follow(303, Method::PUT, HeaderMap::new(), Some(b"a=1")).await;
+            assert_eq!(
+                (end.method.as_str(), end.body.as_slice()),
+                ("GET", &b""[..])
+            );
+        }
+    }
+
     mod security_events {
         use super::*;
         use crate::net::types::{RequestChange, UpgradeReason};

@@ -286,7 +286,8 @@ fetch runs as a stream. Then in `Waiter::finish`:
 
 Before the engine can decide how to treat a response (e.g. hand HTML to the parser), it needs the
 headers and a sniff of the body. `fetch_response_top` returns a `ResponseTop { meta, peek_buf,
-reader }` where `peek_buf` is the first **5 KiB** (`PEEK_MAX`) of the body. Because reading 5 KiB
+body_deadline, reader }` where `peek_buf` is the first **5 KiB** (`PEEK_MAX`) of the body and
+`body_deadline` is when the rest of it must have arrived. Because reading 5 KiB
 off the socket may pull in slightly more, any surplus is stashed and the returned `reader` is
 reconstructed to re-read that surplus first, so the caller sees a seamless body stream starting
 exactly after the peek:
@@ -307,9 +308,10 @@ exactly after the peek:
 
 ### ProgressReader, pump, and SharedBody
 
-For streaming, the tail reader is wrapped in a **`ProgressReader`** that emits `NetEvent::Progress`
-per chunk and enforces cancellation, idle/total timeouts, and max-size limits. `SharedBody`
-(via `from_reader`) spawns a background task that pumps the reader into per-subscriber queues. The
+The tail reader is wrapped in a **`ProgressReader`** that emits `NetEvent::Progress` per chunk,
+stops at cancellation, emits the request's terminal event, and feeds the HTTP cache. It does not
+enforce timeouts or size limits: for a stream, `SharedBody` (via `from_reader`) does, in the
+background task that pumps the reader into per-subscriber queues. The
 **pump** (`pump.rs`) is the higher-level driver that fans a body out to a `SharedBody` and/or a
 file on disk — writing to a temp file and atomically renaming on success (see [`pump.md`](pump.md)).
 
@@ -339,8 +341,13 @@ Timeouts come from `FetcherConfig`: `connect_timeout` and `req_timeout` are enfo
 (`connect_timeout` covers name resolution, TCP and TLS together, and is split evenly across the
 addresses of one family, which are tried in turn; `req_timeout` is reqwest's total request
 timeout, so it covers the body as well as the headers);
-`read_idle_timeout` (max gap between reads) and `total_body_timeout` (whole-body budget) are
-enforced in the read loops of `fetch_response_complete` and the `ProgressReader`/`SharedBody` path;
+`read_idle_timeout` (max gap between reads) and `total_body_timeout` (whole-body budget, counted
+from the response headers) hold from the body's first byte: `fetch_response_top` enforces them
+while it reads the peek window, then the read loop of `fetch_response_complete` or the
+`SharedBody` pump, which is handed what is left of the total budget. A read that blocks is cut
+off when the total budget runs out, not only checked between reads.
+`max_bytes` is enforced in the same two places, and a body that ends inside the peek window is
+checked against it too;
 `redirect_timeout` (budget for the redirect chain, armed by the first redirect) is enforced in
 `get_with_redirects` around each hop's send.
 A `FetchRequest` can override `req_timeout`, `read_idle_timeout`, and `total_body_timeout` for
@@ -380,10 +387,14 @@ browser-matching semantics:
 
 - Only 301, 302, 303, 307 and 308 are redirects (Fetch). Any other 3xx, a 300 or a 304 nobody
   asked for, is returned to the caller like any response, `Location` or not.
-- Method/body downgraded on 301/302/303, preserved on 307/308 (RFC 7231 §6.4).
+- A 301 or 302 turns a `POST` into a `GET`, and a 303 every method but `GET` and `HEAD`, the
+  body going with the method (Fetch §4.5). Every other method keeps its body, as does every
+  method on a 307 or 308.
 - `Authorization`, `Cookie`, `Referer`, `Origin` and `Proxy-Authorization`
-  (`SENSITIVE_REDIRECT_HEADERS`) are stripped on cross-origin redirects (RFC 9110 §15.4), and
-  the cookie jar is re-queried for the new origin.
+  (`SENSITIVE_REDIRECT_HEADERS`) are stripped on cross-origin redirects (RFC 9110 §15.4).
+- The cookie jar is asked again for every hop, with the hop's URL and method.
+- A `Location` without a fragment inherits the request's. A redirect without a `Location` is
+  returned as the response; one with two is a network error (Fetch §2.2.6, §4.5).
 - Only `http`/`https` targets are followed.
 - Each hop is upgraded to `https` if HSTS applies, *before* `url_allowed` is consulted, so the
   hook sees the URL that will actually be requested and no plaintext request is ever opened.
@@ -502,7 +513,12 @@ Semantics, each covered by a test in `hsts.rs`:
 - `includeSubDomains` gates inherited matches only; an exact match ignores it. Per §8.2 a host is
   a Known HSTS Host given a congruent match *or* any superdomain match asserting the flag, so a
   nearer non-matching entry does not shadow a permissive ancestor.
-- A header received over plaintext is ignored (§8.1).
+- A header received over plaintext is ignored (§8.1), and of several fields only the first is
+  read.
+- The value is parsed by the grammar of §6.1: directives separated by `;`, a value a token or a
+  quoted-string (unescaped, so a `;` inside one does not split it). A value off the grammar, a
+  directive given twice, a value on `includeSubDomains` or a `max-age` that is not all digits
+  has the header ignored whole. A `max-age` too large for a `u64` is capped like any long one.
 - `max-age=0` deletes the entry rather than storing an expired one (§6.1.1).
 - An implicit port or `:80` becomes 443; any other explicit port is preserved (§8.3), so
   `http://x:8080/` upgrades to `https://x:8080/`.
