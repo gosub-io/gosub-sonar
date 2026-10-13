@@ -208,6 +208,16 @@ fn directives(value: &str) -> Option<Vec<(&str, Option<String>)>> {
     }
 }
 
+/// A `max-age` value: `delta-seconds`, digits only (§6.1.1), so not `+100` or `-1`, which
+/// Rust's integer parsing would take. The grammar sets no bound, so a value past `u64` is the
+/// largest one rather than a reason to ignore the header; [`record`] caps it anyway.
+fn delta_seconds(value: &str) -> Option<u64> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(value.parse::<u64>().unwrap_or(u64::MAX))
+}
+
 /// Parses a `Strict-Transport-Security` value, or `None` if it does not conform — §6.1 requires
 /// a non-conforming header be ignored whole rather than salvaged in part. `max-age` is required;
 /// any directive given twice, an unknown one too, invalidates the header (§6.1 item 2), as does
@@ -224,7 +234,7 @@ fn parse_sts(value: &str) -> Option<StsDirectives> {
         }
         seen.push(name);
         if name.eq_ignore_ascii_case("max-age") {
-            max_age = Some(val?.parse::<u64>().ok()?);
+            max_age = Some(delta_seconds(&val?)?);
         } else if name.eq_ignore_ascii_case("includeSubDomains") {
             if val.is_some() {
                 return None;
@@ -479,6 +489,18 @@ mod tests {
         ] {
             assert_eq!(parse_sts(value), None, "{value}");
         }
+    }
+
+    /// §6.1.1: `max-age` is `delta-seconds`, digits only and unbounded. A sign makes it
+    /// non-conforming; a value past `u64` is taken as the largest, and capped when recorded.
+    #[test]
+    fn max_age_is_digits_and_saturates() {
+        assert_eq!(parse_sts("max-age=+100"), None);
+        assert_eq!(parse_sts(r#"max-age="+100""#), None);
+        assert_eq!(
+            parse_sts("max-age=99999999999999999999999").map(|d| d.max_age),
+            Some(u64::MAX)
+        );
     }
 
     #[test]

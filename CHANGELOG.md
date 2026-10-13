@@ -74,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `Strict-Transport-Security` `max-age` of `+100` armed HSTS for 100 seconds, while one too
+  large for a `u64` had the header ignored. `max-age` is digits only (RFC 6797 §6.1.1), and an
+  oversized value is capped like any long one now
 - A `Strict-Transport-Security` value with an unknown directive given twice (`preload;
   preload`), or with a value on `includeSubDomains`, armed HSTS. Both are non-conforming
   (RFC 6797 §6.1, §6.1.2), and the header is ignored now
