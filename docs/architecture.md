@@ -756,7 +756,8 @@ They also report only work that actually happened: a request served from the con
 emits no `DnsResolved` and no `Connected`, and a hop covered by a cached CORS grant emits no
 preflight events — the absence is the answer, rather than a zero that would read as "instant".
 `DnsResolved` comes from the fetcher's resolver: the `FetcherConfig::dns_resolver` set, or
-`dns::SystemResolver` when none is, so every lookup the client makes is timed. All three are
+`dns::SystemResolver` when none is, so every lookup the client makes is timed. A lookup that
+fails reports nothing: the request fails with the error instead. All three are
 native-only: on wasm32 the browser owns resolution, connection setup, and preflighting alike.
 
 `Connected` is produced by a tower `connector_layer` (`net::connect_timing`) wrapped around

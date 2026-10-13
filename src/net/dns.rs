@@ -161,7 +161,7 @@ impl reqwest::dns::Resolve for ReqwestResolver {
 ///
 /// Behaviourally the same as reqwest's built-in resolution. It is what the fetcher resolves
 /// through when [`FetcherConfig::dns_resolver`] is `None`, and like any [`DnsResolver`] its
-/// lookups are reported as [`NetEvent::DnsResolved`].
+/// lookups that succeed are reported as [`NetEvent::DnsResolved`].
 ///
 /// [`FetcherConfig::dns_resolver`]: crate::net::fetcher::FetcherConfig::dns_resolver
 ///
