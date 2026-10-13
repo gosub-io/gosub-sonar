@@ -77,6 +77,7 @@ To send headers, a `User-Agent`, or cookies, use `simple_get_with` (and likewise
 
 ```rust,ignore
 use gosub_sonar::{simple_get_with, SimpleOptions};
+use url::Url;
 
 let opts = SimpleOptions::default()
     .with_user_agent("MyBrowser/1.0")
@@ -198,6 +199,7 @@ To persist across restarts, implement `HstsStore` — a host-keyed map. The crat
 `includeSubDomains` matching, and expiry, so the store interprets nothing:
 
 ```rust,ignore
+use std::sync::Arc;
 use gosub_sonar::{HstsEntry, HstsStore, FetcherConfig};
 
 struct ProfileStore { /* in-memory map + async write-through to disk */ }
@@ -231,7 +233,10 @@ proceed anyway, give the fetcher a `TlsOverrideStore`; the error then also carri
 certificate and its fingerprint:
 
 ```rust,ignore
-use gosub_sonar::{FetcherConfig, InMemoryTlsOverrideStore, NetError, FetchResult};
+use std::sync::Arc;
+use gosub_sonar::{
+    FetchResult, FetcherConfig, InMemoryTlsOverrideStore, NetError, TlsOverrideStore,
+};
 
 let overrides = Arc::new(InMemoryTlsOverrideStore::new());
 let cfg = FetcherConfig {
@@ -264,7 +269,9 @@ responses came from the cache.
 `FetcherConfig::cache` holds the store, an `InMemoryHttpCache` with a 16 MiB budget by default:
 
 ```rust,ignore
+use std::sync::Arc;
 use gosub_sonar::{CacheMode, FetchRequest, FetcherConfig, HttpCache, InMemoryHttpCache};
+use http::Method;
 
 let cache = Arc::new(InMemoryHttpCache::new());
 let cfg = FetcherConfig {

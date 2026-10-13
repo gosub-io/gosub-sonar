@@ -74,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The README's examples missed imports: `Arc`, `Url` and `Method`, and `TlsOverrideStore`,
+  without which `overrides.accept(..)` does not compile
 - The `timings` example, `SystemResolver` and `docs/architecture.md` still said
   `DnsResolved` needs a configured `FetcherConfig::dns_resolver`. The fetcher resolves
   through `SystemResolver` when none is set, and reports those lookups too
