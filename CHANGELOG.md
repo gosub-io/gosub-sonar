@@ -74,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `docs/architecture.md` listed fewer fields and reasons than there are: `FetchResultMeta`
+  without `from_cache`, `tainting` and `peer_addr`, `BlockReason` without `BadPort` and
+  `ForbiddenMethod`, and a coalescing key made of the URL, method and headers alone
 - `RequestInit::with_timeout` said it bounds the wait for response headers. Like the
   `timeout` field it sets, it bounds the whole hop, the body included. Both, and
   `FetcherConfig::req_timeout`, said the deadline starts at the first byte sent; it starts

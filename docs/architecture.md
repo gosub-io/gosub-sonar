@@ -208,9 +208,9 @@ Defined in `src/net/types.rs` (and `src/types.rs`):
 
 | Type | Role |
 |------|------|
-| `FetchRequest` | Everything about a request: `url`, `method`, `headers`, `priority`, `streaming`, `auto_decode`, `body`, `max_bytes`, `header_order`, plus correlation fields (`reference`, `req_id`, `kind`, `initiator`). Build via `FetchRequest::builder(method, url)`. `generate_request_key()` derives the **coalescing key** from url/method/headers; it returns `None` for methods other than GET/HEAD, which are never coalesced. |
+| `FetchRequest` | Everything about a request: `url`, `method`, `headers`, `body`, `priority`, `streaming`, `auto_decode`, `max_bytes`, `header_order`; the Fetch fields (`origin`, `mixed_content`, `referrer`, `referrer_policy`, `destination`, `mode`, `credentials`, `cache_mode`); the per-request timeouts and `retry`; plus correlation fields (`reference`, `req_id`, `kind`, `initiator`). Build via `FetchRequest::builder(method, url)`. `generate_request_key()` derives the **coalescing key** from the method, URL, headers and body and every field that changes what a hop sends or accepts; it returns `None` for methods other than GET/HEAD and for a streamed body, which are never coalesced. |
 | `FetchResult` | The outcome sent back: `Stream { meta, peek_buf, shared }`, `Buffered { meta, body }`, or `Error(NetError)`. |
-| `FetchResultMeta` | Response metadata: `final_url`, `status`, `status_text`, `headers`, `content_length`, `content_type`, `has_body`. |
+| `FetchResultMeta` | Response metadata: `final_url`, `status`, `status_text`, `headers`, `content_length`, `content_type`, `has_body`, `from_cache`, `tainting` (how much the initiating document may read), `peer_addr` (the address the response came from). |
 | `Priority` | `High` / `Normal` (default) / `Low` / `Idle`. |
 | `ResourceKind`, `Initiator` | Classification tags handed to `FetcherContext::observer_for`; neither affects scheduling. `Initiator::User` also marks a navigation request as user-activated, which sends `Sec-Fetch-User: ?1` and is part of the coalescing key. |
 | `RequestReference` | Opaque host correlation id (`Background(u64)` / `Tagged(u64)`) — lets the host group requests (e.g. per tab) without the net layer knowing what a tab is. |
@@ -808,7 +808,7 @@ error can fan out to many listeners:
 
 | Variant | Meaning |
 |---------|---------|
-| `Blocked` | Hop refused by policy. Carries a `BlockReason` (mixed content, URL policy, unsupported scheme, not cached, CORS) and the URL of the hop that was refused. |
+| `Blocked` | Hop refused by policy. Carries a `BlockReason` (mixed content, URL policy, unsupported scheme, CORS, not cached, bad port, forbidden method) and the URL of the hop that was refused. |
 | `Transport` | The HTTP client failed. Carries a `TransportError`: a `kind` (`Connect`, `Timeout`, `Redirect`, `Body`, `Decode`, `Request`, `Builder`, `Other`) and the client's own message with its source chain flattened into it. |
 | `ProxyAuthRequired` | A proxy answered the `CONNECT` for an `https` request with `407`. Carries the proxy (without credentials) and the hop's URL. Not retried. Native-only. |
 | `Tls` | TLS handshake failed. Carries a `TlsError` (kind, host, message, and with overrides enabled the certificate and fingerprint); also emitted as `NetEvent::TlsFailed`. Native-only. |
