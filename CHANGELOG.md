@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-13
+
 ### Added
 
 - `stale-while-revalidate` (RFC 5861 §3): a request with an `origin` in the `Default` cache mode
@@ -50,8 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gzip`, `br` and `deflate` bodies through `net::decode`, as the fetcher does, and sends the
   `Accept-Encoding` for them itself. What it returns is unchanged
 - Response bodies are decoded by the fetch (`net::decode`), not by reqwest, which is built
-  without its `gzip`, `brotli` and `deflate` features. What a caller sees is unchanged: a decoded body comes without `Content-Encoding` and `Content-Length`, and
-  `content_length` is `None`. The fetcher now uses one client for decoded and raw requests
+  without its `gzip`, `brotli` and `deflate` features. What a caller sees is unchanged: a
+  decoded body comes without `Content-Encoding` and `Content-Length`, and `content_length` is
+  `None`. The fetcher now uses one client for decoded and raw requests
 - **Breaking:** `NetError` gained `ProxyAuthRequired { proxy, url }`, for a proxy that answers
   the `CONNECT` of an `https` request with `407`. It was a `Transport` error of kind `Connect`,
   told apart only by its message, and retried like a connection that failed. An embedder can
@@ -59,7 +62,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `match` on `NetError` needs an arm for it
 - **Breaking:** `BlockReason` gained `ForbiddenMethod`, so an exhaustive `match` on it outside
   this crate needs an arm for it. `cors::is_forbidden_method` exposes the rule
-
 - The default `Accept` is the value Fetch §4.1 gives for each destination. Images send
   `image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5` instead of a list naming AVIF first, a
   format the engine does not decode, so a server negotiating on it sent images that could not
@@ -1377,7 +1379,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.10.0...v0.11.0
