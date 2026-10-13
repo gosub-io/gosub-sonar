@@ -124,8 +124,8 @@ pub(crate) fn is_proxy_auth_required(e: &reqwest::Error) -> bool {
     false
 }
 
-/// Whether a broken transfer sits somewhere under `e`. A decoding client reports one as a
-/// decode error, wrapping either the client's own body error or an `io::Error` whose kind says
+/// Whether a broken transfer sits somewhere under `e`. The client reports one read from the
+/// body as a decode error, wrapping either its own body error or an `io::Error` whose kind says
 /// the connection ended. `io::Error::source()` skips its inner error, so that is descended into
 /// by hand.
 fn wraps_body_error(e: &reqwest::Error) -> bool {
@@ -205,7 +205,7 @@ mod tests {
         );
     }
 
-    /// With decompression on, the client reports a transfer that broke off as a decode error.
+    /// The client reports a transfer that broke off while its body was read as a decode error.
     /// It is a transfer failure all the same.
     #[tokio::test]
     async fn a_transfer_that_breaks_behind_the_decoder_is_a_body_failure() {
@@ -214,10 +214,7 @@ mod tests {
             .route("/drop", RouteConfig::drop_mid_body(100, 10_000))
             .start()
             .await;
-        let e = reqwest::Client::builder()
-            .gzip(true)
-            .build()
-            .unwrap()
+        let e = reqwest::Client::new()
             .get(srv.url("/drop"))
             .send()
             .await

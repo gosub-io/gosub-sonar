@@ -17,6 +17,8 @@ pub mod cache;
 pub(crate) mod connect_timing;
 pub mod cors;
 #[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod decode;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod dns;
 pub mod events;
 pub mod fetch;
