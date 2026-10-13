@@ -15,10 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request of its own. That request goes out in `NoCache` mode without `Cache-Control: max-age=0`,
   at `Priority::Low`; it reports to `FetcherContext::observer_for` under a request id of its own,
   and `on_ref_active`/`on_ref_done` are not called for it. Two for the same response share one
-  fetch. A redirect hop revalidates its stale entry first. `NetEvent::Cache` reports such a hit as
+  fetch. On a redirect hop it goes on from that hop as the chain had left it: the URLs before it
+  (the `SameSite` context), the referrer and referrer policy, `Sec-Fetch-Site`, a tainted origin,
+  the response tainting and the redirects counted. `NetEvent::Cache` reports such a hit as
   `CacheOutcome::Stale`
 - `NetPolicy::revalidate_in_background` (`with_background_revalidation`), for direct users of
-  `net::fetch`, and `RequestInit::background_revalidation` (`as_background_revalidation`)
+  `net::fetch`: it is handed a `net::fetch::Revalidation`, where the revalidation starts, to send
+  with `RequestInit::background_revalidation` (`as_background_revalidation`)
 - test-support: `CacheRouteOptions::delay` (`delayed`)
 - `RequestChange::HeadersRemoved`: headers the caller set that were not sent, reported once on
   the first hop. `RequestChange` is `#[non_exhaustive]`, so this needs no new `match` arm
@@ -42,7 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `stale_while_revalidate`
 - **Breaking:** `RequestInit` gained the field `background_revalidation`, and `NetPolicy` the
   field `revalidate_in_background`, so a struct literal of either needs it. `RequestInit::new`
-  and `NetPolicy::default` set both to off
+  and `NetPolicy::default` set both to `None`
 - The simple API (`simple_get`, `sync_get`, `sync_fetch` and their `_with` forms) decodes
   `gzip`, `br` and `deflate` bodies through `net::decode`, as the fetcher does, and sends the
   `Accept-Encoding` for them itself. What it returns is unchanged

@@ -802,8 +802,8 @@ pub struct FetchRequest {
     /// [`cache`](crate::net::fetcher::FetcherConfig::cache). See [`cache`](mod@crate::net::cache).
     pub cache_mode: CacheMode,
     /// Set on a background revalidation the fetcher queues itself, to refresh a stale response
-    /// another request was answered with; see [`cache`](mod@crate::net::cache).
-    pub(crate) background_revalidation: bool,
+    /// another request was answered with: where it starts. See [`cache`](mod@crate::net::cache).
+    pub(crate) background_revalidation: Option<crate::net::fetch::Revalidation>,
     /// Overrides [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order)
     /// for this one request; `None` uses the fetcher-wide setting.
     pub header_order: Option<Vec<HeaderName>>,
@@ -1059,9 +1059,19 @@ impl FetchRequest {
         // the server, and the other may be answered from the cache. Two requests can only share
         // a response when they would use the cache the same way.
         // A background revalidation asks the server as `no-cache` does, but with other headers,
-        // and only ever shares a fetch with another revalidation.
+        // and goes on from where its redirect chain was. It only ever shares a fetch with another
+        // revalidation from the same place.
+        let revalidation;
         let cache_mode = match self.cache_mode {
-            _ if self.background_revalidation => "revalidate",
+            _ if self.background_revalidation.is_some() => {
+                let chain = self
+                    .background_revalidation
+                    .as_ref()
+                    .map(|from| from.chain_key())
+                    .unwrap_or_default();
+                revalidation = format!("revalidate@{:x}", short_hash(chain.as_bytes()));
+                revalidation.as_str()
+            }
             CacheMode::Default => "default",
             CacheMode::NoStore => "no-store",
             CacheMode::Reload => "reload",
@@ -1399,7 +1409,7 @@ impl FetchRequestBuilder {
             mode: self.mode,
             credentials: self.credentials,
             cache_mode: self.cache_mode,
-            background_revalidation: false,
+            background_revalidation: None,
             header_order: self.header_order,
             req_timeout: self.req_timeout,
             read_idle_timeout: self.read_idle_timeout,

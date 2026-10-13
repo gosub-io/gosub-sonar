@@ -777,7 +777,9 @@ impl Fetcher {
                     .observer_for(req.reference, req.req_id, req.kind, req.initiator),
                 requested.clone(),
                 !is_leader,
-                (!req.background_revalidation).then(|| (self.ctx.clone(), req.reference)),
+                req.background_revalidation
+                    .is_none()
+                    .then(|| (self.ctx.clone(), req.reference)),
             );
             if let Some(ref to) = upgraded {
                 lifecycle.on_event(NetEvent::SecurityUpgraded {
@@ -1065,10 +1067,9 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
             effective_total_body_timeout(req, cfg),
         )
         .with_max_bytes(req.max_bytes);
-    if req.background_revalidation {
-        init.as_background_revalidation()
-    } else {
-        init
+    match req.background_revalidation.clone() {
+        Some(from) => init.as_background_revalidation(from),
+        None => init,
     }
 }
 
@@ -1232,7 +1233,8 @@ fn build_policy(
 }
 
 /// What starts the background revalidation of a stale response `req` was answered with: a
-/// request of the fetcher's own, `req` again (Fetch: a clone of the request) in
+/// request of the fetcher's own, `req` again (Fetch: a clone of the request) from the hop that
+/// was answered, as its redirect chain had left it, in
 /// [`CacheMode::NoCache`](crate::net::cache::CacheMode::NoCache) and at [`Priority::Low`],
 /// queued by the run loop. It reports to an observer of its own, under a request id of its
 /// own, and the stored response it brings back answers the requests after it.
@@ -1243,13 +1245,16 @@ fn revalidate_later(
 ) -> crate::net::fetch::BackgroundRevalidationFn {
     let req = req.clone();
     let built = built.clone();
-    Box::new(move |url, method| {
+    Box::new(move |from| {
         let mut revalidation = req.clone();
         revalidation.req_id = crate::types::RequestId::new();
-        revalidation.url = url.clone();
-        revalidation.method = method.clone();
+        revalidation.url = from.url().clone();
+        revalidation.method = from.method().clone();
+        revalidation.headers = from.headers().clone();
+        // A redirect to `GET` took the body; a hop that is answered from the cache has none.
+        revalidation.body = None;
         revalidation.cache_mode = crate::net::cache::CacheMode::NoCache;
-        revalidation.background_revalidation = true;
+        revalidation.background_revalidation = Some(from);
         revalidation.priority = Priority::Low;
         // Read to its end, so the cache gets the whole response.
         revalidation.streaming = false;
@@ -1517,7 +1522,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
-            background_revalidation: false,
+            background_revalidation: None,
             header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
@@ -1555,7 +1560,7 @@ mod tests {
                 mode: Default::default(),
                 credentials: Default::default(),
                 cache_mode: Default::default(),
-                background_revalidation: false,
+                background_revalidation: None,
                 header_order: None,
                 req_timeout: None,
                 read_idle_timeout: None,
@@ -1796,7 +1801,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
-            background_revalidation: false,
+            background_revalidation: None,
             header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
@@ -2072,7 +2077,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
-            background_revalidation: false,
+            background_revalidation: None,
             header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
@@ -3782,6 +3787,74 @@ mod tests {
         assert_eq!(sent[0].2.get(header::CACHE_CONTROL), None);
     }
 
+    /// Through the fetcher, a redirect hop's revalidation goes on from that hop: it asks for the
+    /// hop's URL, not the request's, and sends what the chain would have, here no `Referer`
+    /// after a redirect said `Referrer-Policy: no-referrer`.
+    #[tokio::test]
+    async fn a_redirect_hop_is_revalidated_from_that_hop() {
+        use crate::net::test_support::CacheRouteOptions;
+        let srv = TestServer::new()
+            .route(
+                "/swr",
+                RouteConfig::Cacheable(
+                    CacheRouteOptions::default()
+                        .with_cache_control("max-age=0, stale-while-revalidate=600")
+                        .counting(),
+                ),
+            )
+            .route(
+                "/start",
+                RouteConfig::RedirectWithReferrerPolicy {
+                    target: "/swr".into(),
+                    policy: "no-referrer".into(),
+                },
+            )
+            .start()
+            .await;
+        let ctx = Arc::new(Revalidating::default());
+        let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
+        let shutdown = CancellationToken::new();
+        let (f, s) = (fetcher.clone(), shutdown.clone());
+        tokio::spawn(async move { f.run(s).await });
+        let mut ours = Vec::new();
+        let mut fetch = || {
+            let req = FetchRequest::builder(Method::GET, srv.url("/start"))
+                .with_origin(srv.url("/").origin())
+                .with_referrer(srv.url("/page?secret"))
+                .build();
+            ours.push(req.req_id);
+            fetcher.fetch(req)
+        };
+        assert_eq!(body_of(fetch().await), (false, "hit-1".into()));
+        assert_eq!(body_of(fetch().await), (true, "hit-1".into()));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while srv.hit_count("/swr") < 2 {
+            assert!(tokio::time::Instant::now() < deadline, "never revalidated");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The revalidation has ended once its observer saw the end.
+        let revalidation = loop {
+            let found = ctx
+                .observers
+                .lock()
+                .iter()
+                .find(|(id, _)| !ours.contains(id))
+                .map(|(_, rec)| rec.clone());
+            if let Some(rec) = found.filter(|rec| rec.len_finished() == 1) {
+                break rec;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never finished");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        shutdown.cancel();
+        let sent = revalidation.requests_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, srv.url("/swr"));
+        assert_eq!(sent[0].2.get(header::REFERER), None);
+        assert_eq!(srv.hit_count("/start"), 2);
+    }
+
     /// A stored response is revalidated once at a time, however many requests it answers
     /// while that runs.
     #[tokio::test]
@@ -4536,7 +4609,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
-            background_revalidation: false,
+            background_revalidation: None,
             header_order: None,
             req_timeout: None,
             read_idle_timeout: None,
@@ -4907,7 +4980,7 @@ mod tests {
             mode: Default::default(),
             credentials: Default::default(),
             cache_mode: Default::default(),
-            background_revalidation: false,
+            background_revalidation: None,
             header_order: None,
             req_timeout: None,
             read_idle_timeout: None,

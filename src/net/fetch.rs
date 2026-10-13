@@ -331,9 +331,78 @@ pub type ProxyForFn = Box<dyn Fn(&Url) -> Option<Url> + Send + Sync>;
 #[cfg(not(target_arch = "wasm32"))]
 pub type ProxiedFn = Box<dyn Fn(&Url) -> bool + Send + Sync>;
 
-/// Starts the background revalidation of a stale response a hop was answered with: the hop's
-/// URL and method. See [`NetPolicy::revalidate_in_background`].
-pub type BackgroundRevalidationFn = Box<dyn Fn(&Url, &Method) + Send + Sync>;
+/// Starts the background revalidation of a stale response a hop was answered with. See
+/// [`NetPolicy::revalidate_in_background`].
+pub type BackgroundRevalidationFn = Box<dyn Fn(Revalidation) + Send + Sync>;
+
+/// Where the background revalidation of a stale response starts: the hop that was answered
+/// with it, as its request's redirect chain had left it.
+///
+/// Fetch revalidates with a clone of the request, so the revalidation goes on from that hop the
+/// way the request did: with the URLs before it (the `SameSite` context of its cookies), the
+/// referrer and referrer policy the redirects left, the `Sec-Fetch-Site` the chain degraded to,
+/// a tainted origin, the response tainting, and the redirects already counted. Handed to
+/// [`NetPolicy::revalidate_in_background`]; send it as a request to [`url`](Self::url) with
+/// [`method`](Self::method) and [`headers`](Self::headers), carrying it in
+/// [`RequestInit::as_background_revalidation`].
+#[derive(Debug, Clone)]
+pub struct Revalidation {
+    url: Url,
+    method: Method,
+    headers: HeaderMap,
+    url_list: Vec<Url>,
+    referrer: Option<Url>,
+    referrer_policy: ReferrerPolicy,
+    site: SecFetchSite,
+    origin_tainted: bool,
+    tainting: ResponseTainting,
+    redirects: usize,
+}
+
+impl Revalidation {
+    /// The hop's URL, before an HSTS or mixed-content upgrade of that hop.
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// The hop's method.
+    pub fn method(&self) -> &Method {
+        &self.method
+    }
+
+    /// The request's headers at that hop, as its redirects left them, without the ones only
+    /// the user agent sets (Fetch §2.2.2), which every hop works out again.
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// The chain state beyond the URL, method and headers, as text that is equal for two
+    /// revalidations exactly when they would send the same request.
+    pub(crate) fn chain_key(&self) -> String {
+        format!(
+            "{:?};{:?};{:?};{:?};{};{:?};{}",
+            self.url_list.iter().map(Url::as_str).collect::<Vec<_>>(),
+            self.referrer.as_ref().map(Url::as_str),
+            self.referrer_policy,
+            self.site,
+            self.origin_tainted,
+            self.tainting,
+            self.redirects
+        )
+    }
+}
+
+/// `headers` without the forbidden request headers (Fetch §2.2.2).
+#[cfg(not(target_arch = "wasm32"))]
+fn without_forbidden(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in headers {
+        if !cors::is_forbidden_request_header_value(name, value) {
+            out.append(name.clone(), value.clone());
+        }
+    }
+    out
+}
 
 /// Network-level request policies threaded through the fetch stack.
 ///
@@ -391,9 +460,8 @@ pub struct NetPolicy {
     pub cache: Option<Arc<dyn HttpCache>>,
     /// Revalidates a stale response in the background, after the hop it answered has moved on.
     /// With it, a request in the default cache mode that has an origin (Fetch: a client) is
-    /// answered from a stale entry its `stale-while-revalidate` still covers, on its first hop,
-    /// and this is called with the hop's URL and method; without it, such an entry is
-    /// revalidated first.
+    /// answered from a stale entry its `stale-while-revalidate` still covers, and this is called
+    /// with where the revalidation starts; without it, such an entry is revalidated first.
     /// [`Fetcher`](crate::net::fetcher::Fetcher) queues a request of its own for it. Set via
     /// [`NetPolicy::with_background_revalidation`]. See [`cache`](mod@crate::net::cache).
     #[cfg(not(target_arch = "wasm32"))]
@@ -692,12 +760,13 @@ pub struct RequestInit {
     /// Whether the body is decoded from its content codings (`gzip`, `br`, `deflate`). A cache
     /// entry records it, since a decoded body is not the bytes a raw caller asked for.
     pub auto_decode: bool,
-    /// Whether this request is the background revalidation of a stale response another request
-    /// was answered with. It goes out in [`CacheMode::NoCache`] without the
+    /// Set when this request is the background revalidation of a stale response another
+    /// request was answered with: it goes on from the hop that was answered, as that request's
+    /// redirect chain had left it. It goes out in [`CacheMode::NoCache`] without the
     /// `Cache-Control: max-age=0` that mode otherwise adds (Fetch, "prevent no-cache
     /// cache-control header modification flag"): it asks this cache to revalidate, not every
     /// cache on the way.
-    pub background_revalidation: bool,
+    pub background_revalidation: Option<Revalidation>,
     /// Order in which headers are sent, applied per hop; `None` keeps insertion order. See
     /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
     pub header_order: Option<Vec<HeaderName>>,
@@ -756,7 +825,7 @@ impl RequestInit {
             credentials: RequestCredentials::default(),
             cache_mode: CacheMode::default(),
             auto_decode: true,
-            background_revalidation: false,
+            background_revalidation: None,
             header_order: None,
             timeout: None,
             redirect_timeout: None,
@@ -818,10 +887,10 @@ impl RequestInit {
         self
     }
 
-    /// Mark this request as the background revalidation of a stale response. See
+    /// Mark this request as the background revalidation that starts at `from`. See
     /// [`RequestInit::background_revalidation`].
-    pub fn as_background_revalidation(mut self) -> Self {
-        self.background_revalidation = true;
+    pub fn as_background_revalidation(mut self, from: Revalidation) -> Self {
+        self.background_revalidation = Some(from);
         self
     }
 
@@ -2082,10 +2151,53 @@ async fn get_with_redirects(
     // Armed by the first redirect; `None` until then, and for good without a budget.
     let mut redirect_deadline: Option<tokio::time::Instant> = None;
 
+    // A background revalidation goes on from the hop it revalidates, as the redirect chain had
+    // left it (Fetch revalidates with a clone of the request). Its URL, method and headers come
+    // in as the request's own; the rest of the chain is taken up here.
+    #[cfg(not(target_arch = "wasm32"))]
+    let resumed = init.background_revalidation.is_some();
+    let mut first_hop = 0;
+    if let Some(from) = init.background_revalidation {
+        url_list = from.url_list;
+        chain_referrer = from.referrer;
+        referrer_policy = from.referrer_policy;
+        site = from.site;
+        origin_tainted = from.origin_tainted;
+        tainting = from.tainting;
+        first_hop = from.redirects;
+        // Already redirected: the budget runs from here, as it would from a redirect.
+        if first_hop > 0 {
+            redirect_deadline = init
+                .redirect_timeout
+                .map(|budget| tokio::time::Instant::now() + budget);
+        }
+    }
+    // Whether a hop may be answered stale and revalidated behind it: only for a request with a
+    // client (Fetch, HTTP-network-or-cache fetch), one with an origin here, and only with
+    // something to revalidate it.
+    #[cfg(not(target_arch = "wasm32"))]
+    let background =
+        origin.is_some() && policy.cache.is_some() && policy.revalidate_in_background.is_some();
+
     // `redirects` counts the redirects followed so far. One request more than the limit: the
     // chain may follow MAX_REDIRECTS redirects, and only a redirect after those is an error
     // (Fetch, HTTP-redirect fetch: a network error when the count is already 20).
-    for redirects in 0..=MAX_REDIRECTS {
+    for redirects in first_hop..=MAX_REDIRECTS {
+        // Where a background revalidation of this hop would start: the chain as it stands
+        // before the hop does anything.
+        #[cfg(not(target_arch = "wasm32"))]
+        let hop_start = background.then(|| Revalidation {
+            url: url.clone(),
+            method: current_method.clone(),
+            headers: without_forbidden(&current_headers),
+            url_list: url_list.clone(),
+            referrer: chain_referrer.clone(),
+            referrer_policy,
+            site,
+            origin_tainted,
+            tainting,
+            redirects,
+        });
         // HSTS upgrade first: a stored policy forces `https` for a known host regardless of the
         // mixed-content setting. `hop_checks` then re-checks the scheme and mixed content on the
         // (possibly upgraded) URL and runs `url_allowed` last, so the policy hook always vets the
@@ -2460,16 +2572,7 @@ async fn get_with_redirects(
         #[cfg(not(target_arch = "wasm32"))]
         let cache_mode = cache::effective_mode(init.cache_mode, &current_headers);
         // A stale entry its `stale-while-revalidate` covers is used, and revalidated behind the
-        // hop, only by a request with a client (Fetch, HTTP-network-or-cache fetch): one with an
-        // origin, here. Anything else revalidates it first.
-        //
-        // On the first hop only. The revalidation is a request of its own, started from the
-        // hop's URL, and a redirect hop's state (the tainted origin, the `SameSite` context of
-        // the chain, `Sec-Fetch-Site`, a referrer policy a redirect changed) would not carry
-        // over: it could send cookies the chain withholds. A redirect hop revalidates first.
-        #[cfg(not(target_arch = "wasm32"))]
-        let background =
-            origin.is_some() && url_list.is_empty() && policy.revalidate_in_background.is_some();
+        // hop, only where `background` allows. Anything else revalidates it first.
         #[cfg(not(target_arch = "wasm32"))]
         let mut stale = false;
         #[cfg(not(target_arch = "wasm32"))]
@@ -2586,8 +2689,10 @@ async fn get_with_redirects(
                 // next request runs on without it (Fetch: "in parallel").
                 #[cfg(not(target_arch = "wasm32"))]
                 if stale {
-                    if let Some(ref start) = policy.revalidate_in_background {
-                        start(&url, &current_method);
+                    if let (Some(start), Some(from)) =
+                        (policy.revalidate_in_background.as_ref(), hop_start)
+                    {
+                        start(from);
                     }
                 }
                 HopResponse::Cached(entry)
@@ -2616,7 +2721,7 @@ async fn get_with_redirects(
                 {
                     let cache_control = match cache_mode {
                         // A background revalidation asks this cache alone.
-                        CacheMode::NoCache if init.background_revalidation => None,
+                        CacheMode::NoCache if resumed => None,
                         CacheMode::NoCache => Some("max-age=0"),
                         CacheMode::NoStore | CacheMode::Reload => {
                             if !hop_headers.contains_key(header::PRAGMA) {
@@ -6969,8 +7074,8 @@ mod tests {
         .unwrap()
     }
 
-    /// What a test's background revalidation was asked to revalidate.
-    type Revalidations = Arc<std::sync::Mutex<Vec<(Url, Method)>>>;
+    /// Where a test's background revalidations were asked to start.
+    type Revalidations = Arc<std::sync::Mutex<Vec<Revalidation>>>;
 
     /// A policy with `cache` and a background revalidation that records what it was asked to
     /// revalidate.
@@ -6979,8 +7084,8 @@ mod tests {
         let record = started.clone();
         let policy = NetPolicy::default()
             .with_cache(Some(cache))
-            .with_background_revalidation(Box::new(move |url, method| {
-                record.lock().unwrap().push((url.clone(), method.clone()));
+            .with_background_revalidation(Box::new(move |from| {
+                record.lock().unwrap().push(from);
             }));
         (policy, started)
     }
@@ -7019,10 +7124,13 @@ mod tests {
         assert!(meta.from_cache);
         assert_eq!(&body[..], b"hit-1");
         assert_eq!(rec.cache_outcomes(), vec![CacheOutcome::Stale]);
-        assert_eq!(
-            *started.lock().unwrap(),
-            vec![(srv.url("/swr"), Method::GET)]
-        );
+        {
+            let started = started.lock().unwrap();
+            assert_eq!(started.len(), 1);
+            assert_eq!(started[0].url(), &srv.url("/swr"));
+            assert_eq!(started[0].method(), Method::GET);
+            assert_eq!(started[0].redirects, 0);
+        }
         assert_eq!(
             srv.hit_count("/swr"),
             1,
@@ -7057,10 +7165,40 @@ mod tests {
         assert_eq!(&body[..], b"hit-3");
     }
 
-    /// A redirect hop's stale entry is revalidated before it is used: the revalidation could
-    /// not start from the redirect chain's state.
+    /// Two revalidations share a key only from the same place in the same chain.
+    #[test]
+    fn a_revalidation_is_keyed_by_its_chain() {
+        let at = |url_list: Vec<Url>, site| Revalidation {
+            url: Url::parse("https://a.test/r").unwrap(),
+            method: Method::GET,
+            headers: HeaderMap::new(),
+            url_list,
+            referrer: None,
+            referrer_policy: ReferrerPolicy::default(),
+            site,
+            origin_tainted: false,
+            tainting: ResponseTainting::Basic,
+            redirects: 0,
+        };
+        let detour = vec![Url::parse("https://b.test/").unwrap()];
+        let first = at(Vec::new(), SecFetchSite::SameOrigin);
+        assert_eq!(first.chain_key(), first.clone().chain_key());
+        assert_ne!(
+            first.chain_key(),
+            at(detour.clone(), SecFetchSite::SameOrigin).chain_key()
+        );
+        assert_ne!(
+            first.chain_key(),
+            at(Vec::new(), SecFetchSite::CrossSite).chain_key()
+        );
+    }
+
+    /// A redirect hop's stale entry is used and revalidated behind it too, and the revalidation
+    /// goes on from where the chain was (Fetch revalidates with a clone of the request): here a
+    /// redirect said `Referrer-Policy: no-referrer`, so the revalidation sends no `Referer`
+    /// either, as the hop would have.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_redirect_hop_revalidates_its_stale_entry_first() {
+    async fn a_redirect_hop_is_revalidated_from_where_the_chain_left_it() {
         let srv = TestServer::new()
             .route(
                 "/swr",
@@ -7072,19 +7210,58 @@ mod tests {
                     .counting(),
                 ),
             )
-            .route("/start", RouteConfig::RedirectTo("/swr".into()))
+            .route(
+                "/start",
+                RouteConfig::RedirectWithReferrerPolicy {
+                    target: "/swr".into(),
+                    policy: "no-referrer".into(),
+                },
+            )
             .start()
             .await;
         let (policy, cache) = caching_policy();
         let _ = cache_fetch(&srv, "/swr", RequestInit::default(), policy, observer()).await;
 
-        let (policy, started) = swr_policy(cache);
+        let origin = srv.url("/").origin();
+        let page = srv.url("/page?secret");
+        let (policy, started) = swr_policy(cache.clone());
         let init = RequestInit::default()
-            .with_mixed_content(Some(srv.url("/").origin()), MixedContentPolicy::default());
+            .with_mixed_content(Some(origin.clone()), MixedContentPolicy::default())
+            .with_referrer(Some(page.clone()), ReferrerPolicy::default());
         let (meta, body) = cache_fetch(&srv, "/start", init, policy, observer()).await;
+        assert!(meta.from_cache);
+        assert_eq!(&body[..], b"hit-1");
+        let from = started
+            .lock()
+            .unwrap()
+            .pop()
+            .expect("a revalidation was started");
+        assert_eq!(from.url(), &srv.url("/swr"));
+        assert_eq!(from.url_list, vec![srv.url("/start")]);
+        assert_eq!(from.redirects, 1);
+
+        let rec = Arc::new(RecordingObserver::new());
+        let init = RequestInit::new(from.method().clone(), from.headers().clone(), None)
+            .with_mixed_content(Some(origin), MixedContentPolicy::default())
+            .with_referrer(Some(page), ReferrerPolicy::default())
+            .with_cache(CacheMode::NoCache, true)
+            .as_background_revalidation(from);
+        // The jar is asked with the URLs before the hop, which decide `SameSite`.
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let record = asked.clone();
+        let mut policy = NetPolicy::default().with_cache(Some(cache));
+        policy.cookies_for = Box::new(move |hop| {
+            record.lock().unwrap().push(hop.url_list.to_vec());
+            None
+        });
+        let (meta, body) = cache_fetch(&srv, "/swr", init, policy, rec.clone()).await;
         assert!(!meta.from_cache);
         assert_eq!(&body[..], b"hit-2");
-        assert!(started.lock().unwrap().is_empty());
+        let sent = rec.requests_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, srv.url("/swr"));
+        assert_eq!(sent[0].2.get(header::REFERER), None);
+        assert_eq!(*asked.lock().unwrap(), vec![vec![srv.url("/start")]]);
     }
 
     /// The background revalidation asks this cache to revalidate, not the caches on the way: no
@@ -7108,8 +7285,20 @@ mod tests {
             }
         };
         let forced = RequestInit::default().with_cache(CacheMode::NoCache, true);
+        let from = Revalidation {
+            url: srv.url("/swr"),
+            method: Method::GET,
+            headers: HeaderMap::new(),
+            url_list: Vec::new(),
+            referrer: None,
+            referrer_policy: ReferrerPolicy::default(),
+            site: SecFetchSite::SameOrigin,
+            origin_tainted: false,
+            tainting: ResponseTainting::Basic,
+            redirects: 0,
+        };
         assert_eq!(
-            sent_cache_control(forced.as_background_revalidation()).await,
+            sent_cache_control(forced.as_background_revalidation(from)).await,
             None
         );
         let forced = RequestInit::default().with_cache(CacheMode::NoCache, true);

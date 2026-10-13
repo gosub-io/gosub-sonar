@@ -610,19 +610,23 @@ the server, so neither sonar's cache nor one on the way answers for it.
 
 A stale response its `stale-while-revalidate` still covers (RFC 5861 §3) is used without asking
 the server by a request with a client, as Fetch puts it: in sonar, one with an `origin`, in the
-`Default` mode, on its first hop. `NetEvent::Cache` reports it as `CacheOutcome::Stale`, and the
-hop hands the URL to `NetPolicy::revalidate_in_background`. The `Fetcher` turns that into a
+`Default` mode, on any hop. `NetEvent::Cache` reports it as `CacheOutcome::Stale`, and the hop
+hands a `Revalidation` to `NetPolicy::revalidate_in_background`: where the revalidation starts,
+which is that hop as the redirect chain had left it at its start. Fetch revalidates with a clone
+of the request, so it carries the hop's URL, method and headers (without the ones only the user
+agent sets, which every hop works out again), the URLs before it (the `SameSite` context of the
+cookies), the referrer and referrer policy, `Sec-Fetch-Site`, a tainted origin, the response
+tainting and the redirects counted; `get_with_redirects` takes the chain up from there when the
+request carries it in `RequestInit::background_revalidation`. The `Fetcher` turns it into a
 request of its own, queued by the run loop: the request again, in `NoCache` mode but without the
 `Cache-Control: max-age=0` that mode sends (Fetch's "prevent no-cache cache-control header
 modification flag"), at `Priority::Low`, buffered so the cache gets the whole response. It
 reports to the observer `FetcherContext::observer_for` gives it under a request id of its own,
 and is no work of the reference's: `on_ref_active` and `on_ref_done` are not called for it. Two
-for the same stored response share one fetch, as any two alike requests do; the coalescing key
-keeps them apart from a caller's own `NoCache` request, which does send `max-age=0`. A request
-without an origin, a `must-revalidate` response, and a request whose own `max-age` or
-`min-fresh` the stale response does not meet revalidate before using it. So does a redirect hop:
-its revalidation would start from the hop's URL without the chain's state (the tainted origin,
-the `SameSite` context, `Sec-Fetch-Site`), and could send what the chain withholds.
+revalidations from the same place in the same chain share one fetch, as any two alike requests
+do; the coalescing key keeps them apart from a caller's own `NoCache` request, which does send
+`max-age=0`. A request without an origin, a `must-revalidate` response, and a request whose own
+`max-age` or `min-fresh` the stale response does not meet revalidate before using it.
 
 `Set-Cookie` is removed before a response is stored, so a cache hit cannot re-apply a cookie, and
 so are the hop-by-hop headers. A body the fetch decoded is stored
@@ -630,9 +634,8 @@ without its `Content-Encoding`, and only answers requests that also decode, sinc
 asked for different bytes.
 
 Known limits: shared-cache rules (`s-maxage`, the `Authorization` restriction of §3.5) do not
-apply to a private cache; range requests and `206` are not stored; `stale-while-revalidate`
-applies on the first hop only; and a cors-mode request that needs a preflight still sends it
-before a cache hit is considered.
+apply to a private cache; range requests and `206` are not stored; and a cors-mode request that
+needs a preflight still sends it before a cache hit is considered.
 
 ---
 
