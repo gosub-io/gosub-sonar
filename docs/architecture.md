@@ -212,7 +212,7 @@ Defined in `src/net/types.rs` (and `src/types.rs`):
 | `FetchResult` | The outcome sent back: `Stream { meta, peek_buf, shared }`, `Buffered { meta, body }`, or `Error(NetError)`. |
 | `FetchResultMeta` | Response metadata: `final_url`, `status`, `status_text`, `headers`, `content_length`, `content_type`, `has_body`, `from_cache`, `tainting` (how much the initiating document may read), `peer_addr` (the address the response came from). |
 | `Priority` | `High` / `Normal` (default) / `Low` / `Idle`. |
-| `ResourceKind`, `Initiator` | Classification tags handed to `FetcherContext::observer_for`; neither affects scheduling. `Initiator::User` also marks a navigation request as user-activated, which sends `Sec-Fetch-User: ?1` and is part of the coalescing key. |
+| `ResourceKind`, `Initiator` | Classification tags handed to `FetcherContext::observer_for`; neither affects scheduling. `Initiator::User` also marks a navigation request as user-activated, which sends `Sec-Fetch-User: ?1` to a potentially trustworthy target and is part of the coalescing key. |
 | `RequestReference` | Opaque host correlation id (`Background(u64)` / `Tagged(u64)`) — lets the host group requests (e.g. per tab) without the net layer knowing what a tab is. |
 | `RequestId` | UUID identifying one logical request chain, stable across redirects. |
 | `RequestBody` | Request payload with a content-type hint (`bytes`/`json`/`form`/`text` constructors). |

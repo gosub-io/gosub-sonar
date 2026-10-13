@@ -655,7 +655,8 @@ pub struct RequestInit {
     pub mode: RequestMode,
     /// Whether the request stems from a user action. Sends `Sec-Fetch-User: ?1` when the
     /// destination is a navigation one ([`RequestDestination::is_navigation`]), whatever the
-    /// mode; ignored for other destinations.
+    /// mode, to a potentially trustworthy target, the only kind sent `Sec-Fetch-*` headers at
+    /// all; ignored otherwise.
     pub user_activated: bool,
     /// Whether cookies from the policy's jar ride along, and how strict the credentialed CORS
     /// rules are. See [`RequestCredentials`].
