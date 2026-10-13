@@ -74,6 +74,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A redirect within one origin sent the next hop the cookies the jar had given the first:
+  `cookies_for` was only asked again after a `Set-Cookie` or a change of origin. A redirect from
+  `/login` to `/app` sent `/login`'s cookies, and a `POST` turned into a `GET` was not asked
+  about as a `GET` for `SameSite`. The jar is asked for every hop now, with its URL and method
 - A redirect that turned a request into a `GET` dropped its `Content-Type` but went on
   sending `Content-Encoding`, `Content-Language` and `Content-Location`, which described a body
   no longer there. All four request-body headers go with the body now (Fetch §4.5)

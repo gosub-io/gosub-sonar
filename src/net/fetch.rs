@@ -2856,9 +2856,13 @@ async fn get_with_redirects(
         }
 
         // Report Set-Cookie values on this hop to the jar before following the redirect —
-        // login flows commonly set the session cookie on a 302. Dropping our Cookie header
-        // makes the next hop re-query the now-updated jar instead of resending a stale value.
-        if attach_credentials && report_set_cookie(&policy, &from, hop.headers()) {
+        // login flows commonly set the session cookie on a 302.
+        let cookies_set = attach_credentials && report_set_cookie(&policy, &from, hop.headers());
+        // The jar's cookies answered for this hop's URL and method. The next hop asks again for
+        // its own (Fetch appends `Cookie` per request): another path can match other cookies,
+        // and a method changed to `GET` other `SameSite` ones. A caller's own `Cookie` stays,
+        // unless the hop set cookies, which the jar now has, or the redirect leaves the origin.
+        if cookie_from_jar || cookies_set {
             current_headers.remove(header::COOKIE);
             cookie_from_jar = false;
         }
@@ -7457,6 +7461,17 @@ mod tests {
             headers: HeaderMap,
             body: Option<&'static [u8]>,
         ) -> (Seen, Arc<RecordingObserver>) {
+            follow_with(status, method, headers, body, NetPolicy::default()).await
+        }
+
+        /// [`follow`] under `policy`.
+        async fn follow_with(
+            status: u16,
+            method: Method,
+            headers: HeaderMap,
+            body: Option<&'static [u8]>,
+            policy: NetPolicy,
+        ) -> (Seen, Arc<RecordingObserver>) {
             let (base, seen) = server(status, "Location: /end\r\n").await;
             let rec = Arc::new(RecordingObserver::new());
             super::super::fetch_response_complete(
@@ -7468,7 +7483,7 @@ mod tests {
                 None,
                 Duration::from_secs(5),
                 None,
-                NetPolicy::default(),
+                policy,
             )
             .await
             .expect("fetch");
@@ -7540,6 +7555,34 @@ mod tests {
             let (end, _) = follow(307, Method::POST, headers(), Some(b"a=1")).await;
             let lost: Vec<_> = names.iter().filter(|n| end.header(n).is_none()).collect();
             assert!(lost.is_empty(), "307 POST lost {lost:?}");
+        }
+
+        /// The jar is asked for every hop, with the hop's URL and method: a same-origin redirect
+        /// to another path gets that path's cookies, and a `POST` turned into a `GET` is asked
+        /// about as a `GET` (Fetch appends `Cookie` per request). No `Set-Cookie` needed.
+        #[tokio::test(flavor = "current_thread")]
+        async fn the_jar_answers_for_every_hop() {
+            let jar = || NetPolicy {
+                cookies_for: Box::new(|hop| {
+                    Some(format!("at={}&m={}", hop.url.path(), hop.method))
+                }),
+                ..NetPolicy::default()
+            };
+            let (end, _) = follow_with(302, Method::GET, HeaderMap::new(), None, jar()).await;
+            assert_eq!(end.header("cookie"), Some("at=/end&m=GET"));
+            let (end, _) =
+                follow_with(303, Method::POST, HeaderMap::new(), Some(b"a=1"), jar()).await;
+            assert_eq!(end.header("cookie"), Some("at=/end&m=GET"));
+        }
+
+        /// A caller's own `Cookie` is not the jar's: it goes on to the same origin, until a hop
+        /// sets cookies (see `redirect_set_cookie_drops_stale_cookie_header`).
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_callers_cookie_stays_on_the_origin() {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::COOKIE, "mine=1".parse().unwrap());
+            let (end, _) = follow(302, Method::GET, headers, None).await;
+            assert_eq!(end.header("cookie"), Some("mine=1"));
         }
 
         /// Fetch §4.5 step 12: a 303 turns every method into a `GET` but `GET` and `HEAD`.
