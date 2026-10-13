@@ -120,6 +120,10 @@ pub enum CacheMode {
 pub enum CacheOutcome {
     /// A stored response was used without contacting the server.
     Hit,
+    /// A stale stored response was used without contacting the server, as its
+    /// `stale-while-revalidate` allows (RFC 5861 §3), and a revalidation of it was started in the
+    /// background.
+    Stale,
     /// A stored response was revalidated and the server answered `304`; the stored body was
     /// used and its headers updated.
     Validated,
@@ -133,6 +137,7 @@ impl std::fmt::Display for CacheOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Hit => "hit",
+            Self::Stale => "stale",
             Self::Validated => "validated",
             Self::Stored => "stored",
             Self::Invalidated => "invalidated",

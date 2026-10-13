@@ -331,6 +331,10 @@ pub type ProxyForFn = Box<dyn Fn(&Url) -> Option<Url> + Send + Sync>;
 #[cfg(not(target_arch = "wasm32"))]
 pub type ProxiedFn = Box<dyn Fn(&Url) -> bool + Send + Sync>;
 
+/// Starts the background revalidation of a stale response a hop was answered with: the hop's
+/// URL and method. See [`NetPolicy::revalidate_in_background`].
+pub type BackgroundRevalidationFn = Box<dyn Fn(&Url, &Method) + Send + Sync>;
+
 /// Network-level request policies threaded through the fetch stack.
 ///
 /// Bundles the URL allowlist check and the cookie-jar query so both can be applied at
@@ -385,6 +389,14 @@ pub struct NetPolicy {
     /// See [`cache`](mod@crate::net::cache).
     #[cfg(not(target_arch = "wasm32"))]
     pub cache: Option<Arc<dyn HttpCache>>,
+    /// Revalidates a stale response in the background, after the hop it answered has moved on.
+    /// With it, a request in the default cache mode that has an origin (Fetch: a client) is
+    /// answered from a stale entry its `stale-while-revalidate` still covers, and this is called
+    /// with the hop's URL and method; without it, such an entry is revalidated first.
+    /// [`Fetcher`](crate::net::fetcher::Fetcher) queues a request of its own for it. Set via
+    /// [`NetPolicy::with_background_revalidation`]. See [`cache`](mod@crate::net::cache).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub revalidate_in_background: Option<BackgroundRevalidationFn>,
     /// The user agent configured on the HTTP client, purely so that
     /// [`NetEvent::RequestSent`] can report it.
     ///
@@ -461,6 +473,8 @@ impl Default for NetPolicy {
             #[cfg(not(target_arch = "wasm32"))]
             cache: None,
             #[cfg(not(target_arch = "wasm32"))]
+            revalidate_in_background: None,
+            #[cfg(not(target_arch = "wasm32"))]
             proxy_authorization: None,
             #[cfg(not(target_arch = "wasm32"))]
             proxy_for: None,
@@ -502,6 +516,8 @@ impl NetPolicy {
             credentials: None,
             #[cfg(not(target_arch = "wasm32"))]
             cache: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            revalidate_in_background: None,
             // Filled in by the fetcher, which is what knows how its proxies were configured.
             #[cfg(not(target_arch = "wasm32"))]
             proxy_authorization: None,
@@ -622,6 +638,14 @@ impl NetPolicy {
         self.cache = cache;
         self
     }
+
+    /// Attaches what starts the background revalidation of a stale response a hop was
+    /// answered with. See [`NetPolicy::revalidate_in_background`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_background_revalidation(mut self, start: BackgroundRevalidationFn) -> Self {
+        self.revalidate_in_background = Some(start);
+        self
+    }
 }
 
 /// Bundled HTTP method, headers, and optional body passed through the fetch stack.
@@ -667,6 +691,12 @@ pub struct RequestInit {
     /// Whether the body is decoded from its content codings (`gzip`, `br`, `deflate`). A cache
     /// entry records it, since a decoded body is not the bytes a raw caller asked for.
     pub auto_decode: bool,
+    /// Whether this request is the background revalidation of a stale response another request
+    /// was answered with. It goes out in [`CacheMode::NoCache`] without the
+    /// `Cache-Control: max-age=0` that mode otherwise adds (Fetch, "prevent no-cache
+    /// cache-control header modification flag"): it asks this cache to revalidate, not every
+    /// cache on the way.
+    pub background_revalidation: bool,
     /// Order in which headers are sent, applied per hop; `None` keeps insertion order. See
     /// [`FetcherConfig::header_order`](crate::net::fetcher::FetcherConfig::header_order).
     pub header_order: Option<Vec<HeaderName>>,
@@ -725,6 +755,7 @@ impl RequestInit {
             credentials: RequestCredentials::default(),
             cache_mode: CacheMode::default(),
             auto_decode: true,
+            background_revalidation: false,
             header_order: None,
             timeout: None,
             redirect_timeout: None,
@@ -783,6 +814,13 @@ impl RequestInit {
     pub fn with_cache(mut self, mode: CacheMode, auto_decode: bool) -> Self {
         self.cache_mode = mode;
         self.auto_decode = auto_decode;
+        self
+    }
+
+    /// Mark this request as the background revalidation of a stale response. See
+    /// [`RequestInit::background_revalidation`].
+    pub fn as_background_revalidation(mut self) -> Self {
+        self.background_revalidation = true;
         self
     }
 
@@ -2420,28 +2458,45 @@ async fn get_with_redirects(
         // Read here from the caller's headers, before any conditional header of the cache's own.
         #[cfg(not(target_arch = "wasm32"))]
         let cache_mode = cache::effective_mode(init.cache_mode, &current_headers);
+        // A stale entry its `stale-while-revalidate` covers is used, and revalidated behind the
+        // hop, only by a request with a client (Fetch, HTTP-network-or-cache fetch): one with an
+        // origin, here. Anything else revalidates it first.
+        //
+        // On the first hop only. The revalidation is a request of its own, started from the
+        // hop's URL, and a redirect hop's state (the tainted origin, the `SameSite` context of
+        // the chain, `Sec-Fetch-Site`, a referrer policy a redirect changed) would not carry
+        // over: it could send cookies the chain withholds. A redirect hop revalidates first.
+        #[cfg(not(target_arch = "wasm32"))]
+        let background =
+            origin.is_some() && url_list.is_empty() && policy.revalidate_in_background.is_some();
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut stale = false;
         #[cfg(not(target_arch = "wasm32"))]
         let (cache_hit, mut revalidating, mut conditional) = match policy.cache {
             Some(ref cache) => {
                 let key = CacheKey::new(&current_method, &url).in_partition(cache_partition);
                 let stored = cache.get(&key);
-                match cache::decide(
+                let decision = cache::decide(
                     &stored,
                     &current_headers,
                     init.auto_decode,
                     cache_mode,
                     chrono::Utc::now(),
-                )
-                .revalidated()
-                {
+                );
+                match if background {
+                    decision
+                } else {
+                    decision.revalidated()
+                } {
                     CacheDecision::Use(entry) => (Some(entry), None, HeaderMap::new()),
+                    CacheDecision::UseStale(entry) => {
+                        stale = true;
+                        (Some(entry), None, HeaderMap::new())
+                    }
                     CacheDecision::Revalidate(entry, conditional) => {
                         (None, Some(entry), conditional)
                     }
-                    // `revalidated` leaves no `UseStale`.
-                    CacheDecision::Send | CacheDecision::UseStale(_) => {
-                        (None, None, HeaderMap::new())
-                    }
+                    CacheDecision::Send => (None, None, HeaderMap::new()),
                     // `only-if-cached`, with nothing stored to answer it.
                     CacheDecision::NotCached => {
                         return Err(blocked(&observer, url, BlockReason::NotCached))
@@ -2514,10 +2569,26 @@ async fn get_with_redirects(
                 if let Some(grant) = preflight_grant.take() {
                     grant.keep();
                 }
+                #[cfg(not(target_arch = "wasm32"))]
+                let outcome = if stale {
+                    CacheOutcome::Stale
+                } else {
+                    CacheOutcome::Hit
+                };
+                #[cfg(target_arch = "wasm32")]
+                let outcome = CacheOutcome::Hit;
                 observer.on_event(NetEvent::Cache {
                     url: url.clone(),
-                    outcome: CacheOutcome::Hit,
+                    outcome,
                 });
+                // The stale entry answers this hop; the revalidation that refreshes it for the
+                // next request runs on without it (Fetch: "in parallel").
+                #[cfg(not(target_arch = "wasm32"))]
+                if stale {
+                    if let Some(ref start) = policy.revalidate_in_background {
+                        start(&url, &current_method);
+                    }
+                }
                 HopResponse::Cached(entry)
             }
             None => loop {
@@ -2543,6 +2614,8 @@ async fn get_with_redirects(
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     let cache_control = match cache_mode {
+                        // A background revalidation asks this cache alone.
+                        CacheMode::NoCache if init.background_revalidation => None,
                         CacheMode::NoCache => Some("max-age=0"),
                         CacheMode::NoStore | CacheMode::Reload => {
                             if !hop_headers.contains_key(header::PRAGMA) {
@@ -6893,6 +6966,153 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// What a test's background revalidation was asked to revalidate.
+    type Revalidations = Arc<std::sync::Mutex<Vec<(Url, Method)>>>;
+
+    /// A policy with `cache` and a background revalidation that records what it was asked to
+    /// revalidate.
+    fn swr_policy(cache: Arc<crate::net::cache::InMemoryHttpCache>) -> (NetPolicy, Revalidations) {
+        let started = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = started.clone();
+        let policy = NetPolicy::default()
+            .with_cache(Some(cache))
+            .with_background_revalidation(Box::new(move |url, method| {
+                record.lock().unwrap().push((url.clone(), method.clone()));
+            }));
+        (policy, started)
+    }
+
+    /// A response that is stale at once and may be used stale for ten minutes.
+    async fn swr_server() -> crate::net::test_support::TestServerHandle {
+        TestServer::new()
+            .route(
+                "/swr",
+                RouteConfig::Cacheable(
+                    CacheRouteOptions {
+                        cache_control: Some("max-age=0, stale-while-revalidate=600".into()),
+                        ..CacheRouteOptions::default()
+                    }
+                    .counting(),
+                ),
+            )
+            .start()
+            .await
+    }
+
+    /// RFC 5861 §3, Fetch HTTP-network-or-cache fetch: a request with a client is answered from
+    /// a stale entry its `stale-while-revalidate` covers, without waiting for the server, and
+    /// the revalidation is started behind it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_response_is_served_while_it_is_revalidated() {
+        let srv = swr_server().await;
+        let (policy, cache) = caching_policy();
+        let _ = cache_fetch(&srv, "/swr", RequestInit::default(), policy, observer()).await;
+
+        let (policy, started) = swr_policy(cache);
+        let rec = Arc::new(RecordingObserver::new());
+        let init = RequestInit::default()
+            .with_mixed_content(Some(srv.url("/").origin()), MixedContentPolicy::default());
+        let (meta, body) = cache_fetch(&srv, "/swr", init, policy, rec.clone()).await;
+        assert!(meta.from_cache);
+        assert_eq!(&body[..], b"hit-1");
+        assert_eq!(rec.cache_outcomes(), vec![CacheOutcome::Stale]);
+        assert_eq!(
+            *started.lock().unwrap(),
+            vec![(srv.url("/swr"), Method::GET)]
+        );
+        assert_eq!(
+            srv.hit_count("/swr"),
+            1,
+            "nothing was sent for the request itself"
+        );
+    }
+
+    /// Without a client (no origin), or with nothing to revalidate in the background, the
+    /// stale entry is revalidated before it could be used: here it has no validators, so the
+    /// response is fetched again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_response_is_revalidated_first_without_a_background() {
+        let srv = swr_server().await;
+        let (policy, cache) = caching_policy();
+        let _ = cache_fetch(&srv, "/swr", RequestInit::default(), policy, observer()).await;
+
+        let (policy, started) = swr_policy(cache.clone());
+        let (meta, body) =
+            cache_fetch(&srv, "/swr", RequestInit::default(), policy, observer()).await;
+        assert!(!meta.from_cache, "a request without an origin");
+        assert_eq!(&body[..], b"hit-2");
+        assert!(started.lock().unwrap().is_empty());
+
+        let init = RequestInit::default()
+            .with_mixed_content(Some(srv.url("/").origin()), MixedContentPolicy::default());
+        let policy = NetPolicy::default().with_cache(Some(cache));
+        let (meta, body) = cache_fetch(&srv, "/swr", init, policy, observer()).await;
+        assert!(
+            !meta.from_cache,
+            "a policy without a background revalidation"
+        );
+        assert_eq!(&body[..], b"hit-3");
+    }
+
+    /// A redirect hop's stale entry is revalidated before it is used: the revalidation could
+    /// not start from the redirect chain's state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_redirect_hop_revalidates_its_stale_entry_first() {
+        let srv = TestServer::new()
+            .route(
+                "/swr",
+                RouteConfig::Cacheable(
+                    CacheRouteOptions {
+                        cache_control: Some("max-age=0, stale-while-revalidate=600".into()),
+                        ..CacheRouteOptions::default()
+                    }
+                    .counting(),
+                ),
+            )
+            .route("/start", RouteConfig::RedirectTo("/swr".into()))
+            .start()
+            .await;
+        let (policy, cache) = caching_policy();
+        let _ = cache_fetch(&srv, "/swr", RequestInit::default(), policy, observer()).await;
+
+        let (policy, started) = swr_policy(cache);
+        let init = RequestInit::default()
+            .with_mixed_content(Some(srv.url("/").origin()), MixedContentPolicy::default());
+        let (meta, body) = cache_fetch(&srv, "/start", init, policy, observer()).await;
+        assert!(!meta.from_cache);
+        assert_eq!(&body[..], b"hit-2");
+        assert!(started.lock().unwrap().is_empty());
+    }
+
+    /// The background revalidation asks this cache to revalidate, not the caches on the way: no
+    /// `Cache-Control: max-age=0` of the mode's own (Fetch, "prevent no-cache cache-control
+    /// header modification flag"). A forced revalidation from a caller still sends it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_background_revalidation_sends_no_cache_control_of_its_own() {
+        let srv = swr_server().await;
+        let (policy, cache) = caching_policy();
+        let _ = cache_fetch(&srv, "/swr", RequestInit::default(), policy, observer()).await;
+
+        let sent_cache_control = |init: RequestInit| {
+            let (srv, cache) = (&srv, cache.clone());
+            async move {
+                let rec = Arc::new(RecordingObserver::new());
+                let policy = NetPolicy::default().with_cache(Some(cache));
+                let _ = cache_fetch(srv, "/swr", init, policy, rec.clone()).await;
+                let sent = rec.requests_sent();
+                assert_eq!(sent.len(), 1);
+                sent[0].2.get(header::CACHE_CONTROL).cloned()
+            }
+        };
+        let forced = RequestInit::default().with_cache(CacheMode::NoCache, true);
+        assert_eq!(
+            sent_cache_control(forced.as_background_revalidation()).await,
+            None
+        );
+        let forced = RequestInit::default().with_cache(CacheMode::NoCache, true);
+        assert_eq!(sent_cache_control(forced).await.unwrap(), "max-age=0");
     }
 
     /// A `304` sonar did not ask for (no revalidation of its own) goes to the caller and is not
