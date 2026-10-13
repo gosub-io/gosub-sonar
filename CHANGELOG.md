@@ -74,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `RequestInit::user_activated` said it sends `Sec-Fetch-User` for the `navigate` mode. It
+  goes by the destination, as Fetch does: `document`, `embed`, `frame`, `iframe` or `object`
 - `docs/architecture.md` called `Initiator` a tag for logging only. `Initiator::User` also
   sends `Sec-Fetch-User: ?1` on a navigation request, and is part of the coalescing key
 - Proxy credentials went to the wrong proxy. With several `ProxyRule`s, a plain-`http`

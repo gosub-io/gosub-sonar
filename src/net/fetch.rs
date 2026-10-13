@@ -653,8 +653,9 @@ pub struct RequestInit {
     /// The request's mode, sent in `Sec-Fetch-Mode` and selecting the CORS regime.
     /// See [`cors`](mod@crate::net::cors).
     pub mode: RequestMode,
-    /// Whether the request stems from a user action. Sends `Sec-Fetch-User: ?1` when the mode
-    /// is [`RequestMode::Navigate`]; ignored for other modes.
+    /// Whether the request stems from a user action. Sends `Sec-Fetch-User: ?1` when the
+    /// destination is a navigation one ([`RequestDestination::is_navigation`]), whatever the
+    /// mode; ignored for other destinations.
     pub user_activated: bool,
     /// Whether cookies from the policy's jar ride along, and how strict the credentialed CORS
     /// rules are. See [`RequestCredentials`].
