@@ -2913,9 +2913,17 @@ async fn get_with_redirects(
         if to_get {
             current_method = Method::GET;
             current_body = None;
-            current_headers.remove(header::CONTENT_TYPE);
-            current_headers.remove(header::CONTENT_LENGTH);
-            current_headers.remove(header::TRANSFER_ENCODING);
+            // The request-body-header names (Fetch §2.2.2), with the framing of the body gone.
+            for name in [
+                header::CONTENT_ENCODING,
+                header::CONTENT_LANGUAGE,
+                header::CONTENT_LOCATION,
+                header::CONTENT_TYPE,
+                header::CONTENT_LENGTH,
+                header::TRANSFER_ENCODING,
+            ] {
+                current_headers.remove(name);
+            }
         }
 
         // Strip credential headers when redirecting to a different origin (RFC 9110 §15.4).
@@ -7507,6 +7515,31 @@ mod tests {
                     );
                 }
             }
+        }
+
+        /// Fetch §4.5 step 12: a method changed to `GET` loses its body and every
+        /// request-body-header (§2.2.2). One that is kept keeps them all.
+        #[tokio::test(flavor = "current_thread")]
+        async fn the_body_headers_go_with_the_body() {
+            let names = [
+                "content-encoding",
+                "content-language",
+                "content-location",
+                "content-type",
+            ];
+            let headers = || {
+                let mut h = HeaderMap::new();
+                for (name, value) in names.iter().zip(["gzip", "nl", "/form", "text/plain"]) {
+                    h.insert(*name, value.parse().unwrap());
+                }
+                h
+            };
+            let (end, _) = follow(302, Method::POST, headers(), Some(b"a=1")).await;
+            let kept: Vec<_> = names.iter().filter(|n| end.header(n).is_some()).collect();
+            assert!(kept.is_empty(), "302 POST to GET still sends {kept:?}");
+            let (end, _) = follow(307, Method::POST, headers(), Some(b"a=1")).await;
+            let lost: Vec<_> = names.iter().filter(|n| end.header(n).is_none()).collect();
+            assert!(lost.is_empty(), "307 POST lost {lost:?}");
         }
 
         /// Fetch §4.5 step 12: a 303 turns every method into a `GET` but `GET` and `HEAD`.

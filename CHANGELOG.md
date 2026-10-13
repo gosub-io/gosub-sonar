@@ -74,6 +74,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A redirect that turned a request into a `GET` dropped its `Content-Type` but went on
+  sending `Content-Encoding`, `Content-Language` and `Content-Location`, which described a body
+  no longer there. All four request-body headers go with the body now (Fetch §4.5)
 - A 301 or 302 turned every method but `HEAD` into `GET` and dropped the body, and a 303 turned
   `HEAD` into `GET` too. Fetch §4.5 changes only a `POST` on a 301 or 302, and every method but
   `GET` and `HEAD` on a 303: a `PUT`, `DELETE` or `PATCH` redirected by a 301 or 302 now goes on
