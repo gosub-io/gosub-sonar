@@ -68,9 +68,11 @@ Using the fetcher comes down to three steps:
 1. **Construct it** with `Fetcher::new(config, ctx)`. `config` is a `FetcherConfig` (connection
    limits, timeouts, user-agent, …) and `ctx` is an `Arc<dyn FetcherContext>` supplied by the
    embedder — see below.
-2. **Run the loop.** Spawn `fetcher.run(shutdown)` as a long-lived task. This is the scheduler: it
-   pulls requests from the priority queues, coalesces them, and spawns the actual fetch tasks. It
-   parks on a `Notify` when idle and exits when the `shutdown` `CancellationToken` fires.
+2. **Run the loop.** Spawn `fetcher.clone().run(shutdown)` as a long-lived task. This is the
+   scheduler: it pulls requests from the priority queues, coalesces them, and spawns the actual
+   fetch tasks. It parks on a `Notify` when idle and exits when the `shutdown`
+   `CancellationToken` fires. `run` takes an `Arc<Fetcher>` and reopens the queue when it is
+   called, so call it before handing the loop to the runtime, not inside the spawned block.
 3. **Submit requests.** Call `fetcher.submit(req, handle, reply_tx)` to enqueue a `FetchRequest`,
    then await the matching `oneshot` receiver to get back a `FetchResult`.
 

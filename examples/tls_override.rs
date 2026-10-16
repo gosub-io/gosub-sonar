@@ -137,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let run = fetcher.clone();
     let cancel = shutdown.clone();
-    tokio::spawn(async move { run.run(cancel).await });
+    tokio::spawn(run.run(cancel));
 
     println!("Fetching {url} ...");
     let result = fetch(&fetcher, &url).await;

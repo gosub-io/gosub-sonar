@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let run = fetcher.clone();
     let cancel = shutdown.clone();
-    tokio::spawn(async move { run.run(cancel).await });
+    tokio::spawn(run.run(cancel));
 
     // The "page" that makes the requests: same origin as the server, and a cross-origin one.
     let same = srv.url("/page.html");

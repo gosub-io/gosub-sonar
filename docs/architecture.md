@@ -101,7 +101,7 @@ another runtime (e.g. an HTML parser loading a stylesheet mid-parse). Bodies are
 
 ```rust
 let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), ctx)?);
-tokio::spawn({ let f = fetcher.clone(); async move { f.run(shutdown).await } });
+tokio::spawn(fetcher.clone().run(shutdown));
 
 let (tx, rx) = oneshot::channel();
 fetcher.submit(request, handle, tx).await;

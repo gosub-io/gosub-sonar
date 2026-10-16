@@ -106,7 +106,7 @@ let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), Arc::new(NullConte
 let shutdown = CancellationToken::new();
 let f = fetcher.clone();
 let cancel = shutdown.clone();
-tokio::spawn(async move { f.run(cancel).await });
+tokio::spawn(f.run(cancel));
 
 let req = FetchRequest::builder(Method::GET, Url::parse("https://example.org")?)
     .with_priority(Priority::Normal)
