@@ -80,6 +80,8 @@ The `FetcherContext` trait (`src/net/fetcher_context.rs`) is how the fetcher rea
 environment without depending on any particular engine. It provides:
 
 - `observer_for(...)` — hands back a `NetObserver` used to emit `NetEvent`s for a request.
+  `background_observer_for(...)` does the same for the background revalidations the fetcher
+  starts itself, and asks `observer_for` by default.
 - `on_ref_active` / `on_ref_done` — lifecycle callbacks fired for every request as it is
   accepted and as it ends, a coalesced one included, so the embedder can track outstanding work
   per reference.

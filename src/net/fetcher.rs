@@ -787,9 +787,15 @@ impl Fetcher {
             // `Accepted` to its own end (see `lifecycle`), and is its reference's outstanding
             // work for as long. A background revalidation is no work of the reference's: the
             // request it refreshes a response for has already been answered.
-            let lifecycle = Lifecycle::accept(
+            let observer = if req.background_revalidation.is_some() {
                 self.ctx
-                    .observer_for(req.reference, req.req_id, req.kind, req.initiator),
+                    .background_observer_for(req.reference, req.req_id, req.kind, req.initiator)
+            } else {
+                self.ctx
+                    .observer_for(req.reference, req.req_id, req.kind, req.initiator)
+            };
+            let lifecycle = Lifecycle::accept(
+                observer,
                 requested.clone(),
                 !is_leader,
                 req.background_revalidation
@@ -3740,10 +3746,46 @@ mod tests {
         }
     }
 
+    /// A [`Revalidating`] that also takes the fetcher's own revalidations through
+    /// `background_observer_for`, and notes which request ids came that way.
+    #[derive(Default)]
+    struct BackgroundApart {
+        inner: Revalidating,
+        background: parking_lot::Mutex<Vec<RequestId>>,
+    }
+
+    impl FetcherContext for BackgroundApart {
+        fn observer_for(
+            &self,
+            reference: RequestReference,
+            id: RequestId,
+            kind: ResourceKind,
+            initiator: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            self.inner.observer_for(reference, id, kind, initiator)
+        }
+        fn background_observer_for(
+            &self,
+            reference: RequestReference,
+            id: RequestId,
+            kind: ResourceKind,
+            initiator: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            self.background.lock().push(id);
+            self.inner.observer_for(reference, id, kind, initiator)
+        }
+        fn on_ref_active(&self, reference: RequestReference) {
+            self.inner.on_ref_active(reference);
+        }
+        fn on_ref_done(&self, reference: RequestReference) {
+            self.inner.on_ref_done(reference);
+        }
+    }
+
     /// A route that is stale at once and may be used stale for ten minutes, a fetcher with a
     /// cache on `ctx`, and a request for it from a page on the server's origin.
     async fn swr_fetcher(
-        ctx: Arc<Revalidating>,
+        ctx: Arc<dyn FetcherContext>,
         delay: Duration,
     ) -> (
         crate::net::test_support::TestServerHandle,
@@ -3829,6 +3871,36 @@ mod tests {
         let sent = revalidation.requests_sent();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].2.get(header::CACHE_CONTROL), None);
+    }
+
+    /// `FetcherContext::background_observer_for`: the fetcher's own revalidation asks it for
+    /// its observer, and the requests the page made never do.
+    #[tokio::test]
+    async fn a_background_revalidation_reports_through_its_own_observer() {
+        let ctx = Arc::new(BackgroundApart::default());
+        let (_srv, fetcher, shutdown, request) = swr_fetcher(ctx.clone(), Duration::ZERO).await;
+        let mut ours = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let req = request();
+            ours.push(req.req_id);
+            if body_of(fetcher.fetch(req).await).1 == "hit-2" {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never refreshed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown.cancel();
+
+        // Each stale answer may start one, the last included, so count what came, not a number.
+        let background = ctx.background.lock();
+        assert!(!background.is_empty());
+        assert!(
+            background.iter().all(|id| !ours.contains(id)),
+            "{background:?}"
+        );
+        let observers = ctx.inner.observers.lock();
+        assert_eq!(observers.len(), ours.len() + background.len());
     }
 
     /// Through the fetcher, a redirect hop's revalidation goes on from that hop: it asks for the

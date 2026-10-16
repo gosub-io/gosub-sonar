@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `FetcherContext::background_observer_for`: the observer for a background revalidation the
+  `Fetcher` starts itself, asked with the same reference, kind and initiator as `observer_for`
+  and a request id of its own. A host can report these apart from the request they refresh, which
+  has already been answered, so a navigation's revalidation need not look like the navigation
+  loading again. The default asks `observer_for`, so nothing changes for a host that does not
+  override it
+
 ### Changed
 
 - **Breaking:** `Fetcher::run` takes `self: Arc<Self>` and returns the loop as a `'static`

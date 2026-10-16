@@ -42,9 +42,9 @@ impl<'a> CookieHop<'a> {
 pub trait FetcherContext: Send + Sync {
     /// Return an observer to emit NetEvents for this specific request.
     ///
-    /// Also asked for the background revalidations the fetcher starts itself, to refresh a
-    /// stale response a request was answered with (see [`cache`](mod@crate::net::cache)):
-    /// with that request's reference, kind and initiator, under a request id of their own.
+    /// The background revalidations the fetcher starts itself go to
+    /// [`background_observer_for`](Self::background_observer_for) instead, which asks this by
+    /// default.
     fn observer_for(
         &self,
         reference: RequestReference,
@@ -52,6 +52,24 @@ pub trait FetcherContext: Send + Sync {
         kind: ResourceKind,
         initiator: Initiator,
     ) -> Arc<dyn NetObserver + Send + Sync>;
+
+    /// Return an observer for a background revalidation the fetcher starts itself, to refresh
+    /// a stale response a request was answered with (see [`cache`](mod@crate::net::cache)):
+    /// with that request's reference, kind and initiator, under a request id of its own.
+    ///
+    /// Override it to report these apart from the requests made under `reference`: the
+    /// request they refresh has already been answered, so a host that shows a document's
+    /// progress from the events of its navigation request would otherwise show a finished
+    /// navigation loading again. The default asks [`observer_for`](Self::observer_for).
+    fn background_observer_for(
+        &self,
+        reference: RequestReference,
+        req_id: RequestId,
+        kind: ResourceKind,
+        initiator: Initiator,
+    ) -> Arc<dyn NetObserver + Send + Sync> {
+        self.observer_for(reference, req_id, kind, initiator)
+    }
 
     /// Called once per request the fetcher takes, with its reference, as the request is
     /// accepted: that reference has outstanding work. A request that joins another's fetch
