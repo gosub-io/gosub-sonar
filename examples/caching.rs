@@ -97,7 +97,7 @@ async fn main() {
     let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(Ctx)).unwrap());
     let shutdown = CancellationToken::new();
     let (f, c) = (fetcher.clone(), shutdown.clone());
-    tokio::spawn(async move { f.run(c).await });
+    tokio::spawn(f.run(c));
 
     let get = |path: &str| FetchRequest::builder(Method::GET, srv.url(path));
 

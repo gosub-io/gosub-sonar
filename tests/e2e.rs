@@ -23,7 +23,7 @@ fn spawn_fetcher(ctx: Arc<dyn FetcherContext>) -> (Arc<Fetcher>, CancellationTok
     let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), ctx).unwrap());
     let shutdown = CancellationToken::new();
     let (f, c) = (fetcher.clone(), shutdown.clone());
-    tokio::spawn(async move { f.run(c).await });
+    tokio::spawn(f.run(c));
     (fetcher, shutdown)
 }
 
@@ -774,7 +774,7 @@ async fn a_configured_proxy_s_authorization_is_reported_and_sent() {
     let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(RecordingCtx(obs.clone()))).unwrap());
     let shutdown = CancellationToken::new();
     let (f, c) = (fetcher.clone(), shutdown.clone());
-    tokio::spawn(async move { f.run(c).await });
+    tokio::spawn(f.run(c));
 
     let target = Url::parse("http://proxied.example/resource").unwrap();
     let req = FetchRequest::builder(Method::GET, target.clone()).build();
@@ -816,7 +816,7 @@ async fn a_later_rule_s_proxy_credentials_are_not_sent_to_an_earlier_rule_s_prox
     let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
     let shutdown = CancellationToken::new();
     let (f, c) = (fetcher.clone(), shutdown.clone());
-    tokio::spawn(async move { f.run(c).await });
+    tokio::spawn(f.run(c));
 
     let req = FetchRequest::builder(
         Method::GET,
@@ -1431,7 +1431,7 @@ async fn a_pre_seeded_credential_store_answers_without_the_hook() {
     let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
     let shutdown = CancellationToken::new();
     let (f, c) = (fetcher.clone(), shutdown.clone());
-    tokio::spawn(async move { f.run(c).await });
+    tokio::spawn(f.run(c));
 
     let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
     match fetcher.fetch(req).await {
@@ -1463,7 +1463,7 @@ async fn credentials_do_not_cross_origins() {
     let fetcher = Arc::new(Fetcher::new(cfg, ctx.clone()).unwrap());
     let shutdown = CancellationToken::new();
     let (f, c) = (fetcher.clone(), shutdown.clone());
-    tokio::spawn(async move { f.run(c).await });
+    tokio::spawn(f.run(c));
 
     for srv in [&one, &two] {
         let req = FetchRequest::builder(Method::GET, srv.url("/protected")).build();
@@ -1488,7 +1488,7 @@ fn spawn_with_cache(cache: Option<Arc<InMemoryHttpCache>>) -> (Arc<Fetcher>, Can
     let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
     let shutdown = CancellationToken::new();
     let (f, c) = (fetcher.clone(), shutdown.clone());
-    tokio::spawn(async move { f.run(c).await });
+    tokio::spawn(f.run(c));
     (fetcher, shutdown)
 }
 

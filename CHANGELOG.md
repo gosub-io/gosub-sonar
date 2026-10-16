@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `FetcherContext::background_observer_for`: the observer for a background revalidation the
+  `Fetcher` starts itself, asked with the same reference, kind and initiator as `observer_for`
+  and a request id of its own. A host can report these apart from the request they refresh, which
+  has already been answered, so a navigation's revalidation need not look like the navigation
+  loading again. The default asks `observer_for`, so nothing changes for a host that does not
+  override it
+
+### Changed
+
+- **Breaking:** `Fetcher::run` takes `self: Arc<Self>` and returns the loop as a `'static`
+  future, reopening the queue when it is called rather than when the loop is first polled. A
+  request submitted between a restart and the new loop's first turn used to be cancelled as if
+  the fetcher were still stopped; it now waits for the loop. Spawn it as
+  `tokio::spawn(fetcher.clone().run(shutdown))`: inside `async move { f.run(t).await }` the queue
+  reopens only once that block runs
+
 ## [0.14.0] - 2026-10-13
 
 ### Added

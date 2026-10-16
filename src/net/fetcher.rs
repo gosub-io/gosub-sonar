@@ -646,10 +646,25 @@ impl Fetcher {
     /// When it stops, every request still waiting in a lane is answered with
     /// [`NetError::Cancelled`], and so is any submitted afterwards, until `run` is called again.
     /// Fetches already under way finish as usual.
-    pub async fn run(&self, shutdown: CancellationToken) {
-        let mut lane_counter: u8 = 0;
+    ///
+    /// Calling `run` reopens the queue there and then, not when the loop is first polled: a
+    /// request submitted between a restart and the spawned loop's first turn waits for it
+    /// instead of being cancelled as if the fetcher were still stopped. That holds when `run`
+    /// is called before the loop is handed to the runtime, `tokio::spawn(fetcher.clone().run(t))`;
+    /// called inside a spawned block, `async move { f.run(t).await }`, it reopens only once
+    /// that block runs.
+    pub fn run(
+        self: Arc<Self>,
+        shutdown: CancellationToken,
+    ) -> impl std::future::Future<Output = ()> {
         self.stopped
             .store(false, std::sync::atomic::Ordering::Release);
+        async move { self.run_loop(shutdown).await }
+    }
+
+    /// The scheduler loop [`run`](Self::run) returns, with the queue already reopened.
+    async fn run_loop(&self, shutdown: CancellationToken) {
+        let mut lane_counter: u8 = 0;
 
         loop {
             if shutdown.is_cancelled() {
@@ -772,9 +787,15 @@ impl Fetcher {
             // `Accepted` to its own end (see `lifecycle`), and is its reference's outstanding
             // work for as long. A background revalidation is no work of the reference's: the
             // request it refreshes a response for has already been answered.
-            let lifecycle = Lifecycle::accept(
+            let observer = if req.background_revalidation.is_some() {
                 self.ctx
-                    .observer_for(req.reference, req.req_id, req.kind, req.initiator),
+                    .background_observer_for(req.reference, req.req_id, req.kind, req.initiator)
+            } else {
+                self.ctx
+                    .observer_for(req.reference, req.req_id, req.kind, req.initiator)
+            };
+            let lifecycle = Lifecycle::accept(
+                observer,
                 requested.clone(),
                 !is_leader,
                 req.background_revalidation
@@ -1737,7 +1758,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
         let f = fetcher.clone();
-        tokio::spawn(async move { f.run(shutdown.clone()).await });
+        tokio::spawn(f.run(shutdown.clone()));
 
         let (req, handle) = make_req(base, Priority::Normal);
         let (tx, rx) = oneshot::channel();
@@ -1757,7 +1778,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
         let f = fetcher.clone();
-        tokio::spawn(async move { f.run(shutdown.clone()).await });
+        tokio::spawn(f.run(shutdown.clone()));
 
         let (req, handle) = make_req(
             Url::parse(&format!(
@@ -1780,7 +1801,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
         let f = fetcher.clone();
-        tokio::spawn(async move { f.run(shutdown.clone()).await });
+        tokio::spawn(f.run(shutdown.clone()));
 
         let cancel = CancellationToken::new();
         let req_id = RequestId::new();
@@ -1865,7 +1886,7 @@ mod tests {
         let f = fetcher.clone();
         let shutdown = CancellationToken::new();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         for jh in join_handles {
             let _ = tokio::time::timeout(Duration::from_secs(5), jh).await;
@@ -1907,7 +1928,7 @@ mod tests {
         );
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         // The slot is taken before anything else arrives.
         let (req, handle) = make_req(srv.url("/blocker"), Priority::Low);
@@ -1962,7 +1983,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let quitter = CancellationToken::new();
         let quitting = tokio::spawn({
@@ -2018,7 +2039,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         for round in 0..20 {
             let token = CancellationToken::new();
@@ -2056,7 +2077,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let url = srv.base_url();
         let req_id = RequestId::new();
@@ -2135,7 +2156,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let req = FetchRequest::builder(Method::GET, srv.url("/big"))
             .with_streaming(true)
@@ -2176,7 +2197,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         // Over the cap: /dribble-big is 12 KiB, cap at 6 KiB (peek is 5 KiB).
         let (mut req, _) = make_req(srv.url("/dribble-big"), Priority::Normal);
@@ -2255,7 +2276,7 @@ mod tests {
             let shutdown = CancellationToken::new();
             let f = fetcher.clone();
             let s = shutdown.clone();
-            tokio::spawn(async move { f.run(s).await });
+            tokio::spawn(f.run(s));
 
             let (mut req, _) = make_req(srv.url("/dribble-big"), Priority::Normal);
             req.streaming = true;
@@ -2302,7 +2323,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
         let f = fetcher.clone();
-        tokio::spawn(async move { f.run(shutdown.clone()).await });
+        tokio::spawn(f.run(shutdown.clone()));
 
         for (path, expected_status, expected_body) in [
             ("/not-found", 404u16, &b"not found"[..]),
@@ -2344,7 +2365,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let start = std::time::Instant::now();
         let mut receivers = Vec::new();
@@ -2402,7 +2423,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
         (srv, fetcher, shutdown)
     }
 
@@ -2610,7 +2631,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
         store.accept("tls.test", tls.fingerprint.unwrap());
@@ -2636,7 +2657,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, _) = make_req(srv.url("/fast"), Priority::Normal);
         let result = tokio::time::timeout(Duration::from_secs(3), fetcher.fetch(req))
@@ -2669,7 +2690,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         for rx in receivers {
             let result = tokio::time::timeout(Duration::from_secs(3), rx)
@@ -2702,7 +2723,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         for _round in 0..20 {
             let mut receivers = Vec::new();
@@ -2741,7 +2762,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, handle) = make_req(srv.url("/hang"), Priority::Normal);
         let (tx, rx) = oneshot::channel();
@@ -2772,7 +2793,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let mut headers = HeaderMap::new();
         headers.insert("x-first", "1".parse().unwrap());
@@ -2875,7 +2896,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let started = std::time::Instant::now();
         let (tx, rx) = oneshot::channel();
@@ -3247,7 +3268,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
         let (tx, rx) = oneshot::channel();
         fetcher.submit(req, CancellationToken::new(), tx).await;
         let result = tokio::time::timeout(budget, rx).await.unwrap().unwrap();
@@ -3274,7 +3295,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let mut url = srv.url("/coalesce");
         url.set_username("user").unwrap();
@@ -3574,7 +3595,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
             .with_streaming(true)
@@ -3631,7 +3652,7 @@ mod tests {
         fetcher.submit(req, cancel, tx).await;
         let shutdown = CancellationToken::new();
         shutdown.cancel();
-        fetcher.run(shutdown).await;
+        fetcher.clone().run(shutdown).await;
         let result = tokio::time::timeout(Duration::from_secs(1), queued)
             .await
             .expect("a queued request is answered")
@@ -3652,6 +3673,35 @@ mod tests {
             matches!(late, FetchResult::Error(NetError::Cancelled(_))),
             "{late:?}"
         );
+    }
+
+    /// A restart reopens the queue when `run` is called: a request submitted before the new
+    /// loop's first turn waits for it, rather than being cancelled as if the fetcher were still
+    /// stopped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_request_between_restart_and_first_poll_is_served() {
+        let srv = start_server().await;
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(NullContext)).unwrap());
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        fetcher.clone().run(stopped).await;
+
+        let shutdown = CancellationToken::new();
+        let restarted = fetcher.clone().run(shutdown.clone());
+        let (req, cancel) = make_req(srv.base_url().join("/fast").unwrap(), Priority::Normal);
+        let (tx, rx) = oneshot::channel();
+        fetcher.submit(req, cancel, tx).await;
+        tokio::spawn(restarted);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the request is answered")
+            .unwrap();
+        match result {
+            FetchResult::Buffered { meta, .. } => assert_eq!(meta.status, 200),
+            other => panic!("expected the restarted loop to serve it, got {other:?}"),
+        }
+        shutdown.cancel();
     }
 
     /// `NetEvent::Blocked`: "A request hop was refused by policy and never sent.
@@ -3696,10 +3746,46 @@ mod tests {
         }
     }
 
+    /// A [`Revalidating`] that also takes the fetcher's own revalidations through
+    /// `background_observer_for`, and notes which request ids came that way.
+    #[derive(Default)]
+    struct BackgroundApart {
+        inner: Revalidating,
+        background: parking_lot::Mutex<Vec<RequestId>>,
+    }
+
+    impl FetcherContext for BackgroundApart {
+        fn observer_for(
+            &self,
+            reference: RequestReference,
+            id: RequestId,
+            kind: ResourceKind,
+            initiator: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            self.inner.observer_for(reference, id, kind, initiator)
+        }
+        fn background_observer_for(
+            &self,
+            reference: RequestReference,
+            id: RequestId,
+            kind: ResourceKind,
+            initiator: Initiator,
+        ) -> Arc<dyn NetObserver + Send + Sync> {
+            self.background.lock().push(id);
+            self.inner.observer_for(reference, id, kind, initiator)
+        }
+        fn on_ref_active(&self, reference: RequestReference) {
+            self.inner.on_ref_active(reference);
+        }
+        fn on_ref_done(&self, reference: RequestReference) {
+            self.inner.on_ref_done(reference);
+        }
+    }
+
     /// A route that is stale at once and may be used stale for ten minutes, a fetcher with a
     /// cache on `ctx`, and a request for it from a page on the server's origin.
     async fn swr_fetcher(
-        ctx: Arc<Revalidating>,
+        ctx: Arc<dyn FetcherContext>,
         delay: Duration,
     ) -> (
         crate::net::test_support::TestServerHandle,
@@ -3723,7 +3809,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(test_config(), ctx).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
         let url = srv.url("/swr");
         let request = move || {
             FetchRequest::builder(Method::GET, url.clone())
@@ -3787,6 +3873,36 @@ mod tests {
         assert_eq!(sent[0].2.get(header::CACHE_CONTROL), None);
     }
 
+    /// `FetcherContext::background_observer_for`: the fetcher's own revalidation asks it for
+    /// its observer, and the requests the page made never do.
+    #[tokio::test]
+    async fn a_background_revalidation_reports_through_its_own_observer() {
+        let ctx = Arc::new(BackgroundApart::default());
+        let (_srv, fetcher, shutdown, request) = swr_fetcher(ctx.clone(), Duration::ZERO).await;
+        let mut ours = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let req = request();
+            ours.push(req.req_id);
+            if body_of(fetcher.fetch(req).await).1 == "hit-2" {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "never refreshed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown.cancel();
+
+        // Each stale answer may start one, the last included, so count what came, not a number.
+        let background = ctx.background.lock();
+        assert!(!background.is_empty());
+        assert!(
+            background.iter().all(|id| !ours.contains(id)),
+            "{background:?}"
+        );
+        let observers = ctx.inner.observers.lock();
+        assert_eq!(observers.len(), ours.len() + background.len());
+    }
+
     /// Through the fetcher, a redirect hop's revalidation goes on from that hop: it asks for the
     /// hop's URL, not the request's, and sends what the chain would have, here no `Referer`
     /// after a redirect said `Referrer-Policy: no-referrer`.
@@ -3815,7 +3931,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
         let mut ours = Vec::new();
         let mut fetch = || {
             let req = FetchRequest::builder(Method::GET, srv.url("/start"))
@@ -3956,7 +4072,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
         let (a, ca) = make_req(srv.url("/co"), Priority::Normal);
         let (b, cb) = make_req(srv.url("/co"), Priority::Normal);
         let (ida, idb) = (a.req_id, b.req_id);
@@ -4072,7 +4188,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(test_config(), work.clone()).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
         let (a, _) = make_req(srv.url("/co"), Priority::Normal);
         let (mut b, _) = make_req(srv.url("/co"), Priority::Normal);
         b.reference = RequestReference::Background(7);
@@ -4136,7 +4252,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(Recording(log.clone()))).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         // The first holds the only slot; the other two wait for it.
         let (hold, _) = oneshot::channel();
@@ -4192,7 +4308,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         // 12 KiB dribbled over ~360 ms: headers at once, the body still coming.
         let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
@@ -4244,7 +4360,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(test_config(), ctx.clone()).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         // 12 KiB dribbled over ~360 ms: read a little of it, then give up.
         let req = FetchRequest::builder(Method::GET, srv.url("/dribble-big"))
@@ -4352,7 +4468,7 @@ mod tests {
         }
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
         for rx in replies {
             assert!(!rx.await.unwrap().is_error());
         }
@@ -4390,7 +4506,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         // A holds the only slot until its timeout; B waits for it.
         let (tx_a, rx_a) = oneshot::channel();
@@ -4489,7 +4605,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         // `.invalid` is reserved and never resolves, so an unblocked request fails in the
         // transport instead — distinguishable from a block. Blocked cases short-circuit before
@@ -4561,7 +4677,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (mut req, handle) = make_req(srv.url("/hop"), Priority::Normal);
         req.origin = Some(Url::parse("https://example.com").unwrap().origin());
@@ -4635,7 +4751,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, handle) = make_post_req(
             srv.url("/echo"),
@@ -4675,7 +4791,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, handle) = make_post_req(
             srv.url("/post-redirect"),
@@ -4745,7 +4861,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, handle) = make_req(srv.url("/start"), Priority::Normal);
         let (tx, rx) = oneshot::channel();
@@ -4825,7 +4941,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, handle) = make_req(Url::parse(request).unwrap(), Priority::Normal);
         let (tx, rx) = oneshot::channel();
@@ -4908,7 +5024,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         assert!(store.load("hsts.badssl.com").is_none());
 
@@ -5006,7 +5122,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, cancel) = make_req_with_decode(srv.url("/gz"), Priority::Normal, true);
         let (tx, rx) = oneshot::channel();
@@ -5040,7 +5156,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, handle) = make_req_with_decode(srv.url("/gz"), Priority::Normal, false);
         let (tx, rx) = oneshot::channel();
@@ -5080,7 +5196,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         // Submit both before the run loop processes them to maximise coalescing opportunity.
         let (req_dec, handle_dec) = make_req_with_decode(srv.url("/gz"), Priority::Normal, true);
@@ -5141,7 +5257,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, cancel) = make_req(Url::parse(PROXIED_URL).unwrap(), Priority::Normal);
         let (tx, rx) = oneshot::channel();
@@ -5178,7 +5294,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, cancel) = make_req(srv.url("/direct"), Priority::Normal);
         let (tx, rx) = oneshot::channel();
@@ -5248,7 +5364,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let (req, cancel) = make_req(
             Url::parse("https://unroutable.invalid/").unwrap(),
@@ -5288,7 +5404,7 @@ mod tests {
         let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
         let shutdown = CancellationToken::new();
         let (f, s) = (fetcher.clone(), shutdown.clone());
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
         let (req, cancel) = make_req(Url::parse(url).unwrap(), Priority::Normal);
         let (tx, rx) = oneshot::channel();
         fetcher.submit(req, cancel, tx).await;
@@ -5478,7 +5594,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let body_for = |reference: RequestReference, path: &str| {
             let req = FetchRequest::builder(Method::GET, srv.url(path))

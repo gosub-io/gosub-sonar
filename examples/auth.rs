@@ -114,7 +114,7 @@ fn fetcher_with(ctx: Arc<dyn FetcherContext>) -> (Arc<Fetcher>, CancellationToke
     let fetcher = Arc::new(Fetcher::new(cfg, ctx).unwrap());
     let shutdown = CancellationToken::new();
     let (f, c) = (fetcher.clone(), shutdown.clone());
-    tokio::spawn(async move { f.run(c).await });
+    tokio::spawn(f.run(c));
     (fetcher, shutdown)
 }
 

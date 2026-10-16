@@ -106,7 +106,7 @@ let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), Arc::new(NullConte
 let shutdown = CancellationToken::new();
 let f = fetcher.clone();
 let cancel = shutdown.clone();
-tokio::spawn(async move { f.run(cancel).await });
+tokio::spawn(f.run(cancel));
 
 let req = FetchRequest::builder(Method::GET, Url::parse("https://example.org")?)
     .with_priority(Priority::Normal)
@@ -295,8 +295,8 @@ persist entries or bound them differently; `FetcherConfig::cache: None` turns ca
 
 A response with `stale-while-revalidate` is used stale for as long as that grants, by a request
 with an `origin` in the `Default` mode, while the fetcher revalidates it in the background with a
-request of its own. That request reports to `FetcherContext::observer_for` under a request id of
-its own, and is not counted as the reference's work.
+request of its own. That request reports to `FetcherContext::background_observer_for` (by default
+`observer_for`) under a request id of its own, and is not counted as the reference's work.
 
 Not implemented: shared-cache rules (`s-maxage`, the `Authorization` restriction), and range
 requests and `206` responses. Native only: on wasm32 the browser's `fetch()` brings its own cache.

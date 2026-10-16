@@ -31,7 +31,7 @@ fn make_fetcher(config: FetcherConfig) -> (Arc<Fetcher>, CancellationToken) {
         Arc::new(Fetcher::new(config, Arc::new(NullContext)).expect("reqwest client build failed"));
     let f = fetcher.clone();
     let cancel = shutdown.clone();
-    tokio::spawn(async move { f.run(cancel).await });
+    tokio::spawn(f.run(cancel));
     (fetcher, shutdown)
 }
 

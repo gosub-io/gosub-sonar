@@ -37,9 +37,7 @@ async fn main() -> anyhow::Result<()> {
     let shutdown = CancellationToken::new();
     let fetcher_task = fetcher.clone();
     let cancel = shutdown.clone();
-    tokio::spawn(async move {
-        fetcher_task.run(cancel).await;
-    });
+    tokio::spawn(fetcher_task.run(cancel));
 
     // Build the request and fetch. `fetch` handles the reply channel and request handle
     // internally; use `submit` directly if you need to manage those yourself.

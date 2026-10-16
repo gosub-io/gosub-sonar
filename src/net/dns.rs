@@ -241,7 +241,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
         (fetcher, shutdown)
     }
 
@@ -412,7 +412,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let url = Url::parse(&format!("http://sonar-connect.test:{}/x", addr.port())).unwrap();
         let _ = fetch(&fetcher, url).await;
@@ -437,7 +437,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let port = crate::net::test_support::closed_port();
         let url = Url::parse(&format!("http://sonar-dead.test:{port}/x")).unwrap();
@@ -476,7 +476,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let f = fetcher.clone();
         let s = shutdown.clone();
-        tokio::spawn(async move { f.run(s).await });
+        tokio::spawn(f.run(s));
 
         let url = Url::parse(&format!("http://sonar-timed.test:{}/x", addr.port())).unwrap();
         let _ = fetch(&fetcher, url.clone()).await;

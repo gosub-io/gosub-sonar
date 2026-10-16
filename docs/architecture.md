@@ -101,7 +101,7 @@ another runtime (e.g. an HTML parser loading a stylesheet mid-parse). Bodies are
 
 ```rust
 let fetcher = Arc::new(Fetcher::new(FetcherConfig::default(), ctx)?);
-tokio::spawn({ let f = fetcher.clone(); async move { f.run(shutdown).await } });
+tokio::spawn(fetcher.clone().run(shutdown));
 
 let (tx, rx) = oneshot::channel();
 fetcher.submit(request, handle, tx).await;
@@ -621,7 +621,8 @@ request carries it in `RequestInit::background_revalidation`. The `Fetcher` turn
 request of its own, queued by the run loop: the request again, in `NoCache` mode but without the
 `Cache-Control: max-age=0` that mode sends (Fetch's "prevent no-cache cache-control header
 modification flag"), at `Priority::Low`, buffered so the cache gets the whole response. It
-reports to the observer `FetcherContext::observer_for` gives it under a request id of its own,
+reports to the observer `FetcherContext::background_observer_for` gives it (by default the one
+`observer_for` gives) under a request id of its own,
 and is no work of the reference's: `on_ref_active` and `on_ref_done` are not called for it. Two
 revalidations from the same place in the same chain share one fetch, as any two alike requests
 do; the coalescing key keeps them apart from a caller's own `NoCache` request, which does send
@@ -812,6 +813,9 @@ Implemented by the host and passed to `Fetcher::new`. The bridge between schedul
 
 - `observer_for(reference, req_id, kind, initiator)` — returns the `NetObserver` for a given
   request (lets the host route events per tab/resource).
+- `background_observer_for(reference, req_id, kind, initiator)` — the same for a background
+  revalidation the fetcher starts itself, so the host can report it apart from the request it
+  refreshes (default: `observer_for`).
 - `on_ref_active` / `on_ref_done` — fired for every request, a coalesced one included, as it
   is accepted and as it ends (outstanding-work tracking per reference).
 - `is_url_allowed(url)` — URL policy hook (default: allow all).
