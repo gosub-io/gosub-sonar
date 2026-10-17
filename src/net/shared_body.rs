@@ -109,6 +109,10 @@ struct State {
     /// it starts reading, so nothing is pushed while there is nobody to receive it.
     first_subscriber: Arc<Notify>,
     has_subscriber: bool,
+    /// A [`push_wait`](SharedBody::push_wait) recorded its chunk and is still delivering it.
+    /// Another push meanwhile breaks the single-producer contract: its chunk could reach a
+    /// lossless subscriber ahead of the waiting one.
+    delivering: bool,
     /// Cancelled when the state is dropped: every handle and every subscriber's stream is
     /// gone, so nobody can read the body any more. `from_reader` stops reading on it.
     abandoned: CancellationToken,
@@ -186,6 +190,7 @@ impl SharedBody {
                 closed: false,
                 first_subscriber: Arc::new(Notify::new()),
                 has_subscriber: false,
+                delivering: false,
                 abandoned: CancellationToken::new(),
                 error: None,
                 replay_limit,
@@ -215,7 +220,7 @@ impl SharedBody {
     /// - If [`finish`](Self::finish) or [`error`](Self::error) has been called,
     ///   additional pushes are ignored.
     pub fn push(&self, chunk: Bytes) {
-        let Some(targets) = self.record(&chunk) else {
+        let Some(targets) = self.record(&chunk, false) else {
             return;
         };
         let mut to_remove = Vec::new();
@@ -232,10 +237,22 @@ impl SharedBody {
     ///
     /// A lossless subscriber that stops reading without dropping its stream stalls the
     /// producer: callers race this against their own cancellation and deadlines.
+    ///
+    /// A body has one producer: the next `push` or `push_wait` comes after this one returns
+    /// (or is dropped). Overlapping them could deliver a later chunk to a lossless subscriber
+    /// before this one; debug builds panic on it.
     pub async fn push_wait(&self, chunk: Bytes) {
-        let Some(targets) = self.record(&chunk) else {
+        let Some(targets) = self.record(&chunk, true) else {
             return;
         };
+        // Cleared however this ends, a drop mid-delivery included.
+        struct Delivering<'a>(&'a Mutex<State>);
+        impl Drop for Delivering<'_> {
+            fn drop(&mut self) {
+                self.0.lock().delivering = false;
+            }
+        }
+        let _delivering = Delivering(&self.inner);
         let mut to_remove = Vec::new();
         let mut waiting = Vec::new();
         for target in targets {
@@ -257,12 +274,17 @@ impl SharedBody {
     /// returns who it goes to now; `None` once the body has ended.
     ///
     /// Both happen under one lock, so a subscriber attaching at the same time gets the chunk
-    /// exactly once, in its replay or live.
-    fn record(&self, chunk: &Bytes) -> Option<Vec<Target>> {
+    /// exactly once, in its replay or live. `waiting` marks a `push_wait` delivering it.
+    fn record(&self, chunk: &Bytes, waiting: bool) -> Option<Vec<Target>> {
         let mut st = self.inner.lock();
+        debug_assert!(
+            !st.delivering,
+            "SharedBody has one producer: a push overlapped a push_wait still delivering"
+        );
         if st.closed {
             return None;
         }
+        st.delivering = waiting;
         let total = st.replay_bytes.saturating_add(chunk.len());
         if total <= st.replay_limit {
             if let Some(kept) = st.replay.as_mut() {
@@ -1770,5 +1792,41 @@ mod tests {
         }
         assert_eq!(&got[..4], b"HEAD");
         assert_eq!(&got[4..], &body[..]);
+    }
+
+    /// A push while a `push_wait` is still delivering breaks the single-producer contract,
+    /// which debug builds catch.
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "current_thread")]
+    #[should_panic(expected = "one producer")]
+    async fn a_push_overlapping_a_push_wait_panics_in_debug() {
+        let sb = Arc::new(SharedBody::new(1));
+        let _lossless = sb.subscribe_lossless();
+        sb.push_wait(Bytes::from_static(b"A")).await; // the queue is full now
+        let waiting = {
+            let sb = sb.clone();
+            tokio::spawn(async move { sb.push_wait(Bytes::from_static(b"B")).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        sb.push(Bytes::from_static(b"C"));
+    }
+
+    /// A `push_wait` dropped mid-delivery leaves the body free for the next push.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_push_wait_lets_the_next_push_through() {
+        let sb = SharedBody::new(1);
+        let mut lossless = sb.subscribe_lossless();
+        sb.push_wait(Bytes::from_static(b"A")).await;
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(20),
+            sb.push_wait(Bytes::from_static(b"B")),
+        )
+        .await;
+        assert!(blocked.is_err(), "B waits on the full queue");
+        assert_eq!(&lossless.next().await.unwrap().unwrap()[..], b"A");
+        sb.push(Bytes::from_static(b"C"));
+        sb.finish();
+        assert_eq!(&lossless.next().await.unwrap().unwrap()[..], b"C");
     }
 }
