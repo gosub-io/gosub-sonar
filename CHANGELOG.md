@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-17
+
+### Added
+
+- `SharedBody::subscribe_lossless` and `SharedBody::combined_reader_lossless`: the whole body,
+  like `subscribe_stream` and `combined_reader`, from a subscriber that is never dropped for
+  lagging. For a consumer that must have every byte at its own pace, such as a writer to disk
+- `SharedBody::push_wait`: like `push`, but waits until every lossless subscriber has room for
+  the chunk. A lossless stream that is dropped stops being waited for. A body has one producer;
+  debug builds panic when a push overlaps a `push_wait` that is still delivering
+
+### Changed
+
+- `SharedBody::from_reader` pushes with `push_wait`, so a lossless subscriber slows the read to
+  its own pace instead of losing the body. Cancellation and the total deadline still end a read
+  that waits on a stalled subscriber. Without a lossless subscriber nothing changes. `push` keeps
+  its behaviour: it never waits, and drops a full lossless queue too
+
 ## [0.15.0] - 2026-10-16
 
 ### Added
@@ -1399,7 +1417,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.12.0...v0.13.0
