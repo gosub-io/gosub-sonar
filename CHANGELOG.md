@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A streamed fetch is no longer cut off by the request timeout while its body arrives:
+  `req_timeout` (fetcher-wide or per request) now ends when a streamed hop's response headers
+  arrive, and the body is bounded by `read_idle_timeout` and `total_body_timeout`. A download
+  that took longer than the request timeout (60 s by default) used to fail partway with
+  "operation timed out". A buffered fetch keeps the request timeout over headers and body. No
+  change on wasm32
+
 ## [0.16.0] - 2026-10-17
 
 ### Added

@@ -774,6 +774,11 @@ pub struct RequestInit {
     /// read. `None` leaves it to the client's own request timeout. On wasm32 it aborts the
     /// browser's `fetch()`, from when the fetch starts until its body has been read.
     pub timeout: Option<Duration>,
+    /// Deadline for each hop's response headers, from the moment it starts connecting. When
+    /// set, it replaces [`timeout`](Self::timeout) and the client's own request timeout, which
+    /// would cut off a body still arriving: the body is bounded by the read idle and total body
+    /// timeouts instead. Set for a streamed fetch, whose body takes as long as it takes.
+    pub headers_timeout: Option<Duration>,
     /// Wall-clock budget for following redirects. Starts when the first redirect response
     /// arrives and must cover every later hop up to the final response headers. `None` sets
     /// no limit; the hop count is still capped.
@@ -828,6 +833,7 @@ impl RequestInit {
             background_revalidation: None,
             header_order: None,
             timeout: None,
+            headers_timeout: None,
             redirect_timeout: None,
             read_idle_timeout: None,
             total_body_timeout: None,
@@ -899,6 +905,14 @@ impl RequestInit {
     /// On wasm32, where the client has none, it aborts the browser's `fetch()` instead.
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Bounds each hop only until its response headers arrive, leaving the body to the body
+    /// timeouts; see [`headers_timeout`](Self::headers_timeout). `None` keeps
+    /// [`with_timeout`](Self::with_timeout)'s deadline over headers and body.
+    pub fn with_headers_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.headers_timeout = timeout;
         self
     }
 
@@ -1004,6 +1018,11 @@ fn order_hop_headers(
 const PEEK_MAX: usize = 5 * 1024;
 /// Maximum number of redirects allowed
 const MAX_REDIRECTS: usize = 20;
+
+/// The client's timeout for a request whose [`RequestInit::headers_timeout`] bounds the wait
+/// for headers instead: long enough never to end a body, which its own timeouts bound.
+#[cfg(not(target_arch = "wasm32"))]
+const NO_CLIENT_DEADLINE: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Ceiling on the body buffer pre-allocation. Content-Length is server-controlled, so we never
 /// allocate more than this up front; larger honest bodies grow the buffer as bytes arrive.
 const MAX_PREALLOC: usize = 1024 * 1024;
@@ -2765,6 +2784,12 @@ async fn get_with_redirects(
                 if let Some(timeout) = init.timeout {
                     req_builder = req_builder.timeout(timeout);
                 }
+                // A headers deadline takes over from the client's, which would also run over the
+                // body: it is enforced below, around the wait for the response.
+                #[cfg(not(target_arch = "wasm32"))]
+                if init.headers_timeout.is_some() {
+                    req_builder = req_builder.timeout(NO_CLIENT_DEADLINE);
+                }
                 if let Some(ref body) = current_body {
                     // Built fresh per send so a streamed body can be replayed on 307/308 and for an
                     // authenticated retry of this hop.
@@ -2841,6 +2866,13 @@ async fn get_with_redirects(
                     }
                 };
                 tokio::pin!(deadline);
+                let headers_deadline = async {
+                    match init.headers_timeout {
+                        Some(timeout) => tokio::time::sleep(timeout).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::pin!(headers_deadline);
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     requested_at = chrono::Utc::now();
@@ -2857,6 +2889,15 @@ async fn get_with_redirects(
                             init.redirect_timeout.unwrap_or_default(),
                             redirects
                         )));
+                    }
+                    _ = &mut headers_deadline => {
+                        return Err(NetError::Transport(TransportError {
+                            kind: crate::net::transport::TransportErrorKind::Timeout,
+                            message: format!(
+                                "net.get_with_redirects request failed: no response headers within {:?}",
+                                init.headers_timeout.unwrap_or_default()
+                            ),
+                        }));
                     }
                     r = &mut fut => r.map_err(|e| send_error(e, &url, "net.get_with_redirects request failed", &observer, &policy))?
                 };

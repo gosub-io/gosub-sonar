@@ -72,8 +72,10 @@ pub struct FetcherConfig {
     /// attempt after 250 ms and races them.
     pub connect_timeout: Duration,
     /// Deadline for one hop, from the moment it starts connecting until its body has been
-    /// read. The client enforces it, and it covers the body as well as the wait for headers,
-    /// so a download longer than this fails whatever `total_body_timeout` says.
+    /// read. For a buffered fetch it covers the body as well as the wait for headers, so a
+    /// download longer than this fails whatever `total_body_timeout` says. For a streamed
+    /// fetch it ends when the response headers arrive: the body is bounded by
+    /// `read_idle_timeout` and `total_body_timeout`.
     ///
     /// Native-only: on wasm32 the browser's `fetch()` takes no client-wide deadline, and this
     /// is not applied. A per-request timeout ([`FetchRequestBuilder::with_req_timeout`]) is.
@@ -1033,7 +1035,9 @@ fn default_accept(destination: RequestDestination) -> &'static str {
 /// Build a [`RequestInit`] from a [`FetchRequest`], injecting a `Content-Type` header from
 /// the body descriptor when the headers don't already contain one, and carrying the request's
 /// initiating origin plus the fetcher's mixed content policy down to the redirect loop.
-fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
+/// `streaming` is how the fetch is performed, which a streaming caller that joined a buffered
+/// request changes: not the leading request's own `streaming`.
+fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig, streaming: bool) -> RequestInit {
     let mut headers = req.headers.clone();
 
     // `accept` and `accept-encoding` are set here rather than left to the HTTP client.
@@ -1082,6 +1086,7 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
                 .or_else(|| cfg.header_order.clone()),
         )
         .with_timeout(req.req_timeout)
+        .with_headers_timeout(headers_timeout(req, cfg, streaming))
         .with_redirect_timeout(req.redirect_timeout.unwrap_or(cfg.redirect_timeout))
         .with_body_timeouts(
             Some(effective_read_idle_timeout(req, cfg)),
@@ -1092,6 +1097,18 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig) -> RequestInit {
         Some(from) => init.as_background_revalidation(from),
         None => init,
     }
+}
+
+/// For a streamed fetch, the request timeout as a deadline for the response headers only.
+/// A streamed body takes as long as it takes -- a large download outlasts any request timeout --
+/// and is bounded by the read idle and total body timeouts instead. A buffered request keeps
+/// the request timeout over headers and body. On wasm32 the browser's `fetch()` has no
+/// separate deadline for headers, so nothing changes there.
+fn headers_timeout(req: &FetchRequest, cfg: &FetcherConfig, streaming: bool) -> Option<Duration> {
+    if cfg!(target_arch = "wasm32") || !streaming {
+        return None;
+    }
+    Some(req.req_timeout.unwrap_or(cfg.req_timeout))
 }
 
 /// The read idle timeout in force for `req`: its own override, else the fetcher's.
@@ -1326,7 +1343,7 @@ async fn perform_streaming(
             fetch_response_top(
                 client.clone(),
                 req.url.clone(),
-                make_request_init(req, cfg),
+                make_request_init(req, cfg, true),
                 cancel.clone(),
                 observer,
                 build_policy(req, cfg, &ctx, origins.clone(), &built),
@@ -1385,7 +1402,7 @@ async fn perform_buffered(
             fetch_response_complete(
                 client.clone(),
                 req.url.clone(),
-                make_request_init(req, cfg),
+                make_request_init(req, cfg, false),
                 cancel.clone(),
                 observer,
                 req.max_bytes.or(cfg.max_body_bytes),
@@ -2923,6 +2940,134 @@ mod tests {
             "the request's own 200 ms timeout should have fired, not the fetcher's 5 s one \
              (took {elapsed:?})"
         );
+    }
+
+    /// A streamed body is read for as long as it takes: the request timeout ends at the
+    /// headers, and the body is bounded by the idle and total body timeouts. The same body
+    /// fetched buffered still has to fit in the request timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_streamed_body_outlasts_the_request_timeout() {
+        let chunks: Vec<&[u8]> = vec![b"one ", b"two ", b"three ", b"four ", b"five ", b"six"];
+        let srv = TestServer::new()
+            .route(
+                "/slow-body",
+                RouteConfig::chunked_with_delay(chunks, Duration::from_millis(150)),
+            )
+            .start()
+            .await;
+        let cfg = FetcherConfig {
+            req_timeout: Duration::from_millis(300),
+            ..test_config()
+        };
+
+        let req = FetchRequest::builder(Method::GET, srv.url("/slow-body"))
+            .with_streaming(true)
+            .build();
+        let (result, _) = fetch_one(cfg.clone(), req).await;
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = result
+        else {
+            panic!("expected a stream, got {result:?}");
+        };
+        let body = crate::net::utils::stream_to_bytes(peek_buf, shared, None)
+            .await
+            .expect("a streamed body is not held to the request timeout");
+        assert_eq!(&body[..], b"one two three four five six");
+
+        let (result, _) = fetch_one(cfg, make_req(srv.url("/slow-body"), Priority::Normal).0).await;
+        assert!(
+            result.is_error(),
+            "a buffered body still has to arrive within the request timeout"
+        );
+    }
+
+    /// A buffered request that a streaming caller joins before it is sent is performed
+    /// streamed, and its body is then not held to the request timeout either: what decides
+    /// is how the fetch is performed, not the leading request's own `streaming`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_buffered_request_joined_by_a_stream_outlasts_the_request_timeout() {
+        let chunks: Vec<&[u8]> = vec![b"one ", b"two ", b"three ", b"four ", b"five ", b"six"];
+        let srv = TestServer::new()
+            .route("/hang", RouteConfig::hang_after_connect())
+            .route(
+                "/slow-body",
+                RouteConfig::chunked_with_delay(chunks, Duration::from_millis(150)),
+            )
+            .start()
+            .await;
+        // One slot: the leading request waits for it while the stream joins.
+        let cfg = FetcherConfig {
+            global_slots: 1,
+            h1_per_origin: 1,
+            req_timeout: Duration::from_millis(300),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        tokio::spawn(fetcher.clone().run(shutdown.clone()));
+
+        // Holds the slot until it times out waiting for headers.
+        let (hang_tx, _hang_rx) = oneshot::channel();
+        fetcher
+            .submit(
+                FetchRequest::builder(Method::GET, srv.url("/hang"))
+                    .with_streaming(true)
+                    .build(),
+                CancellationToken::new(),
+                hang_tx,
+            )
+            .await;
+        let (buffered_tx, _buffered_rx) = oneshot::channel();
+        fetcher
+            .submit(
+                FetchRequest::builder(Method::GET, srv.url("/slow-body")).build(),
+                CancellationToken::new(),
+                buffered_tx,
+            )
+            .await;
+        let (stream_tx, stream_rx) = oneshot::channel();
+        fetcher
+            .submit(
+                FetchRequest::builder(Method::GET, srv.url("/slow-body"))
+                    .with_streaming(true)
+                    .build(),
+                CancellationToken::new(),
+                stream_tx,
+            )
+            .await;
+
+        let result = tokio::time::timeout(Duration::from_secs(5), stream_rx)
+            .await
+            .expect("the joined stream must get a result")
+            .unwrap();
+        let FetchResult::Stream {
+            peek_buf, shared, ..
+        } = result
+        else {
+            panic!("expected a stream, got {result:?}");
+        };
+        let body = crate::net::utils::stream_to_bytes(peek_buf, shared, None)
+            .await
+            .expect("the shared stream is not held to the request timeout");
+        assert_eq!(&body[..], b"one two three four five six");
+        shutdown.cancel();
+    }
+
+    /// The request timeout still bounds a streamed request's wait for its headers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_streamed_request_times_out_waiting_for_headers() {
+        let srv = start_server().await;
+        let req = FetchRequest::builder(Method::GET, srv.url("/hang"))
+            .with_streaming(true)
+            .with_req_timeout(Duration::from_millis(200))
+            .build();
+        let (result, elapsed) = fetch_one(test_config(), req).await;
+        let FetchResult::Error(err) = &result else {
+            panic!("expected a timeout, got {result:?}");
+        };
+        assert!(err.to_string().contains("no response headers"), "got {err}");
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5455,7 +5600,7 @@ mod tests {
                 FetchRequest::builder(Method::GET, Url::parse("https://example.test/").unwrap())
                     .with_destination(destination)
                     .build();
-            make_request_init(&req, &cfg)
+            make_request_init(&req, &cfg, req.streaming)
                 .headers
                 .get(header::ACCEPT)
                 .map(|v| v.to_str().unwrap().to_string())
@@ -5501,7 +5646,7 @@ mod tests {
             .with_destination(RequestDestination::Document)
             .build();
         assert_eq!(
-            make_request_init(&req, &cfg)
+            make_request_init(&req, &cfg, req.streaming)
                 .headers
                 .get(header::ACCEPT)
                 .map(|v| v.to_str().unwrap()),
