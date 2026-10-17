@@ -20,7 +20,10 @@
 //!   is no longer kept, the stream is a single error instead.
 //! - `subscribe_live()`: only the chunks pushed from now on, for observers that do not need
 //!   the body itself (progress).
-//! - `combined_reader(peek, shared)`: convenient `AsyncRead` of `peek` then the body.
+//! - `subscribe_lossless()`: the whole body, never dropped for lagging: a body driven by
+//!   `from_reader` (or by `push_wait`) waits for this subscriber instead.
+//! - `combined_reader(peek, shared)`: convenient `AsyncRead` of `peek` then the body;
+//!   `combined_reader_lossless` the same over a lossless subscriber.
 
 use crate::net::types::{MaybeSend, NetError};
 use crate::net::utils::spawn_named;
@@ -106,6 +109,10 @@ struct State {
     /// it starts reading, so nothing is pushed while there is nobody to receive it.
     first_subscriber: Arc<Notify>,
     has_subscriber: bool,
+    /// A [`push_wait`](SharedBody::push_wait) recorded its chunk and is still delivering it.
+    /// Another push meanwhile breaks the single-producer contract: its chunk could reach a
+    /// lossless subscriber ahead of the waiting one.
+    delivering: bool,
     /// Cancelled when the state is dropped: every handle and every subscriber's stream is
     /// gone, so nobody can read the body any more. `from_reader` stops reading on it.
     abandoned: CancellationToken,
@@ -131,6 +138,16 @@ impl Drop for State {
 struct Subscriber {
     tx: mpsc::Sender<Result<Bytes, NetError>>,
     lagged: Arc<std::sync::atomic::AtomicBool>,
+    /// Never dropped for lagging: [`SharedBody::push_wait`] waits for room in its queue.
+    lossless: bool,
+}
+
+/// A subscriber as one push sees it, taken under the lock and used after it is released.
+struct Target {
+    id: u64,
+    tx: mpsc::Sender<Result<Bytes, NetError>>,
+    lagged: Arc<std::sync::atomic::AtomicBool>,
+    lossless: bool,
 }
 
 /// The error a subscriber gets when the start of the body is no longer kept for it.
@@ -173,6 +190,7 @@ impl SharedBody {
                 closed: false,
                 first_subscriber: Arc::new(Notify::new()),
                 has_subscriber: false,
+                delivering: false,
                 abandoned: CancellationToken::new(),
                 error: None,
                 replay_limit,
@@ -193,61 +211,125 @@ impl SharedBody {
     /// later subscribers while the body so far fits in the replay limit.
     ///
     /// - If a subscriber's queue is **full**, that subscriber is removed and its
-    ///   stream yields an error, then ends: it missed this chunk.
+    ///   stream yields an error, then ends: it missed this chunk. That holds for a
+    ///   [lossless](Self::subscribe_lossless) subscriber too; only
+    ///   [`push_wait`](Self::push_wait) waits for one.
     /// - If a subscriber's queue is **closed** (the stream was dropped), it is removed.
     ///   A dropped stream deregisters itself, so this only happens when a push races
     ///   that drop.
     /// - If [`finish`](Self::finish) or [`error`](Self::error) has been called,
     ///   additional pushes are ignored.
     pub fn push(&self, chunk: Bytes) {
-        let (subs, mut to_remove) = {
-            let mut st = self.inner.lock();
-            if st.closed {
-                return;
-            }
-            // Keep the chunk for later subscribers, or stop keeping chunks once past the limit.
-            // This happens under the same lock as the snapshot below, so a subscriber attaching
-            // at the same time gets this chunk exactly once, in its replay or live.
-            let total = st.replay_bytes.saturating_add(chunk.len());
-            if total <= st.replay_limit {
-                if let Some(kept) = st.replay.as_mut() {
-                    if !chunk.is_empty() {
-                        kept.push(chunk.clone());
-                    }
-                    st.replay_bytes = total;
-                }
-            } else {
-                st.replay = None;
-                st.replay_bytes = 0;
-            }
-            let subs: Vec<(u64, mpsc::Sender<_>, Arc<std::sync::atomic::AtomicBool>)> = st
-                .subs
-                .iter()
-                .map(|(id, sub)| (*id, sub.tx.clone(), Arc::clone(&sub.lagged)))
-                .collect();
-            (subs, Vec::new())
+        let Some(targets) = self.record(&chunk, false) else {
+            return;
         };
+        let mut to_remove = Vec::new();
+        for target in targets {
+            Self::try_deliver(target, &chunk, &mut to_remove);
+        }
+        self.remove(&to_remove);
+    }
 
-        // Try to send to each subscriber without blocking
-        for (id, tx, lagged) in subs {
-            match tx.try_send(Ok(chunk.clone())) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    // Too slow: it missed this chunk, and must know it did.
-                    lagged.store(true, std::sync::atomic::Ordering::Release);
-                    to_remove.push(id);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    // This subscriber is gone; remove it
-                    to_remove.push(id);
-                }
+    /// Like [`push`](Self::push), but waits until every
+    /// [lossless](Self::subscribe_lossless) subscriber has room for the chunk, so none of them
+    /// misses it. Other subscribers are served as `push` serves them. A lossless subscriber
+    /// whose stream is dropped stops being waited for.
+    ///
+    /// A lossless subscriber that stops reading without dropping its stream stalls the
+    /// producer: callers race this against their own cancellation and deadlines.
+    ///
+    /// A body has one producer: the next `push` or `push_wait` comes after this one returns
+    /// (or is dropped). Overlapping them could deliver a later chunk to a lossless subscriber
+    /// before this one; debug builds panic on it.
+    pub async fn push_wait(&self, chunk: Bytes) {
+        let Some(targets) = self.record(&chunk, true) else {
+            return;
+        };
+        // Cleared however this ends, a drop mid-delivery included.
+        struct Delivering<'a>(&'a Mutex<State>);
+        impl Drop for Delivering<'_> {
+            fn drop(&mut self) {
+                self.0.lock().delivering = false;
             }
         }
+        let _delivering = Delivering(&self.inner);
+        let mut to_remove = Vec::new();
+        let mut waiting = Vec::new();
+        for target in targets {
+            if target.lossless {
+                waiting.push(target);
+            } else {
+                Self::try_deliver(target, &chunk, &mut to_remove);
+            }
+        }
+        for target in waiting {
+            if target.tx.send(Ok(chunk.clone())).await.is_err() {
+                to_remove.push(target.id);
+            }
+        }
+        self.remove(&to_remove);
+    }
 
-        // Remove any subscribers that are placed on the remove list
-        if !to_remove.is_empty() {
+    /// Keeps `chunk` for later subscribers while the body fits in the replay limit, and
+    /// returns who it goes to now; `None` once the body has ended.
+    ///
+    /// Both happen under one lock, so a subscriber attaching at the same time gets the chunk
+    /// exactly once, in its replay or live. `waiting` marks a `push_wait` delivering it.
+    fn record(&self, chunk: &Bytes, waiting: bool) -> Option<Vec<Target>> {
+        let mut st = self.inner.lock();
+        debug_assert!(
+            !st.delivering,
+            "SharedBody has one producer: a push overlapped a push_wait still delivering"
+        );
+        if st.closed {
+            return None;
+        }
+        st.delivering = waiting;
+        let total = st.replay_bytes.saturating_add(chunk.len());
+        if total <= st.replay_limit {
+            if let Some(kept) = st.replay.as_mut() {
+                if !chunk.is_empty() {
+                    kept.push(chunk.clone());
+                }
+                st.replay_bytes = total;
+            }
+        } else {
+            st.replay = None;
+            st.replay_bytes = 0;
+        }
+        Some(
+            st.subs
+                .iter()
+                .map(|(id, sub)| Target {
+                    id: *id,
+                    tx: sub.tx.clone(),
+                    lagged: Arc::clone(&sub.lagged),
+                    lossless: sub.lossless,
+                })
+                .collect(),
+        )
+    }
+
+    /// Hands `chunk` to `target` without waiting. A full queue drops the subscriber: it
+    /// missed this chunk, and its stream says so with an error.
+    fn try_deliver(target: Target, chunk: &Bytes, to_remove: &mut Vec<u64>) {
+        match target.tx.try_send(Ok(chunk.clone())) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                target
+                    .lagged
+                    .store(true, std::sync::atomic::Ordering::Release);
+                to_remove.push(target.id);
+            }
+            // The stream was dropped and is deregistering itself.
+            Err(mpsc::error::TrySendError::Closed(_)) => to_remove.push(target.id),
+        }
+    }
+
+    fn remove(&self, ids: &[u64]) {
+        if !ids.is_empty() {
             let mut st = self.inner.lock();
-            for id in &to_remove {
+            for id in ids {
                 st.subs.remove(id);
             }
         }
@@ -308,7 +390,7 @@ impl SharedBody {
         &self,
         max_queue: usize,
     ) -> BoxStream<'static, Result<Bytes, NetError>> {
-        self.subscribe(max_queue, true)
+        self.subscribe(max_queue, true, false)
     }
 
     /// Subscribes to the chunks pushed **from now on** only, with the default queue capacity.
@@ -318,13 +400,24 @@ impl SharedBody {
     /// [`subscribe_stream`](Self::subscribe_stream) for the body itself.
     pub fn subscribe_live(&self) -> BoxStream<'static, Result<Bytes, NetError>> {
         let cap = self.inner.lock().max_queue;
-        self.subscribe(cap, false)
+        self.subscribe(cap, false, false)
+    }
+
+    /// Subscribes to the whole body, as [`subscribe_stream`](Self::subscribe_stream) does,
+    /// but is never dropped for lagging: [`push_wait`](Self::push_wait), which
+    /// [`from_reader`](Self::from_reader) uses, waits for room in its queue instead. For a
+    /// consumer that must have every byte however slowly it takes them, such as a writer to
+    /// disk. It slows the producer to its own pace, and with it every other subscriber.
+    pub fn subscribe_lossless(&self) -> BoxStream<'static, Result<Bytes, NetError>> {
+        let cap = self.inner.lock().max_queue;
+        self.subscribe(cap, true, true)
     }
 
     fn subscribe(
         &self,
         max_queue: usize,
         replay: bool,
+        lossless: bool,
     ) -> BoxStream<'static, Result<Bytes, NetError>> {
         let (rx, id, lagged, prefix) = {
             let mut st = self.inner.lock();
@@ -359,6 +452,7 @@ impl SharedBody {
                 Subscriber {
                     tx,
                     lagged: Arc::clone(&lagged),
+                    lossless,
                 },
             );
             if !st.has_subscriber {
@@ -424,6 +518,18 @@ impl SharedBody {
 
         let combined = head.chain(rest_stream);
         Box::pin(StreamReader::new(combined))
+    }
+
+    /// [`combined_reader`](Self::combined_reader) over a
+    /// [lossless](Self::subscribe_lossless) subscriber: the reader gets the whole body however
+    /// slowly it reads, and the producer waits for it.
+    pub fn combined_reader_lossless(
+        peek_buf: PeekBuf,
+        shared: Arc<SharedBody>,
+    ) -> Pin<Box<dyn AsyncRead + Send>> {
+        let head = stream::iter([Ok::<Bytes, std::io::Error>(peek_buf.into_bytes())]);
+        let rest_stream = shared.subscribe_lossless().map_err(|e: NetError| e.to_io());
+        Box::pin(StreamReader::new(head.chain(rest_stream)))
     }
 }
 
@@ -678,11 +784,28 @@ impl SharedBody {
                     Ok(n) => {
                         total_read = total_read.saturating_add(n as u64);
 
-                        // Push to shared body, if anyone can still read it
-                        match live() {
-                            Some(sb) => sb.push(Bytes::copy_from_slice(&buf[..n])),
-                            None => return,
+                        // Push to shared body, if anyone can still read it. A lossless
+                        // subscriber is waited for; the handle held meanwhile does not keep
+                        // the body alive past it, since a dropped stream ends the wait.
+                        let Some(sb) = live() else { return };
+                        let deadline_sleep = async {
+                            match deadline {
+                                Some(dl) => tokio::time::sleep_until(dl).await,
+                                None => std::future::pending().await,
+                            }
+                        };
+                        tokio::select! {
+                            _ = sb.push_wait(Bytes::copy_from_slice(&buf[..n])) => {}
+                            _ = cancel.cancelled() => {
+                                sb.error(NetError::Cancelled("read cancelled".to_string()));
+                                return;
+                            }
+                            _ = deadline_sleep => {
+                                sb.error(NetError::Timeout("total read timeout".to_string()));
+                                return;
+                            }
                         }
+                        drop(sb);
 
                         // Did we hit the total deadline?
                         if let Err(e) = check_total_deadline(tokio::time::Instant::now()) {
@@ -1096,6 +1219,7 @@ mod tests {
             Subscriber {
                 tx,
                 lagged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                lossless: false,
             },
         );
         let s = sb.subscribe_stream();
@@ -1535,5 +1659,174 @@ mod tests {
             }
         }
         assert!(got_err);
+    }
+
+    /// A lossless subscriber that reads far slower than the reader produces still gets every
+    /// byte: the pump waits for it instead of dropping it.
+    #[tokio::test]
+    async fn a_slow_lossless_subscriber_gets_the_whole_body() {
+        let body: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let sb = SharedBody::from_reader(
+            std::io::Cursor::new(body.clone()),
+            ReaderOptions {
+                capacity: 2,
+                buf_size: 4 * 1024,
+                replay_limit: 0,
+                ..ReaderOptions::default()
+            },
+        );
+        let mut stream = sb.subscribe_lossless();
+        let mut got = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            got.extend_from_slice(&chunk.expect("a lossless subscriber is never dropped"));
+            if got.len() % (64 * 1024) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        assert_eq!(got, body);
+    }
+
+    /// `push_wait` waits for room in a lossless subscriber's queue; `push` beside it still
+    /// drops a full lossy one.
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_wait_waits_for_a_lossless_subscriber_only() {
+        let sb = Arc::new(SharedBody::new(1));
+        let mut lossless = sb.subscribe_lossless();
+        let mut lossy = sb.subscribe_stream();
+        sb.push_wait(Bytes::from_static(b"A")).await;
+
+        let producer = {
+            let sb = sb.clone();
+            tokio::spawn(async move {
+                sb.push_wait(Bytes::from_static(b"B")).await;
+                sb.finish();
+            })
+        };
+        // The lossless queue is full, so B waits for it.
+        tokio::task::yield_now().await;
+        assert!(!producer.is_finished());
+
+        assert_eq!(&lossless.next().await.unwrap().unwrap()[..], b"A");
+        assert_eq!(&lossless.next().await.unwrap().unwrap()[..], b"B");
+        assert!(lossless.next().await.is_none());
+        producer.await.unwrap();
+
+        // The lossy subscriber was full when B came: it gets A, then the error.
+        assert_eq!(&lossy.next().await.unwrap().unwrap()[..], b"A");
+        assert!(matches!(lossy.next().await, Some(Err(NetError::Read(_)))));
+    }
+
+    /// Dropping a lossless stream ends the wait for it; the body goes on for the others.
+    #[tokio::test]
+    async fn a_dropped_lossless_stream_stops_being_waited_for() {
+        let body: Vec<u8> = vec![9u8; 512 * 1024];
+        let sb = SharedBody::from_reader(
+            std::io::Cursor::new(body.clone()),
+            ReaderOptions {
+                capacity: 1,
+                buf_size: 4 * 1024,
+                ..ReaderOptions::default()
+            },
+        );
+        let stalled = sb.subscribe_lossless();
+        let mut other = sb.subscribe_lossless();
+        let first = other.next().await.unwrap().unwrap();
+        drop(stalled);
+        let mut got = first.to_vec();
+        while let Some(chunk) = other.next().await {
+            got.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(got, body);
+    }
+
+    /// A cancel reaches a pump that is waiting on a lossless subscriber which stopped reading.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_ends_a_wait_on_a_stalled_lossless_subscriber() {
+        let cancel = CancellationToken::new();
+        let sb = SharedBody::from_reader(
+            std::io::Cursor::new(vec![1u8; 256 * 1024]),
+            ReaderOptions {
+                capacity: 1,
+                buf_size: 4 * 1024,
+                cancel: Some(cancel.clone()),
+                ..ReaderOptions::default()
+            },
+        );
+        let mut stream = sb.subscribe_lossless();
+        // Let the pump fill the queue and block on the next chunk.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+        let mut last = None;
+        while let Some(item) = stream.next().await {
+            last = Some(item);
+        }
+        assert!(
+            matches!(last, Some(Err(NetError::Cancelled(_)))),
+            "got {last:?}"
+        );
+    }
+
+    /// The lossless reader yields the peek, then the whole body.
+    #[tokio::test]
+    async fn combined_reader_lossless_yields_peek_then_the_whole_body() {
+        let body: Vec<u8> = (0..300 * 1024).map(|i| (i % 7) as u8).collect();
+        let sb = SharedBody::from_reader(
+            std::io::Cursor::new(body.clone()),
+            ReaderOptions {
+                capacity: 1,
+                buf_size: 1024,
+                ..ReaderOptions::default()
+            },
+        );
+        let mut reader =
+            SharedBody::combined_reader_lossless(PeekBuf::from_slice(b"HEAD"), sb.clone());
+        let mut got = Vec::new();
+        let mut buf = [0u8; 100];
+        loop {
+            let n = reader.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(&got[..4], b"HEAD");
+        assert_eq!(&got[4..], &body[..]);
+    }
+
+    /// A push while a `push_wait` is still delivering breaks the single-producer contract,
+    /// which debug builds catch.
+    #[cfg(debug_assertions)]
+    #[tokio::test(flavor = "current_thread")]
+    #[should_panic(expected = "one producer")]
+    async fn a_push_overlapping_a_push_wait_panics_in_debug() {
+        let sb = Arc::new(SharedBody::new(1));
+        let _lossless = sb.subscribe_lossless();
+        sb.push_wait(Bytes::from_static(b"A")).await; // the queue is full now
+        let waiting = {
+            let sb = sb.clone();
+            tokio::spawn(async move { sb.push_wait(Bytes::from_static(b"B")).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        sb.push(Bytes::from_static(b"C"));
+    }
+
+    /// A `push_wait` dropped mid-delivery leaves the body free for the next push.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_push_wait_lets_the_next_push_through() {
+        let sb = SharedBody::new(1);
+        let mut lossless = sb.subscribe_lossless();
+        sb.push_wait(Bytes::from_static(b"A")).await;
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(20),
+            sb.push_wait(Bytes::from_static(b"B")),
+        )
+        .await;
+        assert!(blocked.is_err(), "B waits on the full queue");
+        assert_eq!(&lossless.next().await.unwrap().unwrap()[..], b"A");
+        sb.push(Bytes::from_static(b"C"));
+        sb.finish();
+        assert_eq!(&lossless.next().await.unwrap().unwrap()[..], b"C");
     }
 }
