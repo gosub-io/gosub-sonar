@@ -7,14 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-10-17
+
 ### Fixed
 
 - A streamed fetch is no longer cut off by the request timeout while its body arrives:
   `req_timeout` (fetcher-wide or per request) now ends when a streamed hop's response headers
   arrive, and the body is bounded by `read_idle_timeout` and `total_body_timeout`. A download
   that took longer than the request timeout (60 s by default) used to fail partway with
-  "operation timed out". A buffered fetch keeps the request timeout over headers and body. No
-  change on wasm32
+  "operation timed out". A buffered request that a streaming caller joins is performed
+  streamed and is treated the same. A buffered fetch keeps the request timeout over headers and
+  body. No change on wasm32
 
 ## [0.16.0] - 2026-10-17
 
@@ -1426,7 +1429,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/gosub-io/gosub-sonar/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.13.0...v0.14.0
