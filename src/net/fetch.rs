@@ -1807,17 +1807,21 @@ pub(crate) async fn fetch_response_complete(
                 None => std::future::pending().await,
             }
         };
+        // Biased: a cancel is reported by this arm, not by whichever of it and the progress
+        // reader under the read happened to be polled first. The deadline also beats a read
+        // that is ready at the same moment.
         let n = tokio::select! {
+            biased;
             // Stream cancelled
             _ = cancel.cancelled() => {
-                return Err(NetError::Cancelled("fetch_request_complete cancelled".into()));
+                return Err(NetError::Cancelled("body read cancelled".into()));
             }
             _ = deadline => return Err(NetError::Timeout("total body timeout".into())),
             // Read bytes, or timeout when not read something in time. `read_buf` reads directly into
             // the spare capacity of `body_buf`, so there is no intermediate scratch buffer.
             r = timeout(read_idle_timeout, reader.read_buf(&mut body_buf)) => {
                 match r {
-                    Err(_) => return Err(NetError::Timeout("fetch_request_complete timeout".into())),
+                    Err(_) => return Err(NetError::Timeout("read idle timeout".into())),
                     Ok(Err(e)) => return Err(e.into()),
                     Ok(Ok(n)) => n,
                 }
@@ -1834,8 +1838,7 @@ pub(crate) async fn fetch_response_complete(
             // the buffer and return that?
             if body_buf.len() > max {
                 return Err(NetError::Read(Arc::new(anyhow!(
-                    "fetch_request_complete exceeded maximum size of {} bytes",
-                    max
+                    "body exceeded maximum size of {max} bytes"
                 ))));
             }
         }
@@ -4605,13 +4608,12 @@ mod tests {
         )
         .await;
 
-        assert!(res.is_err());
-        assert!(res
-            .err()
-            .unwrap()
-            .to_string()
-            .cow_to_ascii_lowercase()
-            .contains("timeout"));
+        // `/slow` stalls after the peek, so this is the buffered loop's timeout. It reads the
+        // same as the streaming path's, without naming an internal function.
+        match res {
+            Err(NetError::Timeout(msg)) => assert_eq!(msg, "read idle timeout"),
+            other => panic!("expected a read idle timeout, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4639,50 +4641,62 @@ mod tests {
 
     /// Uses a chunked route (no Content-Length) so the in-loop size check is what fires; responses
     /// that declare an oversized Content-Length up front are rejected earlier, see
-    /// `huge_content_length_rejected_before_body_read`.
+    /// `huge_content_length_rejected_before_body_read`. The cap is above the peek window, or the
+    /// check right after the peek fires instead.
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_complete_max_bytes_exceeded() {
         let srv = server().await;
+        let max = 2 * super::PEEK_MAX;
         let res = super::fetch_response_complete(
             client(),
             srv.url("/big-chunked"),
             RequestInit::get(HeaderMap::new()),
             CancellationToken::new(),
             observer(),
-            Some(100),
+            Some(max),
             Duration::from_secs(5),
             Some(Duration::from_secs(10)),
             NetPolicy::default(),
         )
         .await;
-        assert!(res.is_err());
-        assert!(res.err().unwrap().to_string().contains("exceeded"));
+        let msg = res.expect_err("body is over the cap").to_string();
+        assert!(
+            msg.contains(&format!("body exceeded maximum size of {max} bytes")),
+            "unexpected error: {msg}"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_complete_cancel_mid_body() {
         let srv = server().await;
         let cancel = CancellationToken::new();
+        let rec = Arc::new(RecordingObserver::new());
         let fut = super::fetch_response_complete(
             client(),
             srv.url("/slow"),
             RequestInit::get(HeaderMap::new()),
             cancel.clone(),
-            observer(),
+            rec.clone(),
             None,
             Duration::from_secs(5),
             Some(Duration::from_secs(10)),
             NetPolicy::default(),
         );
-        cancel.cancel();
-        let res = fut.await;
-        assert!(res.is_err());
-        assert!(res
-            .err()
-            .unwrap()
-            .to_string()
-            .cow_to_ascii_lowercase()
-            .contains("cancel"));
+        // `/slow` sends the peek and then stalls, so a cancel after a moment lands in the
+        // buffered loop, not in the peek.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+        match fut.await {
+            Err(NetError::Cancelled(msg)) => assert_eq!(msg, "body read cancelled"),
+            other => panic!("expected a cancelled body read, got {other:?}"),
+        }
+        // One end for the request: the reader, dropped with the loop, reports it.
+        assert_eq!(
+            rec.cancellations(),
+            vec!["body reader dropped before end of stream"]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
