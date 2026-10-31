@@ -43,7 +43,8 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | Module | File | Responsibility |
 |--------|------|----------------|
 | `net::fetcher` | `src/net/fetcher.rs` | **The scheduler.** Priority queues, coalescing, concurrency limits, task spawning. `Fetcher::{new, run, submit}`. |
-| `net::fetch` | `src/net/fetch.rs` | Low-level fetch primitives: `fetch_response_top`, `fetch_response_complete` (crate-private: they need a client with redirects off, which only `Fetcher` builds), redirect handling, `ProgressReader`, `NetPolicy`. |
+| `net::fetch` | `src/net/fetch.rs` | Low-level fetch primitives: `fetch_response_top`, `fetch_response_complete` (crate-private: they need a client with redirects off, which only `Fetcher` builds), `ProgressReader`, `NetPolicy`. |
+| `net::fetch::chain` | `src/net/fetch/chain.rs` | The redirect chain (`get_with_redirects`): `HopChain` carries the request from hop to hop, and each per-hop stage (HSTS and URL checks, CORS, referrer, `Origin`/`Sec-Fetch-*`, preflight, cookies, cache, send and auth retries, redirect follow) is one of its methods. |
 | `net::fetcher_context` | `src/net/fetcher_context.rs` | `FetcherContext` trait — the host's hook into the fetch lifecycle (observers, ref tracking, URL policy, cookies). |
 | `net::cors` | `src/net/cors.rs` | CORS (WHATWG Fetch): safelist predicates, the CORS check, preflight validation, response tainting/filtering. `CorsPreflightCache` / `InMemoryPreflightCache`. Enforcement is native-only. |
 | `net::cache` | `src/net/cache.rs` | HTTP caching (RFC 9111): freshness and age, request/response `Cache-Control`, conditional revalidation, `Vary`, invalidation. `HttpCache` / `InMemoryHttpCache`, `CacheMode`. Native-only. |
