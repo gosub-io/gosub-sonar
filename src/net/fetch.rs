@@ -172,7 +172,7 @@ fn report_set_cookie(policy: &NetPolicy, url: &Url, headers: &HeaderMap) -> bool
     if values.is_empty() {
         return false;
     }
-    (policy.on_cookies)(url, &values);
+    (policy.cookies.on_cookies)(url, &values);
     true
 }
 
@@ -180,7 +180,10 @@ fn report_set_cookie(policy: &NetPolicy, url: &Url, headers: &HeaderMap) -> bool
 /// with `tls_info`, which the fetcher does when overrides are enabled.
 #[cfg(not(target_arch = "wasm32"))]
 fn over_accepted_override(policy: &NetPolicy, resp: &reqwest::Response) -> bool {
-    let (Some(store), Some(host)) = (policy.tls_overrides.as_ref(), resp.url().host_str()) else {
+    let (Some(store), Some(host)) = (
+        policy.transport.tls_overrides.as_ref(),
+        resp.url().host_str(),
+    ) else {
         return false;
     };
     resp.extensions()
@@ -262,7 +265,7 @@ impl AuthSlot {
     /// Digest nonce, a Negotiate token), and replaying it would only draw another challenge.
     fn accepted(&mut self, policy: &NetPolicy, url: &Url) {
         if let (Some(store), Some((space, credentials))) =
-            (policy.credentials.as_ref(), self.unproven.take())
+            (policy.auth.credentials.as_ref(), self.unproven.take())
         {
             if matches!(credentials, Credentials::Basic { .. }) {
                 store.store(space.clone(), credentials);
@@ -332,7 +335,7 @@ pub type ProxyForFn = Box<dyn Fn(&Url) -> Option<Url> + Send + Sync>;
 pub type ProxiedFn = Box<dyn Fn(&Url) -> bool + Send + Sync>;
 
 /// Starts the background revalidation of a stale response a hop was answered with. See
-/// [`NetPolicy::revalidate_in_background`].
+/// [`CachePolicy::revalidate_in_background`].
 pub type BackgroundRevalidationFn = Box<dyn Fn(Revalidation) + Send + Sync>;
 
 /// Where the background revalidation of a stale response starts: the hop that was answered
@@ -342,7 +345,7 @@ pub type BackgroundRevalidationFn = Box<dyn Fn(Revalidation) + Send + Sync>;
 /// way the request did: with the URLs before it (the `SameSite` context of its cookies), the
 /// referrer and referrer policy the redirects left, the `Sec-Fetch-Site` the chain degraded to,
 /// a tainted origin, the response tainting, and the redirects already counted. Handed to
-/// [`NetPolicy::revalidate_in_background`]; send it as a request to [`url`](Self::url) with
+/// [`CachePolicy::revalidate_in_background`]; send it as a request to [`url`](Self::url) with
 /// [`method`](Self::method) and [`headers`](Self::headers), carrying it in
 /// [`RequestInit::as_background_revalidation`].
 #[derive(Debug, Clone)]
@@ -407,65 +410,26 @@ fn without_forbidden(headers: &HeaderMap) -> HeaderMap {
 /// Network-level request policies threaded through the fetch stack.
 ///
 /// Bundles the URL allowlist check and the cookie-jar query so both can be applied at
-/// every redirect hop without passing separate generic parameters.
+/// every redirect hop without passing separate generic parameters. The hooks are grouped by
+/// what they govern: [`transport`](Self::transport), [`cookies`](Self::cookies),
+/// [`auth`](Self::auth), [`cache`](Self::cache) and [`proxy`](Self::proxy).
 ///
 /// Construct with [`NetPolicy::default`] (no-op, allows everything) or
 /// [`NetPolicy::from_context`] to wire up a [`FetcherContext`] implementation.
+#[derive(Default)]
 pub struct NetPolicy {
-    /// Return `false` to block a URL. Called for the initial URL and each redirect target.
-    pub url_allowed: UrlFilter,
-    /// Return cookies for a hop in `"name=value; name2=value2"` format, or `None`. Called on
-    /// each hop after cross-origin cookie stripping, so the jar is always consulted for the
-    /// correct origin, with the hop's URL, method and the chain before it (see [`CookieHop`]).
-    pub cookies_for: CookieJarFn,
-    /// Called with the raw `Set-Cookie` values of every response, redirect hops included, so a
-    /// cookie set mid-chain (a session cookie on a login 302) reaches the jar before the next
-    /// hop. Not called for a hop the request's credentials mode kept cookies off (Fetch: only
-    /// with *includeCredentials*), so a `credentials: omit` request cannot write the jar.
-    pub on_cookies: CookieSinkFn,
-    /// Called with the URL and HTTP version of every response in the chain, redirects included.
-    /// The fetcher uses this to pick the h1 or h2 per-origin connection limit. Not called on
-    /// wasm32 (the browser's `fetch()` doesn't expose the version). Set via
-    /// [`NetPolicy::with_protocol_sink`].
-    pub on_protocol: ProtocolSinkFn,
-    /// Whether a URL's origin is known to speak HTTP/2 or HTTP/3. Used when applying a
-    /// [`RequestInit::header_order`]: no `host` header is added for such origins, since h2
-    /// carries it in `:authority`. Defaults to `false` for every URL. Set via
-    /// [`NetPolicy::with_protocol_hint`].
-    pub speaks_h2: ProtocolHintFn,
-    /// HSTS store consulted to upgrade each hop, and updated from each hop's response.
-    /// `None` disables HSTS. Set via [`NetPolicy::with_hsts`].
+    /// Which URLs may be fetched, and how each hop's connection is upgraded and checked.
+    pub transport: TransportPolicy,
+    /// The cookie jar each hop reads from and writes to.
+    pub cookies: CookiePolicy,
+    /// How a `401`/`407` challenge is answered.
+    pub auth: AuthPolicy,
+    /// The response and preflight caches.
     #[cfg(not(target_arch = "wasm32"))]
-    pub hsts: Option<Arc<dyn HstsStore>>,
-    /// The client's TLS override store, if any. A response over an accepted override does not
-    /// update HSTS (RFC 6797 §8.1). Set via [`NetPolicy::with_tls_overrides`].
+    pub cache: CachePolicy,
+    /// What the client's proxy configuration means for a hop.
     #[cfg(not(target_arch = "wasm32"))]
-    pub tls_overrides: Option<Arc<dyn TlsOverrideStore>>,
-    /// Cache of CORS preflight grants. `None` still preflights when the spec requires it,
-    /// asking the server every time. Set via [`NetPolicy::with_cors_preflight_cache`].
-    #[cfg(not(target_arch = "wasm32"))]
-    pub cors_preflight: Option<Arc<dyn CorsPreflightCache>>,
-    /// Called for each challenge of a `401`/`407` response until one yields credentials to retry
-    /// the hop with. The default answers no challenge, leaving the response for the caller.
-    /// See [`auth`](mod@crate::net::auth).
-    pub on_auth_challenge: AuthChallengeFn,
-    /// Credentials remembered per protection space, consulted before `on_auth_challenge` and
-    /// updated from its answers. `None` still authenticates, asking the hook every time.
-    /// Set via [`NetPolicy::with_credential_store`].
-    pub credentials: Option<Arc<dyn CredentialStore>>,
-    /// Store of cached responses, consulted before every hop and written to after it.
-    /// `None` disables caching. Set via [`NetPolicy::with_cache`].
-    /// See [`cache`](mod@crate::net::cache).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub cache: Option<Arc<dyn HttpCache>>,
-    /// Revalidates a stale response in the background, after the hop it answered has moved on.
-    /// With it, a request in the default cache mode that has an origin (Fetch: a client) is
-    /// answered from a stale entry its `stale-while-revalidate` still covers, and this is called
-    /// with where the revalidation starts; without it, such an entry is revalidated first.
-    /// [`Fetcher`](crate::net::fetcher::Fetcher) queues a request of its own for it. Set via
-    /// [`NetPolicy::with_background_revalidation`]. See [`cache`](mod@crate::net::cache).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub revalidate_in_background: Option<BackgroundRevalidationFn>,
+    pub proxy: ProxyPolicy,
     /// The user agent configured on the HTTP client, purely so that
     /// [`NetEvent::RequestSent`] can report it.
     ///
@@ -478,6 +442,134 @@ pub struct NetPolicy {
     /// `None` reports no user agent rather than inventing one, which is the honest answer
     /// for a client this crate did not build. Set via [`NetPolicy::with_user_agent`].
     pub user_agent: Option<http::HeaderValue>,
+}
+
+/// The [`NetPolicy::transport`] group: which URLs may be fetched, and how a hop's connection
+/// is upgraded and checked.
+pub struct TransportPolicy {
+    /// Return `false` to block a URL. Called for the initial URL and each redirect target.
+    pub url_allowed: UrlFilter,
+    /// Bad ports to fetch from anyway; see
+    /// [`FetcherConfig::allowed_bad_ports`](crate::net::fetcher::FetcherConfig::allowed_bad_ports).
+    /// Empty (default): every bad port is refused. Set via
+    /// [`NetPolicy::with_allowed_bad_ports`].
+    pub allowed_bad_ports: Vec<u16>,
+    /// HSTS store consulted to upgrade each hop, and updated from each hop's response.
+    /// `None` disables HSTS. Set via [`NetPolicy::with_hsts`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub hsts: Option<Arc<dyn HstsStore>>,
+    /// The client's TLS override store, if any. A response over an accepted override does not
+    /// update HSTS (RFC 6797 §8.1). Set via [`NetPolicy::with_tls_overrides`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub tls_overrides: Option<Arc<dyn TlsOverrideStore>>,
+    /// The resolver a hop with an IP-literal host is checked against; see
+    /// [`dns`](mod@crate::net::dns). `None` skips the check. Set via
+    /// [`NetPolicy::with_dns_resolver`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub dns_resolver: Option<Arc<dyn DnsResolver>>,
+    /// Called with the URL and HTTP version of every response in the chain, redirects included.
+    /// The fetcher uses this to pick the h1 or h2 per-origin connection limit. Not called on
+    /// wasm32 (the browser's `fetch()` doesn't expose the version). Set via
+    /// [`NetPolicy::with_protocol_sink`].
+    pub on_protocol: ProtocolSinkFn,
+    /// Whether a URL's origin is known to speak HTTP/2 or HTTP/3. Used when applying a
+    /// [`RequestInit::header_order`]: no `host` header is added for such origins, since h2
+    /// carries it in `:authority`. Defaults to `false` for every URL. Set via
+    /// [`NetPolicy::with_protocol_hint`].
+    pub speaks_h2: ProtocolHintFn,
+}
+
+impl Default for TransportPolicy {
+    fn default() -> Self {
+        Self {
+            url_allowed: Box::new(|_| true),
+            allowed_bad_ports: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            hsts: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            tls_overrides: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            dns_resolver: None,
+            on_protocol: Box::new(|_, _| {}),
+            speaks_h2: Box::new(|_| false),
+        }
+    }
+}
+
+/// The [`NetPolicy::cookies`] group: the cookie jar each hop reads from and writes to.
+pub struct CookiePolicy {
+    /// Return cookies for a hop in `"name=value; name2=value2"` format, or `None`. Called on
+    /// each hop after cross-origin cookie stripping, so the jar is always consulted for the
+    /// correct origin, with the hop's URL, method and the chain before it (see [`CookieHop`]).
+    pub cookies_for: CookieJarFn,
+    /// Called with the raw `Set-Cookie` values of every response, redirect hops included, so a
+    /// cookie set mid-chain (a session cookie on a login 302) reaches the jar before the next
+    /// hop. Not called for a hop the request's credentials mode kept cookies off (Fetch: only
+    /// with *includeCredentials*), so a `credentials: omit` request cannot write the jar.
+    pub on_cookies: CookieSinkFn,
+    /// The cache partition a hop that carries cookies reads and writes: whose jar
+    /// [`cookies_for`](Self::cookies_for) answers from, so one jar's responses are never
+    /// served to another's requests. A hop without cookies uses the shared, empty partition.
+    /// Set by [`NetPolicy::from_context`] from
+    /// [`FetcherContext::cookie_jar_key`].
+    pub cache_partition: String,
+}
+
+impl Default for CookiePolicy {
+    fn default() -> Self {
+        Self {
+            cookies_for: Box::new(|_| None),
+            on_cookies: Box::new(|_, _| {}),
+            cache_partition: String::new(),
+        }
+    }
+}
+
+/// The [`NetPolicy::auth`] group: how a `401`/`407` challenge is answered.
+pub struct AuthPolicy {
+    /// Called for each challenge of a `401`/`407` response until one yields credentials to retry
+    /// the hop with. The default answers no challenge, leaving the response for the caller.
+    /// See [`auth`](mod@crate::net::auth).
+    pub on_auth_challenge: AuthChallengeFn,
+    /// Credentials remembered per protection space, consulted before `on_auth_challenge` and
+    /// updated from its answers. `None` still authenticates, asking the hook every time.
+    /// Set via [`NetPolicy::with_credential_store`].
+    pub credentials: Option<Arc<dyn CredentialStore>>,
+}
+
+impl Default for AuthPolicy {
+    fn default() -> Self {
+        Self {
+            on_auth_challenge: Box::new(|_| None),
+            credentials: None,
+        }
+    }
+}
+
+/// The [`NetPolicy::cache`] group: the response and preflight caches.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+pub struct CachePolicy {
+    /// Store of cached responses, consulted before every hop and written to after it.
+    /// `None` disables caching. Set via [`NetPolicy::with_cache`].
+    /// See [`cache`](mod@crate::net::cache).
+    pub store: Option<Arc<dyn HttpCache>>,
+    /// Revalidates a stale response in the background, after the hop it answered has moved on.
+    /// With it, a request in the default cache mode that has an origin (Fetch: a client) is
+    /// answered from a stale entry its `stale-while-revalidate` still covers, and this is called
+    /// with where the revalidation starts; without it, such an entry is revalidated first.
+    /// [`Fetcher`](crate::net::fetcher::Fetcher) queues a request of its own for it. Set via
+    /// [`NetPolicy::with_background_revalidation`]. See [`cache`](mod@crate::net::cache).
+    pub revalidate_in_background: Option<BackgroundRevalidationFn>,
+    /// Cache of CORS preflight grants. `None` still preflights when the spec requires it,
+    /// asking the server every time. Set via [`NetPolicy::with_cors_preflight_cache`].
+    pub cors_preflight: Option<Arc<dyn CorsPreflightCache>>,
+}
+
+/// The [`NetPolicy::proxy`] group: what the client's proxy configuration means for a hop.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+pub struct ProxyPolicy {
     /// The `Proxy-Authorization` a configured proxy needs for a given URL, asked per hop.
     ///
     /// Like the user agent, this exists so that a header the client would add on its own is
@@ -487,14 +579,12 @@ pub struct NetPolicy {
     /// `None` leaves the header to the client, which is the honest answer when the proxy in
     /// use was not configured through this crate. Set via
     /// [`NetPolicy::with_proxy_authorization`].
-    #[cfg(not(target_arch = "wasm32"))]
     pub proxy_authorization: Option<ProxyAuthorizationFn>,
     /// The http(s) proxy a request goes through, without credentials. A `407` is only treated
     /// as a proxy challenge on a plain-`http` hop this names; any other `407` is returned as
     /// is. On an `https` hop it names the proxy in
     /// [`NetError::ProxyAuthRequired`].
     /// `None` (default): no hop is proxied. Set via [`NetPolicy::with_proxy_for`].
-    #[cfg(not(target_arch = "wasm32"))]
     pub proxy_for: Option<ProxyForFn>,
     /// Whether a request goes through a proxy (http, https or socks). A proxied response's
     /// connection peer is the proxy, so [`FetchResultMeta::peer_addr`] is `None` for it.
@@ -502,59 +592,7 @@ pub struct NetPolicy {
     /// reqwest's defaults reads proxies from the environment, and its peer may well be one.
     /// The [`Fetcher`](crate::net::fetcher::Fetcher) always sets it. Set via
     /// [`NetPolicy::with_proxied`].
-    #[cfg(not(target_arch = "wasm32"))]
     pub proxied: Option<ProxiedFn>,
-    /// The resolver a hop with an IP-literal host is checked against; see
-    /// [`dns`](mod@crate::net::dns). `None` skips the check. Set via
-    /// [`NetPolicy::with_dns_resolver`].
-    #[cfg(not(target_arch = "wasm32"))]
-    pub dns_resolver: Option<Arc<dyn DnsResolver>>,
-    /// Bad ports to fetch from anyway; see
-    /// [`FetcherConfig::allowed_bad_ports`](crate::net::fetcher::FetcherConfig::allowed_bad_ports).
-    /// Empty (default): every bad port is refused. Set via
-    /// [`NetPolicy::with_allowed_bad_ports`].
-    pub allowed_bad_ports: Vec<u16>,
-    /// The cache partition a hop that carries cookies reads and writes: whose jar
-    /// [`cookies_for`](Self::cookies_for) answers from, so one jar's responses are never
-    /// served to another's requests. A hop without cookies uses the shared, empty partition.
-    /// Set by [`NetPolicy::from_context`] from
-    /// [`FetcherContext::cookie_jar_key`].
-    pub cache_partition: String,
-}
-
-impl Default for NetPolicy {
-    fn default() -> Self {
-        Self {
-            url_allowed: Box::new(|_| true),
-            cookies_for: Box::new(|_| None),
-            on_cookies: Box::new(|_, _| {}),
-            on_protocol: Box::new(|_, _| {}),
-            speaks_h2: Box::new(|_| false),
-            user_agent: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            hsts: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            tls_overrides: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            cors_preflight: None,
-            on_auth_challenge: Box::new(|_| None),
-            credentials: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            cache: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            revalidate_in_background: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            proxy_authorization: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            proxy_for: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            proxied: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            dns_resolver: None,
-            allowed_bad_ports: Vec::new(),
-            cache_partition: String::new(),
-        }
-    }
 }
 
 impl NetPolicy {
@@ -566,38 +604,28 @@ impl NetPolicy {
         let ctx_sink = ctx.clone();
         let ctx_auth = ctx.clone();
         Self {
-            url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
-            cookies_for: Box::new(move |hop| ctx_cookies.cookies_for_hop(reference, hop)),
-            on_cookies: Box::new(move |url, values| {
-                ctx_sink.on_cookies_received(reference, url, values)
-            }),
-            on_protocol: Box::new(|_, _| {}),
-            speaks_h2: Box::new(|_| false),
-            // Filled in by the fetcher, which is what knows how its client was built.
-            user_agent: None,
+            transport: TransportPolicy {
+                url_allowed: Box::new(move |url| ctx_url.is_url_allowed(url)),
+                ..Default::default()
+            },
+            cookies: CookiePolicy {
+                cookies_for: Box::new(move |hop| ctx_cookies.cookies_for_hop(reference, hop)),
+                on_cookies: Box::new(move |url, values| {
+                    ctx_sink.on_cookies_received(reference, url, values)
+                }),
+                cache_partition: ctx.cookie_jar_key(reference),
+            },
+            auth: AuthPolicy {
+                on_auth_challenge: Box::new(move |challenge| ctx_auth.on_auth_challenge(challenge)),
+                credentials: None,
+            },
             #[cfg(not(target_arch = "wasm32"))]
-            hsts: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            tls_overrides: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            cors_preflight: None,
-            on_auth_challenge: Box::new(move |challenge| ctx_auth.on_auth_challenge(challenge)),
-            credentials: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            cache: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            revalidate_in_background: None,
+            cache: CachePolicy::default(),
             // Filled in by the fetcher, which is what knows how its proxies were configured.
             #[cfg(not(target_arch = "wasm32"))]
-            proxy_authorization: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            proxy_for: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            proxied: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            dns_resolver: None,
-            allowed_bad_ports: Vec::new(),
-            cache_partition: ctx.cookie_jar_key(reference),
+            proxy: ProxyPolicy::default(),
+            // Filled in by the fetcher, which is what knows how its client was built.
+            user_agent: None,
         }
     }
 
@@ -609,9 +637,9 @@ impl NetPolicy {
         self
     }
 
-    /// Attaches the exceptions for [`NetPolicy::allowed_bad_ports`].
+    /// Attaches the exceptions for [`TransportPolicy::allowed_bad_ports`].
     pub fn with_allowed_bad_ports(mut self, ports: Vec<u16>) -> Self {
-        self.allowed_bad_ports = ports;
+        self.transport.allowed_bad_ports = ports;
         self
     }
 
@@ -620,54 +648,54 @@ impl NetPolicy {
     /// after the report was emitted.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_proxy_authorization(mut self, f: ProxyAuthorizationFn) -> Self {
-        self.proxy_authorization = Some(f);
+        self.proxy.proxy_authorization = Some(f);
         self
     }
 
-    /// Attaches the callback for [`NetPolicy::proxy_for`].
+    /// Attaches the callback for [`ProxyPolicy::proxy_for`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_proxy_for(mut self, f: ProxyForFn) -> Self {
-        self.proxy_for = Some(f);
+        self.proxy.proxy_for = Some(f);
         self
     }
 
-    /// Attaches the callback for [`NetPolicy::proxied`].
+    /// Attaches the callback for [`ProxyPolicy::proxied`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_proxied(mut self, f: ProxiedFn) -> Self {
-        self.proxied = Some(f);
+        self.proxy.proxied = Some(f);
         self
     }
 
-    /// Attaches the resolver for [`NetPolicy::dns_resolver`].
+    /// Attaches the resolver for [`TransportPolicy::dns_resolver`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_dns_resolver(mut self, resolver: Option<Arc<dyn DnsResolver>>) -> Self {
-        self.dns_resolver = resolver;
+        self.transport.dns_resolver = resolver;
         self
     }
 
     /// Attaches a callback that receives the URL and HTTP version of every response.
     pub fn with_protocol_sink(mut self, sink: ProtocolSinkFn) -> Self {
-        self.on_protocol = sink;
+        self.transport.on_protocol = sink;
         self
     }
 
     /// Attaches a callback that says whether a URL's origin is known to speak HTTP/2 or HTTP/3.
     pub fn with_protocol_hint(mut self, hint: ProtocolHintFn) -> Self {
-        self.speaks_h2 = hint;
+        self.transport.speaks_h2 = hint;
         self
     }
 
     /// Attaches the HSTS store this policy should consult and update. `None` disables HSTS.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_hsts(mut self, store: Option<Arc<dyn HstsStore>>) -> Self {
-        self.hsts = store;
+        self.transport.hsts = store;
         self
     }
 
-    /// Attaches the store for [`NetPolicy::tls_overrides`].
+    /// Attaches the store for [`TransportPolicy::tls_overrides`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_tls_overrides(mut self, store: Option<Arc<dyn TlsOverrideStore>>) -> Self {
-        self.tls_overrides = store;
+        self.transport.tls_overrides = store;
         self
     }
 
@@ -675,7 +703,7 @@ impl NetPolicy {
     /// `None` still preflights when required, without caching the grants.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_cors_preflight_cache(mut self, cache: Arc<dyn CorsPreflightCache>) -> Self {
-        self.cors_preflight = Some(cache);
+        self.cache.cors_preflight = Some(cache);
         self
     }
 
@@ -683,36 +711,36 @@ impl NetPolicy {
     /// remembered between them.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn clear_preflight_cache(mut self) -> Self {
-        self.cors_preflight = None;
+        self.cache.cors_preflight = None;
         self
     }
 
     /// Attaches the credential store consulted for authentication challenges, and updated when
-    /// credentials from [`NetPolicy::on_auth_challenge`] turn out to work. `None` asks the hook
-    /// for every challenge.
+    /// credentials from [`AuthPolicy::on_auth_challenge`] turn out to work. `None` asks the
+    /// hook for every challenge.
     pub fn with_credential_store(mut self, store: Option<Arc<dyn CredentialStore>>) -> Self {
-        self.credentials = store;
+        self.auth.credentials = store;
         self
     }
 
     /// Replaces the callback answering authentication challenges.
     pub fn with_auth_challenge_fn(mut self, hook: AuthChallengeFn) -> Self {
-        self.on_auth_challenge = hook;
+        self.auth.on_auth_challenge = hook;
         self
     }
 
     /// Attaches the store of cached responses. `None` disables caching.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_cache(mut self, cache: Option<Arc<dyn HttpCache>>) -> Self {
-        self.cache = cache;
+        self.cache.store = cache;
         self
     }
 
     /// Attaches what starts the background revalidation of a stale response a hop was
-    /// answered with. See [`NetPolicy::revalidate_in_background`].
+    /// answered with. See [`CachePolicy::revalidate_in_background`].
     #[cfg(not(target_arch = "wasm32"))]
     pub fn with_background_revalidation(mut self, start: BackgroundRevalidationFn) -> Self {
-        self.revalidate_in_background = Some(start);
+        self.cache.revalidate_in_background = Some(start);
         self
     }
 }
@@ -754,7 +782,7 @@ pub struct RequestInit {
     /// Whether cookies from the policy's jar ride along, and how strict the credentialed CORS
     /// rules are. See [`RequestCredentials`].
     pub credentials: RequestCredentials,
-    /// How this request uses the HTTP cache. Inert without [`NetPolicy::cache`].
+    /// How this request uses the HTTP cache. Inert without [`CachePolicy::store`].
     /// See [`cache`](mod@crate::net::cache).
     pub cache_mode: CacheMode,
     /// Whether the body is decoded from its content codings (`gzip`, `br`, `deflate`). A cache
@@ -1872,7 +1900,7 @@ fn send_error(
     // Without a proxy to name, the tunnel failure stays a connect failure.
     #[cfg(not(target_arch = "wasm32"))]
     if crate::net::transport::is_proxy_auth_required(&e) {
-        if let Some(proxy) = policy.proxy_for.as_ref().and_then(|f| f(url)) {
+        if let Some(proxy) = policy.proxy.proxy_for.as_ref().and_then(|f| f(url)) {
             return NetError::ProxyAuthRequired {
                 proxy: Arc::new(proxy),
                 url: url.clone(),
@@ -1935,7 +1963,7 @@ fn origin_peer(
 ) -> Option<std::net::SocketAddr> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        match policy.proxied {
+        match policy.proxy.proxied {
             Some(ref proxied) if !proxied(url) => resp.remote_addr(),
             _ => None,
         }
@@ -2022,10 +2050,11 @@ fn credentials_for_challenges(
     for challenge in challenges {
         let space = challenge.protection_space();
         let known = policy
+            .auth
             .credentials
             .as_ref()
             .and_then(|store| store.credentials_for(&space));
-        let credentials = match known.or_else(|| (policy.on_auth_challenge)(challenge)) {
+        let credentials = match known.or_else(|| (policy.auth.on_auth_challenge)(challenge)) {
             Some(credentials) => credentials,
             None => continue,
         };
@@ -2442,7 +2471,10 @@ mod tests {
         let target = srv.url("/");
 
         let policy = NetPolicy {
-            cookies_for: Box::new(|_| Some("session=abc123".to_string())),
+            cookies: CookiePolicy {
+                cookies_for: Box::new(|_| Some("session=abc123".to_string())),
+                ..CookiePolicy::default()
+            },
             ..NetPolicy::default()
         };
 
@@ -3740,7 +3772,10 @@ mod tests {
             CancellationToken::new(),
             observer(),
             NetPolicy {
-                url_allowed: Box::new(|_| false),
+                transport: TransportPolicy {
+                    url_allowed: Box::new(|_| false),
+                    ..TransportPolicy::default()
+                },
                 ..NetPolicy::default()
             },
         )
@@ -4474,7 +4509,10 @@ mod tests {
             CancellationToken::new(),
             rec.clone(),
             NetPolicy {
-                url_allowed: Box::new(|_| false),
+                transport: TransportPolicy {
+                    url_allowed: Box::new(|_| false),
+                    ..TransportPolicy::default()
+                },
                 ..NetPolicy::default()
             },
         )
@@ -4593,10 +4631,13 @@ mod tests {
             CancellationToken::new(),
             observer(),
             NetPolicy {
-                url_allowed: Box::new(move |u| {
-                    seen_cb.lock().unwrap().push(u.to_string());
-                    true
-                }),
+                transport: TransportPolicy {
+                    url_allowed: Box::new(move |u| {
+                        seen_cb.lock().unwrap().push(u.to_string());
+                        true
+                    }),
+                    ..TransportPolicy::default()
+                },
                 ..NetPolicy::default()
             },
         )
@@ -4804,11 +4845,14 @@ mod tests {
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = received.clone();
         let policy = NetPolicy {
-            on_cookies: Box::new(move |_, values| {
-                sink.lock()
-                    .unwrap()
-                    .extend(values.iter().map(|v| v.to_string()));
-            }),
+            cookies: CookiePolicy {
+                on_cookies: Box::new(move |_, values| {
+                    sink.lock()
+                        .unwrap()
+                        .extend(values.iter().map(|v| v.to_string()));
+                }),
+                ..CookiePolicy::default()
+            },
             ..NetPolicy::default()
         };
         let mut headers = HeaderMap::new();
@@ -4845,18 +4889,21 @@ mod tests {
         let jar_write = jar.clone();
         let received_sink = received.clone();
         let policy = NetPolicy {
-            cookies_for: Box::new(move |_| jar_read.lock().unwrap().clone()),
-            on_cookies: Box::new(move |url, values| {
-                received_sink
-                    .lock()
-                    .unwrap()
-                    .push((url.clone(), values.iter().map(|v| v.to_string()).collect()));
-                // Store only the name=value part, as a real jar would.
-                if let Some(v) = values.first() {
-                    let nv = v.split(';').next().unwrap_or(v).trim().to_string();
-                    *jar_write.lock().unwrap() = Some(nv);
-                }
-            }),
+            cookies: CookiePolicy {
+                cookies_for: Box::new(move |_| jar_read.lock().unwrap().clone()),
+                on_cookies: Box::new(move |url, values| {
+                    received_sink
+                        .lock()
+                        .unwrap()
+                        .push((url.clone(), values.iter().map(|v| v.to_string()).collect()));
+                    // Store only the name=value part, as a real jar would.
+                    if let Some(v) = values.first() {
+                        let nv = v.split(';').next().unwrap_or(v).trim().to_string();
+                        *jar_write.lock().unwrap() = Some(nv);
+                    }
+                }),
+                ..CookiePolicy::default()
+            },
             ..NetPolicy::default()
         };
 
@@ -4930,12 +4977,15 @@ mod tests {
         let seen: SeenCookies = Default::default();
         let sink = seen.clone();
         let policy = NetPolicy {
-            on_cookies: Box::new(move |url, values| {
-                let mut seen = sink.lock().unwrap();
-                for v in values {
-                    seen.push((url.clone(), v.to_string()));
-                }
-            }),
+            cookies: CookiePolicy {
+                on_cookies: Box::new(move |url, values| {
+                    let mut seen = sink.lock().unwrap();
+                    for v in values {
+                        seen.push((url.clone(), v.to_string()));
+                    }
+                }),
+                ..CookiePolicy::default()
+            },
             ..NetPolicy::default()
         };
         (policy, seen)
@@ -5735,9 +5785,12 @@ mod tests {
         let policy = || {
             let seen = seen.clone();
             NetPolicy {
-                on_cookies: Box::new(move |_, values| {
-                    *seen.lock().unwrap() += values.len();
-                }),
+                cookies: CookiePolicy {
+                    on_cookies: Box::new(move |_, values| {
+                        *seen.lock().unwrap() += values.len();
+                    }),
+                    ..CookiePolicy::default()
+                },
                 ..NetPolicy::default()
             }
             .with_cache(Some(cache.clone()))
@@ -5962,7 +6015,7 @@ mod tests {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let record = asked.clone();
         let mut policy = NetPolicy::default().with_cache(Some(cache));
-        policy.cookies_for = Box::new(move |hop| {
+        policy.cookies.cookies_for = Box::new(move |hop| {
             record.lock().unwrap().push(hop.url_list.to_vec());
             None
         });
@@ -6230,7 +6283,10 @@ mod tests {
             .await;
         let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
         let jar = |partition: &str| NetPolicy {
-            cache_partition: partition.to_string(),
+            cookies: CookiePolicy {
+                cache_partition: partition.to_string(),
+                ..CookiePolicy::default()
+            },
             ..NetPolicy::default().with_cache(Some(cache.clone()))
         };
 
@@ -7083,9 +7139,12 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         async fn the_jar_answers_for_every_hop() {
             let jar = || NetPolicy {
-                cookies_for: Box::new(|hop| {
-                    Some(format!("at={}&m={}", hop.url.path(), hop.method))
-                }),
+                cookies: CookiePolicy {
+                    cookies_for: Box::new(|hop| {
+                        Some(format!("at={}&m={}", hop.url.path(), hop.method))
+                    }),
+                    ..CookiePolicy::default()
+                },
                 ..NetPolicy::default()
             };
             let (end, _) = follow_with(302, Method::GET, HeaderMap::new(), None, jar()).await;
@@ -8004,7 +8063,10 @@ mod tests {
                 .start()
                 .await;
             let jar = || NetPolicy {
-                cookies_for: Box::new(|_| Some("session=1".into())),
+                cookies: CookiePolicy {
+                    cookies_for: Box::new(|_| Some("session=1".into())),
+                    ..CookiePolicy::default()
+                },
                 ..NetPolicy::default()
             };
             let other = Some(Url::parse("http://other.example/").unwrap().origin());
@@ -8109,7 +8171,10 @@ mod tests {
                 .start()
                 .await;
             let policy = NetPolicy {
-                cookies_for: Box::new(|_| Some("session=1".into())),
+                cookies: CookiePolicy {
+                    cookies_for: Box::new(|_| Some("session=1".into())),
+                    ..CookiePolicy::default()
+                },
                 ..NetPolicy::default()
             };
             let init = RequestInit::get(HeaderMap::new())
@@ -8173,15 +8238,18 @@ mod tests {
             let seen: Arc<std::sync::Mutex<Seen>> = Arc::default();
             let record = seen.clone();
             let policy = NetPolicy {
-                cookies_for: Box::new(move |hop| {
-                    let paths = hop.url_list.iter().map(|u| u.path().to_string()).collect();
-                    record.lock().unwrap().push((
-                        hop.method.clone(),
-                        hop.url.path().to_string(),
-                        paths,
-                    ));
-                    None
-                }),
+                cookies: CookiePolicy {
+                    cookies_for: Box::new(move |hop| {
+                        let paths = hop.url_list.iter().map(|u| u.path().to_string()).collect();
+                        record.lock().unwrap().push((
+                            hop.method.clone(),
+                            hop.url.path().to_string(),
+                            paths,
+                        ));
+                        None
+                    }),
+                    ..CookiePolicy::default()
+                },
                 ..NetPolicy::default()
             };
             recorded(
