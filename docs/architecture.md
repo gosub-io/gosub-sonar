@@ -231,7 +231,7 @@ and a `SlotPool` (`slots.rs`) that counts its connection slots:
 - **`global_slots`** — total concurrent fetches (default 32).
 - **per origin** — concurrent fetches to one origin. Starts at the HTTP/1 limit (6) and is grown
   to the HTTP/2 limit (16) once an HTTP/2 or HTTP/3 response has been seen from that origin
-  (reported per hop via `NetPolicy::on_protocol`; native only, wasm32 stays at the HTTP/1 limit).
+  (reported per hop via `TransportPolicy::on_protocol`; native only, wasm32 stays at the HTTP/1 limit).
 
 Fetches waiting for slots sit in the pool in the same four lanes, and a freed slot goes to the
 first waiter, by the 8:4:2:1 round-robin, that can use it: one whose origin is below its limit.
@@ -244,7 +244,7 @@ or failed fetch cannot leak one.
 `gosub-sonar/<crate version>`), an optional `header_order` (applied per hop by
 `order_hop_headers` in `fetch.rs`, which also inserts `host` and `user-agent` so they can be
 placed; `host` is skipped for origins the `SlotPool` has seen on HTTP/2, via
-`NetPolicy::speaks_h2`), and a `proxy`
+`TransportPolicy::speaks_h2`), and a `proxy`
 (`proxy.rs`) that defaults to reading `HTTP_PROXY` and friends from the environment. The fetcher
 builds one `reqwest` client, which decodes no bodies. A request with `auto_decode: true` has its
 body decoded by `net::decode` (gzip, br and deflate, the codings its `Accept-Encoding` names):
@@ -365,17 +365,18 @@ it to the connection, not the request.
 
 ## Security & policy
 
-`NetPolicy` (in `fetch.rs`) is the safety hook, populated from the host via
+`NetPolicy` (in `fetch.rs`, its hooks grouped as `transport`, `cookies`, `auth`, `cache` and
+`proxy`) is the safety hook, populated from the host via
 `NetPolicy::from_context`:
 
-- **`url_allowed`** — consulted for the initial URL *and every redirect target*; the place to
-  implement SSRF guards, allow/block lists. Wired to `FetcherContext::is_url_allowed`.
-- **`cookies_for`** — supplies the `Cookie` header per origin from the host's jar, asked on
-  behalf of the request's `RequestReference` with a `CookieHop`: the hop's URL, its method, and
-  the URLs before it.
-- **`hsts`** — the [HSTS](#hsts) store, consulted to upgrade each hop and updated from each hop's
-  response. Set from `FetcherConfig::hsts` rather than `FetcherContext`; `None` disables HSTS.
-- **`cors_preflight`** — the [CORS](#cors) preflight-grant cache, consulted before sending a
+- **`transport.url_allowed`** — consulted for the initial URL *and every redirect target*; the
+  place to implement SSRF guards, allow/block lists. Wired to `FetcherContext::is_url_allowed`.
+- **`cookies.cookies_for`** — supplies the `Cookie` header per origin from the host's jar, asked
+  on behalf of the request's `RequestReference` with a `CookieHop`: the hop's URL, its method,
+  and the URLs before it.
+- **`transport.hsts`** — the [HSTS](#hsts) store, consulted to upgrade each hop and updated from
+  each hop's response. Set from `FetcherConfig::hsts` rather than `FetcherContext`; `None` disables HSTS.
+- **`cache.cors_preflight`** — the [CORS](#cors) preflight-grant cache, consulted before sending a
   preflight `OPTIONS` and updated from its response. Set from
   `FetcherConfig::cors_preflight_cache`; `None` keeps CORS enforced but preflights every time.
 
@@ -612,7 +613,7 @@ the server, so neither sonar's cache nor one on the way answers for it.
 A stale response its `stale-while-revalidate` still covers (RFC 5861 §3) is used without asking
 the server by a request with a client, as Fetch puts it: in sonar, one with an `origin`, in the
 `Default` mode, on any hop. `NetEvent::Cache` reports it as `CacheOutcome::Stale`, and the hop
-hands a `Revalidation` to `NetPolicy::revalidate_in_background`: where the revalidation starts,
+hands a `Revalidation` to `CachePolicy::revalidate_in_background`: where the revalidation starts,
 which is that hop as the redirect chain had left it at its start. Fetch revalidates with a clone
 of the request, so it carries the hop's URL, method and headers (without the ones only the user
 agent sets, which every hop works out again), the URLs before it (the `SameSite` context of the
@@ -821,12 +822,12 @@ Implemented by the host and passed to `Fetcher::new`. The bridge between schedul
   is accepted and as it ends (outstanding-work tracking per reference).
 - `is_url_allowed(url)` — URL policy hook (default: allow all).
 - `cookies_for(reference, url)` — returns the `Cookie` header value for a request hop (default:
-  none), wired into `NetPolicy::cookies_for`. `reference` is the request's, so a host with a jar
+  none), wired into `CookiePolicy::cookies_for`. `reference` is the request's, so a host with a jar
   per tab or partition answers from the right one.
 - `cookies_for_hop(reference, hop)` — the same for one `CookieHop`, which also carries the hop's
   method and the request's URL list so far: a host judging `SameSite` needs both (`Lax` only on a
   safe cross-site navigation; a detour through another site taints the rest of the chain).
-  Defaults to `cookies_for(reference, hop.url)`; this is what `NetPolicy::cookies_for` calls.
+  Defaults to `cookies_for(reference, hop.url)`; this is what `CookiePolicy::cookies_for` calls.
 - `cookie_jar_key(reference)` — which jar the cookie hooks answer `reference` from; credentialed
   requests coalesce only on the same key (default: the reference, so none share).
 - `on_cookies_received(reference, hop_url, set_cookie_values)` — called for every response carrying

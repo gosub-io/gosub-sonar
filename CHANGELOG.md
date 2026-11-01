@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `NetPolicy`'s hooks are grouped into public sub-structs, so a struct literal or
+  field access names the group: `transport` (`TransportPolicy`: `url_allowed`,
+  `allowed_bad_ports`, `hsts`, `tls_overrides`, `dns_resolver`, `on_protocol`, `speaks_h2`),
+  `cookies` (`CookiePolicy`: `cookies_for`, `on_cookies`, `cache_partition`), `auth`
+  (`AuthPolicy`: `on_auth_challenge`, `credentials`), `cache` (`CachePolicy`: `store`, formerly
+  `NetPolicy::cache`, `revalidate_in_background`, `cors_preflight`) and `proxy` (`ProxyPolicy`:
+  `proxy_authorization`, `proxy_for`, `proxied`). `user_agent` stays on `NetPolicy`. A literal
+  written as `NetPolicy { cookies_for, ..NetPolicy::default() }` reads
+  `NetPolicy { cookies: CookiePolicy { cookies_for, ..CookiePolicy::default() }, .. }`. The
+  `with_*` builders are unchanged. `cache` and `proxy` are native only
+
 ## [0.16.1] - 2026-10-17
 
 ### Fixed

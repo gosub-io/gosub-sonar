@@ -87,7 +87,7 @@ struct HopExchange {
 #[cfg(not(target_arch = "wasm32"))]
 fn cache_partition(policy: &NetPolicy, attach_credentials: bool) -> &str {
     if attach_credentials {
-        policy.cache_partition.as_str()
+        policy.cookies.cache_partition.as_str()
     } else {
         ""
     }
@@ -278,7 +278,7 @@ impl HopChain {
         #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut before_hsts: Option<Url> = None;
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ref store) = env.policy.hsts {
+        if let Some(ref store) = env.policy.transport.hsts {
             if hsts::should_upgrade(store.as_ref(), &self.url, chrono::Utc::now()) {
                 before_hsts = Some(self.url.clone());
                 let upgraded = hsts::upgrade(&self.url);
@@ -296,8 +296,8 @@ impl HopChain {
             env.init.mixed_content,
             env.init.origin.as_ref(),
             env.init.destination,
-            &env.policy.allowed_bad_ports,
-            &|u| (env.policy.url_allowed)(u),
+            &env.policy.transport.allowed_bad_ports,
+            &|u| (env.policy.transport.url_allowed)(u),
         ) {
             HopCheck::Reject(reason) => Err(blocked(env.observer, self.url.clone(), reason)),
             HopCheck::Proceed(target) => {
@@ -319,9 +319,10 @@ impl HopChain {
     /// refuses the hop like a refused name would. The returned addresses are unused.
     #[cfg(not(target_arch = "wasm32"))]
     async fn check_ip_literal(&self, env: &ChainEnv<'_>) -> Result<(), NetError> {
-        let (Some(resolver), Some(literal)) =
-            (env.policy.dns_resolver.as_ref(), ip_literal(&self.url))
-        else {
+        let (Some(resolver), Some(literal)) = (
+            env.policy.transport.dns_resolver.as_ref(),
+            ip_literal(&self.url),
+        ) else {
             return Ok(());
         };
         let refused = tokio::select! {
@@ -541,18 +542,23 @@ impl HopChain {
         // A grant made with credentials also covers the request without them
         // (Fetch, "method cache entry match"). It is judged by the credentialed
         // rules it was made under, where a `*` is a literal, not a wildcard.
-        let granted = env.policy.cors_preflight.as_ref().is_some_and(|cache| {
-            let fits = |credentialed: bool| {
-                cache
-                    .get(&serialized, &self.url, credentialed, now)
-                    .is_some_and(|allows| {
-                        allows
-                            .permits(&self.method, &unsafe_names, credentialed)
-                            .is_ok()
-                    })
-            };
-            fits(credentials_include) || (!credentials_include && fits(true))
-        });
+        let granted = env
+            .policy
+            .cache
+            .cors_preflight
+            .as_ref()
+            .is_some_and(|cache| {
+                let fits = |credentialed: bool| {
+                    cache
+                        .get(&serialized, &self.url, credentialed, now)
+                        .is_some_and(|allows| {
+                            allows
+                                .permits(&self.method, &unsafe_names, credentialed)
+                                .is_ok()
+                        })
+                };
+                fits(credentials_include) || (!credentials_include && fits(true))
+            });
         if !granted {
             let mut pf_headers = cors::preflight_request_headers(&self.method, &unsafe_names);
             if let Ok(v) = serialized.parse() {
@@ -608,12 +614,13 @@ impl HopChain {
                     .map(|()| allows)
             })
             .map_err(|e| blocked(env.observer, self.url.clone(), BlockReason::Cors(e)))?;
-            if let Some(cache) = env.policy.cors_preflight.as_ref() {
+            if let Some(cache) = env.policy.cache.cors_preflight.as_ref() {
                 cache.put(&serialized, &self.url, credentials_include, allows, now);
             }
         }
         Ok(env
             .policy
+            .cache
             .cors_preflight
             .as_ref()
             .map(|cache| PreflightGrant {
@@ -647,9 +654,11 @@ impl HopChain {
             modified(env.observer, &self.url, RequestChange::CredentialsWithheld);
         }
         if attach && !self.headers.contains_key(header::COOKIE) {
-            if let Some(cookie_str) =
-                (env.policy.cookies_for)(&CookieHop::new(&self.url, &self.method, &self.url_list))
-            {
+            if let Some(cookie_str) = (env.policy.cookies.cookies_for)(&CookieHop::new(
+                &self.url,
+                &self.method,
+                &self.url_list,
+            )) {
                 if let Ok(mut val) = cookie_str.parse::<http::HeaderValue>() {
                     val.set_sensitive(true);
                     self.headers.insert(header::COOKIE, val);
@@ -678,7 +687,7 @@ impl HopChain {
             conditional: HeaderMap::new(),
             mode: cache_mode,
         };
-        let Some(ref cache) = env.policy.cache else {
+        let Some(ref cache) = env.policy.cache.store else {
             return Ok(lookup);
         };
         let key = CacheKey::new(&self.method, &self.url).in_partition(partition);
@@ -763,7 +772,7 @@ impl HopChain {
         // next request runs on without it (Fetch: "in parallel").
         if plan.cache.stale {
             if let (Some(start), Some(from)) = (
-                env.policy.revalidate_in_background.as_ref(),
+                env.policy.cache.revalidate_in_background.as_ref(),
                 plan.revalidation.take(),
             ) {
                 start(from);
@@ -796,6 +805,7 @@ impl HopChain {
         {
             if let Some((_, credentials)) = env
                 .policy
+                .auth
                 .credentials
                 .as_ref()
                 .and_then(|store| store.upfront_for(&self.url))
@@ -832,7 +842,7 @@ impl HopChain {
                 // tag, and every later revalidation would confirm it again. The entry goes,
                 // and the hop is asked again without conditions, once.
                 if resp.status().as_u16() == 304 && entry.contradicted_by(resp.headers()) {
-                    if let Some(ref cache) = env.policy.cache {
+                    if let Some(ref cache) = env.policy.cache.store {
                         cache.invalidate(&CacheKey::new(&self.method, &self.url));
                     }
                     plan.cache.revalidating = None;
@@ -849,7 +859,7 @@ impl HopChain {
                     // The connection that confirmed the entry is where it now comes from.
                     updated.peer_addr = origin_peer(&resp, &self.url, env.policy);
                     let updated = Arc::new(updated);
-                    if let Some(ref cache) = env.policy.cache {
+                    if let Some(ref cache) = env.policy.cache.store {
                         cache.put(
                             CacheKey::new(&self.method, &self.url)
                                 .in_partition(cache_partition(env.policy, plan.attach_credentials)),
@@ -895,7 +905,13 @@ impl HopChain {
             // any server that sends the status. wasm32: the browser owns the proxy.
             #[cfg(not(target_arch = "wasm32"))]
             let proxy = (self.url.scheme() == "http")
-                .then(|| env.policy.proxy_for.as_ref().and_then(|f| f(&self.url)))
+                .then(|| {
+                    env.policy
+                        .proxy
+                        .proxy_for
+                        .as_ref()
+                        .and_then(|f| f(&self.url))
+                })
                 .flatten();
             #[cfg(target_arch = "wasm32")]
             let proxy: Option<Url> = None;
@@ -924,7 +940,7 @@ impl HopChain {
                 // What was sent to this party last time has just been rejected: drop it so
                 // the store stops handing back a password it no longer takes.
                 if let (Some(store), Some((space, _))) =
-                    (env.policy.credentials.as_ref(), slot.unproven.take())
+                    (env.policy.auth.credentials.as_ref(), slot.unproven.take())
                 {
                     store.forget(&space);
                 }
@@ -1015,7 +1031,7 @@ impl HopChain {
         // already answered a `407` for this hop, which is both the credential that was
         // actually accepted and what the client itself would defer to.
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ref proxy_authorization) = env.policy.proxy_authorization {
+        if let Some(ref proxy_authorization) = env.policy.proxy.proxy_authorization {
             if !hop_headers.contains_key(header::PROXY_AUTHORIZATION) {
                 if let Some(mut value) = proxy_authorization(&self.url) {
                     value.set_sensitive(true);
@@ -1089,7 +1105,7 @@ impl HopChain {
             request,
             env.init.header_order.as_deref(),
             env.policy.user_agent.as_ref(),
-            !(env.policy.speaks_h2)(&self.url),
+            !(env.policy.transport.speaks_h2)(&self.url),
         );
         let mut reported = request.headers().clone();
         // Only when the assembled request does not already carry one: a header set
@@ -1170,7 +1186,7 @@ impl HopChain {
         // per-origin limits also learn about intermediate origins. reqwest's wasm Response has
         // no version().
         #[cfg(not(target_arch = "wasm32"))]
-        (env.policy.on_protocol)(resp.url(), resp.version());
+        (env.policy.transport.on_protocol)(resp.url(), resp.version());
 
         // Per hop, like the other events in this loop: the first one marks
         // time-to-first-byte for the request, and a redirect chain reports each hop
@@ -1199,7 +1215,7 @@ impl HopChain {
         // a site first arms it, and that response is consumed below.
         // RFC 6797 §8.1: not from a connection the user clicked through.
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ref store) = env.policy.hsts {
+        if let Some(ref store) = env.policy.transport.hsts {
             if !over_accepted_override(env.policy, resp) {
                 hsts::record(
                     store.as_ref(),
@@ -1240,7 +1256,7 @@ impl HopChain {
     /// Drops what `hop` shows to be wrong in the cache.
     #[cfg(not(target_arch = "wasm32"))]
     fn invalidate_cache(&self, env: &ChainEnv<'_>, hop: &HopResponse, partition: &str) {
-        let Some(ref cache) = env.policy.cache else {
+        let Some(ref cache) = env.policy.cache.store else {
             return;
         };
         // A method that changed the resource makes what is stored for it wrong, including for
@@ -1489,14 +1505,14 @@ impl HopChain {
 ///   the request had already left — see [`fetch_metadata`](mod@crate::net::fetch_metadata).
 /// - Every upgrade to `https` is reported as [`NetEvent::SecurityUpgraded`], and every other
 ///   change a policy makes to a hop as [`NetEvent::RequestModified`].
-/// - `policy.url_allowed` and `policy.cookies_for` are called at every hop.
+/// - `policy.transport.url_allowed` and `policy.cookies.cookies_for` are called at every hop.
 /// - A `401`/`407` hop is re-sent with credentials from the credential store or
-///   `policy.on_auth_challenge` (see [`auth`](mod@crate::net::auth)); only a response that is
+///   `policy.auth.on_auth_challenge` (see [`auth`](mod@crate::net::auth)); only a response that is
 ///   not a challenge continues through the chain.
-/// - `Set-Cookie` values on 3xx responses are reported via `policy.on_cookies` and the jar is
+/// - `Set-Cookie` values on 3xx responses are reported via `policy.cookies.on_cookies` and the jar is
 ///   re-queried for the next hop; the final response's cookies are the caller's responsibility.
 /// - CORS is enforced per hop when `init.origin` is set — the same-origin/no-cors mode rules
-///   before sending, a preflight (with `policy.cors_preflight` as its cache) when the method or
+///   before sending, a preflight (with `policy.cache.cors_preflight` as its cache) when the method or
 ///   headers need one, and the CORS check on every response of a cors-tainted chain. The chain's
 ///   final [`ResponseTainting`] is returned beside the response — see
 ///   [`cors`](mod@crate::net::cors).
@@ -1521,8 +1537,8 @@ pub(super) async fn get_with_redirects(
         credentials_include: init.credentials == RequestCredentials::Include,
         #[cfg(not(target_arch = "wasm32"))]
         background: init.origin.is_some()
-            && policy.cache.is_some()
-            && policy.revalidate_in_background.is_some(),
+            && policy.cache.store.is_some()
+            && policy.cache.revalidate_in_background.is_some(),
         #[cfg(not(target_arch = "wasm32"))]
         resumed,
     };
@@ -1587,7 +1603,7 @@ pub(super) async fn get_with_redirects(
         // worth keeping and is stored right away, while the final response's write waits for the
         // reader of its body.
         #[cfg(not(target_arch = "wasm32"))]
-        let pending_store = match (&hop, policy.cache.as_ref()) {
+        let pending_store = match (&hop, policy.cache.store.as_ref()) {
             // `no-store` is both directions: the lookup above skipped the cache, and nothing
             // about this exchange is written to it either.
             (HopResponse::Network(resp), Some(cache))

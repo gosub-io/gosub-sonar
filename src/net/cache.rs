@@ -26,7 +26,7 @@
 //!   a client (one with an origin) in the default mode at once, on any hop, and is revalidated
 //!   in the background, from that hop as the redirect chain had left it ([`CacheDecision::UseStale`], [`CacheOutcome::Stale`]).
 //!   The [`Fetcher`] does that with a request of its own; see
-//!   [`NetPolicy::revalidate_in_background`].
+//!   [`CachePolicy::revalidate_in_background`].
 //!
 //! Not implemented: shared-cache rules (`s-maxage`, the `Authorization` restriction of §3.5, since
 //! this is a private cache), and range requests and `206` responses. A request that carries a
@@ -39,7 +39,7 @@
 //!
 //! [`FetcherConfig::cache`]: crate::net::fetcher::FetcherConfig::cache
 //! [`Fetcher`]: crate::net::fetcher::Fetcher
-//! [`NetPolicy::revalidate_in_background`]: crate::net::fetch::NetPolicy::revalidate_in_background
+//! [`CachePolicy::revalidate_in_background`]: crate::net::fetch::CachePolicy::revalidate_in_background
 //! [`FetchRequest::cache_mode`]: crate::net::types::FetchRequest::cache_mode
 
 use crate::net::utils::split_outside_quotes;
