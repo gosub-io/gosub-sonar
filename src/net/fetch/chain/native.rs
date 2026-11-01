@@ -6,17 +6,19 @@ use super::HopChain;
 use crate::net::cache::{self, CacheDecision, CacheEntry, CacheKey, CacheMode, CacheOutcome};
 use crate::net::cors::{self, ResponseTainting};
 use crate::net::events::NetEvent;
+use crate::net::fetch::platform::{
+    ip_literal, order_hop_headers, over_accepted_override, without_forbidden, PreflightGrant,
+    NO_CLIENT_DEADLINE,
+};
 use crate::net::fetch::{
-    blocked, ip_literal, order_hop_headers, origin_peer, over_accepted_override, report_set_cookie,
-    send_error, without_forbidden, HopResponse, NetPolicy, PendingStore, PreflightGrant,
-    RequestInit, Revalidation, NO_CLIENT_DEADLINE,
+    blocked, origin_peer, report_set_cookie, send_error, HopResponse, NetPolicy, PendingStore,
+    RequestInit, Revalidation,
 };
 use crate::net::fetch_metadata::{self, RequestMode, SecFetchSite};
 use crate::net::hsts;
 use crate::net::observer::NetObserver;
 use crate::net::transport::TransportError;
 use crate::net::types::{BlockReason, NetError, RequestCredentials, UpgradeReason};
-use bytes::Bytes;
 use http::{header, HeaderMap, Method};
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
@@ -139,16 +141,6 @@ struct CacheLookup {
     conditional: HeaderMap,
     // The mode as Fetch handles it: a caller's own condition turns `Default` into `NoStore`.
     mode: CacheMode,
-}
-
-/// A redirect's response is stored when the redirect is followed.
-pub(super) fn store_redirect(
-    store: Option<PendingStore>,
-    observer: &Arc<dyn NetObserver + Send + Sync>,
-) {
-    if let Some(store) = store {
-        store.commit(Bytes::new(), observer);
-    }
 }
 
 impl HopChain {

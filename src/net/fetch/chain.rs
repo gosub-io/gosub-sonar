@@ -20,6 +20,7 @@ use crate::net::types::{
     BlockReason, NetError, RequestBody, RequestChange, RequestCredentials, UpgradeReason,
 };
 use anyhow::anyhow;
+use bytes::Bytes;
 use http::{header, HeaderMap, Method};
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -1000,7 +1001,6 @@ pub(super) async fn get_with_redirects(
                 method: chain.method,
                 tainting: chain.tainting,
                 peer_addr,
-                #[cfg(not(target_arch = "wasm32"))]
                 store: pending_store,
             });
         }
@@ -1015,7 +1015,9 @@ pub(super) async fn get_with_redirects(
 
         // A redirect is stored now: the caller never sees its body, and a stored `301` lets the
         // next fetch skip the hop entirely.
-        platform::store_redirect(pending_store, &observer);
+        if let Some(store) = pending_store {
+            store.commit(Bytes::new(), &observer);
+        }
 
         chain.follow_redirect(&env, &hop, attach_credentials)?;
     }

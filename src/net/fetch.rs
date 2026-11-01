@@ -2,11 +2,11 @@
 
 use crate::net::auth::{AuthChallenge, CredentialStore, Credentials, ProtectionSpace};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::net::cache::{self, CacheKey, CacheOutcome, HttpCache};
+use crate::net::cache::HttpCache;
 use crate::net::cache::{CacheEntry, CacheMode};
-use crate::net::cors::ResponseTainting;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::net::cors::{self, CorsPreflightCache};
+use crate::net::cors::CorsPreflightCache;
+use crate::net::cors::ResponseTainting;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::net::dns::DnsResolver;
 use crate::net::events::NetEvent;
@@ -41,6 +41,11 @@ use tokio_util::sync::CancellationToken;
 use url::{Origin, Url};
 
 mod chain;
+#[cfg_attr(not(target_arch = "wasm32"), path = "fetch/native.rs")]
+#[cfg_attr(target_arch = "wasm32", path = "fetch/wasm.rs")]
+mod platform;
+
+use platform::{origin_peer, CacheCollector, PendingStore};
 
 use chain::get_with_redirects;
 
@@ -149,16 +154,6 @@ fn modified(observer: &Arc<dyn NetObserver + Send + Sync>, url: &Url, change: Re
     });
 }
 
-/// The host of `url` when it is an IP literal, without brackets.
-#[cfg(not(target_arch = "wasm32"))]
-fn ip_literal(url: &Url) -> Option<String> {
-    match url.host()? {
-        url::Host::Ipv4(a) => Some(a.to_string()),
-        url::Host::Ipv6(a) => Some(a.to_string()),
-        url::Host::Domain(_) => None,
-    }
-}
-
 /// Hand a response's `Set-Cookie` values to the policy's jar. Returns whether there were any.
 /// A value is read as UTF-8, the way browsers read cookies, not as visible ASCII only: a
 /// non-ASCII cookie value is common and valid, and `to_str` would drop it. Bytes that are not
@@ -174,22 +169,6 @@ fn report_set_cookie(policy: &NetPolicy, url: &Url, headers: &HeaderMap) -> bool
     }
     (policy.cookies.on_cookies)(url, &values);
     true
-}
-
-/// Whether `resp`'s connection was accepted through the override store. Needs a client built
-/// with `tls_info`, which the fetcher does when overrides are enabled.
-#[cfg(not(target_arch = "wasm32"))]
-fn over_accepted_override(policy: &NetPolicy, resp: &reqwest::Response) -> bool {
-    let (Some(store), Some(host)) = (
-        policy.transport.tls_overrides.as_ref(),
-        resp.url().host_str(),
-    ) else {
-        return false;
-    };
-    resp.extensions()
-        .get::<reqwest::tls::TlsInfo>()
-        .and_then(|info| info.peer_certificate())
-        .is_some_and(|der| store.is_accepted(host, &crate::net::tls::fingerprint(der)))
 }
 
 /// The text of a `Location` header. Servers send non-ASCII targets as UTF-8; anything that is
@@ -271,35 +250,6 @@ impl AuthSlot {
                 store.store(space.clone(), credentials);
                 store.accepted_at(&space, url);
             }
-        }
-    }
-}
-
-/// A preflight grant a hop is relying on, dropped from the cache unless the hop's response
-/// passes its CORS check (Fetch §4.4, main fetch: "If corsWithPreflightResponse is a network
-/// error, then clear cache entries using request"). Every way a hop can fail after its grant
-/// returns early, so the drop is what catches them all.
-#[cfg(not(target_arch = "wasm32"))]
-struct PreflightGrant {
-    cache: Arc<dyn CorsPreflightCache>,
-    origin: String,
-    url: Url,
-    kept: bool,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl PreflightGrant {
-    /// The hop's response passed: the grant stays cached.
-    fn keep(mut self) {
-        self.kept = true;
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Drop for PreflightGrant {
-    fn drop(&mut self) {
-        if !self.kept {
-            self.cache.clear(&self.origin, &self.url);
         }
     }
 }
@@ -393,18 +343,6 @@ impl Revalidation {
             self.redirects
         )
     }
-}
-
-/// `headers` without the forbidden request headers (Fetch §2.2.2).
-#[cfg(not(target_arch = "wasm32"))]
-fn without_forbidden(headers: &HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for (name, value) in headers {
-        if !cors::is_forbidden_request_header_value(name, value) {
-            out.append(name.clone(), value.clone());
-        }
-    }
-    out
 }
 
 /// Network-level request policies threaded through the fetch stack.
@@ -972,85 +910,11 @@ impl RequestInit {
     }
 }
 
-/// Reorder `headers` so the names in `order` come first (all values of a name together), with
-/// the remaining headers after them in insertion order. Names without a header are skipped;
-/// duplicates in `order` count once. hyper writes headers in map order, so this is the wire
-/// order.
-#[cfg(not(target_arch = "wasm32"))]
-fn apply_header_order(headers: &mut HeaderMap, order: &[HeaderName]) {
-    if order.is_empty() {
-        return;
-    }
-    let original = std::mem::take(headers);
-    let mut ordered = HeaderMap::with_capacity(original.len());
-    for name in order {
-        if ordered.contains_key(name) {
-            continue;
-        }
-        for value in original.get_all(name) {
-            ordered.append(name.clone(), value.clone());
-        }
-    }
-    for (name, value) in original.iter() {
-        if !order.contains(name) {
-            ordered.append(name.clone(), value.clone());
-        }
-    }
-    *headers = ordered;
-}
-
-/// The `Host` value hyper-util would add for `url`: host, plus the port if not the default.
-#[cfg(not(target_arch = "wasm32"))]
-fn host_header_value(url: &Url) -> Option<http::HeaderValue> {
-    let host = url.host_str()?;
-    let value = match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    };
-    http::HeaderValue::from_str(&value).ok()
-}
-
-/// Apply `order` to the request's headers. No-op when `order` is `None`.
-///
-/// reqwest appends the default `user-agent` and hyper-util the `host` at execute time, after
-/// anything we can reorder, so both are inserted here (if absent) with the values they would
-/// get. `host` only when `place_host`: hyper-util adds it on HTTP/1 connections only, and we
-/// don't know the connection yet, so the caller decides from what it has seen of the origin.
-#[cfg(not(target_arch = "wasm32"))]
-fn order_hop_headers(
-    mut request: reqwest::Request,
-    order: Option<&[HeaderName]>,
-    user_agent: Option<&http::HeaderValue>,
-    place_host: bool,
-) -> reqwest::Request {
-    let Some(order) = order else {
-        return request;
-    };
-    let host = if place_host {
-        host_header_value(request.url())
-    } else {
-        None
-    };
-    let headers = request.headers_mut();
-    if let Some(ua) = user_agent {
-        headers.entry(header::USER_AGENT).or_insert(ua.clone());
-    }
-    if let Some(host) = host {
-        headers.entry(header::HOST).or_insert(host);
-    }
-    apply_header_order(headers, order);
-    request
-}
-
 /// Peek buffer size (first bytes of body). Used for detecting mime type
 const PEEK_MAX: usize = 5 * 1024;
 /// Maximum number of redirects allowed
 const MAX_REDIRECTS: usize = 20;
 
-/// The client's timeout for a request whose [`RequestInit::headers_timeout`] bounds the wait
-/// for headers instead: long enough never to end a body, which its own timeouts bound.
-#[cfg(not(target_arch = "wasm32"))]
-const NO_CLIENT_DEADLINE: Duration = Duration::from_secs(365 * 24 * 3600);
 /// Ceiling on the body buffer pre-allocation. Content-Length is server-controlled, so we never
 /// allocate more than this up front; larger honest bodies grow the buffer as bytes arrive.
 const MAX_PREALLOC: usize = 1024 * 1024;
@@ -1139,7 +1003,6 @@ async fn fetch_response_top_inner(
     let (read_idle_timeout, total_body_timeout) = (init.read_idle_timeout, init.total_body_timeout);
     let max_bytes = init.max_bytes;
     // On wasm32 the browser decodes bodies before they get here.
-    #[cfg(not(target_arch = "wasm32"))]
     let auto_decode = init.auto_decode;
     observer.on_event(NetEvent::Started { url: url.clone() });
     if url_credentials_removed {
@@ -1168,7 +1031,6 @@ async fn fetch_response_top_inner(
         method,
         tainting,
         peer_addr,
-        #[cfg(not(target_arch = "wasm32"))]
         store,
     } = outcome;
     // The body's budget starts now that the final response's headers are in.
@@ -1261,22 +1123,8 @@ async fn fetch_response_top_inner(
     // `Content-Encoding` and `Content-Length` that described the coded bytes: the caller gets
     // the decoded ones, of a length not known until they are read. A body with a coding that
     // cannot be undone keeps both, and its bytes.
-    #[cfg(not(target_arch = "wasm32"))]
-    let codings = if auto_decode && !bodiless {
-        crate::net::decode::codings(&headers).filter(|c| !c.is_empty())
-    } else {
-        None
-    };
-    #[cfg(not(target_arch = "wasm32"))]
-    let (headers, content_length) = match codings {
-        Some(_) => {
-            let mut headers = headers;
-            headers.remove(header::CONTENT_ENCODING);
-            headers.remove(header::CONTENT_LENGTH);
-            (headers, None)
-        }
-        None => (headers, content_length),
-    };
+    let (codings, headers, content_length) =
+        platform::decoding(auto_decode, bodiless, headers, content_length);
 
     // Response is received, setup our meta structure
     let mut meta = FetchResultMeta {
@@ -1310,13 +1158,7 @@ async fn fetch_response_top_inner(
     let body_stream = resp
         .bytes_stream()
         .map_err(|e| NetError::Transport(TransportError::from_client(&e)));
-    #[cfg(not(target_arch = "wasm32"))]
-    let mut body_stream = match codings {
-        Some(codings) => crate::net::decode::decode(body_stream.boxed(), codings),
-        None => body_stream.boxed(),
-    };
-    #[cfg(target_arch = "wasm32")]
-    let mut body_stream = body_stream;
+    let mut body_stream = platform::decode(body_stream, codings);
     let mut received_net: u64 = 0;
     let mut peek_buf_vec: Vec<u8> = Vec::with_capacity(PEEK_MAX);
     let mut excess: Option<Bytes> = None;
@@ -1416,22 +1258,10 @@ async fn fetch_response_top_inner(
     //  |--- Peek buffer ---|---- Excess buffer ----| ---- body stream ----|
     //                                              ^ stream starts here
     //                      ^  new body stream "rereads" the excess buffer and starts here
-    // boxed() demands a `Send` stream; reqwest's wasm body stream is `!Send` (single thread).
-    #[cfg(not(target_arch = "wasm32"))]
     let body_stream = if let Some(ex) = excess {
-        stream::once(async move { Ok::<Bytes, NetError>(ex) })
-            .chain(body_stream)
-            .boxed()
+        platform::boxed(stream::once(async move { Ok::<Bytes, NetError>(ex) }).chain(body_stream))
     } else {
-        body_stream.boxed()
-    };
-    #[cfg(target_arch = "wasm32")]
-    let body_stream = if let Some(ex) = excess {
-        stream::once(async move { Ok::<Bytes, NetError>(ex) })
-            .chain(body_stream)
-            .boxed_local()
-    } else {
-        body_stream.boxed_local()
+        platform::boxed(body_stream)
     };
 
     // Capture only when the observer asked for one, up to the limit it gave. It sees the
@@ -1441,28 +1271,14 @@ async fn fetch_response_top_inner(
     // The peek window is handed over separately and read first, so it is seeded into the
     // capture as the body's opening bytes; the wrapper copies the remainder as the consumer
     // pulls it.
-    #[cfg(not(target_arch = "wasm32"))]
     let body_stream = match observer.body_capture_limit(&meta.headers, meta.content_length) {
-        Some(limit) => crate::net::body_capture::CapturingBody::new(
+        Some(limit) => platform::boxed(crate::net::body_capture::CapturingBody::new(
             body_stream,
             observer.clone(),
             meta.final_url.clone(),
             limit,
             &peek_buf_vec,
-        )
-        .boxed(),
-        None => body_stream,
-    };
-    #[cfg(target_arch = "wasm32")]
-    let body_stream = match observer.body_capture_limit(&meta.headers, meta.content_length) {
-        Some(limit) => crate::net::body_capture::CapturingBody::new(
-            body_stream,
-            observer.clone(),
-            meta.final_url.clone(),
-            limit,
-            &peek_buf_vec,
-        )
-        .boxed_local(),
+        )),
         None => body_stream,
     };
 
@@ -1498,7 +1314,6 @@ async fn fetch_response_top_inner(
     );
     // A response the cache accepted is copied as the caller reads it, and written when the body
     // is complete. A body already known to be too large is not collected at all.
-    #[cfg(not(target_arch = "wasm32"))]
     let progress_reader = progress_reader.with_cache(store.and_then(|store| {
         let too_large = meta
             .content_length
@@ -1512,62 +1327,6 @@ async fn fetch_response_top_inner(
         body_deadline,
         reader: Box::new(progress_reader),
     })
-}
-
-/// Copies a body on its way to the caller so it can be written to the cache when the stream ends.
-///
-/// Only a complete body is stored. A fetch that is cancelled, fails, or is dropped mid-stream
-/// drops the collector instead, and one that grows past the cache's ceiling drops the pending
-/// write and stops copying.
-#[cfg(not(target_arch = "wasm32"))]
-struct CacheCollector {
-    /// The write to perform on EOF. Taken away when the body turns out to be too large.
-    store: Option<PendingStore>,
-    /// Body bytes so far, starting with the peek window the caller already read.
-    body: BytesMut,
-    /// Ceiling from [`HttpCache::max_entry_bytes`].
-    limit: usize,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl CacheCollector {
-    /// Collector for `store`, seeded with the bytes read before the reader was built.
-    fn new(store: PendingStore, prefix: &[u8]) -> Self {
-        let limit = store.max_bytes();
-        let mut body = BytesMut::with_capacity(prefix.len());
-        body.extend_from_slice(prefix);
-        let mut collector = Self {
-            store: Some(store),
-            body,
-            limit,
-        };
-        collector.enforce_limit();
-        collector
-    }
-
-    /// Record bytes handed to the caller.
-    fn feed(&mut self, chunk: &[u8]) {
-        if self.store.is_none() {
-            return;
-        }
-        self.body.extend_from_slice(chunk);
-        self.enforce_limit();
-    }
-
-    /// Give up on a body the cache would refuse anyway, and stop holding it in memory.
-    fn enforce_limit(&mut self) {
-        if self.body.len() > self.limit {
-            self.store = None;
-            self.body = BytesMut::new();
-        }
-    }
-
-    /// Write the complete body to the cache.
-    fn commit(&mut self, observer: &Arc<dyn NetObserver + Send + Sync>) {
-        if let Some(store) = self.store.take() {
-            store.commit(std::mem::take(&mut self.body).freeze(), observer);
-        }
-    }
 }
 
 /// Progres reader is a simple stream that will wrap another AsyncRead stream, and emit progress
@@ -1598,7 +1357,6 @@ struct ProgressReader<R> {
     /// Whether we already emitted a failed event (a reader may be polled again after an error)
     failed_emitted: bool,
     /// Copies the body for the HTTP cache, when this response is one that may be stored.
-    #[cfg(not(target_arch = "wasm32"))]
     cache: Option<CacheCollector>,
 }
 
@@ -1624,13 +1382,11 @@ impl<R: AsyncRead + Unpin> ProgressReader<R> {
             cancel_emitted: false,
             finished_emitted: false,
             failed_emitted: false,
-            #[cfg(not(target_arch = "wasm32"))]
             cache: None,
         }
     }
 
     /// Collect the body for the HTTP cache as it is read.
-    #[cfg(not(target_arch = "wasm32"))]
     fn with_cache(mut self, collector: Option<CacheCollector>) -> Self {
         self.cache = collector;
         self
@@ -1711,12 +1467,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
             if read_bytes == 0 && !self.finished_emitted {
                 self.finished_emitted = true;
                 // The body is complete, so a response waiting to be cached can be written.
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    let observer = self.observer.clone();
-                    if let Some(collector) = self.cache.as_mut() {
-                        collector.commit(&observer);
-                    }
+                let observer = self.observer.clone();
+                if let Some(collector) = self.cache.as_mut() {
+                    collector.commit(&observer);
                 }
                 self.observer.on_event(NetEvent::Finished {
                     received_bytes: self.received,
@@ -1726,7 +1479,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for ProgressReader<R> {
             }
             if read_bytes > 0 {
                 self.last_activity = Instant::now();
-                #[cfg(not(target_arch = "wasm32"))]
                 if let Some(collector) = self.cache.as_mut() {
                     let filled = buf.filled();
                     collector.feed(&filled[pre_len..new_len]);
@@ -1889,26 +1641,9 @@ fn send_error(
     observer: &Arc<dyn NetObserver + Send + Sync>,
     policy: &NetPolicy,
 ) -> NetError {
-    #[cfg(not(target_arch = "wasm32"))]
-    if let Some(tls) = crate::net::tls::classify(&e, url) {
-        observer.on_event(NetEvent::TlsFailed {
-            url: url.clone(),
-            error: tls.clone(),
-        });
-        return NetError::Tls(tls);
+    if let Some(err) = platform::classify_send_error(&e, url, observer, policy) {
+        return err;
     }
-    // Without a proxy to name, the tunnel failure stays a connect failure.
-    #[cfg(not(target_arch = "wasm32"))]
-    if crate::net::transport::is_proxy_auth_required(&e) {
-        if let Some(proxy) = policy.proxy.proxy_for.as_ref().and_then(|f| f(url)) {
-            return NetError::ProxyAuthRequired {
-                proxy: Arc::new(proxy),
-                url: url.clone(),
-            };
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    let _ = (url, observer, policy);
     let mut err = TransportError::from_client(&e);
     err.message = format!("{what}: {}", err.message);
     NetError::Transport(err)
@@ -1953,74 +1688,6 @@ impl HopResponse {
     }
 }
 
-/// The peer `resp` was read from, as [`FetchResultMeta::peer_addr`] reports it: `None` when
-/// the request to `url` went through a proxy, whose address says nothing about the host's, or
-/// when the policy cannot say whether it did.
-fn origin_peer(
-    resp: &reqwest::Response,
-    url: &Url,
-    policy: &NetPolicy,
-) -> Option<std::net::SocketAddr> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        match policy.proxy.proxied {
-            Some(ref proxied) if !proxied(url) => resp.remote_addr(),
-            _ => None,
-        }
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (resp, url, policy);
-        None
-    }
-}
-
-/// A storable response whose body has not been read yet.
-///
-/// `get_with_redirects` decides whether a response may be cached from its headers, but the body
-/// only arrives later, in whichever consumer reads it. This carries that decision until then;
-/// dropping it (a cancelled fetch, a body over the cache's ceiling) stores nothing.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) struct PendingStore {
-    cache: Arc<dyn HttpCache>,
-    key: CacheKey,
-    url: Url,
-    status: u16,
-    response_headers: HeaderMap,
-    request_headers: HeaderMap,
-    decoded: bool,
-    requested_at: chrono::DateTime<chrono::Utc>,
-    received_at: chrono::DateTime<chrono::Utc>,
-    peer_addr: Option<std::net::SocketAddr>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl PendingStore {
-    /// Largest body the cache behind this will accept.
-    pub(crate) fn max_bytes(&self) -> usize {
-        self.cache.max_entry_bytes()
-    }
-
-    /// Write the response to the cache now that its body is complete.
-    pub(crate) fn commit(self, body: Bytes, observer: &Arc<dyn NetObserver + Send + Sync>) {
-        let mut entry = cache::entry_from_response(
-            self.status,
-            &self.response_headers,
-            &self.request_headers,
-            body,
-            self.decoded,
-            self.requested_at,
-            self.received_at,
-        );
-        entry.peer_addr = self.peer_addr;
-        self.cache.put(self.key, Arc::new(entry));
-        observer.on_event(NetEvent::Cache {
-            url: self.url,
-            outcome: CacheOutcome::Stored,
-        });
-    }
-}
-
 /// What a whole redirect chain came to.
 pub(crate) struct ChainOutcome {
     /// The first response that was not a redirect.
@@ -2034,7 +1701,6 @@ pub(crate) struct ChainOutcome {
     /// Where that response came from — see [`FetchResultMeta::peer_addr`].
     pub(crate) peer_addr: Option<std::net::SocketAddr>,
     /// Set when that response may be cached once its body has been read.
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) store: Option<PendingStore>,
 }
 
@@ -2072,6 +1738,7 @@ mod tests {
     use super::*;
 
     use crate::net::auth::{AuthScheme, AuthTarget, InMemoryCredentialStore, MAX_AUTH_ATTEMPTS};
+    use crate::net::cache::CacheOutcome;
     use crate::net::referrer::ReferrerPolicy;
     use crate::net::test_support::{CacheRouteOptions, RecordingObserver, RouteConfig, TestServer};
     use crate::net::types::UpgradeReason;
@@ -2099,7 +1766,7 @@ mod tests {
         headers.insert(header::HOST, "example.org".parse().unwrap());
         headers.insert("x-c", "3".parse().unwrap());
 
-        super::apply_header_order(&mut headers, &[header::HOST, header::ACCEPT]);
+        super::platform::apply_header_order(&mut headers, &[header::HOST, header::ACCEPT]);
 
         assert_eq!(names(&headers), ["host", "accept", "x-a", "x-b", "x-c"]);
         assert_eq!(headers[header::HOST], "example.org");
@@ -2115,7 +1782,7 @@ mod tests {
         headers.append("x-b", "2".parse().unwrap());
         headers.append(header::COOKIE, "b=2".parse().unwrap());
 
-        super::apply_header_order(&mut headers, &[header::COOKIE]);
+        super::platform::apply_header_order(&mut headers, &[header::COOKIE]);
 
         let cookies: Vec<_> = headers
             .get_all(header::COOKIE)
@@ -2133,7 +1800,7 @@ mod tests {
         headers.insert("x-a", "1".parse().unwrap());
         headers.insert("x-b", "2".parse().unwrap());
 
-        super::apply_header_order(
+        super::platform::apply_header_order(
             &mut headers,
             &[
                 header::HOST,
@@ -2152,7 +1819,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-b", "2".parse().unwrap());
         headers.insert("x-a", "1".parse().unwrap());
-        super::apply_header_order(&mut headers, &[]);
+        super::platform::apply_header_order(&mut headers, &[]);
         assert_eq!(names(&headers), ["x-b", "x-a"]);
     }
 
@@ -2173,7 +1840,8 @@ mod tests {
     fn order_hop_headers_adds_host_and_user_agent() {
         let ua = http::HeaderValue::from_static("ua/1");
         let order = [header::HOST, header::USER_AGENT, header::ACCEPT];
-        let request = super::order_hop_headers(hop_request(), Some(&order), Some(&ua), true);
+        let request =
+            super::platform::order_hop_headers(hop_request(), Some(&order), Some(&ua), true);
         assert_eq!(
             names(request.headers()),
             ["host", "user-agent", "accept", "x-a"]
@@ -2187,7 +1855,8 @@ mod tests {
     fn order_hop_headers_no_host_for_h2_origin() {
         let ua = http::HeaderValue::from_static("ua/1");
         let order = [header::HOST, header::USER_AGENT, header::ACCEPT];
-        let request = super::order_hop_headers(hop_request(), Some(&order), Some(&ua), false);
+        let request =
+            super::platform::order_hop_headers(hop_request(), Some(&order), Some(&ua), false);
         assert_eq!(names(request.headers()), ["user-agent", "accept", "x-a"]);
         assert!(!request.headers().contains_key(header::HOST));
     }
@@ -2204,7 +1873,7 @@ mod tests {
             .headers_mut()
             .insert(header::HOST, "other.example".parse().unwrap());
         let order = [header::HOST, header::USER_AGENT];
-        let request = super::order_hop_headers(request, Some(&order), Some(&ua), true);
+        let request = super::platform::order_hop_headers(request, Some(&order), Some(&ua), true);
         assert_eq!(
             names(request.headers()),
             ["host", "user-agent", "x-a", "accept"]
@@ -2217,7 +1886,7 @@ mod tests {
     #[test]
     fn order_hop_headers_none_is_noop() {
         let ua = http::HeaderValue::from_static("ua/1");
-        let request = super::order_hop_headers(hop_request(), None, Some(&ua), true);
+        let request = super::platform::order_hop_headers(hop_request(), None, Some(&ua), true);
         assert_eq!(names(request.headers()), ["x-a", "accept"]);
     }
 
@@ -2225,7 +1894,7 @@ mod tests {
     #[test]
     fn host_header_value_port_handling() {
         let host = |u: &str| {
-            super::host_header_value(&Url::parse(u).unwrap())
+            super::platform::host_header_value(&Url::parse(u).unwrap())
                 .map(|v| v.to_str().unwrap().to_string())
         };
         assert_eq!(host("https://example.org/").as_deref(), Some("example.org"));
