@@ -7,20 +7,11 @@ use super::{
     ChainOutcome, HopCheck, HopResponse, NetPolicy, RequestInit, MAX_REDIRECTS, REFERRER_POLICY,
     SENSITIVE_REDIRECT_HEADERS,
 };
-#[cfg(not(target_arch = "wasm32"))]
-use super::{
-    ip_literal, order_hop_headers, over_accepted_override, without_forbidden, PendingStore,
-    PreflightGrant, Revalidation, NO_CLIENT_DEADLINE,
-};
 use crate::net::auth::{self, AuthTarget, MAX_AUTH_ATTEMPTS};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::net::cache::{self, CacheDecision, CacheEntry, CacheKey, CacheMode, CacheOutcome};
 use crate::net::cors::{self, CorsError, ResponseTainting};
 use crate::net::events::NetEvent;
 use crate::net::fetch_metadata::{self, RequestMode, SecFetchSite};
 use crate::net::fetcher_context::CookieHop;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::net::hsts;
 use crate::net::mixed_content::{self, MixedContentAction};
 use crate::net::observer::NetObserver;
 use crate::net::referrer::{self, ReferrerPolicy};
@@ -29,69 +20,17 @@ use crate::net::types::{
     BlockReason, NetError, RequestBody, RequestChange, RequestCredentials, UpgradeReason,
 };
 use anyhow::anyhow;
-#[cfg(not(target_arch = "wasm32"))]
-use bytes::Bytes;
 use http::{header, HeaderMap, Method};
+use std::ops::ControlFlow;
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::{Origin, Url};
 
-/// What every hop of a chain is fetched with.
-struct ChainEnv<'a> {
-    client: &'a reqwest::Client,
-    // Without the method, headers, body and revalidation: those went into the `HopChain`.
-    init: &'a RequestInit,
-    cancel: &'a CancellationToken,
-    observer: &'a Arc<dyn NetObserver + Send + Sync>,
-    policy: &'a NetPolicy,
-    // The credentialed CORS rules key on the request's credentials *mode*, not on whether
-    // cookies were actually attached on a given hop. Only the native checks consult it — on
-    // wasm32 the browser enforces the credentialed rules itself.
-    #[cfg(not(target_arch = "wasm32"))]
-    credentials_include: bool,
-    // Whether a hop may be answered stale and revalidated behind it: only for a request with a
-    // client (Fetch, HTTP-network-or-cache fetch), one with an origin here, and only with
-    // something to revalidate it.
-    #[cfg(not(target_arch = "wasm32"))]
-    background: bool,
-    // The chain is a background revalidation.
-    #[cfg(not(target_arch = "wasm32"))]
-    resumed: bool,
-}
+#[cfg_attr(not(target_arch = "wasm32"), path = "chain/native.rs")]
+#[cfg_attr(target_arch = "wasm32", path = "chain/wasm.rs")]
+mod platform;
 
-/// What the stages before a hop's send worked out for it.
-struct HopPlan {
-    attach_credentials: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    cache: CacheLookup,
-    #[cfg(not(target_arch = "wasm32"))]
-    preflight: Option<PreflightGrant>,
-    // Where a background revalidation of this hop would start, if it may have one.
-    #[cfg(not(target_arch = "wasm32"))]
-    revalidation: Option<Revalidation>,
-}
-
-/// The response a hop got, and when it was asked for and received, for the age of a cache entry
-/// made from it (RFC 9111 §4.2.3).
-struct HopExchange {
-    response: HopResponse,
-    #[cfg(not(target_arch = "wasm32"))]
-    requested_at: chrono::DateTime<chrono::Utc>,
-    #[cfg(not(target_arch = "wasm32"))]
-    received_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// The cache partition of a hop: one that carries a jar's cookies is cached for that jar alone.
-#[cfg(not(target_arch = "wasm32"))]
-fn cache_partition(policy: &NetPolicy, attach_credentials: bool) -> &str {
-    if attach_credentials {
-        policy.cookies.cache_partition.as_str()
-    } else {
-        ""
-    }
-}
+use platform::{ChainEnv, HopExchange, HopPlan, Timing};
 
 /// The request as its redirect chain carries it from hop to hop: what a redirect changes, and
 /// what each hop works out from the ones before it.
@@ -129,20 +68,6 @@ struct HopChain {
     redirects: usize,
     // Armed by the first redirect; `None` until then, and for good without a budget.
     redirect_deadline: Option<tokio::time::Instant>,
-}
-
-/// What the cache makes of a hop before it is sent.
-#[cfg(not(target_arch = "wasm32"))]
-struct CacheLookup {
-    // A stored response that answers the hop without a request.
-    hit: Option<Arc<CacheEntry>>,
-    // `hit` is stale, and revalidated behind the hop.
-    stale: bool,
-    // The entry the conditional headers revalidate.
-    revalidating: Option<Arc<CacheEntry>>,
-    conditional: HeaderMap,
-    // The mode as Fetch handles it: a caller's own condition turns `Default` into `NoStore`.
-    mode: CacheMode,
 }
 
 impl HopChain {
@@ -246,24 +171,6 @@ impl HopChain {
         Ok(chain)
     }
 
-    /// Where a background revalidation of this hop would start: the chain as it stands before
-    /// the hop does anything.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn revalidation(&self) -> Revalidation {
-        Revalidation {
-            url: self.url.clone(),
-            method: self.method.clone(),
-            headers: without_forbidden(&self.headers),
-            url_list: self.url_list.clone(),
-            referrer: self.referrer.clone(),
-            referrer_policy: self.referrer_policy,
-            site: self.site,
-            origin_tainted: self.origin_tainted,
-            tainting: self.tainting,
-            redirects: self.redirects,
-        }
-    }
-
     /// HSTS upgrade first: a stored policy forces `https` for a known host regardless of the
     /// mixed-content setting. `hop_checks` then re-checks the scheme and mixed content on the
     /// (possibly upgraded) URL and runs `url_allowed` last, so the policy hook always vets the
@@ -275,21 +182,7 @@ impl HopChain {
     /// `https` document linking to `http://` is a downgrade for the referrer even when HSTS then
     /// sends the request over TLS.
     fn secure_url(&mut self, env: &ChainEnv<'_>) -> Result<Option<Url>, NetError> {
-        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
-        let mut before_hsts: Option<Url> = None;
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ref store) = env.policy.transport.hsts {
-            if hsts::should_upgrade(store.as_ref(), &self.url, chrono::Utc::now()) {
-                before_hsts = Some(self.url.clone());
-                let upgraded = hsts::upgrade(&self.url);
-                env.observer.on_event(NetEvent::SecurityUpgraded {
-                    from: self.url.clone(),
-                    to: upgraded.clone(),
-                    reason: UpgradeReason::Hsts,
-                });
-                self.url = upgraded;
-            }
-        }
+        let before_hsts = self.apply_hsts(env);
 
         match hop_checks(
             &self.url,
@@ -311,33 +204,6 @@ impl HopChain {
                 }
                 Ok(before_hsts)
             }
-        }
-    }
-
-    /// The client connects to an IP literal without asking the resolver, so a policy in it
-    /// would never see e.g. 169.254.169.254. Ask it here with the literal as the name; an Err
-    /// refuses the hop like a refused name would. The returned addresses are unused.
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn check_ip_literal(&self, env: &ChainEnv<'_>) -> Result<(), NetError> {
-        let (Some(resolver), Some(literal)) = (
-            env.policy.transport.dns_resolver.as_ref(),
-            ip_literal(&self.url),
-        ) else {
-            return Ok(());
-        };
-        let refused = tokio::select! {
-            _ = env.cancel.cancelled() => {
-                env.observer.on_event(NetEvent::Cancelled { url: self.url.clone(), reason: "all callers cancelled" });
-                return Err(NetError::Cancelled("all callers cancelled".into()));
-            }
-            r = resolver.resolve(&literal) => r.err(),
-        };
-        match refused {
-            Some(e) => Err(NetError::Transport(TransportError {
-                kind: crate::net::transport::TransportErrorKind::Connect,
-                message: format!("dns error: {e}"),
-            })),
-            None => Ok(()),
         }
     }
 
@@ -511,126 +377,6 @@ impl HopChain {
         hop_site
     }
 
-    /// CORS preflight (Fetch §4.9): a cross-origin cors-mode request whose method or headers
-    /// markup could not produce must be approved by the server before it is sent. Running this
-    /// per hop is what modern browsers do after a redirect moves the target — the grant is per
-    /// (origin, URL), so a new URL needs its own, usually served from the cache. The OPTIONS
-    /// goes out credential-less and never follows redirects (the client has redirects disabled;
-    /// a 3xx fails the ok-status test).
-    ///
-    /// Native-only: on wasm32 the browser preflights itself and does not surface the
-    /// `Access-Control-*` response headers this validation would need.
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn preflight(
-        &self,
-        env: &ChainEnv<'_>,
-        hop_site: SecFetchSite,
-    ) -> Result<Option<PreflightGrant>, NetError> {
-        if env.init.mode != RequestMode::Cors || self.tainting != ResponseTainting::Cors {
-            return Ok(None);
-        }
-        let Some(ref o) = env.init.origin else {
-            return Ok(None);
-        };
-        let unsafe_names = cors::unsafe_request_header_names(&self.headers);
-        if cors::is_cors_safelisted_method(&self.method) && unsafe_names.is_empty() {
-            return Ok(None);
-        }
-        let credentials_include = env.credentials_include;
-        let serialized = cors::serialize_origin(o, self.origin_tainted);
-        let now = chrono::Utc::now();
-        // A grant made with credentials also covers the request without them
-        // (Fetch, "method cache entry match"). It is judged by the credentialed
-        // rules it was made under, where a `*` is a literal, not a wildcard.
-        let granted = env
-            .policy
-            .cache
-            .cors_preflight
-            .as_ref()
-            .is_some_and(|cache| {
-                let fits = |credentialed: bool| {
-                    cache
-                        .get(&serialized, &self.url, credentialed, now)
-                        .is_some_and(|allows| {
-                            allows
-                                .permits(&self.method, &unsafe_names, credentialed)
-                                .is_ok()
-                        })
-                };
-                fits(credentials_include) || (!credentials_include && fits(true))
-            });
-        if !granted {
-            let mut pf_headers = cors::preflight_request_headers(&self.method, &unsafe_names);
-            if let Ok(v) = serialized.parse() {
-                pf_headers.insert(header::ORIGIN, v);
-            }
-            // The preflight has the request's referrer (Fetch §4.8 step 1), as this
-            // hop computed it above.
-            if let Some(referer) = self.headers.get(header::REFERER) {
-                pf_headers.insert(header::REFERER, referer.clone());
-            }
-            fetch_metadata::apply_sec_fetch_headers(
-                &mut pf_headers,
-                &self.url,
-                env.init.destination,
-                env.init.mode,
-                hop_site,
-                false,
-            );
-            env.observer.on_event(NetEvent::CorsPreflight {
-                url: self.url.clone(),
-            });
-            let pf_started = Instant::now();
-            let fut = env
-                .client
-                .request(Method::OPTIONS, self.url.clone())
-                .headers(pf_headers)
-                .send();
-            tokio::pin!(fut);
-            let pf_resp = tokio::select! {
-                _ = env.cancel.cancelled() => {
-                    env.observer.on_event(NetEvent::Cancelled { url: self.url.clone(), reason: "cancelled during CORS preflight" });
-                    return Err(NetError::Cancelled("cancelled during CORS preflight".into()));
-                }
-                r = &mut fut => r.map_err(|e| send_error(e, &self.url, "CORS preflight request failed", env.observer, env.policy))?
-            };
-            // Reported before validation: a preflight the server answered cost
-            // this round-trip whether or not the answer turns out to permit the
-            // request. A rejection is separately reported as `Blocked`.
-            env.observer.on_event(NetEvent::CorsPreflightDone {
-                url: self.url.clone(),
-                elapsed: pf_started.elapsed(),
-            });
-            let allows = cors::validate_preflight_response(
-                pf_resp.status().as_u16(),
-                pf_resp.headers(),
-                o,
-                self.origin_tainted,
-                credentials_include,
-            )
-            .and_then(|allows| {
-                allows
-                    .permits(&self.method, &unsafe_names, credentials_include)
-                    .map(|()| allows)
-            })
-            .map_err(|e| blocked(env.observer, self.url.clone(), BlockReason::Cors(e)))?;
-            if let Some(cache) = env.policy.cache.cors_preflight.as_ref() {
-                cache.put(&serialized, &self.url, credentials_include, allows, now);
-            }
-        }
-        Ok(env
-            .policy
-            .cache
-            .cors_preflight
-            .as_ref()
-            .map(|cache| PreflightGrant {
-                cache: cache.clone(),
-                origin: serialized,
-                url: self.url.clone(),
-                kept: false,
-            }))
-    }
-
     /// Whether this hop carries credentials, with the jar's cookies attached when it does.
     ///
     /// Cookies from the jar and an answer to an authentication challenge are both
@@ -669,118 +415,6 @@ impl HopChain {
         attach
     }
 
-    /// The HTTP cache (RFC 9111), consulted per hop with the headers this hop will actually
-    /// send, so `Vary` selects on the cookies and the negotiation headers as sent. A fresh
-    /// stored response ends the hop without a request; a stale one that can be revalidated
-    /// adds its conditional headers to the send. See [`cache`](mod@crate::net::cache).
-    ///
-    /// A stale entry its `stale-while-revalidate` covers is used, and revalidated behind the
-    /// hop, only where `background` allows. Anything else revalidates it first.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn consult_cache(&self, env: &ChainEnv<'_>, partition: &str) -> Result<CacheLookup, NetError> {
-        // Read here from the caller's headers, before any conditional header of the cache's own.
-        let cache_mode = cache::effective_mode(env.init.cache_mode, &self.headers);
-        let mut lookup = CacheLookup {
-            hit: None,
-            stale: false,
-            revalidating: None,
-            conditional: HeaderMap::new(),
-            mode: cache_mode,
-        };
-        let Some(ref cache) = env.policy.cache.store else {
-            return Ok(lookup);
-        };
-        let key = CacheKey::new(&self.method, &self.url).in_partition(partition);
-        let stored = cache.get(&key);
-        let decision = cache::decide(
-            &stored,
-            &self.headers,
-            env.init.auto_decode,
-            cache_mode,
-            chrono::Utc::now(),
-        );
-        match if env.background {
-            decision
-        } else {
-            decision.revalidated()
-        } {
-            CacheDecision::Use(entry) => lookup.hit = Some(entry),
-            CacheDecision::UseStale(entry) => {
-                lookup.hit = Some(entry);
-                lookup.stale = true;
-            }
-            CacheDecision::Revalidate(entry, conditional) => {
-                lookup.revalidating = Some(entry);
-                lookup.conditional = conditional;
-            }
-            CacheDecision::Send => {}
-            // `only-if-cached`, with nothing stored to answer it.
-            CacheDecision::NotCached => {
-                return Err(blocked(
-                    env.observer,
-                    self.url.clone(),
-                    BlockReason::NotCached,
-                ))
-            }
-        }
-        Ok(lookup)
-    }
-
-    /// The hop answered from the cache, with no request sent.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn answer_from_cache(
-        &self,
-        env: &ChainEnv<'_>,
-        entry: Arc<CacheEntry>,
-        plan: &mut HopPlan,
-    ) -> Result<HopResponse, NetError> {
-        // The CORS check applies to a response wherever it came from (Fetch §4.10.3).
-        // The entry may have been stored by a same-origin fetch, which needed no
-        // `Access-Control-Allow-Origin`; handing it to a cross-origin caller would read
-        // it past the check the network path enforces. Blocked rather than re-sent,
-        // as browsers do: a server whose allow-origin depends on `Origin` says
-        // `Vary: Origin`, and then the entry is not a match in the first place.
-        if self.tainting == ResponseTainting::Cors {
-            if let Some(ref o) = env.init.origin {
-                if let Err(e) = cors::cors_check(
-                    o,
-                    self.origin_tainted,
-                    env.credentials_include,
-                    &entry.headers,
-                ) {
-                    return Err(blocked(
-                        env.observer,
-                        self.url.clone(),
-                        BlockReason::Cors(e),
-                    ));
-                }
-            }
-        }
-        if let Some(grant) = plan.preflight.take() {
-            grant.keep();
-        }
-        let outcome = if plan.cache.stale {
-            CacheOutcome::Stale
-        } else {
-            CacheOutcome::Hit
-        };
-        env.observer.on_event(NetEvent::Cache {
-            url: self.url.clone(),
-            outcome,
-        });
-        // The stale entry answers this hop; the revalidation that refreshes it for the
-        // next request runs on without it (Fetch: "in parallel").
-        if plan.cache.stale {
-            if let (Some(start), Some(from)) = (
-                env.policy.cache.revalidate_in_background.as_ref(),
-                plan.revalidation.take(),
-            ) {
-                start(from);
-            }
-        }
-        Ok(HopResponse::Cached(entry))
-    }
-
     /// The hop sent over the network.
     ///
     /// Authentication (RFC 9110 §11): a 401 or 407 is re-sent with credentials whenever they
@@ -814,69 +448,22 @@ impl HopChain {
             }
         }
 
-        // A retried hop overwrites these, so they always describe the send that was kept.
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut requested_at: chrono::DateTime<chrono::Utc>;
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut received_at: chrono::DateTime<chrono::Utc>;
+        // A retried hop overwrites this, so it always describes the send that was kept.
+        let mut timing;
 
         let response = loop {
             let request = self.hop_request(env, plan, &server_auth, &proxy_auth)?;
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                requested_at = chrono::Utc::now();
-            }
+            timing = Timing::requested();
             let resp = self.await_response(env, request).await?;
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                received_at = chrono::Utc::now();
-            }
+            timing.received();
             self.received(env, plan, &resp)?;
 
             // A `304` answers a revalidation: the stored body stands, with the headers the
             // response carried written over the stored ones (RFC 9111 §4.3.4).
-            #[cfg(not(target_arch = "wasm32"))]
-            if let Some(ref entry) = plan.cache.revalidating {
-                // A `304` that names another version than the stored one confirms nothing
-                // (RFC 9111 §4.3.4): updating from it would pin the old body under the new
-                // tag, and every later revalidation would confirm it again. The entry goes,
-                // and the hop is asked again without conditions, once.
-                if resp.status().as_u16() == 304 && entry.contradicted_by(resp.headers()) {
-                    if let Some(ref cache) = env.policy.cache.store {
-                        cache.invalidate(&CacheKey::new(&self.method, &self.url));
-                    }
-                    plan.cache.revalidating = None;
-                    plan.cache.conditional = HeaderMap::new();
-                    continue;
-                }
-                if resp.status().as_u16() == 304 {
-                    let mut updated = entry.updated_by_304(
-                        resp.headers(),
-                        requested_at,
-                        received_at,
-                        &self.headers,
-                    );
-                    // The connection that confirmed the entry is where it now comes from.
-                    updated.peer_addr = origin_peer(&resp, &self.url, env.policy);
-                    let updated = Arc::new(updated);
-                    if let Some(ref cache) = env.policy.cache.store {
-                        cache.put(
-                            CacheKey::new(&self.method, &self.url)
-                                .in_partition(cache_partition(env.policy, plan.attach_credentials)),
-                            updated.clone(),
-                        );
-                    }
-                    env.observer.on_event(NetEvent::Cache {
-                        url: self.url.clone(),
-                        outcome: CacheOutcome::Validated,
-                    });
-                    // The stored copy keeps no cookies, but the jar gets what the `304`
-                    // set (RFC 6265 §3): a session rotated on a revalidation is not lost.
-                    if plan.attach_credentials {
-                        report_set_cookie(env.policy, &self.url, resp.headers());
-                    }
-                    break HopResponse::Cached(updated);
-                }
+            match self.revalidated(env, plan, &resp, &timing) {
+                Some(ControlFlow::Continue(())) => continue,
+                Some(ControlFlow::Break(response)) => break response,
+                None => {}
             }
 
             // After the checks above: a response CORS refuses is blocked even when it asks for
@@ -903,18 +490,7 @@ impl HopChain {
             // 407 *response* on an https or direct hop is the origin server's, and
             // answering it would leak the proxy credentials (or the password dialog) to
             // any server that sends the status. wasm32: the browser owns the proxy.
-            #[cfg(not(target_arch = "wasm32"))]
-            let proxy = (self.url.scheme() == "http")
-                .then(|| {
-                    env.policy
-                        .proxy
-                        .proxy_for
-                        .as_ref()
-                        .and_then(|f| f(&self.url))
-                })
-                .flatten();
-            #[cfg(target_arch = "wasm32")]
-            let proxy: Option<Url> = None;
+            let proxy = self.challenge_proxy(env);
             let may_answer = match target {
                 // Server credentials follow the request's credentials mode, and are only
                 // attached to a chain the CORS regime left untainted. `Authorization` is not a
@@ -964,17 +540,10 @@ impl HopChain {
             slot.attempt += 1;
         };
 
-        Ok(HopExchange {
-            response,
-            #[cfg(not(target_arch = "wasm32"))]
-            requested_at,
-            #[cfg(not(target_arch = "wasm32"))]
-            received_at,
-        })
+        Ok(HopExchange::new(response, timing))
     }
 
     /// The request for one send of the hop, reported as [`NetEvent::RequestSent`].
-    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
     fn hop_request(
         &self,
         env: &ChainEnv<'_>,
@@ -993,52 +562,7 @@ impl HopChain {
                 hop_headers.insert(target.credentials_header(), value.clone());
             }
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        for (name, value) in plan.cache.conditional.iter() {
-            hop_headers.insert(name.clone(), value.clone());
-        }
-        // What the cache mode asks of every cache on the way, not just this one (Fetch,
-        // HTTP-network-or-cache fetch): a forced revalidation says `max-age=0`, a reload
-        // or a no-store request `no-cache`. Each only when the caller set none. Added for
-        // the send, after the CORS decision, as Fetch does: neither header is
-        // CORS-safelisted, and the mode alone must not cost a preflight.
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let cache_control = match plan.cache.mode {
-                // A background revalidation asks this cache alone.
-                CacheMode::NoCache if env.resumed => None,
-                CacheMode::NoCache => Some("max-age=0"),
-                CacheMode::NoStore | CacheMode::Reload => {
-                    if !hop_headers.contains_key(header::PRAGMA) {
-                        hop_headers
-                            .insert(header::PRAGMA, header::HeaderValue::from_static("no-cache"));
-                    }
-                    Some("no-cache")
-                }
-                _ => None,
-            };
-            if let Some(value) = cache_control {
-                if !hop_headers.contains_key(header::CACHE_CONTROL) {
-                    hop_headers.insert(
-                        header::CACHE_CONTROL,
-                        header::HeaderValue::from_static(value),
-                    );
-                }
-            }
-        }
-        // Written here rather than left to the client, which would add it while
-        // executing the request -- after this hop was reported. Only when nothing has
-        // already answered a `407` for this hop, which is both the credential that was
-        // actually accepted and what the client itself would defer to.
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ref proxy_authorization) = env.policy.proxy.proxy_authorization {
-            if !hop_headers.contains_key(header::PROXY_AUTHORIZATION) {
-                if let Some(mut value) = proxy_authorization(&self.url) {
-                    value.set_sensitive(true);
-                    hop_headers.insert(header::PROXY_AUTHORIZATION, value);
-                }
-            }
-        }
+        self.add_send_headers(env, plan, &mut hop_headers);
         let mut req_builder = env
             .client
             .request(self.method.clone(), self.url.clone())
@@ -1051,10 +575,7 @@ impl HopChain {
         }
         // A headers deadline takes over from the client's, which would also run over the
         // body: it is enforced in `await_response`, around the wait for the response.
-        #[cfg(not(target_arch = "wasm32"))]
-        if env.init.headers_timeout.is_some() {
-            req_builder = req_builder.timeout(NO_CLIENT_DEADLINE);
-        }
+        req_builder = platform::client_deadline(env, req_builder);
         if let Some(ref body) = self.body {
             // Built fresh per send so a streamed body can be replayed on 307/308 and for an
             // authenticated retry of this hop.
@@ -1100,13 +621,7 @@ impl HopChain {
                 env.policy,
             )
         })?;
-        #[cfg(not(target_arch = "wasm32"))]
-        let request = order_hop_headers(
-            request,
-            env.init.header_order.as_deref(),
-            env.policy.user_agent.as_ref(),
-            !(env.policy.transport.speaks_h2)(&self.url),
-        );
+        let request = self.order_headers(env, request);
         let mut reported = request.headers().clone();
         // Only when the assembled request does not already carry one: a header set
         // per-request wins over the client default, and reporting the default over
@@ -1175,7 +690,6 @@ impl HopChain {
 
     /// What every response of the hop goes through, a challenge or a `304` included: the
     /// reports, the HSTS harvest and the CORS check.
-    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
     fn received(
         &self,
         env: &ChainEnv<'_>,
@@ -1185,8 +699,7 @@ impl HopChain {
         // Report the HTTP version of every hop, not just the final response, so the fetcher's
         // per-origin limits also learn about intermediate origins. reqwest's wasm Response has
         // no version().
-        #[cfg(not(target_arch = "wasm32"))]
-        (env.policy.transport.on_protocol)(resp.url(), resp.version());
+        platform::report_protocol(env, resp);
 
         // Per hop, like the other events in this loop: the first one marks
         // time-to-first-byte for the request, and a redirect chain reports each hop
@@ -1211,98 +724,8 @@ impl HopChain {
             ))));
         }
 
-        // Harvest HSTS from every hop, not just the final one: a 301 http->https is the usual way
-        // a site first arms it, and that response is consumed below.
-        // RFC 6797 §8.1: not from a connection the user clicked through.
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ref store) = env.policy.transport.hsts {
-            if !over_accepted_override(env.policy, resp) {
-                hsts::record(
-                    store.as_ref(),
-                    &self.url,
-                    resp.headers(),
-                    chrono::Utc::now(),
-                );
-            }
-        }
-
-        // The CORS check (Fetch §4.10.3) runs on *every* response of a cors-tainted chain —
-        // redirects included, and also a final same-origin hop reached through a cross-origin
-        // detour. Native-only: on wasm32 the browser has already enforced this.
-        #[cfg(not(target_arch = "wasm32"))]
-        if self.tainting == ResponseTainting::Cors {
-            if let Some(ref o) = env.init.origin {
-                if let Err(e) = cors::cors_check(
-                    o,
-                    self.origin_tainted,
-                    env.credentials_include,
-                    resp.headers(),
-                ) {
-                    return Err(blocked(
-                        env.observer,
-                        self.url.clone(),
-                        BlockReason::Cors(e),
-                    ));
-                }
-            }
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(grant) = plan.preflight.take() {
-            grant.keep();
-        }
+        self.check_response(env, plan, resp)?;
         Ok(())
-    }
-
-    /// Drops what `hop` shows to be wrong in the cache.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn invalidate_cache(&self, env: &ChainEnv<'_>, hop: &HopResponse, partition: &str) {
-        let Some(ref cache) = env.policy.cache.store else {
-            return;
-        };
-        // A method that changed the resource makes what is stored for it wrong, including for
-        // the `Location` it points at (RFC 9111 §4.4). Only a successful one: a rejected POST
-        // changed nothing.
-        if cache::invalidates(&self.method) && hop.status() < 400 {
-            let mut targets = vec![self.url.clone()];
-            for name in [header::LOCATION, header::CONTENT_LOCATION] {
-                let target = hop
-                    .headers()
-                    .get(&name)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| self.url.join(v).ok());
-                // Only same-origin: a response cannot invalidate another site's entries.
-                if let Some(target) = target.filter(|t| t.origin() == self.url.origin()) {
-                    targets.push(target);
-                }
-            }
-            for target in targets {
-                // Entries are keyed by method, so both of the cacheable ones go; in every
-                // partition (see `HttpCache::invalidate`).
-                for method in [Method::GET, Method::HEAD] {
-                    cache.invalidate(&CacheKey::new(&method, &target));
-                }
-            }
-            env.observer.on_event(NetEvent::Cache {
-                url: self.url.clone(),
-                outcome: CacheOutcome::Invalidated,
-            });
-        }
-
-        // A `HEAD` that shows the resource changed makes the stored `GET` stale (RFC 9111
-        // §4.3.5); it is dropped, in every partition, like a write would drop it.
-        if let HopResponse::Network(resp) = hop {
-            if self.method == Method::HEAD && resp.status().as_u16() == 200 {
-                let get = CacheKey::new(&Method::GET, &self.url);
-                let stored = cache.get(&get.clone().in_partition(partition));
-                if stored.iter().any(|e| e.changed_per_head(resp.headers())) {
-                    cache.invalidate(&get);
-                    env.observer.on_event(NetEvent::Cache {
-                        url: self.url.clone(),
-                        outcome: CacheOutcome::Invalidated,
-                    });
-                }
-            }
-        }
     }
 
     /// Moves the chain on to where the redirect `hop` points, as the next hop will send it.
@@ -1524,77 +947,28 @@ pub(super) async fn get_with_redirects(
     observer: Arc<dyn NetObserver + Send + Sync>,
     policy: NetPolicy,
 ) -> Result<ChainOutcome, NetError> {
-    #[cfg(not(target_arch = "wasm32"))]
     let resumed = init.background_revalidation.is_some();
     let mut chain = HopChain::start(url, &mut init, &observer)?;
-    let env = ChainEnv {
-        client: &client,
-        init: &init,
-        cancel: &cancel,
-        observer: &observer,
-        policy: &policy,
-        #[cfg(not(target_arch = "wasm32"))]
-        credentials_include: init.credentials == RequestCredentials::Include,
-        #[cfg(not(target_arch = "wasm32"))]
-        background: init.origin.is_some()
-            && policy.cache.store.is_some()
-            && policy.cache.revalidate_in_background.is_some(),
-        #[cfg(not(target_arch = "wasm32"))]
-        resumed,
-    };
+    let env = ChainEnv::new(&client, &init, &cancel, &observer, &policy, resumed);
 
     // One request more than the limit: the chain may follow MAX_REDIRECTS redirects, and only a
     // redirect after those is an error (Fetch, HTTP-redirect fetch: a network error when the
     // count is already 20).
     while chain.redirects <= MAX_REDIRECTS {
-        #[cfg(not(target_arch = "wasm32"))]
-        let revalidation = env.background.then(|| chain.revalidation());
+        let revalidation = chain.revalidation_start(&env);
         let before_hsts = chain.secure_url(&env)?;
-        #[cfg(not(target_arch = "wasm32"))]
         chain.check_ip_literal(&env).await?;
         chain.enter_cors_regime(&env)?;
         chain.set_referrer(&env, before_hsts.as_ref());
-        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
         let hop_site = chain.set_fetch_metadata(&env);
-        #[cfg(not(target_arch = "wasm32"))]
         let preflight = chain.preflight(&env, hop_site).await?;
         let attach_credentials = chain.attach_credentials(&env);
-        #[cfg(not(target_arch = "wasm32"))]
-        let partition = cache_partition(&policy, attach_credentials);
+        let mut plan = chain.plan(&env, attach_credentials, preflight, revalidation)?;
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut plan = HopPlan {
-            attach_credentials,
-            cache: chain.consult_cache(&env, partition)?,
-            preflight,
-            revalidation,
-        };
-        #[cfg(target_arch = "wasm32")]
-        let mut plan = HopPlan { attach_credentials };
+        let exchange = chain.exchange(&env, &mut plan).await?;
+        chain.invalidate_cache(&env, &exchange.response, &plan);
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let exchange = match plan.cache.hit.take() {
-            Some(entry) => {
-                let response = chain.answer_from_cache(&env, entry, &mut plan)?;
-                // Only a response from the network is stored, so these are not read.
-                let now = chrono::Utc::now();
-                HopExchange {
-                    response,
-                    requested_at: now,
-                    received_at: now,
-                }
-            }
-            None => chain.send(&env, &mut plan).await?,
-        };
-        // No cache on wasm32, so every hop goes out as it is.
-        #[cfg(target_arch = "wasm32")]
-        let exchange = chain.send(&env, &mut plan).await?;
-        let hop = exchange.response;
-
-        #[cfg(not(target_arch = "wasm32"))]
-        chain.invalidate_cache(&env, &hop, partition);
-
-        let peer_addr = match &hop {
+        let peer_addr = match &exchange.response {
             HopResponse::Network(resp) => origin_peer(resp, &chain.url, &policy),
             HopResponse::Cached(entry) => entry.peer_addr,
         };
@@ -1602,34 +976,8 @@ pub(super) async fn get_with_redirects(
         // Whether this response may be stored. The body is not here yet: a redirect has none
         // worth keeping and is stored right away, while the final response's write waits for the
         // reader of its body.
-        #[cfg(not(target_arch = "wasm32"))]
-        let pending_store = match (&hop, policy.cache.store.as_ref()) {
-            // `no-store` is both directions: the lookup above skipped the cache, and nothing
-            // about this exchange is written to it either.
-            (HopResponse::Network(resp), Some(cache))
-                if plan.cache.mode != CacheMode::NoStore
-                    && cache::is_storable(
-                        &chain.method,
-                        &chain.headers,
-                        resp.status().as_u16(),
-                        resp.headers(),
-                    ) =>
-            {
-                Some(PendingStore {
-                    cache: cache.clone(),
-                    key: CacheKey::new(&chain.method, &chain.url).in_partition(partition),
-                    url: chain.url.clone(),
-                    status: resp.status().as_u16(),
-                    response_headers: resp.headers().clone(),
-                    request_headers: chain.headers.clone(),
-                    decoded: init.auto_decode,
-                    requested_at: exchange.requested_at,
-                    received_at: exchange.received_at,
-                    peer_addr,
-                })
-            }
-            _ => None,
-        };
+        let pending_store = chain.pending_store(&env, &plan, &exchange, peer_addr);
+        let hop = exchange.response;
 
         // Fetch §4.5 steps 3-5, the location URL: a redirect without a `Location` is the
         // response, returned as it is, and one with more than one is a network error. The field
@@ -1667,10 +1015,7 @@ pub(super) async fn get_with_redirects(
 
         // A redirect is stored now: the caller never sees its body, and a stored `301` lets the
         // next fetch skip the hop entirely.
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(store) = pending_store {
-            store.commit(Bytes::new(), &observer);
-        }
+        platform::store_redirect(pending_store, &observer);
 
         chain.follow_redirect(&env, &hop, attach_credentials)?;
     }
