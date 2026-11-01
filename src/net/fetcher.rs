@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 
 const SHARED_MAX_CAPACITY: usize = 32;
 
@@ -676,184 +677,25 @@ impl Fetcher {
             #[cfg(not(target_arch = "wasm32"))]
             self.queue_revalidations().await;
 
-            let next = {
-                let mut high = self.q_high.lock().await;
-                let mut norm = self.q_norm.lock().await;
-                let mut low = self.q_low.lock().await;
-                let mut idle = self.q_idle.lock().await;
-                self.pick_lane(&mut high, &mut norm, &mut low, &mut idle, &mut lane_counter)
-            };
-
-            // `req` is only reassigned by the HSTS upgrade below, which is native-only.
-            #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
             let Some(QueueItem {
                 mut req,
                 cancel,
                 reply: reply_tx,
-            }) = next
+            }) = self.next_item(&mut lane_counter).await
             else {
-                #[cfg(not(target_arch = "wasm32"))]
-                tokio::select! {
-                    _ = self.wake.notified() => {},
-                    _ = self.built.revalidations.ready.notified() => {},
-                    _ = shutdown.cancelled() => {},
-                }
-                #[cfg(target_arch = "wasm32")]
-                tokio::select! {
-                    _ = self.wake.notified() => {},
-                    _ = shutdown.cancelled() => {},
-                }
+                self.wait_for_work(&shutdown).await;
                 continue;
             };
             // What the caller asked for, before anything below rewrites it.
             let requested = req.url.clone();
+            let upgraded = self.admit(&mut req, &requested);
 
-            // Upgrade before the key is derived, or an http:// and an https:// request for the
-            // same HSTS host hash to different keys and run as two fetches instead of coalescing
-            // onto one. Also fixes the origin used for the per-origin limit below.
-            #[cfg(not(target_arch = "wasm32"))]
-            if let Some(ref store) = self.cfg.hsts {
-                if hsts::should_upgrade(store.as_ref(), &req.url, chrono::Utc::now()) {
-                    req.url = hsts::upgrade(&req.url);
-                }
-            }
-            // Reported to the request once it is accepted, below: the redirect loop only sees
-            // the `https` URL and has nothing left to report.
-            let upgraded = (req.url != requested).then(|| req.url.clone());
-
-            // Pin the mixed-content policy to its resolved value before keying, so a request that
-            // inherits the fetcher default and one that names the same policy explicitly land in
-            // the same coalescing bucket instead of needlessly splitting.
-            req.mixed_content = Some(effective_mixed_content(&req, &self.cfg));
-
-            let key_opt = req.request_key(&self.ctx.cookie_jar_key(req.reference));
-            let key_str = match key_opt {
-                Some(k) => k,
-                // A request that may not share a fetch (a POST, a streamed body) gets a key
-                // no other request has. A counter, not the clock: two identical POSTs on
-                // one clock tick would otherwise share a key, and the second body would
-                // never be sent.
-                None => format!(
-                    "{} {} #{}",
-                    req.method,
-                    req.url,
-                    self.unshared
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                ),
-            };
-
-            // Register the reply channel while still holding the DashMap entry guard.
-            // `register` is synchronous (no await), so holding the shard lock here is safe. The
-            // leader removes the entry from the map *before* draining the waiter, and entry() and
-            // remove() serialize on the shard lock — so a follower that finds the entry here is
-            // guaranteed to register before the drain; otherwise it finds the map vacant and
-            // becomes the leader of a fresh fetch. Registering after releasing the guard would
-            // leave a window where the result is lost and the subscriber gets a RecvError.
-            //
-            // An entry whose subscribers have all cancelled stays in the map until its leader
-            // has wound down. A request that finds one (a caller retrying right after it
-            // cancelled, say) takes its place and leads a fresh fetch; the old leader only ever
-            // removes its own entry, so it leaves the new one alone.
-            let new_entry = |req: &FetchRequest| {
-                Arc::new(FetchInflightEntry {
-                    parent_cancel: CancellationToken::new(),
-                    waiter: Arc::new(Waiter::new()),
-                    wants_streaming: AtomicBool::new(req.streaming),
-                    done: CancellationToken::new(),
-                    subs: AtomicUsize::new(1),
-                    shared: std::sync::OnceLock::new(),
-                })
-            };
+            let key_str = self.coalescing_key(&req);
             let (inflight_entry, is_leader, listener) =
-                match self.inflight_map.entry(key_str.clone()) {
-                    Entry::Occupied(entry) if entry.get().try_inc_sub() => {
-                        let arc = entry.get().clone();
-                        let listener = arc.waiter.register(reply_tx, req.streaming);
-                        (arc, false, listener)
-                    }
-                    Entry::Occupied(mut entry) => {
-                        let arc = new_entry(&req);
-                        let listener = arc.waiter.register(reply_tx, req.streaming);
-                        entry.insert(arc.clone());
-                        (arc, true, listener)
-                    }
-                    Entry::Vacant(v) => {
-                        let arc = new_entry(&req);
-                        let listener = arc.waiter.register(reply_tx, req.streaming);
-                        v.insert(arc.clone());
-                        (arc, true, listener)
-                    }
-                };
-
-            // Every request has its own lifecycle, a follower's included: it reports from
-            // `Accepted` to its own end (see `lifecycle`), and is its reference's outstanding
-            // work for as long. A background revalidation is no work of the reference's: the
-            // request it refreshes a response for has already been answered.
-            let observer = if req.background_revalidation.is_some() {
-                self.ctx
-                    .background_observer_for(req.reference, req.req_id, req.kind, req.initiator)
-            } else {
-                self.ctx
-                    .observer_for(req.reference, req.req_id, req.kind, req.initiator)
-            };
-            let lifecycle = Lifecycle::accept(
-                observer,
-                requested.clone(),
-                !is_leader,
-                req.background_revalidation
-                    .is_none()
-                    .then(|| (self.ctx.clone(), req.reference)),
-            );
-            if let Some(ref to) = upgraded {
-                lifecycle.on_event(NetEvent::SecurityUpgraded {
-                    from: requested.clone(),
-                    to: to.clone(),
-                    reason: crate::net::types::UpgradeReason::Hsts,
-                });
-            }
-            let shared = if is_leader {
-                let shared = Shared::new(lifecycle.clone());
-                let _ = inflight_entry.shared.set(shared.clone());
-                Some(shared)
-            } else {
-                // The leader set it in this same loop, before any request could join.
-                if let Some(shared) = inflight_entry.shared.get() {
-                    shared.attach(lifecycle.clone());
-                }
-                None
-            };
-
-            // Watches this caller until its request has ended. A caller that cancels ends its
-            // own request there and then, even while others still want the result; a result
-            // already handed to it is not taken back.
-            let child_cancel = cancel.clone();
-            let entry_for_cancel = inflight_entry.clone();
-            let ended = lifecycle.ended();
-            let caller = lifecycle.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = child_cancel.cancelled() => {
-                        // Only a caller still waiting counts out of the fetch: one that has its
-                        // stream already reads at its own pace, and the body stops by itself
-                        // once nobody can read it.
-                        if entry_for_cancel.waiter.cancel(
-                            listener,
-                            NetError::Cancelled("cancelled by the caller".into()),
-                        ) {
-                            entry_for_cancel.dec_sub_and_maybe_cancel();
-                        }
-                        if let Some(shared) = entry_for_cancel.shared.get() {
-                            shared.detach(&caller);
-                        }
-                        caller.on_event(NetEvent::Cancelled {
-                            url: caller.url().clone(),
-                            reason: "cancelled by the caller",
-                        });
-                    }
-                    _ = ended.cancelled() => {}
-                }
-            });
-            drop(lifecycle);
+                self.join_inflight(&key_str, &req, reply_tx);
+            let (lifecycle, shared) =
+                self.accept(&req, &requested, upgraded, is_leader, &inflight_entry);
+            watch_caller(&inflight_entry, listener, cancel, lifecycle);
 
             if req.streaming {
                 inflight_entry
@@ -867,135 +709,374 @@ impl Fetcher {
             // The fetch reports to every request waiting on it.
             let observer: Arc<dyn NetObserver + Send + Sync> = shared;
 
-            // Pre-flight checks. Only the leader ever sends bytes, so only the leader evaluates
-            // them; rejecting here avoids waiting on a connection slot for a request that will
-            // never go out. The same `hop_checks` runs per hop inside `get_with_redirects`, which
-            // is what catches redirect targets — so this cannot reject anything the enforcement
-            // path would have allowed. The upgraded URL is discarded here; the redirect loop
-            // recomputes and applies it.
-            let reject = match hop_checks(
-                &req.url,
-                effective_mixed_content(&req, &self.cfg),
-                req.origin.as_ref(),
-                req.destination,
-                &self.cfg.allowed_bad_ports,
-                &|u| self.ctx.is_url_allowed(u),
-            ) {
-                HopCheck::Reject(reason) => Some(reason),
-                HopCheck::Proceed(_) => None,
-            };
-
-            if let Some(reason) = reject {
-                // `Blocked` names the cause; `Failed` ends the request, as on any other path
-                // (see `NetEvent::Blocked`).
-                let error = blocked(&observer, req.url.clone(), reason);
-                observer.on_event(NetEvent::Failed {
-                    url: req.url.clone(),
-                    error: anyhow::Error::new(error.clone()),
-                });
-                let err = FetchResult::Error(error);
-                // Remove before finish — see the registration comment above for the ordering.
-                self.inflight_map
-                    .remove_if(&key_str, |_, e| Arc::ptr_eq(e, &inflight_entry));
-                inflight_entry.waiter.finish(err, None).await;
-                inflight_entry.done.cancel();
+            if self
+                .refuse(&req, &observer, &key_str, &inflight_entry)
+                .await
+            {
                 continue;
             }
 
-            let client = self.client.clone();
-            let pool = self.slots.clone();
-            // Join the line for slots here, in dequeue order, rather than in the spawned task:
-            // tasks start in no particular order, which would shuffle requests of one lane.
-            let ticket = self.slots.enqueue(&req.url, req.priority);
-            let built = self.built.clone();
-            let cfg = self.cfg.clone();
-            let inflight = self.inflight_map.clone();
-            let key_for_remove = key_str.clone();
-            let inflight_entry2 = inflight_entry.clone();
-            let shutdown_child = shutdown.clone();
-            let req_for_task = req.clone();
-            let cancel_parent = inflight_entry2.parent_cancel.clone();
-            let ctx_clone = self.ctx.clone();
-
-            let title = format!("Fetcher: {}", short_url(&req.url, 80));
-            spawn_named(&title, async move {
-                // Priority is applied here, where fetches wait: the pool hands a freed slot to
-                // the highest lane that can use it (see `slots`). Waiting ends early on
-                // shutdown, or once every subscriber has cancelled. Either way the entry below
-                // is still cleaned up like a finished fetch, so nothing stays in the in-flight
-                // map and every listener hears.
-                let acquire = async {
-                    tokio::select! {
-                        s = ticket.wait() => s,
-                        _ = shutdown_child.cancelled() => None,
-                        _ = cancel_parent.cancelled() => None,
-                    }
-                };
-                // Held here until the task ends, or by the body of a streamed fetch.
-                let mut held = acquire.await;
-
-                let should_stream =
-                    req.streaming || inflight_entry2.wants_streaming.load(Ordering::Relaxed);
-
-                let result = if held.is_none() {
-                    let why = if shutdown_child.is_cancelled() {
-                        "fetcher shut down before the request was sent"
-                    } else {
-                        "cancelled before the request was sent"
-                    };
-                    // The request ends here, so it says so, as a cancel anywhere later does.
-                    observer.on_event(NetEvent::Cancelled {
-                        url: req_for_task.url.clone(),
-                        reason: why,
-                    });
-                    Err(NetError::Cancelled(why.into()))
-                } else if let (true, Some(slot_guards)) = (should_stream, held.take()) {
-                    perform_streaming(
-                        &client,
-                        observer.clone(),
-                        &req_for_task,
-                        &cfg,
-                        cancel_parent.clone(),
-                        ctx_clone.clone(),
-                        pool.clone(),
-                        built.clone(),
-                        slot_guards,
-                    )
-                    .await
-                } else {
-                    perform_buffered(
-                        &client,
-                        observer.clone(),
-                        &req_for_task,
-                        &cfg,
-                        cancel_parent.clone(),
-                        ctx_clone.clone(),
-                        pool.clone(),
-                        built.clone(),
-                    )
-                    .await
-                };
-
-                let fr = match &result {
-                    Ok(fetch_result) => fetch_result.clone(),
-                    Err(e) => FetchResult::Error(e.clone()),
-                };
-
-                // Remove from the map before draining the waiter: entry() and remove() serialize
-                // on the shard lock, so any follower that found this entry has already registered,
-                // and later arrivals find the map vacant and start a fresh fetch instead. Only
-                // this fetch's own entry: one that replaced it after every subscriber here
-                // cancelled belongs to another leader.
-                inflight.remove_if(&key_for_remove, |_, e| Arc::ptr_eq(e, &inflight_entry2));
-
-                inflight_entry2.waiter.finish(fr, cfg.max_body_bytes).await;
-
-                inflight_entry2.done.cancel();
-
-                drop(held);
-            });
+            self.spawn_fetch(req, observer, key_str, inflight_entry, &shutdown);
         }
     }
+
+    /// The next request to start, picked across the lanes by weighted round-robin.
+    async fn next_item(&self, lane_counter: &mut u8) -> Option<QueueItem> {
+        let mut high = self.q_high.lock().await;
+        let mut norm = self.q_norm.lock().await;
+        let mut low = self.q_low.lock().await;
+        let mut idle = self.q_idle.lock().await;
+        self.pick_lane(&mut high, &mut norm, &mut low, &mut idle, lane_counter)
+    }
+
+    /// Waits until a request is submitted, a background revalidation is queued, or `shutdown`.
+    async fn wait_for_work(&self, shutdown: &CancellationToken) {
+        #[cfg(not(target_arch = "wasm32"))]
+        tokio::select! {
+            _ = self.wake.notified() => {},
+            _ = self.built.revalidations.ready.notified() => {},
+            _ = shutdown.cancelled() => {},
+        }
+        #[cfg(target_arch = "wasm32")]
+        tokio::select! {
+            _ = self.wake.notified() => {},
+            _ = shutdown.cancelled() => {},
+        }
+    }
+
+    /// Settles `req` before it is keyed: the HSTS upgrade and the mixed-content policy. Returns
+    /// the URL HSTS upgraded `requested` to, if it did.
+    fn admit(&self, req: &mut FetchRequest, requested: &Url) -> Option<Url> {
+        // Upgrade before the key is derived, or an http:// and an https:// request for the
+        // same HSTS host hash to different keys and run as two fetches instead of coalescing
+        // onto one. Also fixes the origin used for the per-origin limit below.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ref store) = self.cfg.hsts {
+            if hsts::should_upgrade(store.as_ref(), &req.url, chrono::Utc::now()) {
+                req.url = hsts::upgrade(&req.url);
+            }
+        }
+        // Reported to the request once it is accepted, below: the redirect loop only sees
+        // the `https` URL and has nothing left to report.
+        let upgraded = (req.url != *requested).then(|| req.url.clone());
+
+        // Pin the mixed-content policy to its resolved value before keying, so a request that
+        // inherits the fetcher default and one that names the same policy explicitly land in
+        // the same coalescing bucket instead of needlessly splitting.
+        req.mixed_content = Some(effective_mixed_content(req, &self.cfg));
+        upgraded
+    }
+
+    /// The key requests coalesce on: the same key, the same fetch.
+    fn coalescing_key(&self, req: &FetchRequest) -> String {
+        let key_opt = req.request_key(&self.ctx.cookie_jar_key(req.reference));
+        match key_opt {
+            Some(k) => k,
+            // A request that may not share a fetch (a POST, a streamed body) gets a key
+            // no other request has. A counter, not the clock: two identical POSTs on
+            // one clock tick would otherwise share a key, and the second body would
+            // never be sent.
+            None => format!(
+                "{} {} #{}",
+                req.method,
+                req.url,
+                self.unshared
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+        }
+    }
+
+    /// Joins the fetch in flight under `key_str`, or starts a new one with this request as its
+    /// leader. Returns the entry, whether this request leads it, and its listener there.
+    fn join_inflight(
+        &self,
+        key_str: &str,
+        req: &FetchRequest,
+        reply_tx: oneshot::Sender<FetchResult>,
+    ) -> (Arc<FetchInflightEntry>, bool, u64) {
+        // Register the reply channel while still holding the DashMap entry guard.
+        // `register` is synchronous (no await), so holding the shard lock here is safe. The
+        // leader removes the entry from the map *before* draining the waiter, and entry() and
+        // remove() serialize on the shard lock — so a follower that finds the entry here is
+        // guaranteed to register before the drain; otherwise it finds the map vacant and
+        // becomes the leader of a fresh fetch. Registering after releasing the guard would
+        // leave a window where the result is lost and the subscriber gets a RecvError.
+        //
+        // An entry whose subscribers have all cancelled stays in the map until its leader
+        // has wound down. A request that finds one (a caller retrying right after it
+        // cancelled, say) takes its place and leads a fresh fetch; the old leader only ever
+        // removes its own entry, so it leaves the new one alone.
+        let new_entry = |req: &FetchRequest| {
+            Arc::new(FetchInflightEntry {
+                parent_cancel: CancellationToken::new(),
+                waiter: Arc::new(Waiter::new()),
+                wants_streaming: AtomicBool::new(req.streaming),
+                done: CancellationToken::new(),
+                subs: AtomicUsize::new(1),
+                shared: std::sync::OnceLock::new(),
+            })
+        };
+        match self.inflight_map.entry(key_str.to_string()) {
+            Entry::Occupied(entry) if entry.get().try_inc_sub() => {
+                let arc = entry.get().clone();
+                let listener = arc.waiter.register(reply_tx, req.streaming);
+                (arc, false, listener)
+            }
+            Entry::Occupied(mut entry) => {
+                let arc = new_entry(req);
+                let listener = arc.waiter.register(reply_tx, req.streaming);
+                entry.insert(arc.clone());
+                (arc, true, listener)
+            }
+            Entry::Vacant(v) => {
+                let arc = new_entry(req);
+                let listener = arc.waiter.register(reply_tx, req.streaming);
+                v.insert(arc.clone());
+                (arc, true, listener)
+            }
+        }
+    }
+
+    /// Starts the request's lifecycle, reports an HSTS upgrade on it, and ties it to the fetch:
+    /// a leader returns the fetch's [`Shared`] observer, a follower attaches to it.
+    fn accept(
+        &self,
+        req: &FetchRequest,
+        requested: &Url,
+        upgraded: Option<Url>,
+        is_leader: bool,
+        inflight_entry: &FetchInflightEntry,
+    ) -> (Arc<Lifecycle>, Option<Arc<Shared>>) {
+        // Every request has its own lifecycle, a follower's included: it reports from
+        // `Accepted` to its own end (see `lifecycle`), and is its reference's outstanding
+        // work for as long. A background revalidation is no work of the reference's: the
+        // request it refreshes a response for has already been answered.
+        let observer = if req.background_revalidation.is_some() {
+            self.ctx
+                .background_observer_for(req.reference, req.req_id, req.kind, req.initiator)
+        } else {
+            self.ctx
+                .observer_for(req.reference, req.req_id, req.kind, req.initiator)
+        };
+        let lifecycle = Lifecycle::accept(
+            observer,
+            requested.clone(),
+            !is_leader,
+            req.background_revalidation
+                .is_none()
+                .then(|| (self.ctx.clone(), req.reference)),
+        );
+        if let Some(ref to) = upgraded {
+            lifecycle.on_event(NetEvent::SecurityUpgraded {
+                from: requested.clone(),
+                to: to.clone(),
+                reason: crate::net::types::UpgradeReason::Hsts,
+            });
+        }
+        let shared = if is_leader {
+            let shared = Shared::new(lifecycle.clone());
+            let _ = inflight_entry.shared.set(shared.clone());
+            Some(shared)
+        } else {
+            // The leader set it in this same loop, before any request could join.
+            if let Some(shared) = inflight_entry.shared.get() {
+                shared.attach(lifecycle.clone());
+            }
+            None
+        };
+        (lifecycle, shared)
+    }
+
+    /// The pre-flight checks for a leader's request. Returns whether it was refused, in which
+    /// case every request waiting on it has been answered.
+    async fn refuse(
+        &self,
+        req: &FetchRequest,
+        observer: &Arc<dyn NetObserver + Send + Sync>,
+        key_str: &str,
+        inflight_entry: &Arc<FetchInflightEntry>,
+    ) -> bool {
+        // Pre-flight checks. Only the leader ever sends bytes, so only the leader evaluates
+        // them; rejecting here avoids waiting on a connection slot for a request that will
+        // never go out. The same `hop_checks` runs per hop inside `get_with_redirects`, which
+        // is what catches redirect targets — so this cannot reject anything the enforcement
+        // path would have allowed. The upgraded URL is discarded here; the redirect loop
+        // recomputes and applies it.
+        let reject = match hop_checks(
+            &req.url,
+            effective_mixed_content(req, &self.cfg),
+            req.origin.as_ref(),
+            req.destination,
+            &self.cfg.allowed_bad_ports,
+            &|u| self.ctx.is_url_allowed(u),
+        ) {
+            HopCheck::Reject(reason) => Some(reason),
+            HopCheck::Proceed(_) => None,
+        };
+
+        let Some(reason) = reject else {
+            return false;
+        };
+        // `Blocked` names the cause; `Failed` ends the request, as on any other path
+        // (see `NetEvent::Blocked`).
+        let error = blocked(observer, req.url.clone(), reason);
+        observer.on_event(NetEvent::Failed {
+            url: req.url.clone(),
+            error: anyhow::Error::new(error.clone()),
+        });
+        let err = FetchResult::Error(error);
+        // Remove before finish — see the registration comment in `join_inflight` for the
+        // ordering.
+        self.inflight_map
+            .remove_if(key_str, |_, e| Arc::ptr_eq(e, inflight_entry));
+        inflight_entry.waiter.finish(err, None).await;
+        inflight_entry.done.cancel();
+        true
+    }
+
+    /// Queues the leader's request for its slots and spawns the task that performs it and
+    /// hands the result to every request waiting on it.
+    fn spawn_fetch(
+        &self,
+        req: FetchRequest,
+        observer: Arc<dyn NetObserver + Send + Sync>,
+        key_str: String,
+        inflight_entry: Arc<FetchInflightEntry>,
+        shutdown: &CancellationToken,
+    ) {
+        let client = self.client.clone();
+        let pool = self.slots.clone();
+        // Join the line for slots here, in dequeue order, rather than in the spawned task:
+        // tasks start in no particular order, which would shuffle requests of one lane.
+        let ticket = self.slots.enqueue(&req.url, req.priority);
+        let built = self.built.clone();
+        let cfg = self.cfg.clone();
+        let inflight = self.inflight_map.clone();
+        let key_for_remove = key_str.clone();
+        let inflight_entry2 = inflight_entry.clone();
+        let shutdown_child = shutdown.clone();
+        let req_for_task = req.clone();
+        let cancel_parent = inflight_entry2.parent_cancel.clone();
+        let ctx_clone = self.ctx.clone();
+
+        let title = format!("Fetcher: {}", short_url(&req.url, 80));
+        spawn_named(&title, async move {
+            // Priority is applied here, where fetches wait: the pool hands a freed slot to
+            // the highest lane that can use it (see `slots`). Waiting ends early on
+            // shutdown, or once every subscriber has cancelled. Either way the entry below
+            // is still cleaned up like a finished fetch, so nothing stays in the in-flight
+            // map and every listener hears.
+            let acquire = async {
+                tokio::select! {
+                    s = ticket.wait() => s,
+                    _ = shutdown_child.cancelled() => None,
+                    _ = cancel_parent.cancelled() => None,
+                }
+            };
+            // Held here until the task ends, or by the body of a streamed fetch.
+            let mut held = acquire.await;
+
+            let should_stream =
+                req.streaming || inflight_entry2.wants_streaming.load(Ordering::Relaxed);
+
+            let result = if held.is_none() {
+                let why = if shutdown_child.is_cancelled() {
+                    "fetcher shut down before the request was sent"
+                } else {
+                    "cancelled before the request was sent"
+                };
+                // The request ends here, so it says so, as a cancel anywhere later does.
+                observer.on_event(NetEvent::Cancelled {
+                    url: req_for_task.url.clone(),
+                    reason: why,
+                });
+                Err(NetError::Cancelled(why.into()))
+            } else if let (true, Some(slot_guards)) = (should_stream, held.take()) {
+                perform_streaming(
+                    &client,
+                    observer.clone(),
+                    &req_for_task,
+                    &cfg,
+                    cancel_parent.clone(),
+                    ctx_clone.clone(),
+                    pool.clone(),
+                    built.clone(),
+                    slot_guards,
+                )
+                .await
+            } else {
+                perform_buffered(
+                    &client,
+                    observer.clone(),
+                    &req_for_task,
+                    &cfg,
+                    cancel_parent.clone(),
+                    ctx_clone.clone(),
+                    pool.clone(),
+                    built.clone(),
+                )
+                .await
+            };
+
+            let fr = match &result {
+                Ok(fetch_result) => fetch_result.clone(),
+                Err(e) => FetchResult::Error(e.clone()),
+            };
+
+            // Remove from the map before draining the waiter: entry() and remove() serialize
+            // on the shard lock, so any follower that found this entry has already registered,
+            // and later arrivals find the map vacant and start a fresh fetch instead. Only
+            // this fetch's own entry: one that replaced it after every subscriber here
+            // cancelled belongs to another leader.
+            inflight.remove_if(&key_for_remove, |_, e| Arc::ptr_eq(e, &inflight_entry2));
+
+            inflight_entry2.waiter.finish(fr, cfg.max_body_bytes).await;
+
+            inflight_entry2.done.cancel();
+
+            drop(held);
+        });
+    }
+}
+
+/// Watches this caller until its request has ended; see the comment inside.
+fn watch_caller(
+    inflight_entry: &Arc<FetchInflightEntry>,
+    listener: u64,
+    cancel: CancellationToken,
+    lifecycle: Arc<Lifecycle>,
+) {
+    // Watches this caller until its request has ended. A caller that cancels ends its
+    // own request there and then, even while others still want the result; a result
+    // already handed to it is not taken back.
+    let child_cancel = cancel.clone();
+    let entry_for_cancel = inflight_entry.clone();
+    let ended = lifecycle.ended();
+    let caller = lifecycle.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = child_cancel.cancelled() => {
+                // Only a caller still waiting counts out of the fetch: one that has its
+                // stream already reads at its own pace, and the body stops by itself
+                // once nobody can read it.
+                if entry_for_cancel.waiter.cancel(
+                    listener,
+                    NetError::Cancelled("cancelled by the caller".into()),
+                ) {
+                    entry_for_cancel.dec_sub_and_maybe_cancel();
+                }
+                if let Some(shared) = entry_for_cancel.shared.get() {
+                    shared.detach(&caller);
+                }
+                caller.on_event(NetEvent::Cancelled {
+                    url: caller.url().clone(),
+                    reason: "cancelled by the caller",
+                });
+            }
+            _ = ended.cancelled() => {}
+        }
+    });
+    drop(lifecycle);
 }
 
 /// The mixed content policy in force for `req`: its own override if it set one, otherwise the
