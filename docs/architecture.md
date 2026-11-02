@@ -68,6 +68,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::null_emitter` | `src/net/null_emitter.rs` | `NullEmitter` — a no-op `NetObserver`. |
 | `net::request_ref` | `src/net/request_ref.rs` | `RequestReference` — opaque host correlation tag (e.g. a tab id). |
 | `net::simple` | `src/net/simple.rs` | One-shot `simple_get` / `sync_get` / `sync_fetch` for callers that don't need the scheduler. |
+| `net::simple::platform` | `src/net/simple/native.rs`, `src/net/simple/wasm.rs` | The simple API's per-platform half, one file picked per target: native builds the tuned client with its redirect policy, adds the default `User-Agent` and `Accept-Encoding`, decodes bodies, reads `file:` URLs and runs the blocking fetch; wasm leaves all of it to the browser's `fetch()` and refuses `file:`. |
 | `net::fs_utils` | `src/net/fs_utils.rs` | `temp_path_for` — same-directory temp file for atomic renames. |
 | `net::test_support` | `src/net/test_support.rs` | In-process mock HTTP server (`TestServer` / `RouteConfig`); crate tests + `test-support` feature. |
 | `http::response` | `src/http/response.rs` | Simple `Response` struct returned by the blocking one-shot helpers. |
@@ -80,9 +81,10 @@ redirects, cookies, and decompression — and tokio is limited to its wasm-suppo
 blockable thread are native-only: `net::pump`, `net::fs_utils`, `sync_get`/`sync_fetch`, `file://`
 URLs, and `net::test_support`. Tasks spawn via `spawn_named`, which maps to `tokio::spawn`
 natively and `tokio::task::spawn_local` on wasm32 (the embedder must drive a `LocalSet`).
-The native-only parts of the fetch layer and the fetcher sit behind `net::fetch::platform`,
-`net::fetch::chain::platform` and `net::fetcher::platform`, so `fetch.rs`, `chain.rs` and
-`fetcher.rs` gate only their public API.
+The native-only parts of the fetch layer, the fetcher and the simple API sit behind
+`net::fetch::platform`, `net::fetch::chain::platform`, `net::fetcher::platform` and
+`net::simple::platform`, so `fetch.rs`, `chain.rs`, `fetcher.rs` and `simple.rs` gate only
+their public API.
 
 **Lint posture.** The crate forbids `unsafe_code` and denies `todo!`/`unimplemented!`/`dbg!` and
 (outside tests) `unwrap`/`expect`/`panic`.
