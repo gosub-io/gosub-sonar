@@ -2,7 +2,7 @@
 //! proxies itself, so the items `native.rs` has for those are here and do nothing.
 
 use super::HopChain;
-use crate::net::fetch::{HopResponse, NetPolicy, RequestInit, Revalidation};
+use crate::net::fetch::{HopResponse, NetPolicy, PendingStore, RequestInit, Revalidation};
 use crate::net::fetch_metadata::SecFetchSite;
 use crate::net::observer::NetObserver;
 use crate::net::types::NetError;
@@ -69,13 +69,6 @@ impl Timing {
     }
 
     pub(super) fn received(&mut self) {}
-}
-
-/// Nothing is stored: there is no cache.
-pub(super) fn store_redirect(
-    _store: Option<Infallible>,
-    _observer: &Arc<dyn NetObserver + Send + Sync>,
-) {
 }
 
 impl HopChain {
@@ -171,7 +164,7 @@ impl HopChain {
         _plan: &HopPlan,
         _exchange: &HopExchange,
         _peer_addr: Option<SocketAddr>,
-    ) -> Option<Infallible> {
+    ) -> Option<PendingStore> {
         None
     }
 }
