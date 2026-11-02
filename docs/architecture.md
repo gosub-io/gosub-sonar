@@ -60,6 +60,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::hsts` | `src/net/hsts.rs` | HTTP Strict Transport Security (RFC 6797): header parsing, host matching, expiry, URL upgrade. `HstsStore` / `InMemoryHstsStore`. Native-only. |
 | `net::tls` | `src/net/tls.rs` | `TlsError` / `TlsErrorKind`: why a handshake failed (expired, unknown issuer, wrong host name, ...), extracted from the rustls error. Certificate overrides: `TlsOverrideStore` / `InMemoryTlsOverrideStore` and the verifier that consults them. Native-only. |
 | `net::types` | `src/net/types.rs` | Core data model: `FetchRequest`(+builder), `FetchResult`, `FetchResultMeta`, `Priority`, `NetError`, `BodyStream`, … |
+| `net::types::platform` | `src/net/types/native.rs`, `src/net/types/wasm.rs` | Request bodies' per-platform half, one file picked per target: native has `NativePayload` (bodies streamed from a reader or a file) and the regular-file check; wasm has `NativePayload` as an empty enum, since reqwest's wasm body takes bytes only. |
 | `net::shared_body` | `src/net/shared_body.rs` | `SharedBody` — bounded fan-out byte stream with drop-on-lag per-subscriber queues. |
 | `net::pump` | `src/net/pump.rs` | Drains an `AsyncRead` into a `SharedBody` and/or a file on disk (atomic temp-file + rename). |
 | `net::utils` | `src/net/utils.rs` | `Waiter` (result fan-out to listeners), `stream_to_bytes`, `spawn_named`. |
@@ -81,10 +82,10 @@ redirects, cookies, and decompression — and tokio is limited to its wasm-suppo
 blockable thread are native-only: `net::pump`, `net::fs_utils`, `sync_get`/`sync_fetch`, `file://`
 URLs, and `net::test_support`. Tasks spawn via `spawn_named`, which maps to `tokio::spawn`
 natively and `tokio::task::spawn_local` on wasm32 (the embedder must drive a `LocalSet`).
-The native-only parts of the fetch layer, the fetcher and the simple API sit behind
-`net::fetch::platform`, `net::fetch::chain::platform`, `net::fetcher::platform` and
-`net::simple::platform`, so `fetch.rs`, `chain.rs`, `fetcher.rs` and `simple.rs` gate only
-their public API.
+The native-only parts of the fetch layer, the fetcher, the simple API and request bodies sit
+behind `net::fetch::platform`, `net::fetch::chain::platform`, `net::fetcher::platform`,
+`net::simple::platform` and `net::types::platform`, so `fetch.rs`, `chain.rs`, `fetcher.rs`,
+`simple.rs` and `types.rs` gate only their public API.
 
 **Lint posture.** The crate forbids `unsafe_code` and denies `todo!`/`unimplemented!`/`dbg!` and
 (outside tests) `unwrap`/`expect`/`panic`.
