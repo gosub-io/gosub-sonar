@@ -50,6 +50,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | `net::fetch::chain::platform` | `src/net/fetch/chain/native.rs`, `src/net/fetch/chain/wasm.rs` | The chain's per-platform half, one file picked per target: native has HSTS, the IP-literal resolver check, CORS preflights and checks, the HTTP cache and proxy headers as `HopChain` methods; wasm has the same items doing nothing, since the browser's `fetch()` does all of it. |
 | `net::fetcher_context` | `src/net/fetcher_context.rs` | `FetcherContext` trait — the host's hook into the fetch lifecycle (observers, ref tracking, URL policy, cookies). |
 | `net::cors` | `src/net/cors.rs` | CORS (WHATWG Fetch): safelist predicates, the CORS check, preflight validation, response tainting/filtering. `CorsPreflightCache` / `InMemoryPreflightCache`. Enforcement is native-only. |
+| `net::cors::preflight` | `src/net/cors/preflight.rs` | Native-only half of CORS, not built on wasm32: the CORS check, preflight validation and request headers, `PreflightAllows`, `CorsPreflightCache` / `InMemoryPreflightCache`. Re-exported from `net::cors`. |
 | `net::cache` | `src/net/cache.rs` | HTTP caching (RFC 9111): freshness and age, request/response `Cache-Control`, conditional revalidation, `Vary`, invalidation. `HttpCache` / `InMemoryHttpCache`, `CacheMode`. Native-only. |
 | `net::auth` | `src/net/auth.rs` | HTTP authentication (RFC 9110 §11): `WWW-Authenticate`/`Proxy-Authenticate` parsing into `AuthChallenge`, `Credentials` (Basic computed here, anything else verbatim), `CredentialStore` / `InMemoryCredentialStore`. |
 | `net::referrer` | `src/net/referrer.rs` | `Referer` header from a `ReferrerPolicy` (W3C Referrer Policy), recomputed per redirect hop. |
@@ -85,7 +86,8 @@ natively and `tokio::task::spawn_local` on wasm32 (the embedder must drive a `Lo
 The native-only parts of the fetch layer, the fetcher, the simple API and request bodies sit
 behind `net::fetch::platform`, `net::fetch::chain::platform`, `net::fetcher::platform`,
 `net::simple::platform` and `net::types::platform`, so `fetch.rs`, `chain.rs`, `fetcher.rs`,
-`simple.rs` and `types.rs` gate only their public API.
+`simple.rs` and `types.rs` gate only their public API. The CORS check, preflight validation and
+the preflight cache live in `net::cors::preflight`, which is not built on wasm32.
 
 **Lint posture.** The crate forbids `unsafe_code` and denies `todo!`/`unimplemented!`/`dbg!` and
 (outside tests) `unwrap`/`expect`/`panic`.
