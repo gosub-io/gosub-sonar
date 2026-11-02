@@ -7,6 +7,8 @@
     not(test),
     deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
 )]
+// Shared docs link native-only items; on wasm32 those render as plain text.
+#![cfg_attr(target_arch = "wasm32", allow(rustdoc::broken_intra_doc_links))]
 
 pub mod http;
 pub mod net;
