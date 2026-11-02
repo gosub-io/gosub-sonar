@@ -22,6 +22,10 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, ReadBuf};
 use url::{Origin, Url};
 
+#[cfg_attr(not(target_arch = "wasm32"), path = "types/native.rs")]
+#[cfg_attr(target_arch = "wasm32", path = "types/wasm.rs")]
+mod platform;
+
 /// Priority of the scheduled request. Documents usually have high priority, while images have low.
 /// Currently, the scheduler uses a round-robin system to load resources
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
@@ -548,14 +552,9 @@ pub struct RequestBody {
 #[derive(Clone)]
 enum Payload {
     Bytes(Bytes),
-    #[cfg(not(target_arch = "wasm32"))]
-    Stream {
-        open: BodyStreamFactory,
-        len: Option<u64>,
-    },
-    /// A file on disk, opened and measured at each send.
-    #[cfg(not(target_arch = "wasm32"))]
-    File(std::path::PathBuf),
+    // Never constructed on wasm32, where `NativePayload` has no values.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Native(platform::NativePayload),
 }
 
 impl Default for Payload {
@@ -569,10 +568,7 @@ impl Debug for RequestBody {
         let mut d = f.debug_struct("RequestBody");
         match &self.payload {
             Payload::Bytes(b) => d.field("bytes", &b.len()),
-            #[cfg(not(target_arch = "wasm32"))]
-            Payload::Stream { len, .. } => d.field("stream", len),
-            #[cfg(not(target_arch = "wasm32"))]
-            Payload::File(path) => d.field("file", path),
+            Payload::Native(p) => p.debug_field(&mut d),
         };
         d.field("content_type", &self.content_type).finish()
     }
@@ -621,10 +617,10 @@ impl RequestBody {
         len: Option<u64>,
     ) -> Self {
         Self {
-            payload: Payload::Stream {
+            payload: Payload::Native(platform::NativePayload::Stream {
                 open: Arc::new(open),
                 len,
-            },
+            }),
             content_type: None,
         }
     }
@@ -635,9 +631,9 @@ impl RequestBody {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn file(path: impl Into<std::path::PathBuf>) -> std::io::Result<Self> {
         let path = path.into();
-        regular_file(&std::fs::metadata(&path)?)?;
+        platform::regular_file(&std::fs::metadata(&path)?)?;
         Ok(Self {
-            payload: Payload::File(path),
+            payload: Payload::Native(platform::NativePayload::File(path)),
             content_type: None,
         })
     }
@@ -646,8 +642,7 @@ impl RequestBody {
     pub fn as_bytes(&self) -> Option<&Bytes> {
         match &self.payload {
             Payload::Bytes(b) => Some(b),
-            #[cfg(not(target_arch = "wasm32"))]
-            Payload::Stream { .. } | Payload::File(_) => None,
+            Payload::Native(_) => None,
         }
     }
 
@@ -656,10 +651,7 @@ impl RequestBody {
     pub fn len(&self) -> Option<u64> {
         match &self.payload {
             Payload::Bytes(b) => Some(b.len() as u64),
-            #[cfg(not(target_arch = "wasm32"))]
-            Payload::Stream { len, .. } => *len,
-            #[cfg(not(target_arch = "wasm32"))]
-            Payload::File(path) => std::fs::metadata(path).ok().map(|m| m.len()),
+            Payload::Native(p) => p.len(),
         }
     }
 
@@ -681,36 +673,8 @@ impl RequestBody {
         match &self.payload {
             Payload::Bytes(b) if b.is_empty() => Ok((reqwest::Body::from(b.clone()), None)),
             Payload::Bytes(b) => Ok((reqwest::Body::from(b.clone()), Some(b.len() as u64))),
-            #[cfg(not(target_arch = "wasm32"))]
-            Payload::Stream { open, len } => {
-                let reader = open()?;
-                let stream = tokio_util::io::ReaderStream::new(reader);
-                Ok((reqwest::Body::wrap_stream(stream), *len))
-            }
-            // Length from the handle that is sent, so it matches what is read.
-            #[cfg(not(target_arch = "wasm32"))]
-            Payload::File(path) => {
-                let f = std::fs::File::open(path)?;
-                let len = regular_file(&f.metadata()?)?;
-                let reader = Box::pin(tokio::fs::File::from_std(f)) as BoxedAsyncRead;
-                let stream = tokio_util::io::ReaderStream::new(reader);
-                Ok((reqwest::Body::wrap_stream(stream), Some(len)))
-            }
+            Payload::Native(p) => p.to_reqwest_body(),
         }
-    }
-}
-
-/// The length of a regular file, or an error for anything else (a FIFO or device has no
-/// length and may never end).
-#[cfg(not(target_arch = "wasm32"))]
-fn regular_file(meta: &std::fs::Metadata) -> std::io::Result<u64> {
-    if meta.is_file() {
-        Ok(meta.len())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "request body must be a regular file",
-        ))
     }
 }
 
