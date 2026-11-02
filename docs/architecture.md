@@ -43,6 +43,7 @@ All source lives under `src/`. The library exposes three top-level modules (`htt
 | Module | File | Responsibility |
 |--------|------|----------------|
 | `net::fetcher` | `src/net/fetcher.rs` | **The scheduler.** Priority queues, coalescing, concurrency limits, task spawning. `Fetcher::{new, run, submit}`. |
+| `net::fetcher::platform` | `src/net/fetcher/native.rs`, `src/net/fetcher/wasm.rs` | The fetcher's per-platform half, one file picked per target: native builds the tuned client and adds the proxy, DNS, HSTS, TLS-override and cache hooks to each request's policy, upgrades a request by HSTS before it is keyed, and queues background revalidations; wasm builds a plain client and does none of the rest. |
 | `net::fetch` | `src/net/fetch.rs` | Low-level fetch primitives: `fetch_response_top`, `fetch_response_complete` (crate-private: they need a client with redirects off, which only `Fetcher` builds), `ProgressReader`, `NetPolicy`. |
 | `net::fetch::platform` | `src/net/fetch/native.rs`, `src/net/fetch/wasm.rs` | The fetch layer's per-platform half, one file picked per target: native has the cache's pending writes (`PendingStore`, `CacheCollector`), preflight grants, header order, body decoding, TLS and proxy error classification and the response peer; wasm has the same items doing nothing, with `PendingStore` and `CacheCollector` as empty enums. |
 | `net::fetch::chain` | `src/net/fetch/chain.rs` | The redirect chain (`get_with_redirects`): `HopChain` carries the request from hop to hop, and each per-hop stage (HSTS and URL checks, CORS, referrer, `Origin`/`Sec-Fetch-*`, preflight, cookies, cache, send and auth retries, redirect follow) is one of its methods. |
@@ -79,8 +80,9 @@ redirects, cookies, and decompression — and tokio is limited to its wasm-suppo
 blockable thread are native-only: `net::pump`, `net::fs_utils`, `sync_get`/`sync_fetch`, `file://`
 URLs, and `net::test_support`. Tasks spawn via `spawn_named`, which maps to `tokio::spawn`
 natively and `tokio::task::spawn_local` on wasm32 (the embedder must drive a `LocalSet`).
-The native-only parts of the fetch layer sit behind `net::fetch::platform` and
-`net::fetch::chain::platform`, so `fetch.rs` and `chain.rs` gate only their public API.
+The native-only parts of the fetch layer and the fetcher sit behind `net::fetch::platform`,
+`net::fetch::chain::platform` and `net::fetcher::platform`, so `fetch.rs`, `chain.rs` and
+`fetcher.rs` gate only their public API.
 
 **Lint posture.** The crate forbids `unsafe_code` and denies `todo!`/`unimplemented!`/`dbg!` and
 (outside tests) `unwrap`/`expect`/`panic`.

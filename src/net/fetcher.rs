@@ -15,12 +15,12 @@ use crate::net::fetch::{
 use crate::net::fetch_metadata::RequestDestination;
 use crate::net::fetcher_context::FetcherContext;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::net::hsts::{self, HstsStore, InMemoryHstsStore};
+use crate::net::hsts::{HstsStore, InMemoryHstsStore};
 use crate::net::lifecycle::{Lifecycle, Shared};
 use crate::net::mixed_content::MixedContentPolicy;
 use crate::net::observer::NetObserver;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::net::proxy::{ProxyConfig, ProxyRoutes};
+use crate::net::proxy::ProxyConfig;
 use crate::net::retry::{self, RetryPolicy};
 use crate::net::shared_body::{ReaderOptions, SharedBody, DEFAULT_REPLAY_LIMIT};
 use crate::net::slots::{SlotPool, Slots};
@@ -35,6 +35,12 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::{oneshot, Notify};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+
+#[cfg_attr(not(target_arch = "wasm32"), path = "fetcher/native.rs")]
+#[cfg_attr(target_arch = "wasm32", path = "fetcher/wasm.rs")]
+mod platform;
+
+use platform::{build_client, ClientsBuilt};
 
 const SHARED_MAX_CAPACITY: usize = 32;
 
@@ -402,43 +408,6 @@ pub struct Fetcher {
     built: Arc<ClientsBuilt>,
 }
 
-/// What the client was built with that a request's policy has to agree with, taken when
-/// it was built rather than looked up again per request, and where a request's policy leaves
-/// the background revalidations it starts.
-struct ClientsBuilt {
-    /// The proxies the client routes by; see [`ProxyRoutes`].
-    #[cfg(not(target_arch = "wasm32"))]
-    proxy: ProxyRoutes,
-    /// Background revalidations on their way to the run loop.
-    #[cfg(not(target_arch = "wasm32"))]
-    revalidations: Revalidations,
-}
-
-impl ClientsBuilt {
-    fn new(cfg: &FetcherConfig) -> Self {
-        #[cfg(target_arch = "wasm32")]
-        let _ = cfg;
-        Self {
-            #[cfg(not(target_arch = "wasm32"))]
-            proxy: ProxyRoutes::resolve(&cfg.proxy),
-            #[cfg(not(target_arch = "wasm32"))]
-            revalidations: Revalidations::default(),
-        }
-    }
-}
-
-/// The background revalidations of stale responses that requests were answered with (see
-/// [`cache`](mod@crate::net::cache)), handed from a request's policy to the run loop, which
-/// queues them as requests of the fetcher's own.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Default)]
-struct Revalidations {
-    /// Started and not yet queued.
-    started: std::sync::Mutex<Vec<FetchRequest>>,
-    /// Wakes the run loop for a revalidation started while it waits.
-    ready: Notify,
-}
-
 impl Fetcher {
     /// Creates a fetcher with the given configuration and lifecycle context.
     ///
@@ -532,26 +501,6 @@ impl Fetcher {
                     "fetcher shut down before the request was sent".into(),
                 )));
             }
-        }
-    }
-
-    /// Queue the background revalidations requests have started since the last look. Nobody
-    /// waits for their result: what they bring back goes to the cache. Two for the same stored
-    /// response share one fetch, as any two requests alike do, so it is revalidated once
-    /// however many requests it answers meanwhile.
-    #[cfg(not(target_arch = "wasm32"))]
-    async fn queue_revalidations(&self) {
-        let started = std::mem::take(
-            &mut *self
-                .built
-                .revalidations
-                .started
-                .lock()
-                .unwrap_or_else(|e| e.into_inner()),
-        );
-        for req in started {
-            let (reply, _) = oneshot::channel();
-            self.submit(req, CancellationToken::new(), reply).await;
         }
     }
 
@@ -674,7 +623,6 @@ impl Fetcher {
                 self.stop_queue().await;
                 break;
             }
-            #[cfg(not(target_arch = "wasm32"))]
             self.queue_revalidations().await;
 
             let Some(QueueItem {
@@ -729,33 +677,13 @@ impl Fetcher {
         self.pick_lane(&mut high, &mut norm, &mut low, &mut idle, lane_counter)
     }
 
-    /// Waits until a request is submitted, a background revalidation is queued, or `shutdown`.
-    async fn wait_for_work(&self, shutdown: &CancellationToken) {
-        #[cfg(not(target_arch = "wasm32"))]
-        tokio::select! {
-            _ = self.wake.notified() => {},
-            _ = self.built.revalidations.ready.notified() => {},
-            _ = shutdown.cancelled() => {},
-        }
-        #[cfg(target_arch = "wasm32")]
-        tokio::select! {
-            _ = self.wake.notified() => {},
-            _ = shutdown.cancelled() => {},
-        }
-    }
-
     /// Settles `req` before it is keyed: the HSTS upgrade and the mixed-content policy. Returns
     /// the URL HSTS upgraded `requested` to, if it did.
     fn admit(&self, req: &mut FetchRequest, requested: &Url) -> Option<Url> {
         // Upgrade before the key is derived, or an http:// and an https:// request for the
         // same HSTS host hash to different keys and run as two fetches instead of coalescing
         // onto one. Also fixes the origin used for the per-origin limit below.
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some(ref store) = self.cfg.hsts {
-            if hsts::should_upgrade(store.as_ref(), &req.url, chrono::Utc::now()) {
-                req.url = hsts::upgrade(&req.url);
-            }
-        }
+        self.hsts_upgrade(req);
         // Reported to the request once it is accepted, below: the redirect loop only sees
         // the `https` URL and has nothing left to report.
         let upgraded = (req.url != *requested).then(|| req.url.clone());
@@ -1186,7 +1114,7 @@ fn make_request_init(req: &FetchRequest, cfg: &FetcherConfig, streaming: bool) -
 /// the request timeout over headers and body. On wasm32 the browser's `fetch()` has no
 /// separate deadline for headers, so nothing changes there.
 fn headers_timeout(req: &FetchRequest, cfg: &FetcherConfig, streaming: bool) -> Option<Duration> {
-    if cfg!(target_arch = "wasm32") || !streaming {
+    if !platform::HEADERS_DEADLINE || !streaming {
         return None;
     }
     Some(req.req_timeout.unwrap_or(cfg.req_timeout))
@@ -1201,84 +1129,6 @@ fn effective_read_idle_timeout(req: &FetchRequest, cfg: &FetcherConfig) -> Durat
 /// override can lift the deadline as well as set one.
 fn effective_total_body_timeout(req: &FetchRequest, cfg: &FetcherConfig) -> Option<Duration> {
     req.total_body_timeout.unwrap_or(cfg.total_body_timeout)
-}
-
-/// Build a reqwest client from `FetcherConfig`.
-///
-/// The client decodes no response bodies and adds no `Accept-Encoding`: both are the fetch's,
-/// in `get_with_redirects` and [`decode`](crate::net::decode).
-fn build_client(
-    cfg: &FetcherConfig,
-    ctx: &Arc<dyn FetcherContext>,
-    built: &ClientsBuilt,
-) -> anyhow::Result<reqwest::Client> {
-    // The browser's fetch() owns TLS, connection management, timeouts, proxying, and transparent
-    // decompression; none of the tuning knobs below exist in reqwest's wasm backend.
-    //
-    // It also owns redirects: there is no way to ask for them un-followed, so on wasm32
-    // `get_with_redirects` only ever sees the final response and the per-hop checks run once,
-    // on the initial URL. The browser applies its own mixed content blocking to the hops we
-    // cannot see, so this is a loss of reporting rather than of enforcement.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (ctx, built);
-        let mut b = reqwest::Client::builder();
-        if let Some(ref ua) = cfg.user_agent {
-            b = b.user_agent(ua);
-        }
-        Ok(b.build()?)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let mut b = reqwest::Client::builder()
-            // `get_with_redirects` follows redirects itself so that the per-hop mixed content
-            // check, HSTS upgrade, SSRF/URL policy, cookie jar, cross-origin header stripping,
-            // and `NetEvent::Redirected` all apply at every hop. reqwest's own redirect following
-            // must stay disabled or it swallows each 3xx internally and none of that runs — see
-            // `fetcher_url_policy_is_applied_to_redirect_targets`.
-            .redirect(reqwest::redirect::Policy::none())
-            .connection_verbose(false)
-            .http2_adaptive_window(true)
-            .connect_timeout(cfg.connect_timeout)
-            .timeout(cfg.req_timeout)
-            .pool_max_idle_per_host(cfg.pool_max_idle_per_host)
-            .pool_idle_timeout(cfg.pool_idle_timeout)
-            .tcp_keepalive(cfg.tcp_keepalive)
-            // Bodies are decoded by `net::decode`, never by the client. Off explicitly too: a
-            // crate that enables reqwest's decompression features would turn it on by default.
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd();
-        // overrides need our own verifier, so we build the rustls config ourselves
-        b = match &cfg.tls_overrides {
-            // tls_info: responses carry their peer certificate, for the HSTS check
-            Some(store) => {
-                b.tls_info(true)
-                    .tls_backend_preconfigured(crate::net::tls::client_config(
-                        store.clone(),
-                        ctx.clone(),
-                        cfg.hsts.clone(),
-                    )?)
-            }
-            None => b.use_rustls_tls(),
-        };
-        if let Some(ref ua) = cfg.user_agent {
-            b = b.user_agent(ua);
-        }
-        // Always installed, the system's resolver when none is configured, so that
-        // `localhost` is answered with loopback rather than looked up.
-        let resolver = cfg
-            .dns_resolver
-            .clone()
-            .unwrap_or_else(|| Arc::new(crate::net::dns::SystemResolver));
-        b = b.dns_resolver(Arc::new(crate::net::dns::ReqwestResolver(resolver)));
-        // Observation only - forwards the request and returns the connector's own result
-        // unchanged - so it is installed for every client rather than gated on config.
-        b = b.connector_layer(crate::net::connect_timing::ConnectTimingLayer);
-        b = built.proxy.apply(b)?;
-        Ok(b.build()?)
-    }
 }
 
 /// A body reader that keeps the fetch's slots until it is dropped: when the stream has been
@@ -1310,8 +1160,6 @@ fn build_policy(
     origins: Arc<SlotPool>,
     built: &Arc<ClientsBuilt>,
 ) -> NetPolicy {
-    #[cfg(target_arch = "wasm32")]
-    let _ = built;
     let hint_origins = origins.clone();
     let policy = NetPolicy::from_context(ctx, req.reference)
         .with_protocol_sink(Box::new(move |url, version| origins.observe(url, version)))
@@ -1323,68 +1171,7 @@ fn build_policy(
         // request is executed and never exposes it for reading, so without this an observer
         // sees a request with no user agent on it at all.
         .with_user_agent(cfg.user_agent.as_deref());
-    #[cfg(not(target_arch = "wasm32"))]
-    let policy = {
-        // Same reason as the user agent: the client would attach `Proxy-Authorization` itself,
-        // while executing the request, and an observer would never see the header its own
-        // configuration put there.
-        let proxy = built.clone();
-        let proxy_for = built.clone();
-        let proxied = built.clone();
-        let policy = policy
-            .with_proxy_authorization(Box::new(move |url| proxy.proxy.proxy_authorization(url)))
-            .with_proxy_for(Box::new(move |url| proxy_for.proxy.http_proxy(url)))
-            .with_proxied(Box::new(move |url| proxied.proxy.routes_through_proxy(url)))
-            .with_dns_resolver(cfg.dns_resolver.clone())
-            .with_hsts(cfg.hsts.clone())
-            .with_tls_overrides(cfg.tls_overrides.clone())
-            .with_cache(cfg.cache.clone());
-        let policy = match cfg.cache {
-            Some(_) => policy.with_background_revalidation(revalidate_later(req, built)),
-            None => policy,
-        };
-        match cfg.cors_preflight_cache.clone() {
-            Some(cache) => policy.with_cors_preflight_cache(cache),
-            None => policy,
-        }
-    };
-    policy
-}
-
-/// What starts the background revalidation of a stale response `req` was answered with: a
-/// request of the fetcher's own, `req` again (Fetch: a clone of the request) from the hop that
-/// was answered, as its redirect chain had left it, in
-/// [`CacheMode::NoCache`](crate::net::cache::CacheMode::NoCache) and at [`Priority::Low`],
-/// queued by the run loop. It reports to an observer of its own, under a request id of its
-/// own, and the stored response it brings back answers the requests after it.
-#[cfg(not(target_arch = "wasm32"))]
-fn revalidate_later(
-    req: &FetchRequest,
-    built: &Arc<ClientsBuilt>,
-) -> crate::net::fetch::BackgroundRevalidationFn {
-    let req = req.clone();
-    let built = built.clone();
-    Box::new(move |from| {
-        let mut revalidation = req.clone();
-        revalidation.req_id = crate::types::RequestId::new();
-        revalidation.url = from.url().clone();
-        revalidation.method = from.method().clone();
-        revalidation.headers = from.headers().clone();
-        // A redirect to `GET` took the body; a hop that is answered from the cache has none.
-        revalidation.body = None;
-        revalidation.cache_mode = crate::net::cache::CacheMode::NoCache;
-        revalidation.background_revalidation = Some(from);
-        revalidation.priority = Priority::Low;
-        // Read to its end, so the cache gets the whole response.
-        revalidation.streaming = false;
-        let revalidations = &built.revalidations;
-        revalidations
-            .started
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(revalidation);
-        revalidations.ready.notify_one();
-    })
+    platform::native_policy(policy, req, cfg, built)
 }
 
 /// Request override if set, else the fetcher's.
