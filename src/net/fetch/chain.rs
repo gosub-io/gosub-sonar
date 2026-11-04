@@ -666,8 +666,9 @@ impl HopChain {
 
         tokio::select! {
             _ = env.cancel.cancelled() => {
-                env.observer.on_event(NetEvent::Cancelled { url: self.url.clone(), reason: "all callers cancelled" });
-                Err(NetError::Cancelled("all callers cancelled".into()))
+                let reason = super::cancel_reason();
+                env.observer.on_event(NetEvent::Cancelled { url: self.url.clone(), reason });
+                Err(NetError::Cancelled(reason.into()))
             }
             _ = &mut deadline => {
                 Err(NetError::Timeout(format!(

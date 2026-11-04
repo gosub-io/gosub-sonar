@@ -10,7 +10,7 @@ use crate::net::dns::DnsResolver;
 use crate::net::events::NetEvent;
 use crate::net::fetch::{
     blocked, fetch_response_complete, fetch_response_top, hop_checks, HopCheck, NetPolicy,
-    RequestInit, ResponseTop,
+    RequestInit, ResponseTop, FETCHER_SHUTDOWN,
 };
 use crate::net::fetch_metadata::RequestDestination;
 use crate::net::fetcher_context::FetcherContext;
@@ -891,7 +891,8 @@ impl Fetcher {
         let ctx_clone = self.ctx.clone();
 
         let title = format!("Fetcher: {}", short_url(&req.url, 80));
-        spawn_named(&title, async move {
+        let task_shutdown = shutdown.clone();
+        let task = async move {
             // Priority is applied here, where fetches wait: the pool hands a freed slot to
             // the highest lane that can use it (see `slots`). Waiting ends early on
             // shutdown, or once every subscriber has cancelled. Either way the entry below
@@ -966,7 +967,8 @@ impl Fetcher {
             inflight_entry2.done.cancel();
 
             drop(held);
-        });
+        };
+        spawn_named(&title, FETCHER_SHUTDOWN.scope(task_shutdown, task));
     }
 }
 
@@ -4317,11 +4319,11 @@ mod tests {
             .expect("fetch still running after shutdown")
             .unwrap();
         assert!(
-            matches!(result, FetchResult::Error(NetError::Cancelled(_))),
+            matches!(&result, FetchResult::Error(NetError::Cancelled(m)) if m == "fetcher shut down"),
             "{result:?}"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(log.cancellations().len(), 1, "{:?}", log.event_names());
+        assert_eq!(log.cancellations(), ["fetcher shut down"]);
     }
 
     /// A streamed body the caller is still reading ends with an error on shutdown.

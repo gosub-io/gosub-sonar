@@ -196,8 +196,9 @@ impl HopChain {
         };
         let refused = tokio::select! {
             _ = env.cancel.cancelled() => {
-                env.observer.on_event(NetEvent::Cancelled { url: self.url.clone(), reason: "all callers cancelled" });
-                return Err(NetError::Cancelled("all callers cancelled".into()));
+                let reason = super::super::cancel_reason();
+                env.observer.on_event(NetEvent::Cancelled { url: self.url.clone(), reason });
+                return Err(NetError::Cancelled(reason.into()));
             }
             r = resolver.resolve(&literal) => r.err(),
         };

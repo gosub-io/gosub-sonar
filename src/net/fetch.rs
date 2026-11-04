@@ -49,6 +49,26 @@ use platform::{origin_peer, CacheCollector, PendingStore};
 
 use chain::get_with_redirects;
 
+tokio::task_local! {
+    /// Shutdown token of the fetcher driving the fetch on this task, so a cancel can tell a
+    /// fetcher that stopped from callers that all gave up. Task-local, like
+    /// [`CURRENT_OBSERVER`](crate::net::observer::CURRENT_OBSERVER), so it reaches the chain
+    /// without threading it through every fetch function.
+    pub(crate) static FETCHER_SHUTDOWN: CancellationToken;
+}
+
+/// Why a fetch's cancel token fired: the fetcher shut down, or every caller cancelled.
+fn cancel_reason() -> &'static str {
+    if FETCHER_SHUTDOWN
+        .try_with(CancellationToken::is_cancelled)
+        .unwrap_or(false)
+    {
+        "fetcher shut down"
+    } else {
+        "all callers cancelled"
+    }
+}
+
 /// Headers that must be stripped when following a redirect to a different origin (RFC 9110 §15.4).
 ///
 /// `Referer` and `Origin` are included so hand-set values cannot leak to a third-party host.

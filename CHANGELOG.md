@@ -21,7 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `with_*` builders are unchanged. `cache` and `proxy` are native only
 - Stopping the fetcher (cancelling the token given to `Fetcher::run`) now also cancels fetches
   already under way, streamed bodies included; they used to run on until they finished or
-  timed out, holding their connections, slots and request references (GOS-278)
+  timed out, holding their connections, slots and request references. Such a fetch ends with
+  `Cancelled` and the reason `fetcher shut down`, not `all callers cancelled` (GOS-278)
 
 ## [0.16.1] - 2026-10-17
 
