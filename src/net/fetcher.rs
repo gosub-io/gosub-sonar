@@ -329,11 +329,16 @@ pub struct FetchInflightEntry {
 }
 
 impl FetchInflightEntry {
-    /// Counts one more subscriber in, unless every subscriber has already cancelled: once the
-    /// count has reached zero the fetch is being torn down, and joining it would only hand the
-    /// newcomer that cancellation. Returns whether the subscriber was counted in.
+    /// Counts one more subscriber in, unless every subscriber has already cancelled or the
+    /// fetcher shut down: either way the fetch is being torn down, and joining it would only
+    /// hand the newcomer that cancellation. Returns whether the subscriber was counted in.
     #[inline]
     fn try_inc_sub(&self) -> bool {
+        // Shutdown cancels `parent_cancel` without touching the count; a run restarted before
+        // the old fetch left the map would otherwise join it.
+        if self.parent_cancel.is_cancelled() {
+            return false;
+        }
         let mut n = self.subs.load(Ordering::Acquire);
         while n > 0 {
             match self
@@ -1639,7 +1644,24 @@ mod tests {
         );
     }
 
-    // ── Integration (requires mock server) ────────────────────────────────────
+    /// A run restarted before a shut-down fetch left the map must not join it.
+    #[test]
+    fn inflight_entry_cancelled_by_shutdown_takes_no_one() {
+        let shutdown = CancellationToken::new();
+        let entry = FetchInflightEntry {
+            parent_cancel: shutdown.child_token(),
+            waiter: Arc::new(Waiter::new()),
+            wants_streaming: AtomicBool::new(false),
+            subs: AtomicUsize::new(1),
+            done: CancellationToken::new(),
+            shared: std::sync::OnceLock::new(),
+        };
+        shutdown.cancel();
+        assert!(!entry.try_inc_sub());
+        assert_eq!(entry.subs.load(Ordering::Acquire), 1);
+    }
+
+    // ── Integration (requires mock server)────────────────────────────────────
 
     #[tokio::test(flavor = "current_thread")]
     async fn fetcher_buffers_response() {
