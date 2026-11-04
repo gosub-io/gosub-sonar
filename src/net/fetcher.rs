@@ -10,7 +10,7 @@ use crate::net::dns::DnsResolver;
 use crate::net::events::NetEvent;
 use crate::net::fetch::{
     blocked, fetch_response_complete, fetch_response_top, hop_checks, HopCheck, NetPolicy,
-    RequestInit, ResponseTop,
+    RequestInit, ResponseTop, FETCHER_SHUTDOWN,
 };
 use crate::net::fetch_metadata::RequestDestination;
 use crate::net::fetcher_context::FetcherContext;
@@ -303,13 +303,15 @@ impl Default for FetcherConfig {
 ///    the subscriber's listener is taken out of the waiter and answered with
 ///    `NetError::Cancelled` at once (`Waiter::cancel`), and `dec_sub_and_maybe_cancel`
 ///    decrements `subs`.  If the count reaches zero (all subscribers cancelled),
-///    `parent_cancel` is fired, which in turn cancels the in-progress HTTP request.
+///    `parent_cancel` is fired, which in turn cancels the in-progress HTTP request. It is a
+///    child of the fetcher's shutdown token, so stopping the fetcher cancels it too.
 /// 4. **Completion** — the leader removes the entry from the map (so new requests start a fresh
 ///    fetch instead of joining a waiter that is about to be drained), then calls
 ///    `waiter.finish(result)`, which fans the result out to all registered receivers.  `done` is
 ///    then cancelled to unblock any lingering child-cancel tasks.
 pub struct FetchInflightEntry {
-    /// Fires when *all* subscribers have cancelled, aborting the underlying HTTP request.
+    /// Fires when *all* subscribers have cancelled or the fetcher shuts down, aborting the
+    /// underlying HTTP request.
     parent_cancel: CancellationToken,
     /// Fan-out dispatcher: registers per-subscriber oneshot senders, delivers the result to all.
     waiter: Arc<Waiter>,
@@ -327,11 +329,16 @@ pub struct FetchInflightEntry {
 }
 
 impl FetchInflightEntry {
-    /// Counts one more subscriber in, unless every subscriber has already cancelled: once the
-    /// count has reached zero the fetch is being torn down, and joining it would only hand the
-    /// newcomer that cancellation. Returns whether the subscriber was counted in.
+    /// Counts one more subscriber in, unless every subscriber has already cancelled or the
+    /// fetcher shut down: either way the fetch is being torn down, and joining it would only
+    /// hand the newcomer that cancellation. Returns whether the subscriber was counted in.
     #[inline]
     fn try_inc_sub(&self) -> bool {
+        // Shutdown cancels `parent_cancel` without touching the count; a run restarted before
+        // the old fetch left the map would otherwise join it.
+        if self.parent_cancel.is_cancelled() {
+            return false;
+        }
         let mut n = self.subs.load(Ordering::Acquire);
         while n > 0 {
             match self
@@ -597,7 +604,7 @@ impl Fetcher {
     ///
     /// When it stops, every request still waiting in a lane is answered with
     /// [`NetError::Cancelled`], and so is any submitted afterwards, until `run` is called again.
-    /// Fetches already under way finish as usual.
+    /// Fetches already under way are cancelled too, streamed bodies included.
     ///
     /// Calling `run` reopens the queue there and then, not when the loop is first polled: a
     /// request submitted between a restart and the spawned loop's first turn waits for it
@@ -640,7 +647,7 @@ impl Fetcher {
 
             let key_str = self.coalescing_key(&req);
             let (inflight_entry, is_leader, listener) =
-                self.join_inflight(&key_str, &req, reply_tx);
+                self.join_inflight(&key_str, &req, reply_tx, &shutdown);
             let (lifecycle, shared) =
                 self.accept(&req, &requested, upgraded, is_leader, &inflight_entry);
             watch_caller(&inflight_entry, listener, cancel, lifecycle);
@@ -721,6 +728,7 @@ impl Fetcher {
         key_str: &str,
         req: &FetchRequest,
         reply_tx: oneshot::Sender<FetchResult>,
+        shutdown: &CancellationToken,
     ) -> (Arc<FetchInflightEntry>, bool, u64) {
         // Register the reply channel while still holding the DashMap entry guard.
         // `register` is synchronous (no await), so holding the shard lock here is safe. The
@@ -736,7 +744,7 @@ impl Fetcher {
         // removes its own entry, so it leaves the new one alone.
         let new_entry = |req: &FetchRequest| {
             Arc::new(FetchInflightEntry {
-                parent_cancel: CancellationToken::new(),
+                parent_cancel: shutdown.child_token(),
                 waiter: Arc::new(Waiter::new()),
                 wants_streaming: AtomicBool::new(req.streaming),
                 done: CancellationToken::new(),
@@ -888,7 +896,8 @@ impl Fetcher {
         let ctx_clone = self.ctx.clone();
 
         let title = format!("Fetcher: {}", short_url(&req.url, 80));
-        spawn_named(&title, async move {
+        let task_shutdown = shutdown.clone();
+        let task = async move {
             // Priority is applied here, where fetches wait: the pool hands a freed slot to
             // the highest lane that can use it (see `slots`). Waiting ends early on
             // shutdown, or once every subscriber has cancelled. Either way the entry below
@@ -963,7 +972,8 @@ impl Fetcher {
             inflight_entry2.done.cancel();
 
             drop(held);
-        });
+        };
+        spawn_named(&title, FETCHER_SHUTDOWN.scope(task_shutdown, task));
     }
 }
 
@@ -1634,7 +1644,24 @@ mod tests {
         );
     }
 
-    // ── Integration (requires mock server) ────────────────────────────────────
+    /// A run restarted before a shut-down fetch left the map must not join it.
+    #[test]
+    fn inflight_entry_cancelled_by_shutdown_takes_no_one() {
+        let shutdown = CancellationToken::new();
+        let entry = FetchInflightEntry {
+            parent_cancel: shutdown.child_token(),
+            waiter: Arc::new(Waiter::new()),
+            wants_streaming: AtomicBool::new(false),
+            subs: AtomicUsize::new(1),
+            done: CancellationToken::new(),
+            shared: std::sync::OnceLock::new(),
+        };
+        shutdown.cancel();
+        assert!(!entry.try_inc_sub());
+        assert_eq!(entry.subs.load(Ordering::Acquire), 1);
+    }
+
+    // ── Integration (requires mock server)────────────────────────────────────
 
     #[tokio::test(flavor = "current_thread")]
     async fn fetcher_buffers_response() {
@@ -2775,13 +2802,11 @@ mod tests {
     }
 
     /// Drive one request through a fresh fetcher built from `cfg`, returning its result and
-    /// how long it took. Shuts the fetcher down afterwards.
+    /// how long it took. The fetcher runs until the test's runtime ends: a streamed result is
+    /// still read after this returns, and a shutdown would cut its body off.
     async fn fetch_one(cfg: FetcherConfig, req: FetchRequest) -> (FetchResult, Duration) {
         let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
-        let shutdown = CancellationToken::new();
-        let f = fetcher.clone();
-        let s = shutdown.clone();
-        tokio::spawn(f.run(s));
+        tokio::spawn(fetcher.clone().run(CancellationToken::new()));
 
         let started = std::time::Instant::now();
         let (tx, rx) = oneshot::channel();
@@ -2790,7 +2815,6 @@ mod tests {
             .await
             .expect("fetch must finish within the test budget")
             .unwrap();
-        shutdown.cancel();
         (result, started.elapsed())
     }
 
@@ -4292,6 +4316,72 @@ mod tests {
             ended.contains(&"fetcher shut down before the request was sent"),
             "{ended:?}"
         );
+    }
+
+    /// Shutdown also ends a fetch that holds its slot: it does not run on until a timeout.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_cancels_a_fetch_under_way() {
+        let srv = start_server().await;
+        let log = Arc::new(RecordingObserver::new());
+        let fetcher =
+            Arc::new(Fetcher::new(test_config(), Arc::new(Recording(log.clone()))).unwrap());
+        let shutdown = CancellationToken::new();
+        tokio::spawn(fetcher.clone().run(shutdown.clone()));
+
+        let (tx, rx) = oneshot::channel();
+        let (req, token) = make_req(srv.url("/hang"), Priority::Normal);
+        fetcher.submit(req, token, tx).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(log.cancellations().is_empty());
+
+        shutdown.cancel();
+        // Well inside req_timeout (5s): the shutdown ended it, not the clock.
+        let result = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("fetch still running after shutdown")
+            .unwrap();
+        assert!(
+            matches!(&result, FetchResult::Error(NetError::Cancelled(m)) if m == "fetcher shut down"),
+            "{result:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(log.cancellations(), ["fetcher shut down"]);
+    }
+
+    /// A streamed body the caller is still reading ends with an error on shutdown.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_ends_a_streamed_body() {
+        use futures_util::StreamExt;
+        let srv = start_server().await;
+        let log = Arc::new(RecordingObserver::new());
+        let fetcher = Arc::new(Fetcher::new(test_config(), Arc::new(Recording(log))).unwrap());
+        let shutdown = CancellationToken::new();
+        tokio::spawn(fetcher.clone().run(shutdown.clone()));
+
+        // 8 KiB, then a 30s stall.
+        let (mut req, _) = make_req(srv.url("/stall-late"), Priority::Normal);
+        req.streaming = true;
+        let result = tokio::time::timeout(Duration::from_secs(5), fetcher.fetch(req))
+            .await
+            .unwrap();
+        let FetchResult::Stream { shared, .. } = result else {
+            panic!("expected Stream, got {result:?}");
+        };
+        let mut sub = shared.subscribe_stream();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        shutdown.cancel();
+        let ended = tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(chunk) = sub.next().await {
+                if chunk.is_err() {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .expect("body still open after shutdown");
+        assert!(ended, "body ended cleanly instead of with an error");
     }
 
     /// `FetcherContext::on_ref_done`: "Called once when all subscribers for a fetch are done",
