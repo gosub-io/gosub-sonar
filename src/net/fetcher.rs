@@ -419,7 +419,8 @@ impl Fetcher {
     /// Creates a fetcher with the given configuration and lifecycle context.
     ///
     /// Use [`NullContext`](crate::NullContext) as the context if you don't need lifecycle
-    /// callbacks. Fails if the configured concurrency limits are zero.
+    /// callbacks. Fails if the configured concurrency limits are zero, or (native only) if the
+    /// environment names a proxy that cannot be used; see `ProxyConfig::System`.
     pub fn new(config: FetcherConfig, ctx: Arc<dyn FetcherContext>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             config.global_slots > 0,
@@ -435,7 +436,7 @@ impl Fetcher {
         );
 
         // The environment's proxies are read once, here, and the client is built from that.
-        let built = Arc::new(ClientsBuilt::new(&config));
+        let built = Arc::new(ClientsBuilt::new(&config)?);
         let client = build_client(&config, &ctx, &built)?;
 
         Ok(Self {

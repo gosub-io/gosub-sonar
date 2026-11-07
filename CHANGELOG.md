@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already under way, streamed bodies included; they used to run on until they finished or
   timed out, holding their connections, slots and request references. Such a fetch ends with
   `Cancelled` and the reason `fetcher shut down`, not `all callers cancelled` (GOS-278)
+- `ProxyConfig::System` (the default) fails closed on a proxy from the environment it cannot
+  use: `Fetcher::new` and the simple API (`simple_get`, `sync_get`, ...) now return an error
+  naming the variable, such as `ALL_PROXY=socks5h://...` in a build without the `socks`
+  feature. Such a value used to be skipped with a warning, sending its traffic direct and
+  skipping the operating system's proxy settings as well. The error leaves out the URL's
+  userinfo (GOS-304)
 
 ## [0.16.1] - 2026-10-17
 

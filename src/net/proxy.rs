@@ -432,7 +432,9 @@ pub enum ProxyConfig {
     /// [`ProxyRule::all`] for whatever the other two leave, each bypassing `NO_PROXY` in the
     /// syntax [`ProxyRule::no_proxy`] describes. The uppercase name wins over the lowercase
     /// one, an empty value counts as unset, and a value without a scheme is an `http` proxy. An
-    /// unusable value is skipped with a warning rather than failing the fetcher.
+    /// unusable value, such as a `socks5h://` URL without the `socks` cargo feature, fails
+    /// [`Fetcher::new`](crate::net::fetcher::Fetcher::new) (and a simple request) rather than
+    /// sending its traffic elsewhere.
     ///
     /// Under CGI (`REQUEST_METHOD` is set) `HTTP_PROXY` is ignored: a CGI server passes a
     /// request's `Proxy` header to its program as `HTTP_PROXY`, so the client of that server
@@ -466,19 +468,33 @@ impl ProxyConfig {
         &self,
         builder: reqwest::ClientBuilder,
     ) -> anyhow::Result<reqwest::ClientBuilder> {
-        ProxyRoutes::resolve(self).apply(builder)
+        ProxyRoutes::resolve(self)?.apply(builder)
+    }
+}
+
+/// `url` without its userinfo, for an error message. Textual, so that a URL that does not parse
+/// loses it too; everything up to the last `@` after the scheme counts as userinfo.
+fn without_userinfo(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.rsplit_once('@') {
+            Some((_, host)) => format!("{scheme}://{host}"),
+            None => url.to_string(),
+        },
+        None => url.to_string(),
     }
 }
 
 /// The rules [`ProxyConfig::System`] reads from the environment through `var`, or `None` when
-/// no variable names a proxy. See [`ProxyConfig::System`] for how each is read.
-fn env_rules(var: &dyn Fn(&str) -> Option<String>) -> Option<Vec<ProxyRule>> {
-    let first = |names: &[&str]| {
-        names
-            .iter()
-            .filter_map(|name| var(name))
-            .map(|value| value.trim().to_string())
-            .find(|value| !value.is_empty())
+/// no variable names a proxy. See [`ProxyConfig::System`] for how each is read. Fails on a
+/// value that does not make a usable rule, naming the variable and the URL without userinfo.
+fn env_rules(var: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Option<Vec<ProxyRule>>> {
+    let first = |names: &[&'static str]| {
+        names.iter().find_map(|&name| {
+            var(name)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| (name, value))
+        })
     };
     let cgi = var("REQUEST_METHOD").is_some();
     let http = if cgi {
@@ -489,9 +505,9 @@ fn env_rules(var: &dyn Fn(&str) -> Option<String>) -> Option<Vec<ProxyRule>> {
     let https = first(&["HTTPS_PROXY", "https_proxy"]);
     let all = first(&["ALL_PROXY", "all_proxy"]);
     if http.is_none() && https.is_none() && all.is_none() {
-        return None;
+        return Ok(None);
     }
-    let no_proxy = first(&["NO_PROXY", "no_proxy"]);
+    let no_proxy = first(&["NO_PROXY", "no_proxy"]).map(|(_, value)| value);
     let with_scheme = |url: String| {
         if url.contains("://") {
             url
@@ -499,27 +515,38 @@ fn env_rules(var: &dyn Fn(&str) -> Option<String>) -> Option<Vec<ProxyRule>> {
             format!("http://{url}")
         }
     };
-    let rules = [
+    // Skipping an unusable rule would send its traffic direct, or through a looser rule after
+    // it: a `socks5h://` Tor proxy in a build without `socks` would silently stop proxying.
+    let mut rules = Vec::new();
+    for (scope, value) in [
         (ProxyScope::Http, http),
         (ProxyScope::Https, https),
         (ProxyScope::All, all),
-    ]
-    .into_iter()
-    .filter_map(|(scope, url)| {
+    ] {
+        let Some((name, url)) = value else {
+            continue;
+        };
         let rule = ProxyRule {
             no_proxy: no_proxy.clone(),
-            ..ProxyRule::new(scope, with_scheme(url?))
+            ..ProxyRule::new(scope, with_scheme(url))
         };
-        match rule.to_reqwest() {
-            Ok(_) => Some(rule),
-            Err(e) => {
-                log::warn!("ignoring the proxy from the environment: {e:#}");
-                None
-            }
+        // Checked without userinfo first, so the reason given cannot carry it.
+        let bare = ProxyRule {
+            url: without_userinfo(&rule.url),
+            ..rule.clone()
+        };
+        if let Err(e) = bare.to_reqwest() {
+            anyhow::bail!("unusable proxy in {name}: {e:#}");
         }
-    })
-    .collect();
-    Some(rules)
+        if rule.to_reqwest().is_err() {
+            anyhow::bail!(
+                "unusable proxy in {name}: {:?} is not a usable URL with its userinfo",
+                bare.url
+            );
+        }
+        rules.push(rule);
+    }
+    Ok(Some(rules))
 }
 
 /// A [`ProxyConfig`] resolved once, with the environment read for [`ProxyConfig::System`].
@@ -534,16 +561,25 @@ pub(crate) enum ProxyRoutes {
 }
 
 impl ProxyRoutes {
-    /// Resolve `config`, reading the environment now for [`ProxyConfig::System`].
-    pub(crate) fn resolve(config: &ProxyConfig) -> Self {
-        match config {
-            ProxyConfig::System => match env_rules(&|name| std::env::var(name).ok()) {
+    /// Resolve `config`, reading the environment now for [`ProxyConfig::System`]. Fails when
+    /// the environment names a proxy that cannot be used.
+    pub(crate) fn resolve(config: &ProxyConfig) -> anyhow::Result<Self> {
+        Self::resolve_from(config, &|name| std::env::var(name).ok())
+    }
+
+    /// [`ProxyRoutes::resolve`] with the environment read through `var`.
+    fn resolve_from(
+        config: &ProxyConfig,
+        var: &dyn Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(match config {
+            ProxyConfig::System => match env_rules(var)? {
                 Some(rules) => ProxyRoutes::Rules(rules),
                 None => ProxyRoutes::System(Box::new(proxy_matcher::Matcher::from_system())),
             },
             ProxyConfig::Disabled => ProxyRoutes::Disabled,
             ProxyConfig::Rules(rules) => ProxyRoutes::Rules(rules.clone()),
-        }
+        })
     }
 
     /// Apply these routes to a client builder.
@@ -772,6 +808,7 @@ mod tests {
     /// The `Proxy-Authorization` reported for `url` under `cfg`, as a string.
     fn authorization(cfg: &ProxyConfig, url: &str) -> Option<String> {
         ProxyRoutes::resolve(cfg)
+            .unwrap()
             .proxy_authorization(&Url::parse(url).unwrap())
             .map(|v| v.to_str().unwrap().to_string())
     }
@@ -904,14 +941,31 @@ mod tests {
         assert_eq!(ProxyRoutes::Disabled.proxy_authorization(&url), None);
     }
 
-    /// The routes [`env_rules`] makes of `vars`, or `None` when it finds no proxy.
-    fn env(vars: &[(&str, &str)]) -> Option<ProxyRoutes> {
+    /// [`ProxyRoutes::resolve`] for `config` with `vars` as the environment.
+    fn resolve_env(config: &ProxyConfig, vars: &[(&str, &str)]) -> anyhow::Result<ProxyRoutes> {
         let vars: Vec<(String, String)> = vars
             .iter()
             .map(|(n, v)| (n.to_string(), v.to_string()))
             .collect();
-        env_rules(&|name| vars.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()))
-            .map(ProxyRoutes::Rules)
+        ProxyRoutes::resolve_from(config, &|name| {
+            vars.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        })
+    }
+
+    /// The routes [`env_rules`] makes of `vars`, or `None` when it finds no proxy.
+    fn env(vars: &[(&str, &str)]) -> Option<ProxyRoutes> {
+        match resolve_env(&ProxyConfig::System, vars).unwrap() {
+            ProxyRoutes::System(_) => None,
+            routes => Some(routes),
+        }
+    }
+
+    /// The error [`env_rules`] fails `vars` with, as a string.
+    fn env_error(vars: &[(&str, &str)]) -> String {
+        match resolve_env(&ProxyConfig::System, vars) {
+            Ok(_) => panic!("{vars:?} should not resolve"),
+            Err(e) => format!("{e:#}"),
+        }
     }
 
     /// The proxy a plain-http request to `target` goes through under `routes`, as a string.
@@ -974,8 +1028,8 @@ mod tests {
         assert!(!both.routes_through_proxy(&Url::parse("https://example.com/").unwrap()));
     }
 
-    /// A value without a scheme is an http proxy, an unusable one is skipped, and no proxy
-    /// variable at all leaves the choice to the operating system's settings.
+    /// A value without a scheme is an http proxy, an unusable one fails, and no proxy variable
+    /// at all leaves the choice to the operating system's settings.
     #[test]
     fn env_values_without_a_scheme_unusable_or_absent() {
         let bare = env(&[("HTTP_PROXY", "proxy.test:3128")]).unwrap();
@@ -984,18 +1038,63 @@ mod tests {
             Some("http://proxy.test:3128/")
         );
 
-        let broken = env(&[
+        // Not skipped for the `ALL_PROXY` after it.
+        let broken = env_error(&[
             ("HTTP_PROXY", "http://[not-an-address"),
             ("ALL_PROXY", "http://all.test:3128"),
-        ])
-        .unwrap();
-        assert_eq!(
-            via(&broken, "http://example.com/").as_deref(),
-            Some("http://all.test:3128/")
-        );
+        ]);
+        assert!(broken.contains("HTTP_PROXY"), "{broken}");
+        assert!(broken.contains("[not-an-address"), "{broken}");
 
         assert!(env(&[("NO_PROXY", "*")]).is_none());
         assert!(env(&[("HTTP_PROXY", "  ")]).is_none());
+    }
+
+    /// A socks proxy in the environment without the `socks` feature fails rather than leaving
+    /// every request to go direct.
+    #[test]
+    fn env_socks_proxy_needs_the_socks_feature() {
+        let vars = [("ALL_PROXY", "socks5h://127.0.0.1:9050")];
+        if cfg!(feature = "socks") {
+            assert!(env(&vars)
+                .unwrap()
+                .routes_through_proxy(&Url::parse("https://example.com/").unwrap()));
+        } else {
+            let e = env_error(&vars);
+            assert!(e.contains("ALL_PROXY") && e.contains("socks"), "{e}");
+        }
+    }
+
+    /// The error names the URL without its userinfo, both when the URL itself is unusable and
+    /// when only its userinfo is.
+    #[test]
+    fn env_errors_leave_the_credentials_out() {
+        let e = env_error(&[("https_proxy", "http://alice:hunter2@[not-an-address")]);
+        assert!(e.contains("https_proxy"), "{e}");
+        assert!(e.contains("http://[not-an-address"), "{e}");
+        assert!(!e.contains("alice") && !e.contains("hunter2"), "{e}");
+
+        // The `/` ends the authority, so `hunter2/x` would be read as a port.
+        let e = env_error(&[("HTTP_PROXY", "http://alice:hunter2/x@proxy.test:3128")]);
+        assert!(e.contains("http://proxy.test:3128"), "{e}");
+        assert!(!e.contains("alice") && !e.contains("hunter2"), "{e}");
+    }
+
+    #[test]
+    fn without_userinfo_strips_up_to_the_last_at() {
+        assert_eq!(without_userinfo("http://u:p@h:1"), "http://h:1");
+        assert_eq!(without_userinfo("http://u:p/w@x@h"), "http://h");
+        assert_eq!(without_userinfo("http://h:1/"), "http://h:1/");
+        assert_eq!(without_userinfo("u:p@h"), "u:p@h");
+    }
+
+    /// Only [`ProxyConfig::System`] reads the environment.
+    #[test]
+    fn only_system_reads_the_environment() {
+        let broken = [("ALL_PROXY", "http://[not-an-address")];
+        assert!(resolve_env(&ProxyConfig::System, &broken).is_err());
+        assert!(resolve_env(&ProxyConfig::Disabled, &broken).is_ok());
+        assert!(resolve_env(&ProxyConfig::Rules(vec![]), &broken).is_ok());
     }
 
     /// httpoxy (CVE-2016-5385): under CGI a request's `Proxy` header arrives as `HTTP_PROXY`,
