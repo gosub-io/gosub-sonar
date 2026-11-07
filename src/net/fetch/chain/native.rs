@@ -87,14 +87,21 @@ pub(super) struct HopExchange {
     pub(super) response: HopResponse,
     requested_at: chrono::DateTime<chrono::Utc>,
     received_at: chrono::DateTime<chrono::Utc>,
+    // The `Authorization` the send added, for `Vary` to record.
+    authorization: Option<header::HeaderValue>,
 }
 
 impl HopExchange {
-    pub(super) fn new(response: HopResponse, timing: Timing) -> Self {
+    pub(super) fn new(
+        response: HopResponse,
+        timing: Timing,
+        authorization: Option<header::HeaderValue>,
+    ) -> Self {
         HopExchange {
             response,
             requested_at: timing.requested_at,
             received_at: timing.received_at,
+            authorization,
         }
     }
 }
@@ -362,6 +369,7 @@ impl HopChain {
                     response,
                     requested_at: now,
                     received_at: now,
+                    authorization: None,
                 })
             }
             None => self.send(env, plan).await,
@@ -719,6 +727,10 @@ impl HopChain {
         peer_addr: Option<SocketAddr>,
     ) -> Option<PendingStore> {
         let partition = cache_partition(env.policy, plan.attach_credentials);
+        let mut request_headers = self.headers.clone();
+        if let Some(ref value) = exchange.authorization {
+            request_headers.insert(header::AUTHORIZATION, value.clone());
+        }
         match (&exchange.response, env.policy.cache.store.as_ref()) {
             // `no-store` is both directions: the lookup above skipped the cache, and nothing
             // about this exchange is written to it either.
@@ -737,7 +749,7 @@ impl HopChain {
                     url: self.url.clone(),
                     status: resp.status().as_u16(),
                     response_headers: resp.headers().clone(),
-                    request_headers: self.headers.clone(),
+                    request_headers,
                     decoded: env.init.auto_decode,
                     requested_at: exchange.requested_at,
                     received_at: exchange.received_at,

@@ -55,7 +55,11 @@ pub(super) struct HopExchange {
 }
 
 impl HopExchange {
-    pub(super) fn new(response: HopResponse, _timing: Timing) -> Self {
+    pub(super) fn new(
+        response: HopResponse,
+        _timing: Timing,
+        _authorization: Option<http::HeaderValue>,
+    ) -> Self {
         HopExchange { response }
     }
 }

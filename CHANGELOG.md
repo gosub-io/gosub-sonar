@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Credentials a `CredentialStore` sends upfront are forgotten when the server answers `401`,
   as an answer to a challenge is: the retry asks `on_auth_challenge` instead of re-sending the
   same stale pair from the store (GOS-307)
+- A response stored with `Vary: Authorization` records the `Authorization` the send added (an
+  answer to a challenge, or credentials sent upfront), not the caller's headers without it. A
+  request without credentials no longer matches the variant stored for a login (GOS-307)
 
 ## [0.16.1] - 2026-10-17
 

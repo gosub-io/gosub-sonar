@@ -5019,6 +5019,58 @@ mod tests {
         );
     }
 
+    /// `Vary: Authorization` is selected on the `Authorization` the send added, not on the
+    /// caller's headers: an anonymous request does not get the variant stored for a login.
+    #[tokio::test(flavor = "current_thread")]
+    async fn vary_authorization_records_the_credentials_sent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!("http://{}/r", listener.local_addr().unwrap())).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let response = if head.contains(GOOD_AUTH) {
+                    "HTTP/1.1 200 OK\r\nCache-Control: max-age=600\r\nVary: Authorization\r\n\
+                     Content-Length: 6\r\nConnection: close\r\n\r\nsecret"
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"r\"\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let send = |policy: NetPolicy| {
+            super::fetch_response_complete(
+                client(),
+                base.clone(),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(10)),
+                policy.with_cache(Some(cache.clone())),
+            )
+        };
+        let (policy, _) = answering_policy(Credentials::basic("user", "pass"));
+        let (meta, _) = send(policy).await.unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let (meta, _) = send(NetPolicy::default()).await.unwrap();
+        assert_eq!(meta.status, 401);
+        assert!(!meta.from_cache);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_basic_challenge_is_answered_and_the_hop_retried() {
         let srv = auth_server().await;

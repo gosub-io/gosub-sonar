@@ -543,7 +543,8 @@ impl HopChain {
             slot.attempt += 1;
         };
 
-        Ok(HopExchange::new(response, timing))
+        // The kept send carried this slot's header: it only changes before a retry.
+        Ok(HopExchange::new(response, timing, server_auth.header))
     }
 
     /// The request for one send of the hop, reported as [`NetEvent::RequestSent`].
