@@ -50,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A response whose `Vary` names something that is not a header name is not stored, as for
   `Vary: *`, and an entry a `304` gives such a `Vary` matches no request. The name used to be
   dropped, so the entry answered every request whatever it varied on (GOS-307)
+- A `HEAD` answered from the cache reports the `Content-Length` it declared in
+  `FetchResultMeta::content_length`, as the same response off the wire does, instead of `0`.
+  A `HEAD` stored with `auto_decode` on reports none, since its `Content-Length` was not
+  kept (GOS-307)
 
 ## [0.16.1] - 2026-10-17
 

@@ -1062,6 +1062,7 @@ async fn fetch_response_top_inner(
     let resp = match response {
         HopResponse::Cached(entry) => {
             let peek_len = entry.body.len().min(PEEK_MAX);
+            let body_len = Some(entry.body.len() as u64);
             let meta = FetchResultMeta {
                 tainting,
                 final_url: final_url.clone(),
@@ -1079,7 +1080,12 @@ async fn fetch_response_top_inner(
                     headers.insert(header::AGE, header::HeaderValue::from(age));
                     headers
                 },
-                content_length: Some(entry.body.len() as u64),
+                // A stored HEAD reports the length its GET would have, as one off the wire does.
+                content_length: if method == Method::HEAD {
+                    declared_content_length(&entry.headers)
+                } else {
+                    body_len
+                },
                 content_type: entry
                     .headers
                     .get(header::CONTENT_TYPE)
@@ -1099,12 +1105,12 @@ async fn fetch_response_top_inner(
                 observer.clone(),
                 final_url,
                 started,
-                meta.content_length,
+                body_len,
                 peek_len as u64,
             );
             // A cache hit reports a preview too. No tee here: the entry is already whole in
             // memory, so it is cut to the budget directly.
-            if let Some(limit) = observer.body_capture_limit(&meta.headers, meta.content_length) {
+            if let Some(limit) = observer.body_capture_limit(&meta.headers, body_len) {
                 let take = entry.body.len().min(limit);
                 observer.on_event(NetEvent::BodyPreview {
                     url: meta.final_url.clone(),
@@ -5622,6 +5628,51 @@ mod tests {
         let age: i64 = meta.headers[header::AGE].to_str().unwrap().parse().unwrap();
         assert!((50..60).contains(&age), "Age: {age}");
         assert_eq!(meta.headers.get_all(header::AGE).iter().count(), 1);
+    }
+
+    /// A stored `HEAD` response reports the `Content-Length` it declared, as it did when it came
+    /// off the wire, not the length of the body it never had.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stored_head_reports_its_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!("http://{}/r", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = "HTTP/1.1 200 OK\r\nCache-Control: max-age=600\r\n\
+                                Content-Length: 5000\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let send = || {
+            let init = RequestInit {
+                auto_decode: false,
+                ..RequestInit::new(Method::HEAD, HeaderMap::new(), None)
+            };
+            super::fetch_response_complete(
+                client(),
+                base.clone(),
+                init,
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(10)),
+                NetPolicy::default().with_cache(Some(cache.clone())),
+            )
+        };
+        let (network, _) = send().await.unwrap();
+        let (stored, body) = send().await.unwrap();
+        assert!(!network.from_cache && stored.from_cache);
+        assert_eq!(stored.content_length, Some(5000));
+        assert_eq!(stored.content_length, network.content_length);
+        assert!(!stored.has_body);
+        assert!(body.is_empty());
     }
 
     /// A `HEAD` whose `ETag` is not the stored `GET`'s drops the stored `GET` (RFC 9111 §4.3.5),
