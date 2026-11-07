@@ -45,7 +45,7 @@ pub enum ProxyScope {
 /// This is separate from any authentication the *origin server* asks for. Credentials embedded
 /// in the proxy URL (`http://user:pass@proxy:8080`) work too, but anything needing escaping is
 /// easier to get right here.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ProxyAuth {
     /// `Proxy-Authorization: Basic <base64(username:password)>`.
     Basic {
@@ -61,7 +61,7 @@ pub enum ProxyAuth {
 }
 
 /// One proxy: where it lives, which requests go through it, and which hosts bypass it.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProxyRule {
     /// Which request URLs this rule applies to.
     pub scope: ProxyScope,
@@ -80,6 +80,30 @@ pub struct ProxyRule {
     /// *not* fall back to the `NO_PROXY` environment variable, since configuring a rule
     /// programmatically opts out of the environment entirely.
     pub no_proxy: Option<String>,
+}
+
+impl std::fmt::Debug for ProxyAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Custom(_) => f.write_str("Custom(<redacted>)"),
+        }
+    }
+}
+
+impl std::fmt::Debug for ProxyRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyRule")
+            .field("scope", &self.scope)
+            .field("url", &without_userinfo(&self.url))
+            .field("auth", &self.auth)
+            .field("no_proxy", &self.no_proxy)
+            .finish()
+    }
 }
 
 impl ProxyRule {
@@ -152,7 +176,7 @@ impl ProxyRule {
             anyhow::ensure!(
                 !matches!(scheme.as_str(), "socks4" | "socks4a" | "socks5" | "socks5h"),
                 "proxy URL {:?} needs the `socks` cargo feature",
-                self.url
+                without_userinfo(&self.url)
             );
         }
 
@@ -164,10 +188,10 @@ impl ProxyRule {
                 ProxyScope::Https => reqwest::Proxy::https(&self.url),
                 ProxyScope::All => reqwest::Proxy::all(&self.url),
             }
-            .with_context(|| format!("unusable proxy URL {:?}", self.url))?
+            .with_context(|| format!("unusable proxy URL {:?}", without_userinfo(&self.url)))?
         } else {
             let proxy_url = Url::parse(&self.url)
-                .with_context(|| format!("unusable proxy URL {:?}", self.url))?;
+                .with_context(|| format!("unusable proxy URL {:?}", without_userinfo(&self.url)))?;
             let rule = self.clone();
             reqwest::Proxy::custom(move |url: &Url| {
                 let dst: http::Uri = url.as_str().parse().ok()?;
@@ -192,7 +216,10 @@ impl ProxyRule {
             }
             Some(ProxyAuth::Custom(ref value)) => {
                 let header = value.parse().with_context(|| {
-                    format!("proxy {:?}: invalid Proxy-Authorization value", self.url)
+                    format!(
+                        "proxy {:?}: invalid Proxy-Authorization value",
+                        without_userinfo(&self.url)
+                    )
                 })?;
                 proxy = proxy.custom_http_auth(header);
             }
@@ -398,6 +425,19 @@ fn bypass_entries(list: &str) -> Vec<BypassEntry> {
             }
         })
         .collect()
+}
+
+/// `url` with any `user:password@` masked, for messages. Textual, so it also works on a URL
+/// that does not parse.
+fn without_userinfo(url: &str) -> String {
+    let start = url.find("://").map_or(0, |i| i + 3);
+    let end = url[start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| start + i);
+    match url[start..end].rfind('@') {
+        Some(at) => format!("{}***{}", &url[..start], &url[start + at..]),
+        None => url.to_string(),
+    }
 }
 
 /// `s` percent-encoded for the userinfo of a URL, every byte but the unreserved ones (RFC 3986
@@ -1150,5 +1190,42 @@ mod tests {
             ProxyRoutes::Disabled.http_proxy(&Url::parse("http://example.test/").unwrap()),
             None
         );
+    }
+
+    /// Neither `Debug` nor a configuration error shows a proxy password, whether it is in the
+    /// rule's credentials or in its URL.
+    #[test]
+    fn proxy_passwords_stay_out_of_debug_and_errors() {
+        let rule =
+            ProxyRule::all("http://alice:hunter2@proxy.corp:8080").with_basic_auth("bob", "s3cret");
+        let shown = format!("{:?}", ProxyConfig::Rules(vec![rule]));
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("s3cret"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("proxy.corp:8080") && shown.contains("bob"),
+            "{shown}"
+        );
+
+        let custom = format!(
+            "{:?}",
+            ProxyRule::all("http://proxy.corp").with_custom_auth("Bearer t0ken")
+        );
+        assert!(!custom.contains("t0ken"), "{custom}");
+
+        for url in [
+            "http://alice:hunter2@[bad",
+            "http://alice:hunter2@proxy corp/",
+        ] {
+            let err = ProxyRule::all(url).to_reqwest().unwrap_err();
+            let err = format!("{err:#}");
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+        let err = ProxyRule::all("http://alice:hunter2@proxy.corp")
+            .with_custom_auth("bad\nvalue")
+            .to_reqwest()
+            .unwrap_err();
+        assert!(!format!("{err:#}").contains("hunter2"), "{err:#}");
     }
 }

@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored as a whole, as the spec has it, and the current policy stands. Its valid tokens used
   to be kept, which could loosen the policy. The field lines of a redirect's header are read as
   one list, so a bad line fails them all (GOS-307)
+- `ProxyAuth` and `ProxyRule` (and so `ProxyConfig`) no longer show a proxy password in their
+  `Debug` output, and an unusable proxy URL is named without its `user:password@` in the error
+  from `Fetcher::new` and in the warning for one from the environment (GOS-307)
 
 ## [0.16.1] - 2026-10-17
 
