@@ -390,10 +390,11 @@ impl HopChain {
         };
         let key = CacheKey::new(&self.method, &self.url).in_partition(partition);
         let stored = cache.get(&key);
+        // A `HEAD` gets no body to decode.
         let decision = cache::decide(
             &stored,
             &self.headers,
-            env.init.auto_decode,
+            env.init.auto_decode && self.method != Method::HEAD,
             cache_mode,
             chrono::Utc::now(),
         );
@@ -738,7 +739,8 @@ impl HopChain {
                     status: resp.status().as_u16(),
                     response_headers: resp.headers().clone(),
                     request_headers: self.headers.clone(),
-                    decoded: env.init.auto_decode,
+                    // Set once the body's codings are known; a redirect's body is never decoded.
+                    decoded: false,
                     requested_at: exchange.requested_at,
                     received_at: exchange.received_at,
                     peer_addr,

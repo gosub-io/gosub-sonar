@@ -248,7 +248,8 @@ pub struct CacheEntry {
     /// response had no `Vary`.
     pub vary: Vec<(String, Option<String>)>,
     /// Whether the body is the decoded form of a `Content-Encoding` the client unpacked. Such an
-    /// entry only answers requests that also want decoding; see
+    /// entry only answers requests that also want decoding, and one still in a coding they would
+    /// undo only requests that do not; see
     /// [`FetchRequest::auto_decode`](crate::net::types::FetchRequest::auto_decode).
     pub decoded: bool,
     /// When the request that produced this response was sent.
@@ -274,11 +275,18 @@ impl CacheEntry {
 
     /// Whether this variant answers a request with these headers (RFC 9111 §4.1).
     ///
-    /// `decoded` is the requesting fetch's auto-decode setting: a stored decoded body is not the
-    /// same resource as the encoded one the raw caller asked for.
+    /// `decoded` is whether the requesting fetch decodes the body it gets: a stored decoded body
+    /// is not the same resource as the encoded one the raw caller asked for, nor a raw gzip body
+    /// the decoded one. A body in no coding, or in one that cannot be undone, is the same for
+    /// both.
     pub fn matches(&self, request: &HeaderMap, decoded: bool) -> bool {
+        let same = if decoded {
+            self.decoded || !self.decodable()
+        } else {
+            !self.decoded
+        };
         // `Vary: *` always fails to match (RFC 9111 §4.1).
-        if self.decoded != decoded || self.vary.iter().any(|(name, _)| name == "*") {
+        if !same || self.vary.iter().any(|(name, _)| name == "*") {
             return false;
         }
         self.vary.iter().all(|(name, stored)| {
@@ -412,6 +420,18 @@ impl CacheEntry {
                 .is_some_and(|len| len != self.body.len())
         };
         differs(header::ETAG) || differs(header::LAST_MODIFIED) || (!self.decoded && length())
+    }
+
+    /// Whether a fetch that decodes would undo a coding of this stored body.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn decodable(&self) -> bool {
+        crate::net::decode::codings(&self.headers).is_some_and(|c| !c.is_empty())
+    }
+
+    /// Nothing is stored on wasm32: the browser caches and decodes itself.
+    #[cfg(target_arch = "wasm32")]
+    fn decodable(&self) -> bool {
+        false
     }
 
     /// Whether the entry carries a validator, i.e. whether a `304` can ever come back for it.
@@ -783,7 +803,7 @@ fn vary_names(headers: &HeaderMap) -> Vec<String> {
 /// Decide what a hop does with what is stored for it.
 ///
 /// `entries` are the variants stored under the hop's key, `request` the headers the hop is about
-/// to send, and `decoded` its auto-decode setting.
+/// to send, and `decoded` whether it decodes the body it gets.
 pub fn decide(
     entries: &[Arc<CacheEntry>],
     request: &HeaderMap,
@@ -2235,6 +2255,57 @@ mod tests {
             decide(&stored, &asked, false, CacheMode::Default, at(1)),
             CacheDecision::Send
         ));
+    }
+
+    #[test]
+    fn a_body_in_no_coding_answers_raw_and_decoding_requests() {
+        let stored = [entry(&[("cache-control", "max-age=60")])];
+        for decoded in [false, true] {
+            assert!(matches!(
+                decide(
+                    &stored,
+                    &HeaderMap::new(),
+                    decoded,
+                    CacheMode::Default,
+                    at(1)
+                ),
+                CacheDecision::Use(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_raw_coded_body_answers_only_raw_requests() {
+        let coded = |coding| {
+            [entry(&[
+                ("cache-control", "max-age=60"),
+                ("content-encoding", coding),
+            ])]
+        };
+        let gzip = coded("gzip");
+        assert!(matches!(
+            decide(&gzip, &HeaderMap::new(), false, CacheMode::Default, at(1)),
+            CacheDecision::Use(_)
+        ));
+        assert!(matches!(
+            decide(&gzip, &HeaderMap::new(), true, CacheMode::Default, at(1)),
+            CacheDecision::Send
+        ));
+        // A coding a decoding fetch cannot undo reaches it unchanged too.
+        for coding in ["zstd", "gzip, x-frob"] {
+            for decoded in [false, true] {
+                assert!(matches!(
+                    decide(
+                        &coded(coding),
+                        &HeaderMap::new(),
+                        decoded,
+                        CacheMode::Default,
+                        at(1)
+                    ),
+                    CacheDecision::Use(_)
+                ));
+            }
+        }
     }
 
     #[test]
