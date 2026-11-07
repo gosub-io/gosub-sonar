@@ -54,6 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FetchResultMeta::content_length`, as the same response off the wire does, instead of `0`.
   A `HEAD` stored with `auto_decode` on reports none, since its `Content-Length` was not
   kept (GOS-307)
+- A CORS preflight runs under the request's timeout, headers deadline and redirect deadline.
+  It had none of them, so a server that never answered the `OPTIONS` held the request until the
+  client's own timeout, if any. Cancelling it reports the same reason as cancelling the request
+  (`all callers cancelled` or `fetcher shut down`) (GOS-307)
 
 ## [0.16.1] - 2026-10-17
 

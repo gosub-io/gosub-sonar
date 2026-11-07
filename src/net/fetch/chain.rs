@@ -457,7 +457,9 @@ impl HopChain {
         let response = loop {
             let request = self.hop_request(env, plan, &server_auth, &proxy_auth)?;
             timing = Timing::requested();
-            let resp = self.await_response(env, request).await?;
+            let resp = self
+                .await_response(env, request, "net.get_with_redirects request failed")
+                .await?;
             timing.received();
             self.received(env, plan, &resp)?;
 
@@ -653,6 +655,7 @@ impl HopChain {
         &self,
         env: &ChainEnv<'_>,
         request: reqwest::Request,
+        what: &str,
     ) -> Result<reqwest::Response, NetError> {
         let fut = env.client.execute(request);
         tokio::pin!(fut);
@@ -688,12 +691,12 @@ impl HopChain {
                 Err(NetError::Transport(TransportError {
                     kind: crate::net::transport::TransportErrorKind::Timeout,
                     message: format!(
-                        "net.get_with_redirects request failed: no response headers within {:?}",
+                        "{what}: no response headers within {:?}",
                         env.init.headers_timeout.unwrap_or_default()
                     ),
                 }))
             }
-            r = &mut fut => r.map_err(|e| send_error(e, &self.url, "net.get_with_redirects request failed", env.observer, env.policy))
+            r = &mut fut => r.map_err(|e| send_error(e, &self.url, what, env.observer, env.policy))
         }
     }
 

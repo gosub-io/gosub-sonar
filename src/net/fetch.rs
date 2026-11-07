@@ -5473,6 +5473,57 @@ mod tests {
         assert_eq!(rec.auth_required().len(), 1);
     }
 
+    /// A preflight runs under the request's timeout and headers deadline: a server that never
+    /// answers the `OPTIONS` times the request out instead of holding it forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_preflight_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = Url::parse(&format!("http://{}/r", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let short = Some(Duration::from_millis(200));
+        for init in [
+            RequestInit::get(HeaderMap::new()).with_timeout(short),
+            RequestInit::get(HeaderMap::new()).with_headers_timeout(short),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-custom", header::HeaderValue::from_static("1"));
+            let init = RequestInit {
+                headers,
+                origin: Some(Url::parse("https://example.com/").unwrap().origin()),
+                mode: RequestMode::Cors,
+                ..init
+            };
+            let rec = Arc::new(RecordingObserver::new());
+            let fetch = super::fetch_response_complete(
+                client(),
+                url.clone(),
+                init,
+                CancellationToken::new(),
+                rec.clone(),
+                None,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(10)),
+                NetPolicy::default(),
+            );
+            let err = tokio::time::timeout(Duration::from_secs(5), fetch)
+                .await
+                .expect("the preflight is not held past its deadline")
+                .unwrap_err();
+            assert!(
+                matches!(err, NetError::Transport(ref t) if t.kind == crate::net::transport::TransportErrorKind::Timeout),
+                "{err:?}"
+            );
+            assert_eq!(rec.cors_preflights().len(), 1);
+        }
+    }
+
     /// `Authorization` is not CORS-safelisted, so a cors-tainted chain is left alone instead of
     /// getting credentials added behind the preflight's back.
     #[tokio::test(flavor = "current_thread")]
