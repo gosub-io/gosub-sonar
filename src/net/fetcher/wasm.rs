@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 pub(super) struct ClientsBuilt;
 
 impl ClientsBuilt {
-    pub(super) fn new(_cfg: &FetcherConfig) -> Self {
-        ClientsBuilt
+    pub(super) fn new(_cfg: &FetcherConfig) -> anyhow::Result<Self> {
+        Ok(ClientsBuilt)
     }
 }
 

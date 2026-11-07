@@ -23,11 +23,11 @@ pub(super) struct ClientsBuilt {
 }
 
 impl ClientsBuilt {
-    pub(super) fn new(cfg: &FetcherConfig) -> Self {
-        Self {
-            proxy: ProxyRoutes::resolve(&cfg.proxy),
+    pub(super) fn new(cfg: &FetcherConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            proxy: ProxyRoutes::resolve(&cfg.proxy)?,
             revalidations: Revalidations::default(),
-        }
+        })
     }
 }
 
