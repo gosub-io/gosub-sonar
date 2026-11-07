@@ -538,6 +538,10 @@ impl HopChain {
             let Some((space, credentials, value)) = answer else {
                 break HopResponse::Network(resp);
             };
+            // The challenge is not returned, so its cookies are reported here or not at all.
+            if plan.attach_credentials {
+                report_set_cookie(env.policy, &self.url, resp.headers());
+            }
             slot.header = Some(value);
             slot.unproven = Some((space, credentials));
             slot.attempt += 1;

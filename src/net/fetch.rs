@@ -5019,6 +5019,59 @@ mod tests {
         );
     }
 
+    /// A `Set-Cookie` on a `401` that is answered and retried reaches the jar, as it does on a
+    /// `401` that is returned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_cookie_on_a_retried_challenge_reaches_the_jar() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!("http://{}/r", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let response = if head.contains(GOOD_AUTH) {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"r\"\r\n\
+                     Set-Cookie: sid=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let cookies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = cookies.clone();
+        let (policy, _) = answering_policy(Credentials::basic("user", "pass"));
+        let policy = NetPolicy {
+            cookies: CookiePolicy {
+                on_cookies: Box::new(move |_, values| {
+                    sink.lock()
+                        .unwrap()
+                        .extend(values.iter().map(|v| v.to_string()));
+                }),
+                ..CookiePolicy::default()
+            },
+            ..policy
+        };
+        let (meta, _) = super::fetch_response_complete(
+            client(),
+            base,
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(*cookies.lock().unwrap(), vec!["sid=1".to_string()]);
+    }
     /// `Vary: Authorization` is selected on the `Authorization` the send added, not on the
     /// caller's headers: an anonymous request does not get the variant stored for a login.
     #[tokio::test(flavor = "current_thread")]
