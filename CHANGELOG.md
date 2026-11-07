@@ -24,6 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timed out, holding their connections, slots and request references. Such a fetch ends with
   `Cancelled` and the reason `fetcher shut down`, not `all callers cancelled` (GOS-278)
 
+### Fixed
+
+- A cached response to a request that carried the caller's own `Authorization` or `Cookie`
+  without the jar's cookies (credentials `Omit`, or `SameOrigin` on a cross-origin hop) is no
+  longer served to another jar's request without those values or with others. Such a response
+  used to be stored in the shared, empty partition. It is now stored under a hash of those
+  headers; requests with neither still share the empty partition (GOS-303)
+
 ## [0.16.1] - 2026-10-17
 
 ### Fixed

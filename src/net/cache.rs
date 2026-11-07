@@ -211,7 +211,9 @@ pub struct CacheKey {
     /// names it; empty for a request that carried no cookies. A response is what one jar's
     /// cookies bought, and a server that does not say `Vary: Cookie` (most do not) would
     /// otherwise have it handed to another jar's request: one cache per jar, as a browser keeps
-    /// one per profile.
+    /// one per profile. A request without the jar's cookies that sets its own `Authorization`
+    /// or `Cookie` is stored under a hash of those values instead, so only the same values
+    /// read it.
     pub partition: String,
 }
 
