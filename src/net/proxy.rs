@@ -190,8 +190,20 @@ impl ProxyRule {
             }
             .with_context(|| format!("unusable proxy URL {:?}", without_userinfo(&self.url)))?
         } else {
-            let proxy_url = Url::parse(&self.url)
+            let mut proxy_url = Url::parse(&self.url)
                 .with_context(|| format!("unusable proxy URL {:?}", without_userinfo(&self.url)))?;
+            // The socks connector takes credentials from the proxy URL only, not from the header
+            // `basic_auth` keeps for a custom proxy below.
+            if let Some(ProxyAuth::Basic {
+                ref username,
+                ref password,
+            }) = self.auth
+            {
+                if proxy_url.scheme().starts_with("socks") {
+                    let _ = proxy_url.set_username(&userinfo_encoded(username));
+                    let _ = proxy_url.set_password(Some(&userinfo_encoded(password)));
+                }
+            }
             let rule = self.clone();
             reqwest::Proxy::custom(move |url: &Url| {
                 let dst: http::Uri = url.as_str().parse().ok()?;
@@ -1227,5 +1239,54 @@ mod tests {
             .to_reqwest()
             .unwrap_err();
         assert!(!format!("{err:#}").contains("hunter2"), "{err:#}");
+    }
+
+    /// A socks proxy with `with_basic_auth` offers username/password in its handshake (RFC 1929),
+    /// also when a port-bearing bypass entry makes the rule decide per request.
+    #[cfg(feature = "socks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_socks_rule_with_a_port_entry_authenticates() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy = format!("socks5://{}", listener.local_addr().unwrap());
+        let greeting = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 2];
+            stream.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            stream.read_exact(&mut methods).await.unwrap();
+            assert!(methods.contains(&0x02), "{methods:?}");
+            stream.write_all(&[5, 2]).await.unwrap();
+            // RFC 1929: version, then the username and the password, each length-prefixed.
+            let mut auth = [0u8; 2];
+            stream.read_exact(&mut auth).await.unwrap();
+            let mut user = vec![0u8; auth[1] as usize];
+            stream.read_exact(&mut user).await.unwrap();
+            let mut pass = vec![0u8; stream.read_u8().await.unwrap() as usize];
+            stream.read_exact(&mut pass).await.unwrap();
+            let pair = (
+                String::from_utf8(user).unwrap(),
+                String::from_utf8(pass).unwrap(),
+            );
+            // Kept open, so the client does not fail first.
+            (pair, stream)
+        });
+        let cfg = ProxyConfig::Rules(vec![ProxyRule::all(proxy)
+            .with_basic_auth("alice", "p@ss:w%rd")
+            .bypassing("localhost:1")]);
+        let client = cfg
+            .apply(reqwest::Client::builder())
+            .unwrap()
+            .build()
+            .unwrap();
+        let send = client.get("http://192.0.2.1/").send();
+        let (pair, _stream) = tokio::select! {
+            biased;
+            m = greeting => m.unwrap(),
+            r = send => panic!("the client never authenticated: {r:?}"),
+        };
+        assert_eq!(pair, ("alice".to_string(), "p@ss:w%rd".to_string()));
     }
 }

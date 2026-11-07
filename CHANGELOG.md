@@ -58,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It had none of them, so a server that never answered the `OPTIONS` held the request until the
   client's own timeout, if any. Cancelling it reports the same reason as cancelling the request
   (`all callers cancelled` or `fetcher shut down`) (GOS-307)
+- A socks proxy rule with `with_basic_auth` and a bypass entry that names a port
+  (`localhost:8080`) authenticates in the socks handshake. The credentials went only into a
+  header a socks proxy never reads, so the proxy refused the connection (GOS-307)
 
 ## [0.16.1] - 2026-10-17
 
