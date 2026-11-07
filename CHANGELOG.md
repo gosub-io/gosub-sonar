@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ProxyAuth` and `ProxyRule` (and so `ProxyConfig`) no longer show a proxy password in their
   `Debug` output, and an unusable proxy URL is named without its `user:password@` in the error
   from `Fetcher::new` and in the warning for one from the environment (GOS-307)
+- A stored response confirmed by a `304` without `Date` is dated from when the `304` arrived,
+  and loses the `Age` it was first stored with unless the `304` brings one. It used to keep the
+  old `Date` and `Age`, so it was stale again right after validation and revalidated on every
+  request (GOS-307)
 
 ## [0.16.1] - 2026-10-17
 

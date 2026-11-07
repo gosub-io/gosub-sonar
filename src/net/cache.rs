@@ -464,6 +464,17 @@ impl CacheEntry {
                 })
                 .collect();
         }
+        // The 304 is a response of its own: one without a `Date` gets the time it arrived, as
+        // a stored one does (RFC 9110 §6.6.1), and the `Age` the old one arrived with is not
+        // its age.
+        if !headers.contains_key(header::DATE) {
+            if let Ok(date) = header::HeaderValue::from_str(&format_http_date(received_at)) {
+                updated.headers.insert(header::DATE, date);
+            }
+        }
+        if !headers.contains_key(header::AGE) {
+            updated.headers.remove(header::AGE);
+        }
         updated.requested_at = requested_at;
         updated.received_at = received_at;
         updated
@@ -2434,6 +2445,39 @@ mod tests {
         );
         // The age clock restarts, so the entry is fresh again.
         assert!(updated.is_fresh(at(150)));
+    }
+
+    /// A 304 without `Date` or `Age` dates the entry from when it arrived: the old `Date` and
+    /// `Age` would make it stale again right after it was confirmed.
+    #[test]
+    fn a_304_without_date_or_age_restarts_the_age_from_its_arrival() {
+        let stored = entry(&[
+            ("cache-control", "max-age=60"),
+            ("etag", "\"v1\""),
+            ("age", "30"),
+        ]);
+        let updated = stored.updated_by_304(
+            &headers(&[("etag", "\"v1\"")]),
+            at(1000),
+            at(1000),
+            &HeaderMap::new(),
+        );
+        assert_eq!(
+            updated.headers.get(header::DATE).unwrap(),
+            http_date(at(1000)).as_str()
+        );
+        assert!(!updated.headers.contains_key(header::AGE));
+        assert_eq!(updated.current_age(at(1000)), TimeDelta::zero());
+        assert!(updated.is_fresh(at(1050)));
+
+        // What the 304 does carry still counts.
+        let updated = stored.updated_by_304(
+            &headers(&[("date", &http_date(at(990))), ("age", "5")]),
+            at(1000),
+            at(1000),
+            &HeaderMap::new(),
+        );
+        assert_eq!(updated.current_age(at(1000)), TimeDelta::seconds(10));
     }
 
     #[test]
