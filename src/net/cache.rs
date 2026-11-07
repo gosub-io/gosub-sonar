@@ -282,9 +282,11 @@ impl CacheEntry {
             return false;
         }
         self.vary.iter().all(|(name, stored)| {
-            let current = HeaderName::try_from(name.as_str())
-                .ok()
-                .and_then(|n| vary_value(request, &n));
+            // No request can carry a header by a name that is not one, so like `*` it fails.
+            let Ok(name) = HeaderName::try_from(name.as_str()) else {
+                return false;
+            };
+            let current = vary_value(request, &name);
             current.as_deref() == stored.as_deref().map(normalize_list).as_deref()
         })
     }
@@ -672,8 +674,12 @@ pub fn is_storable(
         return false;
     }
     // `Vary: *` says the response depends on something the request headers do not capture, so no
-    // stored entry can ever be shown to match.
-    if vary_names(response).iter().any(|n| n == "*") {
+    // stored entry can ever be shown to match. Nor can one that varies on a name that is not a
+    // header name.
+    if vary_names(response)
+        .iter()
+        .any(|n| n == "*" || HeaderName::try_from(n.as_str()).is_err())
+    {
         return false;
     }
     // Partial content needs range support, which this cache does not have.
@@ -1976,6 +1982,39 @@ mod tests {
         );
         assert!(by_language.matches(&asked, false));
         assert!(!by_language.matches(&headers(&[("accept-language", "en")]), false));
+
+        let unparsable = stored.updated_by_304(
+            &headers(&[("etag", "\"v1\""), ("vary", "x@y")]),
+            at(1),
+            at(1),
+            &asked,
+        );
+        assert!(!unparsable.matches(&asked, false));
+    }
+
+    /// A `Vary` name that is not a header name cannot be matched, so the response is not stored,
+    /// as for `Vary: *`. Dropped, it would answer every request.
+    #[test]
+    fn a_vary_name_that_is_not_a_header_name_is_not_stored() {
+        let ok = |vary: &str| headers(&[("cache-control", "max-age=60"), ("vary", vary)]);
+        assert!(is_storable(
+            &Method::GET,
+            &HeaderMap::new(),
+            200,
+            &ok("accept")
+        ));
+        assert!(!is_storable(
+            &Method::GET,
+            &HeaderMap::new(),
+            200,
+            &ok("accept, x@y")
+        ));
+        assert!(!is_storable(
+            &Method::GET,
+            &HeaderMap::new(),
+            200,
+            &ok("a b")
+        ));
     }
 
     /// RFC 9111 §4.3.4: a `304` without a validator selects a stored response only if that one

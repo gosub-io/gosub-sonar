@@ -47,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and loses the `Age` it was first stored with unless the `304` brings one. It used to keep the
   old `Date` and `Age`, so it was stale again right after validation and revalidated on every
   request (GOS-307)
+- A response whose `Vary` names something that is not a header name is not stored, as for
+  `Vary: *`, and an entry a `304` gives such a `Vary` matches no request. The name used to be
+  dropped, so the entry answered every request whatever it varied on (GOS-307)
 
 ## [0.16.1] - 2026-10-17
 
