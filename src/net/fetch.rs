@@ -3976,6 +3976,36 @@ mod tests {
         );
     }
 
+    /// The field lines of `Referrer-Policy` make one list: a bad element on the second line fails
+    /// the header, and the looser policy on the first is not adopted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_bad_referrer_policy_line_fails_the_whole_header() {
+        let srv = TestServer::new()
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+        let hop = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute_with_headers(
+                    &[
+                        ("referrer-policy", "unsafe-url"),
+                        ("referrer-policy", "\"x\""),
+                    ],
+                    srv.url("/echo").as_str(),
+                ),
+            )
+            .start()
+            .await;
+        // Same-origin with the first hop, so it gets the full URL and the next, cross-origin
+        // one only the origin, unless the redirect's `unsafe-url` were adopted.
+        let doc = format!("{}page?q=1", hop.base_url());
+        assert_eq!(
+            referer_seen_by_server(&hop, "/hop", Some(&doc), ReferrerPolicy::default()).await,
+            hop.base_url().as_str()
+        );
+    }
+
     /// Fetch `path` on `srv` with `init` and return the response body as text. Pair with
     /// [`RouteConfig::echo_request_header`] to see a header exactly as the server received it.
     async fn header_seen_by_server(

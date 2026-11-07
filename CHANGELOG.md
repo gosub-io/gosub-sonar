@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `on_cookies`, as one on a challenge that is returned is. It used to be dropped (GOS-307)
 - A redirect refused for credentials in its `Location` reports the target without them in
   `NetError::Blocked` and `NetEvent::Blocked`, so the password does not end up in logs (GOS-307)
+- A `Referrer-Policy` header with an element that is not a token (`unsafe-url, "x"`) is
+  ignored as a whole, as the spec has it, and the current policy stands. Its valid tokens used
+  to be kept, which could loosen the policy. The field lines of a redirect's header are read as
+  one list, so a bad line fails them all (GOS-307)
 
 ## [0.16.1] - 2026-10-17
 

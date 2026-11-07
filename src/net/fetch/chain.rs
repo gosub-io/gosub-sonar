@@ -751,16 +751,17 @@ impl HopChain {
             HopResponse::Cached(_) => self.url.clone(),
         };
 
-        // A redirect may tighten (or loosen) the policy for the rest of the chain. Read every
-        // field line, not just the first: a server may split the list across lines, and the
-        // last token we understand wins across all of them.
-        if let Some(updated) = hop
+        // A redirect may tighten (or loosen) the policy for the rest of the chain. Every field
+        // line is part of one list: the last token we understand wins across all of them, and
+        // a bad element on any line fails the whole header.
+        let lines: Option<Vec<&str>> = hop
             .headers()
             .get_all(&REFERRER_POLICY)
             .iter()
-            .filter_map(|v| v.to_str().ok())
-            .filter_map(ReferrerPolicy::parse_header)
-            .next_back()
+            .map(|v| v.to_str().ok())
+            .collect();
+        if let Some(updated) =
+            lines.and_then(|lines| ReferrerPolicy::parse_header(&lines.join(",")))
         {
             self.referrer_policy = updated;
         }
