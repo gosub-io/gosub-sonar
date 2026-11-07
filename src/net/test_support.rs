@@ -1294,6 +1294,16 @@ impl RecordingObserver {
             .collect()
     }
 
+    /// Every event recorded, as its `{:?}`, in order.
+    pub fn debug_events(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| format!("{e:?}"))
+            .collect()
+    }
+
     /// The variant name of every event recorded, in order (`"Started"`, `"RequestSent"`, ...),
     /// for tests about where an event falls in the stream.
     pub fn event_names(&self) -> Vec<String> {
