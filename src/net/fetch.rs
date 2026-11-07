@@ -3233,6 +3233,52 @@ mod tests {
             .all(|(_, url, _)| url.username().is_empty()));
     }
 
+    /// A `Location` refused for its credentials is reported without them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_credentialed_location_is_reported_without_credentials() {
+        let srv = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_to_with_credentials("user:pw", "/end"),
+            )
+            .route("/end", RouteConfig::ok(b"x"))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+        let init = RequestInit {
+            origin: Some(srv.url("/").origin()),
+            mode: RequestMode::Cors,
+            ..RequestInit::get(HeaderMap::new())
+        };
+        let err = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            init,
+            CancellationToken::new(),
+            rec.clone(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap_err();
+        let NetError::Blocked { reason, url } = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(
+            reason,
+            BlockReason::Cors(crate::net::cors::CorsError::CredentialedRedirect)
+        );
+        assert_eq!(url, srv.url("/end"));
+        assert_eq!(
+            rec.blocked_reason(),
+            Some(BlockReason::Cors(
+                crate::net::cors::CorsError::CredentialedRedirect
+            ))
+        );
+    }
+
     #[test]
     fn location_text_decodes_utf8_then_bytes() {
         assert_eq!(location_text(b"/plain"), "/plain");

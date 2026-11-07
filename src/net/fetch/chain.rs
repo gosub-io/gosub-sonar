@@ -812,6 +812,8 @@ impl HopChain {
         if (!to.username().is_empty() || to.password().is_some())
             && (env.init.mode == RequestMode::Cors || from.origin() != to.origin())
         {
+            // Reported without them: the error's text ends up in logs.
+            strip_url_credentials(&mut to);
             return Err(blocked(
                 env.observer,
                 to,

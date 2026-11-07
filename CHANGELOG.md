@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request without credentials no longer matches the variant stored for a login (GOS-307)
 - A `Set-Cookie` on a `401` or `407` that is answered and retried is reported to
   `on_cookies`, as one on a challenge that is returned is. It used to be dropped (GOS-307)
+- A redirect refused for credentials in its `Location` reports the target without them in
+  `NetError::Blocked` and `NetEvent::Blocked`, so the password does not end up in logs (GOS-307)
 
 ## [0.16.1] - 2026-10-17
 
