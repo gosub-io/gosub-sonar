@@ -438,7 +438,7 @@ impl HopChain {
             && self.tainting == ResponseTainting::Basic
             && !self.headers.contains_key(header::AUTHORIZATION)
         {
-            if let Some((_, credentials)) = env
+            if let Some((space, credentials)) = env
                 .policy
                 .auth
                 .credentials
@@ -446,6 +446,8 @@ impl HopChain {
                 .and_then(|store| store.upfront_for(&self.url))
             {
                 server_auth.header = credentials.header_value();
+                // Unproven like an answer to a challenge: a 401 forgets them.
+                server_auth.unproven = Some((space, credentials));
             }
         }
 

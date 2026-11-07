@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timed out, holding their connections, slots and request references. Such a fetch ends with
   `Cancelled` and the reason `fetcher shut down`, not `all callers cancelled` (GOS-278)
 
+### Fixed
+
+- Credentials a `CredentialStore` sends upfront are forgotten when the server answers `401`,
+  as an answer to a challenge is: the retry asks `on_auth_challenge` instead of re-sending the
+  same stale pair from the store (GOS-307)
+
 ## [0.16.1] - 2026-10-17
 
 ### Fixed

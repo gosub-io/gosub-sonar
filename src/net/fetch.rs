@@ -4970,6 +4970,55 @@ mod tests {
         assert_eq!(meta.status, 401);
     }
 
+    /// Credentials sent upfront that draw a `401` are forgotten like any rejected answer: the
+    /// retry asks the hook instead of re-sending the same stale pair from the store.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_upfront_credentials_are_forgotten() {
+        let srv = TestServer::new()
+            .route(
+                "/area/other",
+                RouteConfig::require_auth(
+                    r#"Basic realm="Secure Area""#,
+                    GOOD_AUTH,
+                    b"other".to_vec(),
+                ),
+            )
+            .start()
+            .await;
+        let space = ProtectionSpace {
+            target: AuthTarget::Server,
+            scheme: AuthScheme::Basic,
+            origin: Some(srv.url("/").origin().ascii_serialization()),
+            realm: "Secure Area".into(),
+        };
+        let store = Arc::new(InMemoryCredentialStore::new());
+        store.store(space.clone(), Credentials::basic("user", "stale"));
+        store.accepted_at(&space, &srv.url("/area/page"));
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+        let policy = policy.with_credential_store(Some(store.clone()));
+
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/area/other",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(
+            srv.hit_count("/area/other"),
+            2,
+            "upfront, then the hook's answer"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.credentials_for(&space),
+            Some(Credentials::basic("user", "pass"))
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_basic_challenge_is_answered_and_the_hop_retried() {
         let srv = auth_server().await;
