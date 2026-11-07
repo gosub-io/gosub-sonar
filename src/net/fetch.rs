@@ -157,7 +157,7 @@ pub(crate) fn normalize_method(method: Method) -> Method {
 /// into an `Authorization` header, which lets a page or a redirect send credentials of its
 /// choosing along with the user's cookies. Browsers do not send them either. Credentials for a
 /// server come from the auth hook, after a challenge.
-fn strip_url_credentials(url: &mut Url) -> bool {
+pub(crate) fn strip_url_credentials(url: &mut Url) -> bool {
     if url.username().is_empty() && url.password().is_none() {
         return false;
     }
@@ -979,6 +979,7 @@ pub(crate) async fn fetch_response_top(
     policy: NetPolicy,
 ) -> Result<ResponseTop, NetError> {
     let mut url = url;
+    // The Fetcher strips on submit; this covers the crate's direct callers.
     let credentials_removed = strip_url_credentials(&mut url);
     let result = fetch_response_top_inner(
         client,

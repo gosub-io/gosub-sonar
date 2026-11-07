@@ -45,6 +45,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used to be stored in the shared, empty partition. It is now stored under a hash of those
   headers; requests with neither still share the empty partition (GOS-303)
 
+### Fixed
+
+- `Fetcher::submit` removes a `user:password@` from the URL before anything sees it. It used to
+  reach `Accepted`, `SecurityUpgraded`, `Blocked`, `Failed`, `Retrying`, `Cancelled`, the task's
+  tracing span and `is_url_allowed`, and only the redirect chain removed it. `UrlCredentialsRemoved`
+  is now reported once per request, followers of a coalesced fetch included, instead of once per
+  attempt by the leader. Two requests that differ only in URL credentials now coalesce (GOS-306)
+
 ## [0.16.1] - 2026-10-17
 
 ### Fixed
