@@ -157,7 +157,7 @@ pub(crate) fn normalize_method(method: Method) -> Method {
 /// into an `Authorization` header, which lets a page or a redirect send credentials of its
 /// choosing along with the user's cookies. Browsers do not send them either. Credentials for a
 /// server come from the auth hook, after a challenge.
-fn strip_url_credentials(url: &mut Url) -> bool {
+pub(crate) fn strip_url_credentials(url: &mut Url) -> bool {
     if url.username().is_empty() && url.password().is_none() {
         return false;
     }
@@ -467,7 +467,8 @@ pub struct CookiePolicy {
     pub on_cookies: CookieSinkFn,
     /// The cache partition a hop that carries cookies reads and writes: whose jar
     /// [`cookies_for`](Self::cookies_for) answers from, so one jar's responses are never
-    /// served to another's requests. A hop without cookies uses the shared, empty partition.
+    /// served to another's requests. A hop without them uses a partition for the caller's own
+    /// `Authorization` and `Cookie`, or, with neither, the shared, empty one.
     /// Set by [`NetPolicy::from_context`] from
     /// [`FetcherContext::cookie_jar_key`].
     pub cache_partition: String,
@@ -978,6 +979,7 @@ pub(crate) async fn fetch_response_top(
     policy: NetPolicy,
 ) -> Result<ResponseTop, NetError> {
     let mut url = url;
+    // The Fetcher strips on submit; this covers the crate's direct callers.
     let credentials_removed = strip_url_credentials(&mut url);
     let result = fetch_response_top_inner(
         client,
@@ -1151,6 +1153,7 @@ async fn fetch_response_top_inner(
     // cannot be undone keeps both, and its bytes.
     let (codings, headers, content_length) =
         platform::decoding(auto_decode, bodiless, headers, content_length);
+    let store = store.map(|store| store.decoded(codings.is_some()));
 
     // Response is received, setup our meta structure
     let mut meta = FetchResultMeta {
@@ -6333,6 +6336,89 @@ mod tests {
         assert_eq!(srv.hit_count("/mine"), 3);
     }
 
+    /// Without the jar's cookies, a hop that carries the caller's own `Authorization` or
+    /// `Cookie` is cached for those values: another jar's request without them, or with
+    /// others, goes to the network. The same values share the entry, and so do requests
+    /// with neither.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_callers_credentials_partition_the_cache_without_the_jar() {
+        let srv = TestServer::new()
+            .route(
+                "/me",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(60, b"v1".to_vec()).counting()),
+            )
+            .route(
+                "/anon",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(60, b"v1".to_vec()).counting()),
+            )
+            .start()
+            .await;
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let jar = |partition: &str| NetPolicy {
+            cookies: CookiePolicy {
+                cache_partition: partition.to_string(),
+                ..CookiePolicy::default()
+            },
+            ..NetPolicy::default().with_cache(Some(cache.clone()))
+        };
+        let omit = |name: Option<(header::HeaderName, &str)>| {
+            let mut headers = HeaderMap::new();
+            if let Some((name, value)) = name {
+                headers.insert(name, value.parse().unwrap());
+            }
+            RequestInit::get(headers).with_credentials(RequestCredentials::Omit)
+        };
+        let bearer = |token: &'static str| Some((header::AUTHORIZATION, token));
+
+        let (meta, body) =
+            cache_fetch(&srv, "/me", omit(bearer("Bearer a")), jar("a"), observer()).await;
+        assert!(!meta.from_cache);
+        assert_eq!(&body[..], b"hit-1");
+
+        let (meta, _) = cache_fetch(&srv, "/me", omit(None), jar("b"), observer()).await;
+        assert!(
+            !meta.from_cache,
+            "not served to a request without the token"
+        );
+        let (meta, _) =
+            cache_fetch(&srv, "/me", omit(bearer("Bearer b")), jar("b"), observer()).await;
+        assert!(
+            !meta.from_cache,
+            "not served to a request with another token"
+        );
+        let (meta, _) = cache_fetch(
+            &srv,
+            "/me",
+            omit(Some((header::COOKIE, "sid=a"))),
+            jar("b"),
+            observer(),
+        )
+        .await;
+        assert!(
+            !meta.from_cache,
+            "not served to a request with a cookie instead"
+        );
+        assert_eq!(srv.hit_count("/me"), 4);
+
+        let (meta, body) =
+            cache_fetch(&srv, "/me", omit(bearer("Bearer a")), jar("b"), observer()).await;
+        assert!(meta.from_cache, "the same token is served from the cache");
+        assert_eq!(&body[..], b"hit-1");
+        let (meta, body) =
+            cache_fetch(&srv, "/me", omit(bearer("Bearer b")), jar("a"), observer()).await;
+        assert!(meta.from_cache);
+        assert_eq!(&body[..], b"hit-3");
+        assert_eq!(srv.hit_count("/me"), 4);
+
+        cache_fetch(&srv, "/anon", omit(None), jar("a"), observer()).await;
+        let (meta, _) = cache_fetch(&srv, "/anon", omit(None), jar("b"), observer()).await;
+        assert!(
+            meta.from_cache,
+            "a request without credentials still shares the entry"
+        );
+        assert_eq!(srv.hit_count("/anon"), 1);
+    }
+
     /// A stored response is CORS-checked like a fresh one: an entry stored by a same-origin
     /// fetch carries no `Access-Control-Allow-Origin`, and a cross-origin caller must not
     /// read it from the cache when it could not read it from the network.
@@ -6953,6 +7039,118 @@ mod tests {
             assert_eq!(&body[..], &coded[..]);
             assert_eq!(meta.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
             assert_eq!(meta.content_length, Some(coded.len() as u64));
+        }
+
+        async fn cached(
+            url: Url,
+            method: Method,
+            auto_decode: bool,
+            cache: &Arc<crate::net::cache::InMemoryHttpCache>,
+        ) -> (FetchResultMeta, Bytes) {
+            let mut init = RequestInit::new(method, HeaderMap::new(), None);
+            init.auto_decode = auto_decode;
+            super::super::fetch_response_complete(
+                client(),
+                url,
+                init,
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(5),
+                None,
+                NetPolicy::default().with_cache(Some(cache.clone())),
+            )
+            .await
+            .expect("fetch")
+        }
+
+        /// A coding that cannot be undone is stored as it came, header and length included, and
+        /// served that way.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_body_left_coded_is_cached_with_its_coding() {
+            let coded = b"not really zstd".to_vec();
+            let url = server(
+                "Cache-Control: max-age=600\r\nContent-Encoding: zstd\r\n".into(),
+                coded.clone(),
+            )
+            .await;
+            let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+            let _ = cached(url.clone(), Method::GET, true, &cache).await;
+            let (meta, body) = cached(url, Method::GET, true, &cache).await;
+            assert!(meta.from_cache);
+            assert_eq!(&body[..], &coded[..]);
+            assert_eq!(meta.headers.get(header::CONTENT_ENCODING).unwrap(), "zstd");
+            let length = coded.len().to_string();
+            assert_eq!(meta.headers.get(header::CONTENT_LENGTH).unwrap(), &length);
+            assert_eq!(meta.content_length, Some(coded.len() as u64));
+        }
+
+        /// A decoded body is stored and served decoded, and answers no raw request.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_decoded_body_is_cached_decoded() {
+            let plain = b"gzipped".to_vec();
+            let url = server(
+                "Cache-Control: max-age=600\r\nContent-Encoding: gzip\r\n".into(),
+                gz(&plain),
+            )
+            .await;
+            let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+            let _ = cached(url.clone(), Method::GET, true, &cache).await;
+            let (meta, body) = cached(url.clone(), Method::GET, true, &cache).await;
+            assert!(meta.from_cache);
+            assert_eq!(&body[..], &plain[..]);
+            assert!(!meta.headers.contains_key(header::CONTENT_ENCODING));
+            assert!(!meta.headers.contains_key(header::CONTENT_LENGTH));
+            assert!(!cached(url, Method::GET, false, &cache).await.0.from_cache);
+        }
+
+        /// A raw gzip body answers no request that wants it decoded.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_raw_coded_body_answers_no_decoding_request() {
+            let url = server(
+                "Cache-Control: max-age=600\r\nContent-Encoding: gzip\r\n".into(),
+                gz(b"raw"),
+            )
+            .await;
+            let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+            let _ = cached(url.clone(), Method::GET, false, &cache).await;
+            assert!(
+                cached(url.clone(), Method::GET, false, &cache)
+                    .await
+                    .0
+                    .from_cache
+            );
+            let (meta, body) = cached(url, Method::GET, true, &cache).await;
+            assert!(!meta.from_cache);
+            assert_eq!(&body[..], b"raw");
+        }
+
+        /// A body in no coding is the same either way, and answers both kinds of request.
+        #[tokio::test(flavor = "current_thread")]
+        async fn an_uncoded_body_answers_raw_and_decoding_requests() {
+            let url = server("Cache-Control: max-age=600\r\n".into(), b"plain".to_vec()).await;
+            let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+            let _ = cached(url.clone(), Method::GET, true, &cache).await;
+            let (meta, body) = cached(url.clone(), Method::GET, false, &cache).await;
+            assert!(meta.from_cache);
+            assert_eq!(&body[..], b"plain");
+            assert!(cached(url, Method::GET, true, &cache).await.0.from_cache);
+        }
+
+        /// A `HEAD` has no body to decode: its response is stored with the coding it names.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_head_is_cached_with_its_coding() {
+            let url = server(
+                "Cache-Control: max-age=600\r\nContent-Encoding: gzip\r\n".into(),
+                gz(b"head"),
+            )
+            .await;
+            let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+            let _ = cached(url.clone(), Method::HEAD, true, &cache).await;
+            let (meta, _) = cached(url.clone(), Method::HEAD, true, &cache).await;
+            assert!(meta.from_cache);
+            assert_eq!(meta.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
+            assert!(cached(url, Method::HEAD, false, &cache).await.0.from_cache);
         }
     }
 

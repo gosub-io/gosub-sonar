@@ -19,6 +19,7 @@ use crate::net::hsts;
 use crate::net::observer::NetObserver;
 use crate::net::transport::TransportError;
 use crate::net::types::{BlockReason, NetError, RequestCredentials, UpgradeReason};
+use crate::net::utils::short_hash;
 use http::{header, HeaderMap, Method};
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
@@ -75,6 +76,8 @@ impl<'a> ChainEnv<'a> {
 /// What the stages before a hop's send worked out for it.
 pub(super) struct HopPlan {
     pub(super) attach_credentials: bool,
+    // The cache partition this hop reads and writes; see `cache_partition`.
+    partition: String,
     cache: CacheLookup,
     preflight: Option<PreflightGrant>,
     // Where a background revalidation of this hop would start, if it may have one.
@@ -129,11 +132,26 @@ impl Timing {
 }
 
 /// The cache partition of a hop: one that carries a jar's cookies is cached for that jar alone.
-fn cache_partition(policy: &NetPolicy, attach_credentials: bool) -> &str {
+/// Without them, a hop that carries the caller's own `Authorization` or `Cookie` is cached for
+/// those values alone, and only a hop with neither shares the empty partition.
+/// `Proxy-Authorization` is left out: it answers the proxy, not the origin.
+fn cache_partition(policy: &NetPolicy, headers: &HeaderMap, attach_credentials: bool) -> String {
     if attach_credentials {
-        policy.cookies.cache_partition.as_str()
+        return policy.cookies.cache_partition.clone();
+    }
+    let mut buf = Vec::new();
+    for name in [header::AUTHORIZATION, header::COOKIE] {
+        for value in headers.get_all(&name) {
+            buf.extend_from_slice(name.as_str().as_bytes());
+            buf.push(b':');
+            buf.extend_from_slice(value.as_bytes());
+            buf.push(b'\n');
+        }
+    }
+    if buf.is_empty() {
+        String::new()
     } else {
-        ""
+        format!("credentials:{:x}", short_hash(&buf))
     }
 }
 
@@ -352,10 +370,11 @@ impl HopChain {
         preflight: Option<PreflightGrant>,
         revalidation: Option<Revalidation>,
     ) -> Result<HopPlan, NetError> {
-        let partition = cache_partition(env.policy, attach_credentials);
+        let partition = cache_partition(env.policy, &self.headers, attach_credentials);
         Ok(HopPlan {
             attach_credentials,
-            cache: self.consult_cache(env, partition)?,
+            cache: self.consult_cache(env, &partition)?,
+            partition,
             preflight,
             revalidation,
         })
@@ -405,10 +424,11 @@ impl HopChain {
         };
         let key = CacheKey::new(&self.method, &self.url).in_partition(partition);
         let stored = cache.get(&key);
+        // A `HEAD` gets no body to decode.
         let decision = cache::decide(
             &stored,
             &self.headers,
-            env.init.auto_decode,
+            env.init.auto_decode && self.method != Method::HEAD,
             cache_mode,
             chrono::Utc::now(),
         );
@@ -527,8 +547,7 @@ impl HopChain {
                 let updated = Arc::new(updated);
                 if let Some(ref cache) = env.policy.cache.store {
                     cache.put(
-                        CacheKey::new(&self.method, &self.url)
-                            .in_partition(cache_partition(env.policy, plan.attach_credentials)),
+                        CacheKey::new(&self.method, &self.url).in_partition(&plan.partition),
                         updated.clone(),
                     );
                 }
@@ -675,7 +694,6 @@ impl HopChain {
 
     /// Drops what `hop` shows to be wrong in the cache.
     pub(super) fn invalidate_cache(&self, env: &ChainEnv<'_>, hop: &HopResponse, plan: &HopPlan) {
-        let partition = cache_partition(env.policy, plan.attach_credentials);
         let Some(ref cache) = env.policy.cache.store else {
             return;
         };
@@ -713,7 +731,7 @@ impl HopChain {
         if let HopResponse::Network(resp) = hop {
             if self.method == Method::HEAD && resp.status().as_u16() == 200 {
                 let get = CacheKey::new(&Method::GET, &self.url);
-                let stored = cache.get(&get.clone().in_partition(partition));
+                let stored = cache.get(&get.clone().in_partition(&plan.partition));
                 if stored.iter().any(|e| e.changed_per_head(resp.headers())) {
                     cache.invalidate(&get);
                     env.observer.on_event(NetEvent::Cache {
@@ -733,7 +751,6 @@ impl HopChain {
         exchange: &HopExchange,
         peer_addr: Option<SocketAddr>,
     ) -> Option<PendingStore> {
-        let partition = cache_partition(env.policy, plan.attach_credentials);
         let mut request_headers = self.headers.clone();
         if let Some(ref value) = exchange.authorization {
             request_headers.insert(header::AUTHORIZATION, value.clone());
@@ -752,12 +769,13 @@ impl HopChain {
             {
                 Some(PendingStore {
                     cache: cache.clone(),
-                    key: CacheKey::new(&self.method, &self.url).in_partition(partition),
+                    key: CacheKey::new(&self.method, &self.url).in_partition(&plan.partition),
                     url: self.url.clone(),
                     status: resp.status().as_u16(),
                     response_headers: resp.headers().clone(),
                     request_headers,
-                    decoded: env.init.auto_decode,
+                    // Set once the body's codings are known; a redirect's body is never decoded.
+                    decoded: false,
                     requested_at: exchange.requested_at,
                     received_at: exchange.received_at,
                     peer_addr,

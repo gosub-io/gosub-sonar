@@ -369,6 +369,8 @@ impl FetchInflightEntry {
 struct QueueItem {
     /// What to fetch and how (URL, method, headers, body, priority, …).
     req: FetchRequest,
+    /// `submit` removed a `user:password@` from `req.url`, to be reported once it is accepted.
+    url_credentials_removed: bool,
     /// Per-request handle carrying the cancellation token for this specific subscriber.
     /// Distinct from `FetchInflightEntry::parent_cancel`, which fires only when *all*
     /// subscribers cancel; this token fires when just this one caller cancels.
@@ -419,7 +421,8 @@ impl Fetcher {
     /// Creates a fetcher with the given configuration and lifecycle context.
     ///
     /// Use [`NullContext`](crate::NullContext) as the context if you don't need lifecycle
-    /// callbacks. Fails if the configured concurrency limits are zero.
+    /// callbacks. Fails if the configured concurrency limits are zero, or (native only) if the
+    /// environment names a proxy that cannot be used; see `ProxyConfig::System`.
     pub fn new(config: FetcherConfig, ctx: Arc<dyn FetcherContext>) -> anyhow::Result<Self> {
         anyhow::ensure!(
             config.global_slots > 0,
@@ -435,7 +438,7 @@ impl Fetcher {
         );
 
         // The environment's proxies are read once, here, and the client is built from that.
-        let built = Arc::new(ClientsBuilt::new(&config));
+        let built = Arc::new(ClientsBuilt::new(&config)?);
         let client = build_client(&config, &ctx, &built)?;
 
         Ok(Self {
@@ -558,17 +561,14 @@ impl Fetcher {
         req.method = crate::net::fetch::normalize_method(req.method);
         // So a `{:?}` of the request anywhere prints credentials redacted.
         crate::net::utils::mark_sensitive(&mut req.headers);
-        if log::log_enabled!(log::Level::Debug) {
-            let mut shown = req.url.clone();
-            let _ = shown.set_username("");
-            let _ = shown.set_password(None);
-            log::debug!(
-                "Submitting fetch request {} {} {}",
-                req.req_id,
-                req.method,
-                short_url(&shown, 200)
-            );
-        }
+        // Here, not in the chain: every event, span and policy call below sees `req.url`.
+        let url_credentials_removed = crate::net::fetch::strip_url_credentials(&mut req.url);
+        log::debug!(
+            "Submitting fetch request {} {} {}",
+            req.req_id,
+            req.method,
+            short_url(&req.url, 200)
+        );
 
         let mut lane = match req.priority {
             Priority::High => self.q_high.lock().await,
@@ -587,6 +587,7 @@ impl Fetcher {
         }
         lane.push_back(QueueItem {
             req,
+            url_credentials_removed,
             // handle: req_handle,\
             cancel,
             reply: reply_tx,
@@ -634,6 +635,7 @@ impl Fetcher {
 
             let Some(QueueItem {
                 mut req,
+                url_credentials_removed,
                 cancel,
                 reply: reply_tx,
             }) = self.next_item(&mut lane_counter).await
@@ -648,8 +650,14 @@ impl Fetcher {
             let key_str = self.coalescing_key(&req);
             let (inflight_entry, is_leader, listener) =
                 self.join_inflight(&key_str, &req, reply_tx, &shutdown);
-            let (lifecycle, shared) =
-                self.accept(&req, &requested, upgraded, is_leader, &inflight_entry);
+            let (lifecycle, shared) = self.accept(
+                &req,
+                &requested,
+                url_credentials_removed,
+                upgraded,
+                is_leader,
+                &inflight_entry,
+            );
             watch_caller(&inflight_entry, listener, cancel, lifecycle);
 
             if req.streaming {
@@ -773,12 +781,14 @@ impl Fetcher {
         }
     }
 
-    /// Starts the request's lifecycle, reports an HSTS upgrade on it, and ties it to the fetch:
-    /// a leader returns the fetch's [`Shared`] observer, a follower attaches to it.
+    /// Starts the request's lifecycle, reports the credentials `submit` removed from its URL and
+    /// an HSTS upgrade on it, and ties it to the fetch: a leader returns the fetch's [`Shared`]
+    /// observer, a follower attaches to it.
     fn accept(
         &self,
         req: &FetchRequest,
         requested: &Url,
+        url_credentials_removed: bool,
         upgraded: Option<Url>,
         is_leader: bool,
         inflight_entry: &FetchInflightEntry,
@@ -802,6 +812,12 @@ impl Fetcher {
                 .is_none()
                 .then(|| (self.ctx.clone(), req.reference)),
         );
+        if url_credentials_removed {
+            lifecycle.on_event(NetEvent::RequestModified {
+                url: requested.clone(),
+                change: crate::net::types::RequestChange::UrlCredentialsRemoved,
+            });
+        }
         if let Some(ref to) = upgraded {
             lifecycle.on_event(NetEvent::SecurityUpgraded {
                 from: requested.clone(),
@@ -1488,6 +1504,7 @@ mod tests {
                 max_bytes: None,
                 body: None,
             },
+            url_credentials_removed: false,
             cancel: CancellationToken::new(),
             reply: tx,
         }
@@ -3320,11 +3337,10 @@ mod tests {
         }
     }
 
-    /// Security events reach the fetcher's observer. Coalesced requests share one fetch, and
-    /// the change is reported once, to the request that started it. A follower has its own
-    /// lifecycle, but no request changes of its own: it sent nothing.
+    /// Security events reach the fetcher's observer. Coalesced requests share one fetch, but
+    /// URL credentials are removed on submit, so each request reports its own.
     #[tokio::test(flavor = "current_thread")]
-    async fn request_changes_are_reported_once_through_the_fetcher() {
+    async fn url_credentials_are_reported_per_request_through_the_fetcher() {
         let srv = start_server().await;
         let log = Arc::new(RecordingObserver::new());
         let fetcher =
@@ -3367,13 +3383,96 @@ mod tests {
             1,
             "the two requests must coalesce"
         );
+        let removed = (
+            srv.url("/coalesce").to_string(),
+            crate::net::types::RequestChange::UrlCredentialsRemoved,
+        );
+        assert_eq!(log.modifications(), vec![removed.clone(), removed]);
+    }
+
+    /// No event of a request carries the `user:password@` it was submitted with, retried or
+    /// not, and the removal is reported once, not once per attempt.
+    #[tokio::test(flavor = "current_thread")]
+    async fn url_credentials_reach_no_event() {
+        let srv = start_server().await;
+        let mut url = srv.url("/flaky");
+        url.set_username("u").unwrap();
+        url.set_password(Some("p")).unwrap();
+        let (result, log) =
+            fetch_recorded(retrying_config(), make_req(url, Priority::Normal).0).await;
+        assert_eq!(status_of(&result), 200);
+        assert!(log.event_names().contains(&"Retrying".to_string()));
+        let events = log.debug_events();
+        assert!(events.iter().all(|e| !e.contains("u:p")), "{events:?}");
         assert_eq!(
             log.modifications(),
             vec![(
-                srv.url("/coalesce").to_string(),
+                srv.url("/flaky").to_string(),
                 crate::net::types::RequestChange::UrlCredentialsRemoved
             )]
         );
+    }
+
+    /// A request refused before it is sent reports `Blocked` and `Failed` without the URL's
+    /// credentials, and the removal once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn url_credentials_reach_no_refusal() {
+        let url = Url::parse("http://u:p@127.0.0.1:6000/").unwrap();
+        let (result, log) = fetch_recorded(test_config(), make_req(url, Priority::Normal).0).await;
+        assert!(matches!(result, FetchResult::Error(_)));
+        let names = log.event_names();
+        assert!(names.contains(&"Blocked".to_string()), "{names:?}");
+        assert!(names.contains(&"Failed".to_string()), "{names:?}");
+        let events = log.debug_events();
+        assert!(events.iter().all(|e| !e.contains("u:p")), "{events:?}");
+        assert_eq!(
+            log.modifications(),
+            vec![(
+                "http://127.0.0.1:6000/".to_string(),
+                crate::net::types::RequestChange::UrlCredentialsRemoved
+            )]
+        );
+    }
+
+    /// Two requests that differ only in URL credentials send the same bytes, so they coalesce.
+    #[tokio::test(flavor = "current_thread")]
+    async fn requests_differing_only_in_url_credentials_coalesce() {
+        let srv = start_server().await;
+        let log = Arc::new(RecordingObserver::new());
+        let fetcher =
+            Arc::new(Fetcher::new(test_config(), Arc::new(Recording(log.clone()))).unwrap());
+        let shutdown = CancellationToken::new();
+        tokio::spawn(fetcher.clone().run(shutdown.clone()));
+
+        let plain = srv.url("/coalesce");
+        let mut with_credentials = plain.clone();
+        with_credentials.set_username("u").unwrap();
+        with_credentials.set_password(Some("p")).unwrap();
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+        fetcher
+            .submit(
+                make_req(with_credentials, Priority::Normal).0,
+                CancellationToken::new(),
+                tx1,
+            )
+            .await;
+        fetcher
+            .submit(
+                make_req(plain, Priority::Normal).0,
+                CancellationToken::new(),
+                tx2,
+            )
+            .await;
+        for rx in [rx1, rx2] {
+            let result = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(status_of(&result), 200);
+        }
+        shutdown.cancel();
+        assert_eq!(srv.hit_count("/coalesce"), 1);
     }
 
     /// A retried request reports one end, the last attempt's, after every attempt's `Started`

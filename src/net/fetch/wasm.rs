@@ -21,6 +21,10 @@ impl PendingStore {
         match *self {}
     }
 
+    pub(crate) fn decoded(self, _decoded: bool) -> Self {
+        match self {}
+    }
+
     pub(crate) fn commit(self, _body: Bytes, _observer: &Arc<dyn NetObserver + Send + Sync>) {
         match self {}
     }

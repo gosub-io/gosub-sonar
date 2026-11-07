@@ -23,6 +23,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already under way, streamed bodies included; they used to run on until they finished or
   timed out, holding their connections, slots and request references. Such a fetch ends with
   `Cancelled` and the reason `fetcher shut down`, not `all callers cancelled` (GOS-278)
+- `ProxyConfig::System` (the default) fails closed on a proxy from the environment it cannot
+  use: `Fetcher::new` and the simple API (`simple_get`, `sync_get`, ...) now return an error
+  naming the variable, such as `ALL_PROXY=socks5h://...` in a build without the `socks`
+  feature. Such a value used to be skipped with a warning, sending its traffic direct and
+  skipping the operating system's proxy settings as well. The error leaves out the URL's
+  userinfo (GOS-304)
+
+### Fixed
+
+- The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
+  as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
+  and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
+  both raw and decoding requests; a raw `gzip` body still answers only raw ones (GOS-305)
+
+### Fixed
+
+- A cached response to a request that carried the caller's own `Authorization` or `Cookie`
+  without the jar's cookies (credentials `Omit`, or `SameOrigin` on a cross-origin hop) is no
+  longer served to another jar's request without those values or with others. Such a response
+  used to be stored in the shared, empty partition. It is now stored under a hash of those
+  headers; requests with neither still share the empty partition (GOS-303)
+
+### Fixed
+
+- `Fetcher::submit` removes a `user:password@` from the URL before anything sees it. It used to
+  reach `Accepted`, `SecurityUpgraded`, `Blocked`, `Failed`, `Retrying`, `Cancelled`, the task's
+  tracing span and `is_url_allowed`, and only the redirect chain removed it. `UrlCredentialsRemoved`
+  is now reported once per request, followers of a coalesced fetch included, instead of once per
+  attempt by the leader. Two requests that differ only in URL credentials now coalesce (GOS-306)
 
 ### Fixed
 
