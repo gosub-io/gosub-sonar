@@ -467,7 +467,8 @@ pub struct CookiePolicy {
     pub on_cookies: CookieSinkFn,
     /// The cache partition a hop that carries cookies reads and writes: whose jar
     /// [`cookies_for`](Self::cookies_for) answers from, so one jar's responses are never
-    /// served to another's requests. A hop without cookies uses the shared, empty partition.
+    /// served to another's requests. A hop without them uses a partition for the caller's own
+    /// `Authorization` and `Cookie`, or, with neither, the shared, empty one.
     /// Set by [`NetPolicy::from_context`] from
     /// [`FetcherContext::cookie_jar_key`].
     pub cache_partition: String,
@@ -6000,6 +6001,89 @@ mod tests {
             "a request without cookies does not read a jar's entry"
         );
         assert_eq!(srv.hit_count("/mine"), 3);
+    }
+
+    /// Without the jar's cookies, a hop that carries the caller's own `Authorization` or
+    /// `Cookie` is cached for those values: another jar's request without them, or with
+    /// others, goes to the network. The same values share the entry, and so do requests
+    /// with neither.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_callers_credentials_partition_the_cache_without_the_jar() {
+        let srv = TestServer::new()
+            .route(
+                "/me",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(60, b"v1".to_vec()).counting()),
+            )
+            .route(
+                "/anon",
+                RouteConfig::Cacheable(CacheRouteOptions::max_age(60, b"v1".to_vec()).counting()),
+            )
+            .start()
+            .await;
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let jar = |partition: &str| NetPolicy {
+            cookies: CookiePolicy {
+                cache_partition: partition.to_string(),
+                ..CookiePolicy::default()
+            },
+            ..NetPolicy::default().with_cache(Some(cache.clone()))
+        };
+        let omit = |name: Option<(header::HeaderName, &str)>| {
+            let mut headers = HeaderMap::new();
+            if let Some((name, value)) = name {
+                headers.insert(name, value.parse().unwrap());
+            }
+            RequestInit::get(headers).with_credentials(RequestCredentials::Omit)
+        };
+        let bearer = |token: &'static str| Some((header::AUTHORIZATION, token));
+
+        let (meta, body) =
+            cache_fetch(&srv, "/me", omit(bearer("Bearer a")), jar("a"), observer()).await;
+        assert!(!meta.from_cache);
+        assert_eq!(&body[..], b"hit-1");
+
+        let (meta, _) = cache_fetch(&srv, "/me", omit(None), jar("b"), observer()).await;
+        assert!(
+            !meta.from_cache,
+            "not served to a request without the token"
+        );
+        let (meta, _) =
+            cache_fetch(&srv, "/me", omit(bearer("Bearer b")), jar("b"), observer()).await;
+        assert!(
+            !meta.from_cache,
+            "not served to a request with another token"
+        );
+        let (meta, _) = cache_fetch(
+            &srv,
+            "/me",
+            omit(Some((header::COOKIE, "sid=a"))),
+            jar("b"),
+            observer(),
+        )
+        .await;
+        assert!(
+            !meta.from_cache,
+            "not served to a request with a cookie instead"
+        );
+        assert_eq!(srv.hit_count("/me"), 4);
+
+        let (meta, body) =
+            cache_fetch(&srv, "/me", omit(bearer("Bearer a")), jar("b"), observer()).await;
+        assert!(meta.from_cache, "the same token is served from the cache");
+        assert_eq!(&body[..], b"hit-1");
+        let (meta, body) =
+            cache_fetch(&srv, "/me", omit(bearer("Bearer b")), jar("a"), observer()).await;
+        assert!(meta.from_cache);
+        assert_eq!(&body[..], b"hit-3");
+        assert_eq!(srv.hit_count("/me"), 4);
+
+        cache_fetch(&srv, "/anon", omit(None), jar("a"), observer()).await;
+        let (meta, _) = cache_fetch(&srv, "/anon", omit(None), jar("b"), observer()).await;
+        assert!(
+            meta.from_cache,
+            "a request without credentials still shares the entry"
+        );
+        assert_eq!(srv.hit_count("/anon"), 1);
     }
 
     /// A stored response is CORS-checked like a fresh one: an entry stored by a same-origin

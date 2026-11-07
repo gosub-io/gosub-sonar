@@ -37,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
   both raw and decoding requests; a raw `gzip` body still answers only raw ones (GOS-305)
 
+### Fixed
+
+- A cached response to a request that carried the caller's own `Authorization` or `Cookie`
+  without the jar's cookies (credentials `Omit`, or `SameOrigin` on a cross-origin hop) is no
+  longer served to another jar's request without those values or with others. Such a response
+  used to be stored in the shared, empty partition. It is now stored under a hash of those
+  headers; requests with neither still share the empty partition (GOS-303)
+
 ## [0.16.1] - 2026-10-17
 
 ### Fixed
