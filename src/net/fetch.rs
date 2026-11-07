@@ -1064,6 +1064,7 @@ async fn fetch_response_top_inner(
     let resp = match response {
         HopResponse::Cached(entry) => {
             let peek_len = entry.body.len().min(PEEK_MAX);
+            let body_len = Some(entry.body.len() as u64);
             let meta = FetchResultMeta {
                 tainting,
                 final_url: final_url.clone(),
@@ -1081,7 +1082,12 @@ async fn fetch_response_top_inner(
                     headers.insert(header::AGE, header::HeaderValue::from(age));
                     headers
                 },
-                content_length: Some(entry.body.len() as u64),
+                // A stored HEAD reports the length its GET would have, as one off the wire does.
+                content_length: if method == Method::HEAD {
+                    declared_content_length(&entry.headers)
+                } else {
+                    body_len
+                },
                 content_type: entry
                     .headers
                     .get(header::CONTENT_TYPE)
@@ -1101,12 +1107,12 @@ async fn fetch_response_top_inner(
                 observer.clone(),
                 final_url,
                 started,
-                meta.content_length,
+                body_len,
                 peek_len as u64,
             );
             // A cache hit reports a preview too. No tee here: the entry is already whole in
             // memory, so it is cut to the budget directly.
-            if let Some(limit) = observer.body_capture_limit(&meta.headers, meta.content_length) {
+            if let Some(limit) = observer.body_capture_limit(&meta.headers, body_len) {
                 let take = entry.body.len().min(limit);
                 observer.on_event(NetEvent::BodyPreview {
                     url: meta.final_url.clone(),
@@ -3236,6 +3242,52 @@ mod tests {
             .all(|(_, url, _)| url.username().is_empty()));
     }
 
+    /// A `Location` refused for its credentials is reported without them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_credentialed_location_is_reported_without_credentials() {
+        let srv = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_to_with_credentials("user:pw", "/end"),
+            )
+            .route("/end", RouteConfig::ok(b"x"))
+            .start()
+            .await;
+        let rec = Arc::new(RecordingObserver::new());
+        let init = RequestInit {
+            origin: Some(srv.url("/").origin()),
+            mode: RequestMode::Cors,
+            ..RequestInit::get(HeaderMap::new())
+        };
+        let err = super::fetch_response_complete(
+            client(),
+            srv.url("/hop"),
+            init,
+            CancellationToken::new(),
+            rec.clone(),
+            None,
+            Duration::from_secs(3),
+            Some(Duration::from_secs(5)),
+            NetPolicy::default(),
+        )
+        .await
+        .unwrap_err();
+        let NetError::Blocked { reason, url } = err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(
+            reason,
+            BlockReason::Cors(crate::net::cors::CorsError::CredentialedRedirect)
+        );
+        assert_eq!(url, srv.url("/end"));
+        assert_eq!(
+            rec.blocked_reason(),
+            Some(BlockReason::Cors(
+                crate::net::cors::CorsError::CredentialedRedirect
+            ))
+        );
+    }
+
     #[test]
     fn location_text_decodes_utf8_then_bytes() {
         assert_eq!(location_text(b"/plain"), "/plain");
@@ -3930,6 +3982,36 @@ mod tests {
         assert_eq!(
             seen, "<absent>",
             "the redirect's no-referrer policy must suppress the header on the next hop"
+        );
+    }
+
+    /// The field lines of `Referrer-Policy` make one list: a bad element on the second line fails
+    /// the header, and the looser policy on the first is not adopted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_bad_referrer_policy_line_fails_the_whole_header() {
+        let srv = TestServer::new()
+            .route("/echo", RouteConfig::echo_referer_header())
+            .start()
+            .await;
+        let hop = TestServer::new()
+            .route(
+                "/hop",
+                RouteConfig::redirect_absolute_with_headers(
+                    &[
+                        ("referrer-policy", "unsafe-url"),
+                        ("referrer-policy", "\"x\""),
+                    ],
+                    srv.url("/echo").as_str(),
+                ),
+            )
+            .start()
+            .await;
+        // Same-origin with the first hop, so it gets the full URL and the next, cross-origin
+        // one only the origin, unless the redirect's `unsafe-url` were adopted.
+        let doc = format!("{}page?q=1", hop.base_url());
+        assert_eq!(
+            referer_seen_by_server(&hop, "/hop", Some(&doc), ReferrerPolicy::default()).await,
+            hop.base_url().as_str()
         );
     }
 
@@ -4973,6 +5055,160 @@ mod tests {
         assert_eq!(meta.status, 401);
     }
 
+    /// Credentials sent upfront that draw a `401` are forgotten like any rejected answer: the
+    /// retry asks the hook instead of re-sending the same stale pair from the store.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_upfront_credentials_are_forgotten() {
+        let srv = TestServer::new()
+            .route(
+                "/area/other",
+                RouteConfig::require_auth(
+                    r#"Basic realm="Secure Area""#,
+                    GOOD_AUTH,
+                    b"other".to_vec(),
+                ),
+            )
+            .start()
+            .await;
+        let space = ProtectionSpace {
+            target: AuthTarget::Server,
+            scheme: AuthScheme::Basic,
+            origin: Some(srv.url("/").origin().ascii_serialization()),
+            realm: "Secure Area".into(),
+        };
+        let store = Arc::new(InMemoryCredentialStore::new());
+        store.store(space.clone(), Credentials::basic("user", "stale"));
+        store.accepted_at(&space, &srv.url("/area/page"));
+        let (policy, seen) = answering_policy(Credentials::basic("user", "pass"));
+        let policy = policy.with_credential_store(Some(store.clone()));
+
+        let (meta, _) = auth_fetch(
+            &srv,
+            "/area/other",
+            RequestInit::get(HeaderMap::new()),
+            policy,
+            observer(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(
+            srv.hit_count("/area/other"),
+            2,
+            "upfront, then the hook's answer"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            store.credentials_for(&space),
+            Some(Credentials::basic("user", "pass"))
+        );
+    }
+
+    /// A `Set-Cookie` on a `401` that is answered and retried reaches the jar, as it does on a
+    /// `401` that is returned.
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_cookie_on_a_retried_challenge_reaches_the_jar() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!("http://{}/r", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let response = if head.contains(GOOD_AUTH) {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"r\"\r\n\
+                     Set-Cookie: sid=1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let cookies = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = cookies.clone();
+        let (policy, _) = answering_policy(Credentials::basic("user", "pass"));
+        let policy = NetPolicy {
+            cookies: CookiePolicy {
+                on_cookies: Box::new(move |_, values| {
+                    sink.lock()
+                        .unwrap()
+                        .extend(values.iter().map(|v| v.to_string()));
+                }),
+                ..CookiePolicy::default()
+            },
+            ..policy
+        };
+        let (meta, _) = super::fetch_response_complete(
+            client(),
+            base,
+            RequestInit::get(HeaderMap::new()),
+            CancellationToken::new(),
+            observer(),
+            None,
+            Duration::from_secs(5),
+            Some(Duration::from_secs(10)),
+            policy,
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(*cookies.lock().unwrap(), vec!["sid=1".to_string()]);
+    }
+    /// `Vary: Authorization` is selected on the `Authorization` the send added, not on the
+    /// caller's headers: an anonymous request does not get the variant stored for a login.
+    #[tokio::test(flavor = "current_thread")]
+    async fn vary_authorization_records_the_credentials_sent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!("http://{}/r", listener.local_addr().unwrap())).unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = vec![0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let response = if head.contains(GOOD_AUTH) {
+                    "HTTP/1.1 200 OK\r\nCache-Control: max-age=600\r\nVary: Authorization\r\n\
+                     Content-Length: 6\r\nConnection: close\r\n\r\nsecret"
+                } else {
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"r\"\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let send = |policy: NetPolicy| {
+            super::fetch_response_complete(
+                client(),
+                base.clone(),
+                RequestInit::get(HeaderMap::new()),
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(10)),
+                policy.with_cache(Some(cache.clone())),
+            )
+        };
+        let (policy, _) = answering_policy(Credentials::basic("user", "pass"));
+        let (meta, _) = send(policy).await.unwrap();
+        assert_eq!(meta.status, 200);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let (meta, _) = send(NetPolicy::default()).await.unwrap();
+        assert_eq!(meta.status, 401);
+        assert!(!meta.from_cache);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_basic_challenge_is_answered_and_the_hop_retried() {
         let srv = auth_server().await;
@@ -5240,6 +5476,57 @@ mod tests {
         assert_eq!(rec.auth_required().len(), 1);
     }
 
+    /// A preflight runs under the request's timeout and headers deadline: a server that never
+    /// answers the `OPTIONS` times the request out instead of holding it forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_preflight_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let url = Url::parse(&format!("http://{}/r", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let short = Some(Duration::from_millis(200));
+        for init in [
+            RequestInit::get(HeaderMap::new()).with_timeout(short),
+            RequestInit::get(HeaderMap::new()).with_headers_timeout(short),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-custom", header::HeaderValue::from_static("1"));
+            let init = RequestInit {
+                headers,
+                origin: Some(Url::parse("https://example.com/").unwrap().origin()),
+                mode: RequestMode::Cors,
+                ..init
+            };
+            let rec = Arc::new(RecordingObserver::new());
+            let fetch = super::fetch_response_complete(
+                client(),
+                url.clone(),
+                init,
+                CancellationToken::new(),
+                rec.clone(),
+                None,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(10)),
+                NetPolicy::default(),
+            );
+            let err = tokio::time::timeout(Duration::from_secs(5), fetch)
+                .await
+                .expect("the preflight is not held past its deadline")
+                .unwrap_err();
+            assert!(
+                matches!(err, NetError::Transport(ref t) if t.kind == crate::net::transport::TransportErrorKind::Timeout),
+                "{err:?}"
+            );
+            assert_eq!(rec.cors_preflights().len(), 1);
+        }
+    }
+
     /// `Authorization` is not CORS-safelisted, so a cors-tainted chain is left alone instead of
     /// getting credentials added behind the preflight's back.
     #[tokio::test(flavor = "current_thread")]
@@ -5395,6 +5682,51 @@ mod tests {
         let age: i64 = meta.headers[header::AGE].to_str().unwrap().parse().unwrap();
         assert!((50..60).contains(&age), "Age: {age}");
         assert_eq!(meta.headers.get_all(header::AGE).iter().count(), 1);
+    }
+
+    /// A stored `HEAD` response reports the `Content-Length` it declared, as it did when it came
+    /// off the wire, not the length of the body it never had.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stored_head_reports_its_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = Url::parse(&format!("http://{}/r", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = "HTTP/1.1 200 OK\r\nCache-Control: max-age=600\r\n\
+                                Content-Length: 5000\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let send = || {
+            let init = RequestInit {
+                auto_decode: false,
+                ..RequestInit::new(Method::HEAD, HeaderMap::new(), None)
+            };
+            super::fetch_response_complete(
+                client(),
+                base.clone(),
+                init,
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(5),
+                Some(Duration::from_secs(10)),
+                NetPolicy::default().with_cache(Some(cache.clone())),
+            )
+        };
+        let (network, _) = send().await.unwrap();
+        let (stored, body) = send().await.unwrap();
+        assert!(!network.from_cache && stored.from_cache);
+        assert_eq!(stored.content_length, Some(5000));
+        assert_eq!(stored.content_length, network.content_length);
+        assert!(!stored.has_body);
+        assert!(body.is_empty());
     }
 
     /// A `HEAD` whose `ETag` is not the stored `GET`'s drops the stored `GET` (RFC 9111 §4.3.5),

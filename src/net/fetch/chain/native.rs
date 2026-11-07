@@ -90,14 +90,21 @@ pub(super) struct HopExchange {
     pub(super) response: HopResponse,
     requested_at: chrono::DateTime<chrono::Utc>,
     received_at: chrono::DateTime<chrono::Utc>,
+    // The `Authorization` the send added, for `Vary` to record.
+    authorization: Option<header::HeaderValue>,
 }
 
 impl HopExchange {
-    pub(super) fn new(response: HopResponse, timing: Timing) -> Self {
+    pub(super) fn new(
+        response: HopResponse,
+        timing: Timing,
+        authorization: Option<header::HeaderValue>,
+    ) -> Self {
         HopExchange {
             response,
             requested_at: timing.requested_at,
             received_at: timing.received_at,
+            authorization,
         }
     }
 }
@@ -298,19 +305,26 @@ impl HopChain {
                 url: self.url.clone(),
             });
             let pf_started = Instant::now();
-            let fut = env
+            // Under the same timeouts and deadlines as the request it precedes.
+            let mut pf_builder = env
                 .client
                 .request(Method::OPTIONS, self.url.clone())
-                .headers(pf_headers)
-                .send();
-            tokio::pin!(fut);
-            let pf_resp = tokio::select! {
-                _ = env.cancel.cancelled() => {
-                    env.observer.on_event(NetEvent::Cancelled { url: self.url.clone(), reason: "cancelled during CORS preflight" });
-                    return Err(NetError::Cancelled("cancelled during CORS preflight".into()));
-                }
-                r = &mut fut => r.map_err(|e| send_error(e, &self.url, "CORS preflight request failed", env.observer, env.policy))?
-            };
+                .headers(pf_headers);
+            if let Some(timeout) = env.init.timeout {
+                pf_builder = pf_builder.timeout(timeout);
+            }
+            let pf_request = client_deadline(env, pf_builder).build().map_err(|e| {
+                send_error(
+                    e,
+                    &self.url,
+                    "CORS preflight request build failed",
+                    env.observer,
+                    env.policy,
+                )
+            })?;
+            let pf_resp = self
+                .await_response(env, pf_request, "CORS preflight request failed")
+                .await?;
             // Reported before validation: a preflight the server answered cost
             // this round-trip whether or not the answer turns out to permit the
             // request. A rejection is separately reported as `Blocked`.
@@ -381,6 +395,7 @@ impl HopChain {
                     response,
                     requested_at: now,
                     received_at: now,
+                    authorization: None,
                 })
             }
             None => self.send(env, plan).await,
@@ -736,6 +751,10 @@ impl HopChain {
         exchange: &HopExchange,
         peer_addr: Option<SocketAddr>,
     ) -> Option<PendingStore> {
+        let mut request_headers = self.headers.clone();
+        if let Some(ref value) = exchange.authorization {
+            request_headers.insert(header::AUTHORIZATION, value.clone());
+        }
         match (&exchange.response, env.policy.cache.store.as_ref()) {
             // `no-store` is both directions: the lookup above skipped the cache, and nothing
             // about this exchange is written to it either.
@@ -754,7 +773,7 @@ impl HopChain {
                     url: self.url.clone(),
                     status: resp.status().as_u16(),
                     response_headers: resp.headers().clone(),
-                    request_headers: self.headers.clone(),
+                    request_headers,
                     // Set once the body's codings are known; a redirect's body is never decoded.
                     decoded: false,
                     requested_at: exchange.requested_at,

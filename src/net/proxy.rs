@@ -45,7 +45,7 @@ pub enum ProxyScope {
 /// This is separate from any authentication the *origin server* asks for. Credentials embedded
 /// in the proxy URL (`http://user:pass@proxy:8080`) work too, but anything needing escaping is
 /// easier to get right here.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum ProxyAuth {
     /// `Proxy-Authorization: Basic <base64(username:password)>`.
     Basic {
@@ -61,7 +61,7 @@ pub enum ProxyAuth {
 }
 
 /// One proxy: where it lives, which requests go through it, and which hosts bypass it.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProxyRule {
     /// Which request URLs this rule applies to.
     pub scope: ProxyScope,
@@ -80,6 +80,30 @@ pub struct ProxyRule {
     /// *not* fall back to the `NO_PROXY` environment variable, since configuring a rule
     /// programmatically opts out of the environment entirely.
     pub no_proxy: Option<String>,
+}
+
+impl std::fmt::Debug for ProxyAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Custom(_) => f.write_str("Custom(<redacted>)"),
+        }
+    }
+}
+
+impl std::fmt::Debug for ProxyRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyRule")
+            .field("scope", &self.scope)
+            .field("url", &without_userinfo(&self.url))
+            .field("auth", &self.auth)
+            .field("no_proxy", &self.no_proxy)
+            .finish()
+    }
 }
 
 impl ProxyRule {
@@ -152,7 +176,7 @@ impl ProxyRule {
             anyhow::ensure!(
                 !matches!(scheme.as_str(), "socks4" | "socks4a" | "socks5" | "socks5h"),
                 "proxy URL {:?} needs the `socks` cargo feature",
-                self.url
+                without_userinfo(&self.url)
             );
         }
 
@@ -164,10 +188,22 @@ impl ProxyRule {
                 ProxyScope::Https => reqwest::Proxy::https(&self.url),
                 ProxyScope::All => reqwest::Proxy::all(&self.url),
             }
-            .with_context(|| format!("unusable proxy URL {:?}", self.url))?
+            .with_context(|| format!("unusable proxy URL {:?}", without_userinfo(&self.url)))?
         } else {
-            let proxy_url = Url::parse(&self.url)
-                .with_context(|| format!("unusable proxy URL {:?}", self.url))?;
+            let mut proxy_url = Url::parse(&self.url)
+                .with_context(|| format!("unusable proxy URL {:?}", without_userinfo(&self.url)))?;
+            // The socks connector takes credentials from the proxy URL only, not from the header
+            // `basic_auth` keeps for a custom proxy below.
+            if let Some(ProxyAuth::Basic {
+                ref username,
+                ref password,
+            }) = self.auth
+            {
+                if proxy_url.scheme().starts_with("socks") {
+                    let _ = proxy_url.set_username(&userinfo_encoded(username));
+                    let _ = proxy_url.set_password(Some(&userinfo_encoded(password)));
+                }
+            }
             let rule = self.clone();
             reqwest::Proxy::custom(move |url: &Url| {
                 let dst: http::Uri = url.as_str().parse().ok()?;
@@ -192,7 +228,10 @@ impl ProxyRule {
             }
             Some(ProxyAuth::Custom(ref value)) => {
                 let header = value.parse().with_context(|| {
-                    format!("proxy {:?}: invalid Proxy-Authorization value", self.url)
+                    format!(
+                        "proxy {:?}: invalid Proxy-Authorization value",
+                        without_userinfo(&self.url)
+                    )
                 })?;
                 proxy = proxy.custom_http_auth(header);
             }
@@ -1249,5 +1288,91 @@ mod tests {
             ProxyRoutes::Disabled.http_proxy(&Url::parse("http://example.test/").unwrap()),
             None
         );
+    }
+
+    /// Neither `Debug` nor a configuration error shows a proxy password, whether it is in the
+    /// rule's credentials or in its URL.
+    #[test]
+    fn proxy_passwords_stay_out_of_debug_and_errors() {
+        let rule =
+            ProxyRule::all("http://alice:hunter2@proxy.corp:8080").with_basic_auth("bob", "s3cret");
+        let shown = format!("{:?}", ProxyConfig::Rules(vec![rule]));
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("s3cret"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("proxy.corp:8080") && shown.contains("bob"),
+            "{shown}"
+        );
+
+        let custom = format!(
+            "{:?}",
+            ProxyRule::all("http://proxy.corp").with_custom_auth("Bearer t0ken")
+        );
+        assert!(!custom.contains("t0ken"), "{custom}");
+
+        for url in [
+            "http://alice:hunter2@[bad",
+            "http://alice:hunter2@proxy corp/",
+        ] {
+            let err = ProxyRule::all(url).to_reqwest().unwrap_err();
+            let err = format!("{err:#}");
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+        let err = ProxyRule::all("http://alice:hunter2@proxy.corp")
+            .with_custom_auth("bad\nvalue")
+            .to_reqwest()
+            .unwrap_err();
+        assert!(!format!("{err:#}").contains("hunter2"), "{err:#}");
+    }
+
+    /// A socks proxy with `with_basic_auth` offers username/password in its handshake (RFC 1929),
+    /// also when a port-bearing bypass entry makes the rule decide per request.
+    #[cfg(feature = "socks")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_socks_rule_with_a_port_entry_authenticates() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let proxy = format!("socks5://{}", listener.local_addr().unwrap());
+        let greeting = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 2];
+            stream.read_exact(&mut head).await.unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            stream.read_exact(&mut methods).await.unwrap();
+            assert!(methods.contains(&0x02), "{methods:?}");
+            stream.write_all(&[5, 2]).await.unwrap();
+            // RFC 1929: version, then the username and the password, each length-prefixed.
+            let mut auth = [0u8; 2];
+            stream.read_exact(&mut auth).await.unwrap();
+            let mut user = vec![0u8; auth[1] as usize];
+            stream.read_exact(&mut user).await.unwrap();
+            let mut pass = vec![0u8; stream.read_u8().await.unwrap() as usize];
+            stream.read_exact(&mut pass).await.unwrap();
+            let pair = (
+                String::from_utf8(user).unwrap(),
+                String::from_utf8(pass).unwrap(),
+            );
+            // Kept open, so the client does not fail first.
+            (pair, stream)
+        });
+        let cfg = ProxyConfig::Rules(vec![ProxyRule::all(proxy)
+            .with_basic_auth("alice", "p@ss:w%rd")
+            .bypassing("localhost:1")]);
+        let client = cfg
+            .apply(reqwest::Client::builder())
+            .unwrap()
+            .build()
+            .unwrap();
+        let send = client.get("http://192.0.2.1/").send();
+        let (pair, _stream) = tokio::select! {
+            biased;
+            m = greeting => m.unwrap(),
+            r = send => panic!("the client never authenticated: {r:?}"),
+        };
+        assert_eq!(pair, ("alice".to_string(), "p@ss:w%rd".to_string()));
     }
 }

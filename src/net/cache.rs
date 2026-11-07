@@ -292,9 +292,11 @@ impl CacheEntry {
             return false;
         }
         self.vary.iter().all(|(name, stored)| {
-            let current = HeaderName::try_from(name.as_str())
-                .ok()
-                .and_then(|n| vary_value(request, &n));
+            // No request can carry a header by a name that is not one, so like `*` it fails.
+            let Ok(name) = HeaderName::try_from(name.as_str()) else {
+                return false;
+            };
+            let current = vary_value(request, &name);
             current.as_deref() == stored.as_deref().map(normalize_list).as_deref()
         })
     }
@@ -485,6 +487,17 @@ impl CacheEntry {
                     (name, value)
                 })
                 .collect();
+        }
+        // The 304 is a response of its own: one without a `Date` gets the time it arrived, as
+        // a stored one does (RFC 9110 §6.6.1), and the `Age` the old one arrived with is not
+        // its age.
+        if !headers.contains_key(header::DATE) {
+            if let Ok(date) = header::HeaderValue::from_str(&format_http_date(received_at)) {
+                updated.headers.insert(header::DATE, date);
+            }
+        }
+        if !headers.contains_key(header::AGE) {
+            updated.headers.remove(header::AGE);
         }
         updated.requested_at = requested_at;
         updated.received_at = received_at;
@@ -683,8 +696,12 @@ pub fn is_storable(
         return false;
     }
     // `Vary: *` says the response depends on something the request headers do not capture, so no
-    // stored entry can ever be shown to match.
-    if vary_names(response).iter().any(|n| n == "*") {
+    // stored entry can ever be shown to match. Nor can one that varies on a name that is not a
+    // header name.
+    if vary_names(response)
+        .iter()
+        .any(|n| n == "*" || HeaderName::try_from(n.as_str()).is_err())
+    {
         return false;
     }
     // Partial content needs range support, which this cache does not have.
@@ -1987,6 +2004,39 @@ mod tests {
         );
         assert!(by_language.matches(&asked, false));
         assert!(!by_language.matches(&headers(&[("accept-language", "en")]), false));
+
+        let unparsable = stored.updated_by_304(
+            &headers(&[("etag", "\"v1\""), ("vary", "x@y")]),
+            at(1),
+            at(1),
+            &asked,
+        );
+        assert!(!unparsable.matches(&asked, false));
+    }
+
+    /// A `Vary` name that is not a header name cannot be matched, so the response is not stored,
+    /// as for `Vary: *`. Dropped, it would answer every request.
+    #[test]
+    fn a_vary_name_that_is_not_a_header_name_is_not_stored() {
+        let ok = |vary: &str| headers(&[("cache-control", "max-age=60"), ("vary", vary)]);
+        assert!(is_storable(
+            &Method::GET,
+            &HeaderMap::new(),
+            200,
+            &ok("accept")
+        ));
+        assert!(!is_storable(
+            &Method::GET,
+            &HeaderMap::new(),
+            200,
+            &ok("accept, x@y")
+        ));
+        assert!(!is_storable(
+            &Method::GET,
+            &HeaderMap::new(),
+            200,
+            &ok("a b")
+        ));
     }
 
     /// RFC 9111 §4.3.4: a `304` without a validator selects a stored response only if that one
@@ -2507,6 +2557,39 @@ mod tests {
         );
         // The age clock restarts, so the entry is fresh again.
         assert!(updated.is_fresh(at(150)));
+    }
+
+    /// A 304 without `Date` or `Age` dates the entry from when it arrived: the old `Date` and
+    /// `Age` would make it stale again right after it was confirmed.
+    #[test]
+    fn a_304_without_date_or_age_restarts_the_age_from_its_arrival() {
+        let stored = entry(&[
+            ("cache-control", "max-age=60"),
+            ("etag", "\"v1\""),
+            ("age", "30"),
+        ]);
+        let updated = stored.updated_by_304(
+            &headers(&[("etag", "\"v1\"")]),
+            at(1000),
+            at(1000),
+            &HeaderMap::new(),
+        );
+        assert_eq!(
+            updated.headers.get(header::DATE).unwrap(),
+            http_date(at(1000)).as_str()
+        );
+        assert!(!updated.headers.contains_key(header::AGE));
+        assert_eq!(updated.current_age(at(1000)), TimeDelta::zero());
+        assert!(updated.is_fresh(at(1050)));
+
+        // What the 304 does carry still counts.
+        let updated = stored.updated_by_304(
+            &headers(&[("date", &http_date(at(990))), ("age", "5")]),
+            at(1000),
+            at(1000),
+            &HeaderMap::new(),
+        );
+        assert_eq!(updated.current_age(at(1000)), TimeDelta::seconds(10));
     }
 
     #[test]

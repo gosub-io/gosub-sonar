@@ -53,6 +53,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is now reported once per request, followers of a coalesced fetch included, instead of once per
   attempt by the leader. Two requests that differ only in URL credentials now coalesce (GOS-306)
 
+### Fixed
+
+- Credentials a `CredentialStore` sends upfront are forgotten when the server answers `401`,
+  as an answer to a challenge is: the retry asks `on_auth_challenge` instead of re-sending the
+  same stale pair from the store (GOS-307)
+- A response stored with `Vary: Authorization` records the `Authorization` the send added (an
+  answer to a challenge, or credentials sent upfront), not the caller's headers without it. A
+  request without credentials no longer matches the variant stored for a login (GOS-307)
+- A `Set-Cookie` on a `401` or `407` that is answered and retried is reported to
+  `on_cookies`, as one on a challenge that is returned is. It used to be dropped (GOS-307)
+- A redirect refused for credentials in its `Location` reports the target without them in
+  `NetError::Blocked` and `NetEvent::Blocked`, so the password does not end up in logs (GOS-307)
+- A `Referrer-Policy` header with an element that is not a token (`unsafe-url, "x"`) is
+  ignored as a whole, as the spec has it, and the current policy stands. Its valid tokens used
+  to be kept, which could loosen the policy. The field lines of a redirect's header are read as
+  one list, so a bad line fails them all (GOS-307)
+- `ProxyAuth` and `ProxyRule` (and so `ProxyConfig`) no longer show a proxy password in their
+  `Debug` output, and an unusable proxy URL is named without its `user:password@` in the error
+  from `Fetcher::new` and in the warning for one from the environment (GOS-307)
+- A stored response confirmed by a `304` without `Date` is dated from when the `304` arrived,
+  and loses the `Age` it was first stored with unless the `304` brings one. It used to keep the
+  old `Date` and `Age`, so it was stale again right after validation and revalidated on every
+  request (GOS-307)
+- A response whose `Vary` names something that is not a header name is not stored, as for
+  `Vary: *`, and an entry a `304` gives such a `Vary` matches no request. The name used to be
+  dropped, so the entry answered every request whatever it varied on (GOS-307)
+- A `HEAD` answered from the cache reports the `Content-Length` it declared in
+  `FetchResultMeta::content_length`, as the same response off the wire does, instead of `0`.
+  A `HEAD` stored with `auto_decode` on reports none, since its `Content-Length` was not
+  kept (GOS-307)
+- A CORS preflight runs under the request's timeout, headers deadline and redirect deadline.
+  It had none of them, so a server that never answered the `OPTIONS` held the request until the
+  client's own timeout, if any. Cancelling it reports the same reason as cancelling the request
+  (`all callers cancelled` or `fetcher shut down`) (GOS-307)
+- A socks proxy rule with `with_basic_auth` and a bypass entry that names a port
+  (`localhost:8080`) authenticates in the socks handshake. The credentials went only into a
+  header a socks proxy never reads, so the proxy refused the connection (GOS-307)
+
 ## [0.16.1] - 2026-10-17
 
 ### Fixed

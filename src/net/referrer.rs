@@ -68,14 +68,26 @@ impl ReferrerPolicy {
     /// header entirely. Returns `None` when nothing in the list is recognised, meaning the
     /// current policy stands.
     ///
-    /// An element that is not a valid token at all (`foo_bar`, a quoted string) is skipped like
-    /// an unknown one. That follows browsers rather than the letter of the spec, where such an
-    /// element makes the whole header fail (Referrer Policy §8.1, via Fetch's "extract header
-    /// list values") and the current policy would stand. Browsers keep the valid tokens, which
-    /// is never looser than the spec: `no-referrer, foo_bar` gives `no-referrer` here instead
-    /// of leaving a weaker policy in place.
+    /// An element that is not a token at all (`foo_bar`, a quoted string) fails the whole
+    /// header, which then also returns `None` (Referrer Policy §8.1, via Fetch's "extract header
+    /// list values"): `unsafe-url, "x"` leaves the current policy in place rather than loosening
+    /// it.
     pub fn parse_header(value: &str) -> Option<Self> {
-        value.split(',').filter_map(Self::parse_token).next_back()
+        let mut policy = None;
+        for element in value.split(',').map(str::trim) {
+            if element.is_empty() {
+                continue;
+            }
+            // `extension-token = 1*( ALPHA / "-" )`, which every known token also is.
+            if !element
+                .bytes()
+                .all(|b| b.is_ascii_alphabetic() || b == b'-')
+            {
+                return None;
+            }
+            policy = Self::parse_token(element).or(policy);
+        }
+        policy
     }
 
     /// The policy's token, as written in a `Referrer-Policy` header.
@@ -448,6 +460,18 @@ mod tests {
         // Nothing understood at all leaves the caller's policy in force.
         assert_eq!(ReferrerPolicy::parse_header("a, b"), None);
         assert_eq!(ReferrerPolicy::parse_header(""), None);
+    }
+
+    /// An element that is not a token fails the whole header, so the current policy stands
+    /// instead of the looser one listed beside it.
+    #[test]
+    fn header_with_a_non_token_element_is_ignored() {
+        assert_eq!(ReferrerPolicy::parse_header("unsafe-url, \"x\""), None);
+        assert_eq!(ReferrerPolicy::parse_header("no-referrer, foo_bar"), None);
+        assert_eq!(
+            ReferrerPolicy::parse_header("no-referrer, , origin"),
+            Some(ReferrerPolicy::Origin)
+        );
     }
 
     /// Over-long referrers degrade to their origin, before the policy is even consulted.

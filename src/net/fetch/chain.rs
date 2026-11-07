@@ -438,7 +438,7 @@ impl HopChain {
             && self.tainting == ResponseTainting::Basic
             && !self.headers.contains_key(header::AUTHORIZATION)
         {
-            if let Some((_, credentials)) = env
+            if let Some((space, credentials)) = env
                 .policy
                 .auth
                 .credentials
@@ -446,6 +446,8 @@ impl HopChain {
                 .and_then(|store| store.upfront_for(&self.url))
             {
                 server_auth.header = credentials.header_value();
+                // Unproven like an answer to a challenge: a 401 forgets them.
+                server_auth.unproven = Some((space, credentials));
             }
         }
 
@@ -455,7 +457,9 @@ impl HopChain {
         let response = loop {
             let request = self.hop_request(env, plan, &server_auth, &proxy_auth)?;
             timing = Timing::requested();
-            let resp = self.await_response(env, request).await?;
+            let resp = self
+                .await_response(env, request, "net.get_with_redirects request failed")
+                .await?;
             timing.received();
             self.received(env, plan, &resp)?;
 
@@ -536,12 +540,17 @@ impl HopChain {
             let Some((space, credentials, value)) = answer else {
                 break HopResponse::Network(resp);
             };
+            // The challenge is not returned, so its cookies are reported here or not at all.
+            if plan.attach_credentials {
+                report_set_cookie(env.policy, &self.url, resp.headers());
+            }
             slot.header = Some(value);
             slot.unproven = Some((space, credentials));
             slot.attempt += 1;
         };
 
-        Ok(HopExchange::new(response, timing))
+        // The kept send carried this slot's header: it only changes before a retry.
+        Ok(HopExchange::new(response, timing, server_auth.header))
     }
 
     /// The request for one send of the hop, reported as [`NetEvent::RequestSent`].
@@ -646,6 +655,7 @@ impl HopChain {
         &self,
         env: &ChainEnv<'_>,
         request: reqwest::Request,
+        what: &str,
     ) -> Result<reqwest::Response, NetError> {
         let fut = env.client.execute(request);
         tokio::pin!(fut);
@@ -681,12 +691,12 @@ impl HopChain {
                 Err(NetError::Transport(TransportError {
                     kind: crate::net::transport::TransportErrorKind::Timeout,
                     message: format!(
-                        "net.get_with_redirects request failed: no response headers within {:?}",
+                        "{what}: no response headers within {:?}",
                         env.init.headers_timeout.unwrap_or_default()
                     ),
                 }))
             }
-            r = &mut fut => r.map_err(|e| send_error(e, &self.url, "net.get_with_redirects request failed", env.observer, env.policy))
+            r = &mut fut => r.map_err(|e| send_error(e, &self.url, what, env.observer, env.policy))
         }
     }
 
@@ -744,16 +754,17 @@ impl HopChain {
             HopResponse::Cached(_) => self.url.clone(),
         };
 
-        // A redirect may tighten (or loosen) the policy for the rest of the chain. Read every
-        // field line, not just the first: a server may split the list across lines, and the
-        // last token we understand wins across all of them.
-        if let Some(updated) = hop
+        // A redirect may tighten (or loosen) the policy for the rest of the chain. Every field
+        // line is part of one list: the last token we understand wins across all of them, and
+        // a bad element on any line fails the whole header.
+        let lines: Option<Vec<&str>> = hop
             .headers()
             .get_all(&REFERRER_POLICY)
             .iter()
-            .filter_map(|v| v.to_str().ok())
-            .filter_map(ReferrerPolicy::parse_header)
-            .next_back()
+            .map(|v| v.to_str().ok())
+            .collect();
+        if let Some(updated) =
+            lines.and_then(|lines| ReferrerPolicy::parse_header(&lines.join(",")))
         {
             self.referrer_policy = updated;
         }
@@ -805,6 +816,8 @@ impl HopChain {
         if (!to.username().is_empty() || to.password().is_some())
             && (env.init.mode == RequestMode::Cors || from.origin() != to.origin())
         {
+            // Reported without them: the error's text ends up in logs.
+            strip_url_credentials(&mut to);
             return Err(blocked(
                 env.observer,
                 to,
