@@ -24,6 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timed out, holding their connections, slots and request references. Such a fetch ends with
   `Cancelled` and the reason `fetcher shut down`, not `all callers cancelled` (GOS-278)
 
+### Fixed
+
+- The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
+  as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
+  and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
+  both raw and decoding requests; a raw `gzip` body still answers only raw ones (GOS-305)
+
 ## [0.16.1] - 2026-10-17
 
 ### Fixed

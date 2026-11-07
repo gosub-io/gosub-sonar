@@ -1145,6 +1145,7 @@ async fn fetch_response_top_inner(
     // cannot be undone keeps both, and its bytes.
     let (codings, headers, content_length) =
         platform::decoding(auto_decode, bodiless, headers, content_length);
+    let store = store.map(|store| store.decoded(codings.is_some()));
 
     // Response is received, setup our meta structure
     let mut meta = FetchResultMeta {
@@ -6621,6 +6622,118 @@ mod tests {
             assert_eq!(&body[..], &coded[..]);
             assert_eq!(meta.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
             assert_eq!(meta.content_length, Some(coded.len() as u64));
+        }
+
+        async fn cached(
+            url: Url,
+            method: Method,
+            auto_decode: bool,
+            cache: &Arc<crate::net::cache::InMemoryHttpCache>,
+        ) -> (FetchResultMeta, Bytes) {
+            let mut init = RequestInit::new(method, HeaderMap::new(), None);
+            init.auto_decode = auto_decode;
+            super::super::fetch_response_complete(
+                client(),
+                url,
+                init,
+                CancellationToken::new(),
+                observer(),
+                None,
+                Duration::from_secs(5),
+                None,
+                NetPolicy::default().with_cache(Some(cache.clone())),
+            )
+            .await
+            .expect("fetch")
+        }
+
+        /// A coding that cannot be undone is stored as it came, header and length included, and
+        /// served that way.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_body_left_coded_is_cached_with_its_coding() {
+            let coded = b"not really zstd".to_vec();
+            let url = server(
+                "Cache-Control: max-age=600\r\nContent-Encoding: zstd\r\n".into(),
+                coded.clone(),
+            )
+            .await;
+            let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+            let _ = cached(url.clone(), Method::GET, true, &cache).await;
+            let (meta, body) = cached(url, Method::GET, true, &cache).await;
+            assert!(meta.from_cache);
+            assert_eq!(&body[..], &coded[..]);
+            assert_eq!(meta.headers.get(header::CONTENT_ENCODING).unwrap(), "zstd");
+            let length = coded.len().to_string();
+            assert_eq!(meta.headers.get(header::CONTENT_LENGTH).unwrap(), &length);
+            assert_eq!(meta.content_length, Some(coded.len() as u64));
+        }
+
+        /// A decoded body is stored and served decoded, and answers no raw request.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_decoded_body_is_cached_decoded() {
+            let plain = b"gzipped".to_vec();
+            let url = server(
+                "Cache-Control: max-age=600\r\nContent-Encoding: gzip\r\n".into(),
+                gz(&plain),
+            )
+            .await;
+            let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+            let _ = cached(url.clone(), Method::GET, true, &cache).await;
+            let (meta, body) = cached(url.clone(), Method::GET, true, &cache).await;
+            assert!(meta.from_cache);
+            assert_eq!(&body[..], &plain[..]);
+            assert!(!meta.headers.contains_key(header::CONTENT_ENCODING));
+            assert!(!meta.headers.contains_key(header::CONTENT_LENGTH));
+            assert!(!cached(url, Method::GET, false, &cache).await.0.from_cache);
+        }
+
+        /// A raw gzip body answers no request that wants it decoded.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_raw_coded_body_answers_no_decoding_request() {
+            let url = server(
+                "Cache-Control: max-age=600\r\nContent-Encoding: gzip\r\n".into(),
+                gz(b"raw"),
+            )
+            .await;
+            let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+            let _ = cached(url.clone(), Method::GET, false, &cache).await;
+            assert!(
+                cached(url.clone(), Method::GET, false, &cache)
+                    .await
+                    .0
+                    .from_cache
+            );
+            let (meta, body) = cached(url, Method::GET, true, &cache).await;
+            assert!(!meta.from_cache);
+            assert_eq!(&body[..], b"raw");
+        }
+
+        /// A body in no coding is the same either way, and answers both kinds of request.
+        #[tokio::test(flavor = "current_thread")]
+        async fn an_uncoded_body_answers_raw_and_decoding_requests() {
+            let url = server("Cache-Control: max-age=600\r\n".into(), b"plain".to_vec()).await;
+            let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+            let _ = cached(url.clone(), Method::GET, true, &cache).await;
+            let (meta, body) = cached(url.clone(), Method::GET, false, &cache).await;
+            assert!(meta.from_cache);
+            assert_eq!(&body[..], b"plain");
+            assert!(cached(url, Method::GET, true, &cache).await.0.from_cache);
+        }
+
+        /// A `HEAD` has no body to decode: its response is stored with the coding it names.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_head_is_cached_with_its_coding() {
+            let url = server(
+                "Cache-Control: max-age=600\r\nContent-Encoding: gzip\r\n".into(),
+                gz(b"head"),
+            )
+            .await;
+            let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+            let _ = cached(url.clone(), Method::HEAD, true, &cache).await;
+            let (meta, _) = cached(url.clone(), Method::HEAD, true, &cache).await;
+            assert!(meta.from_cache);
+            assert_eq!(meta.headers.get(header::CONTENT_ENCODING).unwrap(), "gzip");
+            assert!(cached(url, Method::HEAD, false, &cache).await.0.from_cache);
         }
     }
 

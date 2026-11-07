@@ -227,6 +227,12 @@ impl PendingStore {
         self.cache.max_entry_bytes()
     }
 
+    /// This store with `decoded` set: whether a coding of the body was undone.
+    pub(crate) fn decoded(mut self, decoded: bool) -> Self {
+        self.decoded = decoded;
+        self
+    }
+
     /// Write the response to the cache now that its body is complete.
     pub(crate) fn commit(self, body: Bytes, observer: &Arc<dyn NetObserver + Send + Sync>) {
         let mut entry = cache::entry_from_response(
