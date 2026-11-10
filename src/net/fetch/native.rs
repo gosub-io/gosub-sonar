@@ -198,8 +198,18 @@ impl CacheCollector {
     /// Write the complete body to the cache.
     pub(super) fn commit(&mut self, observer: &Arc<dyn NetObserver + Send + Sync>) {
         if let Some(store) = self.store.take() {
-            store.commit(std::mem::take(&mut self.body).freeze(), observer);
+            store.commit(exact(std::mem::take(&mut self.body)), observer);
         }
+    }
+}
+
+/// `body` frozen without its spare capacity, which the cache charges nothing for: a grown
+/// buffer can hold up to twice its length.
+fn exact(body: BytesMut) -> Bytes {
+    if body.capacity() > body.len() {
+        Bytes::copy_from_slice(&body)
+    } else {
+        body.freeze()
     }
 }
 
@@ -339,5 +349,22 @@ pub(super) fn origin_peer(
     match policy.proxy.proxied {
         Some(ref proxied) if !proxied(url) => resp.remote_addr(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A grown buffer is copied down to its length before the cache holds it.
+    #[test]
+    fn a_cached_body_has_no_spare_capacity() {
+        let mut body = BytesMut::new();
+        for _ in 0..1000 {
+            body.extend_from_slice(b"abc");
+        }
+        assert!(body.capacity() > body.len());
+        let stored = exact(body).try_into_mut().expect("unique");
+        assert_eq!(stored.capacity(), 3000);
     }
 }

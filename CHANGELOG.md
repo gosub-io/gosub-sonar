@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A `Strict-Transport-Security` header is checked for repeated directives in linear time. The
   check scanned every earlier name per directive, so a 400 KB header of distinct directives
   held a fetch task for seconds (GOS-358)
+- `InMemoryHttpCache` charges closer to what an entry really holds: about 136 bytes of map
+  bookkeeping per header instead of 4, the key twice (it sits in the map and the LRU order),
+  and a body without the spare capacity of the buffer it was collected in. The per-entry
+  ceiling now covers the whole charge, URL and `Vary` values included. Small responses with
+  many empty headers could hold several times the budget (GOS-358)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers

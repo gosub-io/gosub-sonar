@@ -264,13 +264,17 @@ pub struct CacheEntry {
     pub peer_addr: Option<std::net::SocketAddr>,
 }
 
+/// What one header costs a `HeaderMap` beyond its name and value bytes: the bucket, the index
+/// slot, the name and value structs. Measured at 136 bytes per distinct name on 64-bit.
+const HEADER_OVERHEAD: usize = 136;
+
 impl CacheEntry {
-    /// Bytes this entry occupies: the body plus a rough estimate of the headers.
+    /// Bytes this entry occupies: the body plus an estimate of the headers.
     pub fn size(&self) -> usize {
         let headers: usize = self
             .headers
             .iter()
-            .map(|(n, v)| n.as_str().len() + v.len() + 4)
+            .map(|(n, v)| n.as_str().len() + v.len() + HEADER_OVERHEAD)
             .sum();
         self.body.len() + headers
     }
@@ -1101,14 +1105,15 @@ impl Contents {
 const STORED_OVERHEAD: usize = 256;
 
 /// What a variant costs against the budget: the response plus the key and `Vary` list it is
-/// found by, so a flood of tiny bodies under long URLs cannot sit outside the accounting.
+/// found by, so a flood of tiny bodies under long URLs cannot sit outside the accounting. The
+/// key is held twice, in the map and in the LRU order.
 fn charge(key: &CacheKey, entry: &CacheEntry) -> usize {
     let vary: usize = entry
         .vary
         .iter()
         .map(|(name, value)| name.len() + value.as_ref().map_or(0, String::len))
         .sum();
-    entry.size() + key.url.as_str().len() + key.partition.len() + vary + STORED_OVERHEAD
+    entry.size() + 2 * (key.url.as_str().len() + key.partition.len()) + vary + STORED_OVERHEAD
 }
 
 /// [`HttpCache`] holding entries in memory, bounded by a byte budget.
@@ -1133,7 +1138,8 @@ impl InMemoryHttpCache {
         Self::with_limits(DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRY_BYTES)
     }
 
-    /// Cache with an explicit total budget and per-entry ceiling.
+    /// Cache with an explicit total budget and per-entry ceiling. Both count what an entry is
+    /// charged: body, headers, key and `Vary` values.
     pub fn with_limits(max_bytes: usize, max_entry_bytes: usize) -> Self {
         Self {
             contents: parking_lot::Mutex::new(Contents::default()),
@@ -1189,10 +1195,10 @@ impl HttpCache for InMemoryHttpCache {
     }
 
     fn put(&self, key: CacheKey, entry: Arc<CacheEntry>) {
-        if entry.size() > self.max_entry_bytes {
+        let charged = charge(&key, &entry);
+        if charged > self.max_entry_bytes {
             return;
         }
-        let charged = charge(&key, &entry);
         let mut contents = self.contents.lock();
         contents.clock += 1;
         let clock = contents.clock;
@@ -2777,6 +2783,28 @@ mod tests {
         }
         assert!(cache.len() <= 8, "{} entries", cache.len());
         assert!(cache.byte_len() <= 64 * 1024);
+    }
+
+    /// Each header is charged for the map's own bookkeeping, not just its bytes: 100 empty
+    /// headers cost a `HeaderMap` over 13 KB.
+    #[test]
+    fn near_empty_headers_are_charged_for_the_map() {
+        let names: Vec<(String, &str)> = (0..100).map(|i| (format!("x-{i}"), "")).collect();
+        let fields: Vec<(&str, &str)> = names.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        assert!(entry(&fields).size() >= 100 * HEADER_OVERHEAD);
+    }
+
+    /// The per-entry ceiling covers the whole charge, so a tiny body under a long URL is
+    /// refused like a large body.
+    #[test]
+    fn the_per_entry_ceiling_counts_the_key() {
+        let cache = InMemoryHttpCache::with_limits(1024 * 1024, 4096);
+        let url = format!("https://example.com/?{}", "x".repeat(8 * 1024));
+        let k = CacheKey::new(&Method::GET, &Url::parse(&url).unwrap());
+        cache.put(k, entry(&[("cache-control", "max-age=60")]));
+        assert!(cache.is_empty());
+        cache.put(key(), entry(&[("cache-control", "max-age=60")]));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
