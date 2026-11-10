@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A proxy URL with a scheme other than `http`, `https` or a socks one (`socks://`, `ftp://`, a
+  typo such as `htpp://`) now fails `Fetcher::new` and the simple API, from the environment
+  and from `ProxyConfig::Rules` alike. Such a rule was accepted and never routed through, so
+  its traffic went direct, or through a looser variable after it (GOS-353)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
