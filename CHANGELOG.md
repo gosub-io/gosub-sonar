@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A response whose `Content-Encoding` lists more than eight codings is no longer decoded: it is
+  passed on as it came, like one with a coding that cannot be undone. One decoder was nested
+  per coding, and a list of thousands (`gzip,gzip,...` in a 50 KB header) overflowed the stack
+  and aborted the process, through the fetcher and the simple API alike (GOS-352)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
