@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A full `InMemoryHstsStore` now drops the entry stored longest ago, not the one expiring
   soonest. `max-age` is the server's to choose, so a site could fill the store with hosts of
   its own set to expire in a century and push out every real policy (GOS-355)
+- A response received over a clicked-through certificate (an accepted TLS override) is no
+  longer stored in the HTTP cache, and a `304` over one no longer refreshes a stored entry. A
+  cache hit makes no connection, so such an entry went on answering after the override was
+  revoked (GOS-354)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
