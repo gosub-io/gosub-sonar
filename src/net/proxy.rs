@@ -512,14 +512,18 @@ impl ProxyConfig {
 }
 
 /// `url` without its userinfo, for an error message. Textual, so that a URL that does not parse
-/// loses it too; everything up to the last `@` after the scheme counts as userinfo.
+/// loses it too; everything up to the last `@` after the scheme counts as userinfo. A URL
+/// without a scheme is one reqwest reads as `http://`, so it loses it as well.
 fn without_userinfo(url: &str) -> String {
     match url.split_once("://") {
         Some((scheme, rest)) => match rest.rsplit_once('@') {
             Some((_, host)) => format!("{scheme}://{host}"),
             None => url.to_string(),
         },
-        None => url.to_string(),
+        None => match url.rsplit_once('@') {
+            Some((_, host)) => host.to_string(),
+            None => url.to_string(),
+        },
     }
 }
 
@@ -1124,7 +1128,16 @@ mod tests {
         assert_eq!(without_userinfo("http://u:p@h:1"), "http://h:1");
         assert_eq!(without_userinfo("http://u:p/w@x@h"), "http://h");
         assert_eq!(without_userinfo("http://h:1/"), "http://h:1/");
-        assert_eq!(without_userinfo("u:p@h"), "u:p@h");
+        assert_eq!(without_userinfo("u:p@h"), "h");
+        assert_eq!(without_userinfo("h:1"), "h:1");
+    }
+
+    /// A rule without a scheme still routes in reqwest, so its Debug hides the password too.
+    #[test]
+    fn debug_hides_the_password_of_a_rule_without_a_scheme() {
+        let shown = format!("{:?}", ProxyRule::all("alice:hunter2@proxy.corp:8080"));
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("proxy.corp:8080"), "{shown}");
     }
 
     /// Only [`ProxyConfig::System`] reads the environment.

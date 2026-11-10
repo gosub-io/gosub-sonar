@@ -44,6 +44,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of skipping it, and compares such a request header value byte for byte under
   `Vary`. Skipping failed open: `no-store` next to the byte was lost, the `Vary` names with
   it, and a request header compared as absent (GOS-358)
+- The `Debug` output of a `ProxyRule` without a scheme (`alice:secret@proxy:8080`) no longer
+  shows the password. reqwest routes such a rule as `http://`, but only URLs with a scheme
+  were redacted (GOS-358)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
