@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `parse_challenges` reads at most `MAX_CHALLENGES` (16) challenges from a `401` or `407`.
   Each carried a copy of the URL and went to the credential store and the context, so a
   `WWW-Authenticate` listing hundreds of thousands cost gigabytes with a long URL (GOS-356)
+- A full `InMemoryHstsStore` now drops the entry stored longest ago, not the one expiring
+  soonest. `max-age` is the server's to choose, so a site could fill the store with hosts of
+  its own set to expire in a century and push out every real policy (GOS-355)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
