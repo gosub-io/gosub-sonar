@@ -32,6 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `SharedBody` keeps chunks below 16 KiB together in its replay instead of one `Bytes` each.
+  The replay limit counted bytes only, so a body sent in 1-byte chunks held about a hundred
+  times the limit, and every late subscriber cloned that again: 4 MiB pushed a byte at a time
+  now costs about 4.6 MB instead of 394 MB. A late subscriber gets the small chunks it missed
+  as fewer, larger ones (GOS-357)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
