@@ -40,6 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a body without the spare capacity of the buffer it was collected in. The per-entry
   ceiling now covers the whole charge, URL and `Vary` values included. Small responses with
   many empty headers could hold several times the budget (GOS-358)
+- The HTTP cache reads a `Cache-Control`, `Pragma` or `Vary` line with a non-ASCII byte
+  instead of skipping it, and compares such a request header value byte for byte under
+  `Vary`. Skipping failed open: `no-store` next to the byte was lost, the `Vary` names with
+  it, and a request header compared as absent (GOS-358)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers

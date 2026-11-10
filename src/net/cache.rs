@@ -45,7 +45,8 @@
 use crate::net::utils::split_outside_quotes;
 use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
-use http::{header, HeaderMap, HeaderName, Method};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Method};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
@@ -96,6 +97,16 @@ fn connection_listed(headers: &HeaderMap) -> Vec<HeaderName> {
         .flat_map(|v| v.split(','))
         .filter_map(|name| HeaderName::try_from(name.trim()).ok())
         .collect()
+}
+
+/// A field line as text, byte for byte: non-ASCII (`obs-text`) bytes become the chars of the
+/// same value. Skipping a line that is not ASCII fails open: a `Cache-Control` line would lose
+/// its `no-store`, a `Vary` line its names, a request header compared by `Vary` its value.
+fn field_text(value: &HeaderValue) -> Cow<'_, str> {
+    match value.to_str() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(value.as_bytes().iter().map(|&b| b as char).collect()),
+    }
 }
 
 /// How a request uses the cache, mirroring the Fetch standard's request cache mode.
@@ -619,12 +630,11 @@ impl RequestDirectives {
     pub fn parse(headers: &HeaderMap) -> Self {
         let mut out = Self::default();
         if !headers.contains_key(header::CACHE_CONTROL) {
-            out.no_cache = headers
-                .get_all(header::PRAGMA)
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .flat_map(|v| v.split(','))
-                .any(|d| d.trim().eq_ignore_ascii_case("no-cache"));
+            out.no_cache = headers.get_all(header::PRAGMA).iter().any(|v| {
+                field_text(v)
+                    .split(',')
+                    .any(|d| d.trim().eq_ignore_ascii_case("no-cache"))
+            });
         }
         for (name, value) in directives(headers) {
             match name.as_str() {
@@ -647,8 +657,12 @@ fn directives(headers: &HeaderMap) -> Vec<(String, Option<String>)> {
     headers
         .get_all(header::CACHE_CONTROL)
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(split_outside_quotes)
+        .flat_map(|v| {
+            split_outside_quotes(&field_text(v))
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
         .filter_map(|part| {
             let part = part.trim();
             if part.is_empty() {
@@ -764,11 +778,15 @@ pub fn entry_from_response(
         headers.remove(header::CONTENT_LENGTH);
     }
 
+    // A name that is not a header name stays in the list, so the entry never matches; see
+    // `matches`.
     let vary = vary_names(response)
         .into_iter()
-        .filter_map(|name| {
-            let header_name = HeaderName::try_from(name.as_str()).ok()?;
-            Some((name, vary_value(request, &header_name)))
+        .map(|name| {
+            let value = HeaderName::try_from(name.as_str())
+                .ok()
+                .and_then(|header_name| vary_value(request, &header_name));
+            (name, value)
         })
         .collect();
 
@@ -789,11 +807,7 @@ pub fn entry_from_response(
 /// `en, nl`, `en,nl` and the two lines `en` and `nl` are the same value. `None` when the request
 /// carries no such header.
 fn vary_value(request: &HeaderMap, name: &HeaderName) -> Option<String> {
-    let lines: Vec<&str> = request
-        .get_all(name)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect();
+    let lines: Vec<Cow<'_, str>> = request.get_all(name).iter().map(field_text).collect();
     if lines.is_empty() {
         return None;
     }
@@ -816,9 +830,12 @@ fn vary_names(headers: &HeaderMap) -> Vec<String> {
     headers
         .get_all(header::VARY)
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(|n| n.trim().to_ascii_lowercase())
+        .flat_map(|v| {
+            field_text(v)
+                .split(',')
+                .map(|n| n.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
         .filter(|n| !n.is_empty())
         .collect()
 }
@@ -2043,6 +2060,57 @@ mod tests {
             200,
             &ok("a b")
         ));
+    }
+
+    /// A field line with a non-ASCII byte is still read: skipped whole, it would take the
+    /// `no-store` or the `Vary` names next to the byte with it.
+    #[test]
+    fn a_non_ascii_line_is_not_skipped() {
+        let with = |name: &str, value: &[u8]| {
+            let mut out = headers(&[("cache-control", "max-age=60")]);
+            out.append(
+                HeaderName::try_from(name).unwrap(),
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+            out
+        };
+        let get =
+            |response: &HeaderMap| is_storable(&Method::GET, &HeaderMap::new(), 200, response);
+        assert!(!get(&with("cache-control", b"no-store, x=\"caf\xe9\"")));
+        assert!(!get(&with("vary", b"accept, x-caf\xe9")));
+
+        let stored = entry_from_response(
+            200,
+            &with("vary", b"accept, x-caf\xe9"),
+            &HeaderMap::new(),
+            Bytes::from_static(b"body"),
+            false,
+            at(0),
+            at(0),
+        );
+        assert!(!stored.matches(&HeaderMap::new(), false));
+    }
+
+    /// A request header with a non-ASCII byte is compared byte for byte, not as absent.
+    #[test]
+    fn vary_compares_non_ascii_values_by_byte() {
+        let request = |value: &[u8]| {
+            let mut out = HeaderMap::new();
+            out.insert("x-user", HeaderValue::from_bytes(value).unwrap());
+            out
+        };
+        let stored = entry_from_response(
+            200,
+            &headers(&[("cache-control", "max-age=60"), ("vary", "x-user")]),
+            &request(b"Jos\xe9"),
+            Bytes::from_static(b"body"),
+            false,
+            at(0),
+            at(0),
+        );
+        assert!(stored.matches(&request(b"Jos\xe9"), false));
+        assert!(!stored.matches(&request(b"Jos\xe8"), false));
+        assert!(!stored.matches(&HeaderMap::new(), false));
     }
 
     /// RFC 9111 §4.3.4: a `304` without a validator selects a stored response only if that one
