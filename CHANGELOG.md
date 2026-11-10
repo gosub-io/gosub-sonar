@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `parse_challenges` reads at most `MAX_CHALLENGES` (16) challenges from a `401` or `407`.
+  Each carried a copy of the URL and went to the credential store and the context, so a
+  `WWW-Authenticate` listing hundreds of thousands cost gigabytes with a long URL (GOS-356)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
