@@ -60,11 +60,15 @@ pub trait HstsStore: Send + Sync {
 pub const MAX_HSTS_ENTRIES: usize = 4096;
 
 /// The default [`HstsStore`]: an in-memory map that does not survive a restart. Past
-/// [`MAX_HSTS_ENTRIES`], expired entries are swept and then the one expiring soonest is
-/// dropped.
+/// [`MAX_HSTS_ENTRIES`], expired entries are swept and then the one stored longest ago is
+/// dropped. Not the one expiring soonest: `max-age` is the server's to choose, so a site could
+/// push out real policies with hosts of its own that never expire. A site refreshes its entry
+/// with every response that carries the header.
 #[derive(Debug, Default)]
 pub struct InMemoryHstsStore {
-    entries: DashMap<String, HstsEntry>,
+    // Each entry with the clock value of its last `store`.
+    entries: DashMap<String, (HstsEntry, u64)>,
+    clock: std::sync::atomic::AtomicU64,
 }
 
 impl InMemoryHstsStore {
@@ -86,25 +90,28 @@ impl InMemoryHstsStore {
 
 impl HstsStore for InMemoryHstsStore {
     fn load(&self, host: &str) -> Option<HstsEntry> {
-        self.entries.get(host).map(|e| e.clone())
+        self.entries.get(host).map(|e| e.0.clone())
     }
 
     fn store(&self, host: &str, entry: HstsEntry) {
         if self.entries.len() >= MAX_HSTS_ENTRIES && !self.entries.contains_key(host) {
             let now = Utc::now();
-            self.entries.retain(|_, e| e.expires_at > now);
+            self.entries.retain(|_, (e, _)| e.expires_at > now);
             if self.entries.len() >= MAX_HSTS_ENTRIES {
-                let soonest = self
+                let oldest = self
                     .entries
                     .iter()
-                    .min_by_key(|e| e.value().expires_at)
+                    .min_by_key(|e| e.value().1)
                     .map(|e| e.key().clone());
-                if let Some(host) = soonest {
+                if let Some(host) = oldest {
                     self.entries.remove(&host);
                 }
             }
         }
-        self.entries.insert(host.to_string(), entry);
+        let stamp = self
+            .clock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.entries.insert(host.to_string(), (entry, stamp));
     }
 
     fn remove(&self, host: &str) {
@@ -372,11 +379,35 @@ mod tests {
         store.store("new1.test", entry(1000));
         assert_eq!(store.len(), MAX_HSTS_ENTRIES);
         assert!(store.load("expired.test").is_none());
-        // full again: the one expiring soonest goes
+        // full again: the one stored longest ago goes
         store.store("new2.test", entry(1000));
         assert_eq!(store.len(), MAX_HSTS_ENTRIES);
         assert!(store.load("h0.test").is_none());
         assert!(store.load("new2.test").is_some());
+    }
+
+    /// A flood of far-future policies does not push out the ones stored after it, nor one
+    /// refreshed since: eviction goes by when an entry was stored, not by its `max-age`.
+    #[test]
+    fn far_future_entries_do_not_push_out_newer_ones() {
+        let store = InMemoryHstsStore::new();
+        let now = Utc::now();
+        let entry = |days: i64| HstsEntry {
+            expires_at: now + chrono::TimeDelta::days(days),
+            include_subdomains: false,
+        };
+        store.store("bank.test", entry(365));
+        for i in 0..MAX_HSTS_ENTRIES - 2 {
+            store.store(&format!("h{i}.evil.test"), entry(36_500));
+        }
+        store.store("shop.test", entry(30));
+        assert_eq!(store.len(), MAX_HSTS_ENTRIES);
+        // bank.test is the oldest, but a visit refreshes it
+        store.store("bank.test", entry(365));
+        store.store("h-next.evil.test", entry(36_500));
+        assert!(store.load("bank.test").is_some());
+        assert!(store.load("shop.test").is_some());
+        assert!(store.load("h0.evil.test").is_none());
     }
 
     fn now() -> DateTime<Utc> {
