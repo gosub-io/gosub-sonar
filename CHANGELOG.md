@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `Debug` output of a `ProxyRule` without a scheme (`alice:secret@proxy:8080`) no longer
   shows the password. reqwest routes such a rule as `http://`, but only URLs with a scheme
   were redacted (GOS-358)
+- A proxy rule without a scheme (`127.0.0.1:8080`, `proxy.corp:8080`) is read as `http://`
+  when deciding which rule a request goes through, as reqwest reads it. It counted as not
+  routing, so the next rule's credentials went on a request sent to the first rule's proxy
+  (GOS-358)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers

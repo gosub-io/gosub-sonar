@@ -190,7 +190,8 @@ impl ProxyRule {
             }
             .with_context(|| format!("unusable proxy URL {:?}", without_userinfo(&self.url)))?
         } else {
-            let mut proxy_url = Url::parse(&self.url)
+            let mut proxy_url = self
+                .proxy_url()
                 .with_context(|| format!("unusable proxy URL {:?}", without_userinfo(&self.url)))?;
             // The socks connector takes credentials from the proxy URL only, not from the header
             // `basic_auth` keeps for a custom proxy below.
@@ -256,7 +257,7 @@ impl ProxyRule {
     fn non_tunnel_authorization(&self, dst: &http::Uri) -> Option<http::HeaderValue> {
         let auth = self.auth.as_ref()?;
 
-        let mut proxy_url = Url::parse(&self.url).ok()?;
+        let mut proxy_url = self.proxy_url()?;
         if let ProxyAuth::Basic {
             ref username,
             ref password,
@@ -280,7 +281,7 @@ impl ProxyRule {
     /// The http(s) proxy this rule routes a plain-`http` request to `dst` through, without
     /// credentials; `None` if the rule does not apply or names a socks proxy.
     fn non_tunnel_proxy(&self, dst: &http::Uri) -> Option<Url> {
-        let proxy_url = Url::parse(&self.url).ok()?;
+        let proxy_url = self.proxy_url()?;
         let intercept = self.intercept(proxy_url, dst)?;
         let mut proxy = Url::parse(&intercept.uri().to_string()).ok()?;
         let _ = proxy.set_username("");
@@ -297,10 +298,32 @@ impl ProxyRule {
 
     /// Whether this rule sends a request to `dst` through its proxy, of any kind.
     fn routes(&self, dst: &http::Uri) -> bool {
-        Url::parse(&self.url)
-            .ok()
+        self.proxy_url()
             .and_then(|proxy_url| self.intercept_any(proxy_url, dst))
             .is_some()
+    }
+
+    /// The proxy URL as reqwest reads it: one without a host, or that does not parse as
+    /// absolute (`127.0.0.1:8080`, `proxy.corp:8080`), is taken as `http://` plus the text, and a
+    /// socks URL without a port gets 1080. Parsed any other way, a rule reqwest routes through
+    /// would not route here, and the next rule's credentials would go to its proxy.
+    fn proxy_url(&self) -> Option<Url> {
+        match Url::parse(&self.url) {
+            Ok(mut url) if url.has_host() => {
+                if url.port().is_none()
+                    && matches!(url.scheme(), "socks4" | "socks4a" | "socks5" | "socks5h")
+                {
+                    let _ = url.set_port(Some(1080));
+                }
+                Some(url)
+            }
+            Ok(_) | Err(url::ParseError::RelativeUrlWithoutBase) => {
+                Url::parse(&format!("http://{}", self.url))
+                    .ok()
+                    .filter(Url::has_host)
+            }
+            Err(_) => None,
+        }
     }
 
     /// [`intercept`](Self::intercept) without the filter: socks proxies match too.
@@ -957,6 +980,30 @@ mod tests {
             authorization(&cfg, "http://target.example/").as_deref(),
             Some("Basic YWxpY2U6aHVudGVyMg==")
         );
+    }
+
+    /// A rule without a scheme routes as `http://`, as in reqwest, so it is the first routing
+    /// rule and the second one's credentials stay with the second proxy.
+    #[test]
+    fn a_rule_without_a_scheme_routes_as_http() {
+        let target = Url::parse("http://target.example/").unwrap();
+        for first in ["127.0.0.1:8080", "proxy.corp:8080"] {
+            let cfg = ProxyConfig::Rules(vec![
+                ProxyRule::all(first),
+                ProxyRule::all("http://127.0.0.1:9").with_basic_auth("alice", "hunter2"),
+            ]);
+            assert_eq!(
+                authorization(&cfg, "http://target.example/"),
+                None,
+                "{first}"
+            );
+            let routes = ProxyRoutes::resolve(&cfg).unwrap();
+            assert_eq!(
+                routes.http_proxy(&target).map(|u| u.to_string()),
+                Some(format!("http://{first}/")),
+                "{first}"
+            );
+        }
     }
 
     /// Behind a socks proxy the next HTTP recipient is the origin server, so an http rule
