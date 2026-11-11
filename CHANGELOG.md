@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A proxy URL with a scheme other than `http`, `https` or a socks one (`socks://`, `ftp://`, a
+  typo such as `htpp://`) now fails `Fetcher::new` and the simple API, from the environment
+  and from `ProxyConfig::Rules` alike. Such a rule was accepted and never routed through, so
+  its traffic went direct, or through a looser variable after it (GOS-353)
 - A response whose `Content-Encoding` lists more than eight codings is no longer decoded: it is
   passed on as it came, like one with a coding that cannot be undone. One decoder was nested
   per coding, and a list of thousands (`gzip,gzip,...` in a 50 KB header) overflowed the stack
