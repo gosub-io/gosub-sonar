@@ -62,6 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about it (and a `false` withholds the response), and the CORS regime and tainting are judged
   from it. A `401` from it is reported for it and not answered with the first URL's
   credentials (GOS-358)
+- Fetches waiting for a connection slot are kept per origin, so an origin at its limit is
+  passed over once instead of once per fetch waiting on it, and a cancelled fetch leaves the
+  line at once. Every enqueue and every freed slot scanned all waiters under the pool lock:
+  queueing 10k fetches on one stalled origin took 2.6 s, 40k took 44 s (GOS-358)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
