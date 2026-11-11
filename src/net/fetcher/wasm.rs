@@ -48,9 +48,10 @@ pub(super) fn build_client(
     // decompression; none of the tuning knobs below exist in reqwest's wasm backend.
     //
     // It also owns redirects: there is no way to ask for them un-followed, so on wasm32
-    // `get_with_redirects` only ever sees the final response and the per-hop checks run once,
-    // on the initial URL. The browser applies its own mixed content blocking to the hops we
-    // cannot see, so this is a loss of reporting rather than of enforcement.
+    // `get_with_redirects` only ever sees the final response. The per-hop checks run on the
+    // initial URL before it is sent, and the URL policy and CORS regime on the final one after
+    // its response is in (`HopChain::followed`). The hops between are never seen; the browser
+    // applies its own mixed content blocking to them.
     let mut b = reqwest::Client::builder();
     if let Some(ref ua) = cfg.user_agent {
         b = b.user_agent(ua);

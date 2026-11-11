@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature. Such a value used to be skipped with a warning, sending its traffic direct and
   skipping the operating system's proxy settings as well. The error leaves out the URL's
   userinfo (GOS-304)
+- On wasm32 the browser's `fetch()` gets the request's credentials mode, cache mode, referrer
+  and referrer policy. It got none, and ran on its own defaults (`same-origin` credentials).
+  Under the default `RequestCredentials::Include` a cross-origin `cors` request now carries
+  cookies, and a server answering `Access-Control-Allow-Origin: *` fails it; `fetch()`-style
+  requests want `SameOrigin`. `CacheMode::OnlyIfCached` is refused with
+  `BlockReason::NotCached`: the browser takes it from a `same-origin` request only (GOS-358)
 
 ### Fixed
 
@@ -51,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when deciding which rule a request goes through, as reqwest reads it. It counted as not
   routing, so the next rule's credentials went on a request sent to the first rule's proxy
   (GOS-358)
+- On wasm32, where the browser follows redirects itself, a response from another URL is
+  taken as that URL's: it is the final URL reported, `FetcherContext::is_url_allowed` is asked
+  about it (and a `false` withholds the response), and the CORS regime and tainting are judged
+  from it. A `401` from it is reported for it and not answered with the first URL's
+  credentials (GOS-358)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers

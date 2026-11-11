@@ -86,6 +86,10 @@ pub trait FetcherContext: Send + Sync {
     ///
     /// Called for the initial request URL and for every redirect target. Override to implement
     /// SSRF protection, allowlists, or blocklists. The default allows all URLs.
+    ///
+    /// On wasm32 the browser follows redirects without showing them: this sees the initial URL
+    /// before it is fetched and the final one once its response is in, which a `false` then
+    /// withholds. The redirect targets between are not seen.
     fn is_url_allowed(&self, _url: &Url) -> bool {
         true
     }
