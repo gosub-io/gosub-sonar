@@ -32,6 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A response whose `Content-Encoding` lists more than eight codings is no longer decoded: it is
+  passed on as it came, like one with a coding that cannot be undone. One decoder was nested
+  per coding, and a list of thousands (`gzip,gzip,...` in a 50 KB header) overflowed the stack
+  and aborted the process, through the fetcher and the simple API alike (GOS-352)
 - `parse_challenges` reads at most `MAX_CHALLENGES` (16) challenges from a `401` or `407`.
   Each carried a copy of the URL and went to the credential store and the context, so a
   `WWW-Authenticate` listing hundreds of thousands cost gigabytes with a long URL (GOS-356)

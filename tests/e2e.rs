@@ -107,6 +107,39 @@ async fn simple_get_roundtrip() {
     assert_eq!(&bytes[..], b"simple");
 }
 
+/// A `Content-Encoding` of thousands of codings comes through as it was, through the fetcher
+/// and the simple API; decoding it nested a decoder per coding and overflowed the stack.
+#[tokio::test]
+async fn a_body_with_thousands_of_codings_is_passed_on_undecoded() {
+    let codings = vec!["gzip"; 10_000].join(",");
+    let srv = TestServer::new()
+        .route(
+            "/coded",
+            RouteConfig::OkWithHeaders(
+                vec![("content-encoding".into(), codings.clone())],
+                b"not gzip".to_vec(),
+            ),
+        )
+        .start()
+        .await;
+    let (fetcher, shutdown) = spawn_fetcher(Arc::new(NullContext));
+
+    let req = FetchRequest::builder(Method::GET, srv.url("/coded")).build();
+    match fetcher.fetch(req).await {
+        FetchResult::Buffered { meta, body } => {
+            assert_eq!(&body[..], b"not gzip");
+            assert_eq!(
+                meta.headers.get("content-encoding").unwrap(),
+                codings.as_str()
+            );
+        }
+        other => panic!("expected Buffered, got {other:?}"),
+    }
+    let bytes = simple_get(&srv.url("/coded")).await.unwrap();
+    assert_eq!(&bytes[..], b"not gzip");
+    shutdown.cancel();
+}
+
 /// Implements only the required methods plus a cookie jar.
 struct CookieContext;
 

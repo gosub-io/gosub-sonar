@@ -30,10 +30,15 @@ pub(crate) enum Coding {
     Brotli,
 }
 
+/// Most codings [`decode`] undoes on one body. It nests a decoder per coding, and a list of
+/// thousands overflows the stack on the first read. No server applies more than two or three.
+const MAX_CODINGS: usize = 8;
+
 /// The codings applied to a body, in the order they were applied, read from every
 /// `Content-Encoding` field line (RFC 9110 §5.3, §8.4) and compared case-insensitively
 /// (§8.4.1). `identity` is no coding. `None` when one of them is not a coding [`decode`] can
-/// undo, or a line is not text: such a body cannot be decoded, and is passed on as it is.
+/// undo, a line is not text, or there are more than [`MAX_CODINGS`]: such a body cannot be
+/// decoded, and is passed on as it is.
 pub(crate) fn codings(headers: &HeaderMap) -> Option<Vec<Coding>> {
     let mut out = Vec::new();
     for line in headers.get_all(header::CONTENT_ENCODING) {
@@ -53,6 +58,9 @@ pub(crate) fn codings(headers: &HeaderMap) -> Option<Vec<Coding>> {
                     return None;
                 },
             );
+            if out.len() > MAX_CODINGS {
+                return None;
+            }
         }
     }
     Some(out)
@@ -176,6 +184,24 @@ mod tests {
     fn an_unknown_coding_is_not_decoded() {
         assert_eq!(codings(&headers(&["gzip, x-frob"])), None);
         assert_eq!(codings(&headers(&["zstd"])), None);
+    }
+
+    /// A list past the cap is not decoded: one decoder per coding would overflow the stack.
+    #[test]
+    fn too_many_codings_are_not_decoded() {
+        let at_cap = ["gzip"; MAX_CODINGS].join(",");
+        assert_eq!(
+            codings(&headers(&[&at_cap])).map(|c| c.len()),
+            Some(MAX_CODINGS)
+        );
+        let past_cap = ["gzip"; MAX_CODINGS + 1].join(",");
+        assert_eq!(codings(&headers(&[&past_cap])), None);
+        assert_eq!(codings(&headers(&[&at_cap, "br"])), None);
+        let identities = ["identity"; 100].join(",");
+        assert_eq!(
+            codings(&headers(&[&identities, "gzip"])),
+            Some(vec![Coding::Gzip])
+        );
     }
 
     /// The last coding applied is undone first: `gzip` over `deflate`, on two lines.
