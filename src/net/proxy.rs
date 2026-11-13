@@ -165,20 +165,21 @@ impl ProxyRule {
         // reqwest accepts a socks URL whether or not its own `socks` feature is on, and without
         // it quietly falls back to speaking HTTP at the socks port — a connect-time failure with
         // nothing pointing at the cause. Reject it here, while there is still a URL to name.
+        let scheme = proxy_scheme(&self.url);
+        let socks = matches!(scheme.as_str(), "socks4" | "socks4a" | "socks5" | "socks5h");
         #[cfg(not(feature = "socks"))]
-        {
-            let scheme = self
-                .url
-                .split("://")
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            anyhow::ensure!(
-                !matches!(scheme.as_str(), "socks4" | "socks4a" | "socks5" | "socks5h"),
-                "proxy URL {:?} needs the `socks` cargo feature",
-                without_userinfo(&self.url)
-            );
-        }
+        anyhow::ensure!(
+            !socks,
+            "proxy URL {:?} needs the `socks` cargo feature",
+            without_userinfo(&self.url)
+        );
+        // reqwest takes any other scheme too, and then never routes through it: `socks://` or a
+        // typo would send the rule's traffic direct.
+        anyhow::ensure!(
+            socks || matches!(scheme.as_str(), "http" | "https"),
+            "proxy URL {:?} has an unsupported scheme",
+            without_userinfo(&self.url)
+        );
 
         // A bypass entry with a port is beyond the matcher, which only knows hosts: such a rule
         // decides per request itself, with the same answer `intercept_any` gives.
@@ -547,6 +548,16 @@ fn without_userinfo(url: &str) -> String {
             Some((_, host)) => host.to_string(),
             None => url.to_string(),
         },
+    }
+}
+
+/// The scheme of a proxy URL, lowercased. Textual, like [`without_userinfo`]: a URL that does
+/// not parse is reqwest's to reject. One written without a scheme (`proxy.corp:8080`) is http,
+/// as reqwest reads it.
+fn proxy_scheme(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, _)) => scheme.to_ascii_lowercase(),
+        None => "http".to_string(),
     }
 }
 
@@ -1266,6 +1277,52 @@ mod tests {
             .to_reqwest()
             .is_ok();
         assert_eq!(built, cfg!(feature = "socks"));
+    }
+
+    /// A scheme the matcher never routes through fails, rather than sending the rule's traffic
+    /// direct. A URL without a scheme is http, as reqwest reads it.
+    #[test]
+    fn unsupported_proxy_schemes_are_reported() {
+        for url in [
+            "socks://127.0.0.1:9050",
+            "htpp://proxy.example:8080",
+            "ftp://proxy.example",
+            "direct://",
+            "pac+http://proxy.example/proxy.pac",
+        ] {
+            let err = ProxyRule::all(url).to_reqwest().unwrap_err();
+            assert!(
+                err.to_string().contains("unsupported scheme"),
+                "{url}: {err}"
+            );
+        }
+        let err = ProxyRule::all("socks://alice:hunter2@127.0.0.1:9050")
+            .to_reqwest()
+            .unwrap_err();
+        assert!(!err.to_string().contains("hunter2"), "{err}");
+        for url in [
+            "HTTP://proxy.example:8080",
+            "proxy.example:8080",
+            "127.0.0.1:3128",
+        ] {
+            assert!(ProxyRule::all(url).to_reqwest().is_ok(), "{url}");
+        }
+    }
+
+    /// An unusable variable fails the whole environment, and is not skipped for the rule
+    /// after it.
+    #[test]
+    fn an_env_proxy_with_an_unsupported_scheme_fails() {
+        let e = env_error(&[("ALL_PROXY", "socks://127.0.0.1:9050")]);
+        assert!(
+            e.contains("ALL_PROXY") && e.contains("unsupported scheme"),
+            "{e}"
+        );
+        let e = env_error(&[
+            ("HTTP_PROXY", "htpp://first.example:8080"),
+            ("ALL_PROXY", "http://all.example:3128"),
+        ]);
+        assert!(e.contains("HTTP_PROXY"), "{e}");
     }
 
     #[test]

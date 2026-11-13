@@ -38,6 +38,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A proxy URL with a scheme other than `http`, `https` or a socks one (`socks://`, `ftp://`, a
+  typo such as `htpp://`) now fails `Fetcher::new` and the simple API, from the environment
+  and from `ProxyConfig::Rules` alike. Such a rule was accepted and never routed through, so
+  its traffic went direct, or through a looser variable after it (GOS-353)
+- A response whose `Content-Encoding` lists more than eight codings is no longer decoded: it is
+  passed on as it came, like one with a coding that cannot be undone. One decoder was nested
+  per coding, and a list of thousands (`gzip,gzip,...` in a 50 KB header) overflowed the stack
+  and aborted the process, through the fetcher and the simple API alike (GOS-352)
+- `parse_challenges` reads at most `MAX_CHALLENGES` (16) challenges from a `401` or `407`.
+  Each carried a copy of the URL and went to the credential store and the context, so a
+  `WWW-Authenticate` listing hundreds of thousands cost gigabytes with a long URL (GOS-356)
+- A full `InMemoryHstsStore` now drops the entry stored longest ago, not the one expiring
+  soonest. `max-age` is the server's to choose, so a site could fill the store with hosts of
+  its own set to expire in a century and push out every real policy (GOS-355)
+- A response received over a clicked-through certificate (an accepted TLS override) is no
+  longer stored in the HTTP cache, and a `304` over one no longer refreshes a stored entry. A
+  cache hit makes no connection, so such an entry went on answering after the override was
+  revoked (GOS-354)
+- `SharedBody` keeps chunks below 16 KiB together in its replay instead of one `Bytes` each.
+  The replay limit counted bytes only, so a body sent in 1-byte chunks held about a hundred
+  times the limit, and every late subscriber cloned that again: 4 MiB pushed a byte at a time
+  now costs about 4.6 MB instead of 394 MB. A late subscriber gets the small chunks it missed
+  as fewer, larger ones (GOS-357)
 - A `Strict-Transport-Security` header is checked for repeated directives in linear time. The
   check scanned every earlier name per directive, so a 400 KB header of distinct directives
   held a fetch task for seconds (GOS-358)

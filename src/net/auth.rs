@@ -473,7 +473,13 @@ impl CredentialStore for InMemoryCredentialStore {
     }
 }
 
-/// Parse every challenge a `401`/`407` response offers, in the order the server listed them.
+/// Most challenges [`parse_challenges`] reads from one response. Each carries a copy of the URL
+/// and is put to the credential store and the context, so a header listing thousands is cut
+/// off here. Servers offer two or three.
+pub const MAX_CHALLENGES: usize = 16;
+
+/// Parse every challenge a `401`/`407` response offers, in the order the server listed them,
+/// up to [`MAX_CHALLENGES`].
 ///
 /// Reads all field lines of the target's challenge header. Unparsable challenges are skipped
 /// instead of failing the response, since a malformed header still leaves a usable `401` for the
@@ -492,6 +498,7 @@ pub fn parse_challenges(
         // the strict `to_str` refuses; that would drop the whole challenge and make logging in
         // impossible. UTF-8 is what servers mean by them in practice.
         .flat_map(|v| parse_challenge_list(&String::from_utf8_lossy(v.as_bytes())))
+        .take(MAX_CHALLENGES)
         .map(|raw| AuthChallenge {
             url: url.clone(),
             target,
@@ -542,7 +549,10 @@ fn parse_challenge_list(value: &str) -> Vec<RawChallenge> {
             continue;
         }
 
-        // Otherwise: `scheme`, `scheme token68`, or `scheme first-param`.
+        // Otherwise: `scheme`, `scheme token68`, or `scheme first-param`. None past the cap.
+        if out.len() == MAX_CHALLENGES {
+            break;
+        }
         let (scheme, rest) = match element.find(char::is_whitespace) {
             Some(i) => (&element[..i], element[i..].trim()),
             None => (element, ""),
@@ -799,6 +809,31 @@ mod tests {
         assert_eq!(c[0].scheme, AuthScheme::Negotiate);
         assert_eq!(c[1].scheme, AuthScheme::Basic);
         assert!(c.iter().all(|c| c.attempt == 1));
+    }
+
+    /// A header listing thousands of challenges yields the first `MAX_CHALLENGES`, on one field
+    /// line or spread over several.
+    #[test]
+    fn challenges_past_the_cap_are_dropped() {
+        let many = ["a"; 10_000].join(",");
+        let c = challenges(&many);
+        assert_eq!(c.len(), MAX_CHALLENGES);
+        assert!(c.iter().all(|c| c.scheme == AuthScheme::Other("a".into())));
+
+        let mut headers = HeaderMap::new();
+        for _ in 0..MAX_CHALLENGES {
+            headers.append(header::WWW_AUTHENTICATE, "Negotiate".parse().unwrap());
+        }
+        headers.append(
+            header::WWW_AUTHENTICATE,
+            r#"Basic realm="x""#.parse().unwrap(),
+        );
+        let c = parse_challenges(&headers, AuthTarget::Server, &url(), 0, None);
+        assert_eq!(c.len(), MAX_CHALLENGES);
+        assert!(c.iter().all(|c| c.scheme == AuthScheme::Negotiate));
+
+        let c = challenges(r#"Basic realm="x", charset="UTF-8""#);
+        assert_eq!(c[0].param("charset"), Some("UTF-8"));
     }
 
     #[test]

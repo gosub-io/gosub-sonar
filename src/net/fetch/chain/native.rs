@@ -545,7 +545,11 @@ impl HopChain {
                 // The connection that confirmed the entry is where it now comes from.
                 updated.peer_addr = origin_peer(resp, &self.url, env.policy);
                 let updated = Arc::new(updated);
-                if let Some(ref cache) = env.policy.cache.store {
+                // A `304` over a clicked-through certificate confirms nothing to keep.
+                if let (Some(cache), false) = (
+                    env.policy.cache.store.as_ref(),
+                    over_accepted_override(env.policy, resp),
+                ) {
                     cache.put(
                         CacheKey::new(&self.method, &self.url).in_partition(&plan.partition),
                         updated.clone(),
@@ -775,9 +779,12 @@ impl HopChain {
         }
         match (&exchange.response, env.policy.cache.store.as_ref()) {
             // `no-store` is both directions: the lookup above skipped the cache, and nothing
-            // about this exchange is written to it either.
+            // about this exchange is written to it either. Nor is a response over a
+            // clicked-through certificate: a hit makes no connection, so it would outlive the
+            // override.
             (HopResponse::Network(resp), Some(cache))
                 if plan.cache.mode != CacheMode::NoStore
+                    && !over_accepted_override(env.policy, resp)
                     && cache::is_storable(
                         &self.method,
                         &self.headers,

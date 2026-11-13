@@ -2575,6 +2575,55 @@ mod tests {
         shutdown.cancel();
     }
 
+    /// A response over a clicked-through certificate is not cached: a hit makes no connection,
+    /// so it would go on answering after the override is revoked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_response_over_an_overridden_connection_is_not_cached() {
+        let store = Arc::new(crate::net::tls::InMemoryTlsOverrideStore::new());
+        let cache = Arc::new(crate::net::cache::InMemoryHttpCache::new());
+        let srv = TestServer::new()
+            .tls("tls.test")
+            .route(
+                "/",
+                RouteConfig::ok_with_headers(&[("Cache-Control", "max-age=600")], b"x"),
+            )
+            .start()
+            .await;
+        let cfg = FetcherConfig {
+            tls_overrides: Some(store.clone()),
+            cache: Some(cache.clone()),
+            dns_resolver: Some(Arc::new(Loopback(srv.socket_addr()))),
+            ..test_config()
+        };
+        let fetcher = Arc::new(Fetcher::new(cfg, Arc::new(NullContext)).unwrap());
+        let shutdown = CancellationToken::new();
+        tokio::spawn(fetcher.clone().run(shutdown.clone()));
+
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        store.accept("tls.test", tls.fingerprint.unwrap());
+        for _ in 0..2 {
+            match fetch_root(&fetcher, &srv).await {
+                FetchResult::Buffered { meta, .. } => {
+                    assert_eq!(meta.status, 200);
+                    assert!(!meta.from_cache);
+                }
+                other => panic!("expected success after override, got {other:?}"),
+            }
+        }
+        assert_eq!(srv.hit_count("/"), 2);
+        assert!(cache
+            .get(&crate::net::cache::CacheKey::new(
+                &Method::GET,
+                &srv.url("/")
+            ))
+            .is_empty());
+
+        store.revoke("tls.test");
+        let tls = expect_tls_error(fetch_root(&fetcher, &srv).await);
+        assert_eq!(tls.kind, crate::net::tls::TlsErrorKind::UnknownIssuer);
+        shutdown.cancel();
+    }
+
     /// The `fetch` convenience must deliver the same result as the manual
     /// submit/handle/oneshot ritual, and a stopped fetcher must resolve to an error
     /// rather than hanging.

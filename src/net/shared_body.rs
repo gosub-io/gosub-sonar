@@ -28,7 +28,7 @@
 use crate::net::types::{MaybeSend, NetError};
 use crate::net::utils::spawn_named;
 use crate::types::PeekBuf;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures_core::stream::BoxStream;
 use futures_core::Stream;
 use futures_util::{stream, StreamExt, TryStreamExt};
@@ -121,10 +121,55 @@ struct State {
     error: Option<NetError>,
     /// Most bytes `replay` may hold.
     replay_limit: usize,
-    /// Every chunk pushed so far, while they fit in `replay_limit`; `None` once they did not,
+    /// Every byte pushed so far, while they fit in `replay_limit`; `None` once they did not,
     /// after which a new (non-live) subscriber can no longer get the whole body.
-    replay: Option<Vec<Bytes>>,
+    replay: Option<Replay>,
     replay_bytes: usize,
+}
+
+/// Chunks below this size are copied together into the replay. Kept one `Bytes` each, a body
+/// pushed a byte at a time cost a hundred times its replay limit.
+const REPLAY_BLOCK: usize = 16 * 1024;
+
+/// The start of the body, for subscribers that attach late.
+#[derive(Default)]
+struct Replay {
+    // In order: full blocks, and chunks pushed at block size or larger, as they came.
+    blocks: Vec<Bytes>,
+    // Small chunks since the last block.
+    open: BytesMut,
+}
+
+impl Replay {
+    fn push(&mut self, chunk: &Bytes) {
+        if chunk.len() >= REPLAY_BLOCK {
+            self.seal();
+            self.blocks.push(chunk.clone());
+            return;
+        }
+        if self.open.is_empty() {
+            self.open.reserve(REPLAY_BLOCK);
+        }
+        self.open.extend_from_slice(chunk);
+        if self.open.len() >= REPLAY_BLOCK {
+            self.seal();
+        }
+    }
+
+    fn seal(&mut self) {
+        if !self.open.is_empty() {
+            self.blocks.push(std::mem::take(&mut self.open).freeze());
+        }
+    }
+
+    /// What a late subscriber is replayed: the blocks, then a copy of the open one.
+    fn chunks(&self) -> Vec<Bytes> {
+        let mut out = self.blocks.clone();
+        if !self.open.is_empty() {
+            out.push(Bytes::copy_from_slice(&self.open));
+        }
+        out
+    }
 }
 
 impl Drop for State {
@@ -194,7 +239,7 @@ impl SharedBody {
                 abandoned: CancellationToken::new(),
                 error: None,
                 replay_limit,
-                replay: Some(Vec::new()),
+                replay: Some(Replay::default()),
                 replay_bytes: 0,
             })),
         }
@@ -289,7 +334,7 @@ impl SharedBody {
         if total <= st.replay_limit {
             if let Some(kept) = st.replay.as_mut() {
                 if !chunk.is_empty() {
-                    kept.push(chunk.clone());
+                    kept.push(chunk);
                 }
                 st.replay_bytes = total;
             }
@@ -424,8 +469,8 @@ impl SharedBody {
             // The replay is taken under the same lock as the registration below, so every
             // chunk is either in it or delivered live.
             let prefix: Vec<Bytes> = if replay {
-                match st.replay.clone() {
-                    Some(kept) => kept,
+                match st.replay.as_ref() {
+                    Some(kept) => kept.chunks(),
                     None => {
                         let e = replay_overflow_error(st.replay_limit);
                         return stream::once(async move { Err(e) }).boxed();
@@ -970,7 +1015,7 @@ mod tests {
     }
 
     /// A subscriber that attaches mid-stream, without any reservation, gets the chunks it
-    /// missed and then the live ones, in order.
+    /// missed and then the live ones, in order. Small missed chunks come as one.
     #[tokio::test(flavor = "current_thread")]
     async fn a_late_subscriber_gets_the_replay_then_live_chunks_in_order() {
         let sb = SharedBody::new(8);
@@ -987,9 +1032,52 @@ mod tests {
         while let Some(chunk) = s2.next().await {
             chunks.push(chunk.unwrap());
         }
-        assert_eq!(chunks, [&b"a"[..], b"b", b"c", b"d", b"e"]);
+        assert_eq!(chunks, [&b"abc"[..], b"d", b"e"]);
         assert_eq!(collect(s1).await.unwrap(), b"abcde");
         assert_eq!(collect(s3).await.unwrap(), b"abcde");
+    }
+
+    /// A body pushed a byte at a time is replayed in blocks, not a `Bytes` per byte; a large
+    /// chunk is kept as it came, behind the small ones before it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn small_chunks_are_replayed_in_blocks() {
+        let sb = SharedBody::new(8);
+        let mut body = Vec::new();
+        for i in 0..3 * REPLAY_BLOCK + 10 {
+            let byte = Bytes::from(vec![i as u8]);
+            body.extend_from_slice(&byte);
+            sb.push(byte);
+        }
+        let big = Bytes::from(vec![7u8; REPLAY_BLOCK]);
+        body.extend_from_slice(&big);
+        sb.push(big.clone());
+        sb.push(Bytes::from_static(b"end"));
+        body.extend_from_slice(b"end");
+        sb.finish();
+
+        let mut chunks = Vec::new();
+        let mut late = sb.subscribe_stream();
+        while let Some(chunk) = late.next().await {
+            chunks.push(chunk.unwrap());
+        }
+        let lens: Vec<usize> = chunks.iter().map(Bytes::len).collect();
+        assert_eq!(
+            lens,
+            [
+                REPLAY_BLOCK,
+                REPLAY_BLOCK,
+                REPLAY_BLOCK,
+                10,
+                REPLAY_BLOCK,
+                3
+            ]
+        );
+        assert_eq!(
+            chunks[4].as_ptr(),
+            big.as_ptr(),
+            "a large chunk is not copied"
+        );
+        assert_eq!(chunks.concat(), body);
     }
 
     /// Joining mid-stream while the queue still holds chunks for others, and reading the
@@ -1058,11 +1146,7 @@ mod tests {
         let mut at_limit = sb.subscribe_stream();
         assert_eq!(
             at_limit.next().await.unwrap().unwrap(),
-            Bytes::from_static(b"12345")
-        );
-        assert_eq!(
-            at_limit.next().await.unwrap().unwrap(),
-            Bytes::from_static(b"67890")
+            Bytes::from_static(b"1234567890")
         );
 
         // One byte past it, the start is gone for anyone attaching now.
