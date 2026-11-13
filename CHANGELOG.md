@@ -66,6 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   passed over once instead of once per fetch waiting on it, and a cancelled fetch leaves the
   line at once. Every enqueue and every freed slot scanned all waiters under the pool lock:
   queueing 10k fetches on one stalled origin took 2.6 s, 40k took 44 s (GOS-358)
+- The connection slot pool forgets an origin once it has no slots in use, and remembers only
+  the last 1024 origins seen on HTTP/2 or HTTP/3. It kept an entry for every origin ever
+  fetched, for the fetcher's lifetime. A forgotten HTTP/2 origin starts at the HTTP/1 limit
+  again until its next response (GOS-358)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers

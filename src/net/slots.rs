@@ -3,6 +3,8 @@
 //! A fetch needs two slots before it may connect: one of the fetcher-wide `global_slots`, and
 //! one of its origin's (`h1_per_origin`, grown to `h2_per_origin` once the origin is seen
 //! speaking HTTP/2 or HTTP/3). [`SlotPool`] holds both counts and the fetches waiting for them.
+//! An origin is kept while it has slots in use; the last 1024 seen on HTTP/2 or HTTP/3 are
+//! remembered as such.
 //!
 //! Waiting fetches sit in the same four lanes as the scheduler's queues, and a freed slot goes
 //! to the next waiter picked by the same weighted round-robin (High 8 : Normal 4 : Low 2 :
@@ -37,7 +39,9 @@ pub(crate) struct SlotPool {
 
 struct State {
     global_free: usize,
-    origins: HashMap<String, Origin>,
+    /// Slots in use per origin; an origin with none is not kept.
+    in_use: HashMap<String, usize>,
+    h2: H2Origins,
     /// Waiters per lane: High, Normal, Low, Idle.
     lanes: [Lane; 4],
     /// Position in the 15-step weighted round-robin cycle.
@@ -46,10 +50,54 @@ struct State {
     next_seq: u64,
 }
 
+impl State {
+    /// Takes back a global slot and one of `origin`'s.
+    fn put_back(&mut self, origin: &str) {
+        self.global_free += 1;
+        if let Some(n) = self.in_use.get_mut(origin) {
+            *n -= 1;
+            if *n == 0 {
+                self.in_use.remove(origin);
+            }
+        }
+    }
+}
+
+/// How many origins are remembered as speaking HTTP/2 or HTTP/3.
+const H2_ORIGINS_KEPT: usize = 1024;
+
+/// The origins seen speaking HTTP/2 or HTTP/3, the least recently seen forgotten past
+/// [`H2_ORIGINS_KEPT`]. A forgotten one is learned again from its next response.
 #[derive(Default)]
-struct Origin {
-    in_use: usize,
-    h2: bool,
+struct H2Origins {
+    seen: HashMap<String, u64>,
+    order: BTreeMap<u64, String>,
+    clock: u64,
+}
+
+impl H2Origins {
+    fn contains(&self, origin: &str) -> bool {
+        self.seen.contains_key(origin)
+    }
+
+    /// Marks `origin` as seen now. True when it was not known.
+    fn insert(&mut self, origin: String) -> bool {
+        self.clock += 1;
+        let new = match self.seen.insert(origin.clone(), self.clock) {
+            Some(before) => {
+                self.order.remove(&before);
+                false
+            }
+            None => true,
+        };
+        self.order.insert(self.clock, origin);
+        if self.seen.len() > H2_ORIGINS_KEPT {
+            if let Some((_, oldest)) = self.order.pop_first() {
+                self.seen.remove(&oldest);
+            }
+        }
+        new
+    }
 }
 
 /// One lane's waiters, kept per origin so that an origin at its limit is passed over once, not
@@ -167,7 +215,8 @@ impl SlotPool {
             h2_per_origin: cfg.h2_per_origin,
             state: Mutex::new(State {
                 global_free: cfg.global_slots,
-                origins: HashMap::new(),
+                in_use: HashMap::new(),
+                h2: H2Origins::default(),
                 lanes: Default::default(),
                 turn: 0,
                 next_seq: 0,
@@ -175,8 +224,8 @@ impl SlotPool {
         })
     }
 
-    fn limit(&self, origin: &Origin) -> usize {
-        if origin.h2 {
+    fn limit(&self, state: &State, origin: &str) -> usize {
+        if state.h2.contains(origin) {
             // Never below the h1 limit: the slots only ever grow.
             self.h2_per_origin.max(self.h1_per_origin)
         } else {
@@ -215,10 +264,7 @@ impl SlotPool {
     /// Gives a fetch's slots back and hands them to whoever is next.
     fn release(self: &Arc<Self>, origin: &str) {
         let mut state = self.state.lock();
-        state.global_free += 1;
-        if let Some(o) = state.origins.get_mut(origin) {
-            o.in_use -= 1;
-        }
+        state.put_back(origin);
         self.grant(&mut state);
     }
 
@@ -233,7 +279,7 @@ impl SlotPool {
             };
             state.turn = (state.turn + 1) % 15;
             state.global_free -= 1;
-            state.origins.entry(origin.clone()).or_default().in_use += 1;
+            *state.in_use.entry(origin.clone()).or_default() += 1;
 
             let slots = Slots {
                 pool: self.clone(),
@@ -245,10 +291,7 @@ impl SlotPool {
                 // the slots back here: letting them drop would re-enter the lock this function
                 // runs under.
                 unsent.armed = false;
-                state.global_free += 1;
-                if let Some(o) = state.origins.get_mut(&unsent.origin) {
-                    o.in_use -= 1;
-                }
+                state.put_back(&unsent.origin);
             }
         }
     }
@@ -259,10 +302,7 @@ impl SlotPool {
     fn next_waiter(&self, state: &State) -> Option<(usize, u64, String)> {
         for lane in lane_order(state.turn) {
             let found = state.lanes[lane].heads.iter().find(|(_, origin)| {
-                let origin = state.origins.get(origin);
-                let in_use = origin.map_or(0, |o| o.in_use);
-                let limit = origin.map_or(self.h1_per_origin, |o| self.limit(o));
-                in_use < limit
+                state.in_use.get(origin).map_or(0, |n| *n) < self.limit(state, origin)
             });
             if let Some((seq, origin)) = found {
                 return Some((lane, *seq, origin.clone()));
@@ -278,35 +318,26 @@ impl SlotPool {
             return;
         }
         let mut state = self.state.lock();
-        let origin = state.origins.entry(origin_key(url)).or_default();
-        if !origin.h2 {
-            origin.h2 = true;
+        if state.h2.insert(origin_key(url)) {
             self.grant(&mut state);
         }
     }
 
     /// True once a response from this origin came in over HTTP/2 or HTTP/3.
     pub(crate) fn speaks_h2(&self, url: &Url) -> bool {
-        self.state
-            .lock()
-            .origins
-            .get(&origin_key(url))
-            .is_some_and(|o| o.h2)
+        self.state.lock().h2.contains(&origin_key(url))
     }
 
     #[cfg(test)]
     pub(crate) fn limit_for(&self, url: &Url) -> usize {
         let state = self.state.lock();
-        state
-            .origins
-            .get(&origin_key(url))
-            .map_or(self.h1_per_origin, |o| self.limit(o))
+        self.limit(&state, &origin_key(url))
     }
 
     #[cfg(test)]
     pub(crate) fn in_use(&self, url: &Url) -> usize {
         let state = self.state.lock();
-        state.origins.get(&origin_key(url)).map_or(0, |o| o.in_use)
+        state.in_use.get(&origin_key(url)).map_or(0, |n| *n)
     }
 
     #[cfg(test)]
@@ -564,5 +595,43 @@ mod tests {
         p.observe(&a, http::Version::HTTP_3);
         p.observe(&a, http::Version::HTTP_11);
         assert_eq!(p.limit_for(&a), 8);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_origin_with_no_slots_in_use_is_not_kept() {
+        let p = pool(4, 2, 2);
+        for i in 0..100 {
+            let slots = p
+                .acquire(&url(&format!("https://o{i}.example/")), Priority::Normal)
+                .await;
+            drop(slots);
+        }
+        assert_eq!(p.state.lock().in_use.len(), 0);
+    }
+
+    #[test]
+    fn the_h2_origins_kept_are_capped_and_the_recent_ones_stay() {
+        let p = pool(32, 3, 8);
+        let first = url("https://first.example/");
+        p.observe(&first, http::Version::HTTP_2);
+        for i in 0..H2_ORIGINS_KEPT {
+            p.observe(
+                &url(&format!("https://o{i}.example/")),
+                http::Version::HTTP_2,
+            );
+            // Seen again now and then, so it stays among the recent ones.
+            if i % 100 == 0 {
+                p.observe(&first, http::Version::HTTP_2);
+            }
+        }
+        p.observe(&url("https://last.example/"), http::Version::HTTP_2);
+        assert_eq!(p.state.lock().h2.seen.len(), H2_ORIGINS_KEPT);
+        assert!(p.speaks_h2(&first));
+        assert!(
+            !p.speaks_h2(&url("https://o0.example/")),
+            "the oldest one goes"
+        );
+        assert_eq!(p.limit_for(&url("https://o0.example/")), 3);
+        assert!(p.speaks_h2(&url("https://last.example/")));
     }
 }
