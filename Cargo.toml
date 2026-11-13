@@ -74,7 +74,7 @@ sha2 = "0.11"
 tokio = { version = "1.52.3", features = ["rt", "io-util", "sync", "time", "macros"] }
 tokio-util = { version = "0.7.16", features = ["io"] }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
-reqwest = { version = "0.13.3", default-features = false, features = ["stream"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
 uuid = { version = "1", features = ["v4", "js"] }
 
 [features]
