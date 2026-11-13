@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-13
+
 ### Changed
 
 - **Breaking:** `NetPolicy`'s hooks are grouped into public sub-structs, so a struct literal or
@@ -104,25 +106,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers
   both raw and decoding requests; a raw `gzip` body still answers only raw ones (GOS-305)
-
-### Fixed
-
 - A cached response to a request that carried the caller's own `Authorization` or `Cookie`
   without the jar's cookies (credentials `Omit`, or `SameOrigin` on a cross-origin hop) is no
   longer served to another jar's request without those values or with others. Such a response
   used to be stored in the shared, empty partition. It is now stored under a hash of those
   headers; requests with neither still share the empty partition (GOS-303)
-
-### Fixed
-
 - `Fetcher::submit` removes a `user:password@` from the URL before anything sees it. It used to
   reach `Accepted`, `SecurityUpgraded`, `Blocked`, `Failed`, `Retrying`, `Cancelled`, the task's
   tracing span and `is_url_allowed`, and only the redirect chain removed it. `UrlCredentialsRemoved`
   is now reported once per request, followers of a coalesced fetch included, instead of once per
   attempt by the leader. Two requests that differ only in URL credentials now coalesce (GOS-306)
-
-### Fixed
-
 - Credentials a `CredentialStore` sends upfront are forgotten when the server answers `401`,
   as an answer to a challenge is: the retry asks `on_auth_challenge` instead of re-sending the
   same stale pair from the store (GOS-307)
@@ -1581,7 +1574,8 @@ browser engine, extracted into a standalone, browser-agnostic crate.
 - Runnable examples: `simple_fetch`, `fetcher`, and `fetcher_harness`
 - No unsafe code (`#![forbid(unsafe_code)]`); full public-API documentation
 
-[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/gosub-io/gosub-sonar/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/gosub-io/gosub-sonar/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/gosub-io/gosub-sonar/compare/v0.14.0...v0.15.0
