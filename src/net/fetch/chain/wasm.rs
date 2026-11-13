@@ -1,7 +1,7 @@
 //! The redirect chain on wasm32: the browser's `fetch()` applies HSTS, CORS, its cache and its
 //! proxies itself, so the items `native.rs` has for those are here and do nothing.
 
-use super::{followed_to, HopChain};
+use super::{browser_referrer, followed_to, HopChain};
 use crate::net::cache::CacheMode;
 use crate::net::fetch::{blocked, HopResponse, NetPolicy, PendingStore, RequestInit, Revalidation};
 use crate::net::fetch_metadata::SecFetchSite;
@@ -164,6 +164,7 @@ impl HopChain {
         };
         // An empty referrer is none; left unset, the browser would send the page's URL.
         let source = env.init.referrer.as_ref().and_then(referrer::strip);
+        let source = browser_referrer(source, page_origin().as_deref());
         req_builder
             .fetch_referrer(source.as_ref().map_or("", Url::as_str))
             .fetch_referrer_policy(self.referrer_policy.as_str())
@@ -245,3 +246,11 @@ pub(super) fn client_deadline(
 
 /// reqwest's wasm Response has no version().
 pub(super) fn report_protocol(_env: &ChainEnv<'_>, _resp: &reqwest::Response) {}
+
+/// The origin of the page or worker this runs in, from `self.location.origin`.
+fn page_origin() -> Option<String> {
+    let location = js_sys::Reflect::get(&js_sys::global(), &"location".into()).ok()?;
+    js_sys::Reflect::get(&location, &"origin".into())
+        .ok()?
+        .as_string()
+}

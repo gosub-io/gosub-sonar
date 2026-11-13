@@ -617,6 +617,7 @@ dependencies = [
  "futures-util",
  "http",
  "hyper-util",
+ "js-sys",
  "log",
  "parking_lot",
  "psl",

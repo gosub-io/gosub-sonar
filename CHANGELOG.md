@@ -33,8 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and referrer policy. It got none, and ran on its own defaults (`same-origin` credentials).
   Under the default `RequestCredentials::Include` a cross-origin `cors` request now carries
   cookies, and a server answering `Access-Control-Allow-Origin: *` fails it; `fetch()`-style
-  requests want `SameOrigin`. `CacheMode::OnlyIfCached` is refused with
-  `BlockReason::NotCached`: the browser takes it from a `same-origin` request only (GOS-358)
+  requests want `SameOrigin`. A referrer of another origin than the hosting page's is not
+  sent: the browser would send the page's own URL in its place. `CacheMode::OnlyIfCached` is
+  refused with `BlockReason::NotCached`: the browser takes it from a `same-origin` request only
+  (GOS-358)
 
 ### Fixed
 

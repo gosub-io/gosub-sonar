@@ -1065,9 +1065,17 @@ fn followed_to(sent: &Url, response: &Url) -> Option<Url> {
     Some(response_bare)
 }
 
+/// The referrer to hand the browser's `fetch()`. The browser takes one of the page's own origin
+/// only and puts the page's URL in place of any other, which with `unsafe-url` is the page's
+/// full URL. Such a referrer is not sent at all, as when the page's origin is unknown.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn browser_referrer(source: Option<Url>, page_origin: Option<&str>) -> Option<Url> {
+    source.filter(|url| Some(url.origin().ascii_serialization().as_str()) == page_origin)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::followed_to;
+    use super::{browser_referrer, followed_to};
     use url::Url;
 
     fn url(s: &str) -> Url {
@@ -1097,5 +1105,25 @@ mod tests {
             followed_to(&url("https://a.test/x#top"), &url("https://a.test/y")),
             Some(url("https://a.test/y#top"))
         );
+    }
+
+    #[test]
+    fn the_browser_gets_a_referrer_of_the_page_origin_only() {
+        let page = Some("https://app.test");
+        let same = url("https://app.test/doc?q=1");
+        assert_eq!(
+            browser_referrer(Some(same.clone()), page),
+            Some(same.clone())
+        );
+        assert_eq!(
+            browser_referrer(Some(url("https://other.test/doc")), page),
+            None
+        );
+        assert_eq!(
+            browser_referrer(Some(url("http://app.test/doc")), page),
+            None
+        );
+        assert_eq!(browser_referrer(Some(same), None), None);
+        assert_eq!(browser_referrer(None, page), None);
     }
 }
