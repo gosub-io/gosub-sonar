@@ -15,6 +15,7 @@
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dashmap::DashMap;
 use http::{header, HeaderMap};
+use std::collections::HashSet;
 use url::{Host, Url};
 
 /// Ceiling on `max-age`. The value is server-controlled and unbounded in the grammar, so this
@@ -233,13 +234,13 @@ fn delta_seconds(value: &str) -> Option<u64> {
 fn parse_sts(value: &str) -> Option<StsDirectives> {
     let mut max_age: Option<u64> = None;
     let mut include_subdomains = false;
-    let mut seen: Vec<&str> = Vec::new();
+    // A set: scanning a list per directive is quadratic in a header the server sizes.
+    let mut seen: HashSet<String> = HashSet::new();
 
     for (name, val) in directives(value)? {
-        if seen.iter().any(|s| s.eq_ignore_ascii_case(name)) {
+        if !seen.insert(name.to_ascii_lowercase()) {
             return None;
         }
-        seen.push(name);
         if name.eq_ignore_ascii_case("max-age") {
             max_age = Some(delta_seconds(&val?)?);
         } else if name.eq_ignore_ascii_case("includeSubDomains") {
@@ -553,6 +554,18 @@ mod tests {
             parse_sts("max-age=1; includeSubDomains; includeSubDomains"),
             None
         );
+        assert_eq!(parse_sts("max-age=1; Foo; fOO"), None);
+    }
+
+    /// A header of 100k distinct directives parses in linear time: the duplicate check used to
+    /// scan every earlier name, about 6 s for this one in a release build.
+    #[test]
+    fn many_distinct_directives_parse_quickly() {
+        let names: Vec<String> = (0..100_000).map(|i| format!("x{i}")).collect();
+        let value = format!("max-age=1;{}", names.join(";"));
+        let started = std::time::Instant::now();
+        assert_eq!(parse_sts(&value).map(|d| d.max_age), Some(1));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   feature. Such a value used to be skipped with a warning, sending its traffic direct and
   skipping the operating system's proxy settings as well. The error leaves out the URL's
   userinfo (GOS-304)
+- On wasm32 the browser's `fetch()` gets the request's credentials mode, cache mode, referrer
+  and referrer policy. It got none, and ran on its own defaults (`same-origin` credentials).
+  Under the default `RequestCredentials::Include` a cross-origin `cors` request now carries
+  cookies, and a server answering `Access-Control-Allow-Origin: *` fails it; `fetch()`-style
+  requests want `SameOrigin`. A referrer of another origin than the hosting page's is not
+  sent: the browser would send the page's own URL in its place. `CacheMode::OnlyIfCached` is
+  refused with `BlockReason::NotCached`: the browser takes it from a `same-origin` request only
+  (GOS-358)
 
 ### Fixed
 
@@ -55,6 +63,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   times the limit, and every late subscriber cloned that again: 4 MiB pushed a byte at a time
   now costs about 4.6 MB instead of 394 MB. A late subscriber gets the small chunks it missed
   as fewer, larger ones (GOS-357)
+- A `Strict-Transport-Security` header is checked for repeated directives in linear time. The
+  check scanned every earlier name per directive, so a 400 KB header of distinct directives
+  held a fetch task for seconds (GOS-358)
+- `InMemoryHttpCache` charges closer to what an entry really holds: about 136 bytes of map
+  bookkeeping per header instead of 4, the key twice (it sits in the map and the LRU order),
+  and a body without the spare capacity of the buffer it was collected in. The per-entry
+  ceiling now covers the whole charge, URL and `Vary` values included. Small responses with
+  many empty headers could hold several times the budget (GOS-358)
+- The HTTP cache reads a `Cache-Control`, `Pragma` or `Vary` line with a non-ASCII byte
+  instead of skipping it, and compares such a request header value byte for byte under
+  `Vary`. Skipping failed open: `no-store` next to the byte was lost, the `Vary` names with
+  it, and a request header compared as absent (GOS-358)
+- The `Debug` output of a `ProxyRule` without a scheme (`alice:secret@proxy:8080`) no longer
+  shows the password. reqwest routes such a rule as `http://`, but only URLs with a scheme
+  were redacted (GOS-358)
+- A proxy rule without a scheme (`127.0.0.1:8080`, `proxy.corp:8080`) is read as `http://`
+  when deciding which rule a request goes through, as reqwest reads it. It counted as not
+  routing, so the next rule's credentials went on a request sent to the first rule's proxy
+  (GOS-358)
+- On wasm32, where the browser follows redirects itself, a response from another URL is
+  taken as that URL's: it is the final URL reported, `FetcherContext::is_url_allowed` is asked
+  about it (and a `false` withholds the response), and the CORS regime and tainting are judged
+  from it. A `401` from it is reported for it and not answered with the first URL's
+  credentials (GOS-358)
+- Fetches waiting for a connection slot are kept per origin, so an origin at its limit is
+  passed over once instead of once per fetch waiting on it, and a cancelled fetch leaves the
+  line at once. Every enqueue and every freed slot scanned all waiters under the pool lock:
+  queueing 10k fetches on one stalled origin took 2.6 s, 40k took 44 s (GOS-358)
+- The connection slot pool forgets an origin once it has no slots in use, and remembers only
+  the last 1024 origins seen on HTTP/2 or HTTP/3. It kept an entry for every origin ever
+  fetched, for the fetcher's lifetime. A forgotten HTTP/2 origin starts at the HTTP/1 limit
+  again until its next response (GOS-358)
+- `spawn_pump` writes a file target through the handle its temp file was created with, and
+  moves it into place with `persist`. It opened the temp file again by path (create, truncate,
+  following a symlink), so whoever could write to the download directory could swap the path
+  in between. A destination name of 239 bytes or more no longer fails: it is cut short in the
+  temp name, which ran past the 255-byte limit (GOS-358)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers

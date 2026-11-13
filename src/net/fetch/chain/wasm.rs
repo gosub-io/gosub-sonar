@@ -1,11 +1,13 @@
 //! The redirect chain on wasm32: the browser's `fetch()` applies HSTS, CORS, its cache and its
 //! proxies itself, so the items `native.rs` has for those are here and do nothing.
 
-use super::HopChain;
-use crate::net::fetch::{HopResponse, NetPolicy, PendingStore, RequestInit, Revalidation};
+use super::{browser_referrer, followed_to, HopChain};
+use crate::net::cache::CacheMode;
+use crate::net::fetch::{blocked, HopResponse, NetPolicy, PendingStore, RequestInit, Revalidation};
 use crate::net::fetch_metadata::SecFetchSite;
 use crate::net::observer::NetObserver;
-use crate::net::types::NetError;
+use crate::net::referrer;
+use crate::net::types::{BlockReason, NetError, RequestCredentials};
 use http::HeaderMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -98,12 +100,74 @@ impl HopChain {
 
     pub(super) fn plan(
         &self,
-        _env: &ChainEnv<'_>,
+        env: &ChainEnv<'_>,
         attach_credentials: bool,
         _preflight: Option<Infallible>,
         _revalidation: Option<Revalidation>,
     ) -> Result<HopPlan, NetError> {
+        // The browser takes `only-if-cached` from a `same-origin` request only, a mode reqwest
+        // cannot ask for, and throws otherwise. Its cache cannot be asked first.
+        if env.init.cache_mode == CacheMode::OnlyIfCached {
+            return Err(blocked(
+                env.observer,
+                self.url.clone(),
+                BlockReason::NotCached,
+            ));
+        }
         Ok(HopPlan { attach_credentials })
+    }
+
+    /// The browser follows redirects without showing them, so a response can be another URL's.
+    /// That URL is checked once the response is in, and the response withheld when the policy
+    /// refuses it: the request has been made by then. The hops between are never seen, and a
+    /// detour through another origin back to the first one goes unnoticed.
+    pub(super) fn followed(
+        &mut self,
+        env: &ChainEnv<'_>,
+        hop: &HopResponse,
+    ) -> Result<(), NetError> {
+        let HopResponse::Network(resp) = hop else {
+            return Ok(());
+        };
+        let Some(to) = followed_to(&self.url, resp.url()) else {
+            return Ok(());
+        };
+        if !(env.policy.transport.url_allowed)(&to) {
+            return Err(blocked(env.observer, to, BlockReason::UrlPolicy));
+        }
+        self.url_list.push(std::mem::replace(&mut self.url, to));
+        self.redirects += 1;
+        self.enter_cors_regime(env)
+    }
+
+    /// What the browser applies when told: the credentials mode, its cache and the referrer.
+    /// `Referer` is a header the browser drops, so it gets the source and the policy and works
+    /// out the value for each hop itself.
+    pub(super) fn fetch_init(
+        &self,
+        env: &ChainEnv<'_>,
+        req_builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        let req_builder = match env.init.credentials {
+            RequestCredentials::Omit => req_builder.fetch_credentials_omit(),
+            RequestCredentials::SameOrigin => req_builder.fetch_credentials_same_origin(),
+            RequestCredentials::Include => req_builder.fetch_credentials_include(),
+        };
+        let req_builder = match env.init.cache_mode {
+            CacheMode::Default => req_builder.fetch_cache_default(),
+            CacheMode::NoStore => req_builder.fetch_cache_no_store(),
+            CacheMode::Reload => req_builder.fetch_cache_reload(),
+            CacheMode::NoCache => req_builder.fetch_cache_no_cache(),
+            CacheMode::ForceCache => req_builder.fetch_cache_force_cache(),
+            // Refused in `plan`.
+            CacheMode::OnlyIfCached => req_builder,
+        };
+        // An empty referrer is none; left unset, the browser would send the page's URL.
+        let source = env.init.referrer.as_ref().and_then(referrer::strip);
+        let source = browser_referrer(source, page_origin().as_deref());
+        req_builder
+            .fetch_referrer(source.as_ref().map_or("", Url::as_str))
+            .fetch_referrer_policy(self.referrer_policy.as_str())
     }
 
     /// No cache on wasm32, so every hop goes out as it is.
@@ -182,3 +246,11 @@ pub(super) fn client_deadline(
 
 /// reqwest's wasm Response has no version().
 pub(super) fn report_protocol(_env: &ChainEnv<'_>, _resp: &reqwest::Response) {}
+
+/// The origin of the page or worker this runs in, from `self.location.origin`.
+fn page_origin() -> Option<String> {
+    let location = js_sys::Reflect::get(&js_sys::global(), &"location".into()).ok()?;
+    js_sys::Reflect::get(&location, &"origin".into())
+        .ok()?
+        .as_string()
+}

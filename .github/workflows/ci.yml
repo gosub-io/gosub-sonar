@@ -10,6 +10,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Every job only reads the repository.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Treat every rustc warning and every clippy lint as an error.

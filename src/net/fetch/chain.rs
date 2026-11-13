@@ -462,6 +462,9 @@ impl HopChain {
                 .await?;
             timing.received();
             self.received(env, plan, &resp)?;
+            // wasm32: the browser followed a redirect, so this is another URL's response.
+            let followed = followed_to(&self.url, resp.url());
+            let at = followed.as_ref().unwrap_or(&self.url);
 
             // A `304` answers a revalidation: the stored body stands, with the headers the
             // response carried written over the stored ones (RFC 9111 §4.3.4).
@@ -475,8 +478,10 @@ impl HopChain {
             // credentials.
             let Some(target) = AuthTarget::for_status(resp.status().as_u16()) else {
                 // Neither the proxy nor the server objected: whatever each was sent is
-                // accepted.
-                server_auth.accepted(env.policy, &self.url);
+                // accepted. Not when another URL answered: that says nothing of the first one.
+                if followed.is_none() {
+                    server_auth.accepted(env.policy, &self.url);
+                }
                 proxy_auth.accepted(env.policy, &self.url);
                 break HopResponse::Network(resp);
             };
@@ -502,21 +507,20 @@ impl HopChain {
                 // CORS-safelisted header, so adding it to a cors request would need a preflight
                 // of its own, and adding it to a no-cors one would be a header markup cannot
                 // produce. Navigations and requests without a document origin stay basic, and
-                // those are the ones a browser shows its password dialog for.
+                // those are the ones a browser shows its password dialog for. A challenge from
+                // where the browser was redirected to is not answered: the retry goes to this
+                // hop's URL, and the browser strips `Authorization` from a cross-origin redirect.
                 AuthTarget::Server => {
-                    plan.attach_credentials && self.tainting == ResponseTainting::Basic
+                    plan.attach_credentials
+                        && self.tainting == ResponseTainting::Basic
+                        && followed.is_none()
                 }
                 // `Proxy-Authorization` never reaches the origin, so CORS and the credentials
                 // mode don't apply; only whether there is a proxy to answer.
                 AuthTarget::Proxy => proxy.is_some(),
             };
-            let challenges = auth::parse_challenges(
-                resp.headers(),
-                target,
-                &self.url,
-                slot.attempt,
-                proxy.as_ref(),
-            );
+            let challenges =
+                auth::parse_challenges(resp.headers(), target, at, slot.attempt, proxy.as_ref());
             let answer = if may_answer && slot.attempt < MAX_AUTH_ATTEMPTS {
                 // What was sent to this party last time has just been rejected: drop it so
                 // the store stops handing back a password it no longer takes.
@@ -531,7 +535,7 @@ impl HopChain {
             };
 
             env.observer.on_event(NetEvent::AuthRequired {
-                url: self.url.clone(),
+                url: at.clone(),
                 target,
                 challenges,
                 retried: answer.is_some(),
@@ -586,6 +590,7 @@ impl HopChain {
         // A headers deadline takes over from the client's, which would also run over the
         // body: it is enforced in `await_response`, around the wait for the response.
         req_builder = platform::client_deadline(env, req_builder);
+        req_builder = self.fetch_init(env, req_builder);
         if let Some(ref body) = self.body {
             // Built fresh per send so a streamed body can be replayed on 307/308 and for an
             // authenticated retry of this hop.
@@ -981,6 +986,7 @@ pub(super) async fn get_with_redirects(
         let mut plan = chain.plan(&env, attach_credentials, preflight, revalidation)?;
 
         let exchange = chain.exchange(&env, &mut plan).await?;
+        chain.followed(&env, &exchange.response)?;
         chain.invalidate_cache(&env, &exchange.response, &plan);
 
         let peer_addr = match &exchange.response {
@@ -1037,4 +1043,87 @@ pub(super) async fn get_with_redirects(
     }
 
     Err(NetError::Redirect(Arc::new(anyhow!("too many redirects"))))
+}
+
+/// Where a response to `sent` came from when that is somewhere else, as on wasm32, where the
+/// browser follows redirects itself. The browser's response URL has no fragment, so `sent`'s is
+/// kept, as a redirect keeps it (Fetch §2.2.6). `None` for the hop's own response.
+fn followed_to(sent: &Url, response: &Url) -> Option<Url> {
+    if sent == response {
+        return None;
+    }
+    let mut sent_bare = sent.clone();
+    sent_bare.set_fragment(None);
+    let mut response_bare = response.clone();
+    response_bare.set_fragment(None);
+    if sent_bare == response_bare {
+        return None;
+    }
+    if response.fragment().is_none() {
+        response_bare.set_fragment(sent.fragment());
+    }
+    Some(response_bare)
+}
+
+/// The referrer to hand the browser's `fetch()`. The browser takes one of the page's own origin
+/// only and puts the page's URL in place of any other, which with `unsafe-url` is the page's
+/// full URL. Such a referrer is not sent at all, as when the page's origin is unknown.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn browser_referrer(source: Option<Url>, page_origin: Option<&str>) -> Option<Url> {
+    source.filter(|url| Some(url.origin().ascii_serialization().as_str()) == page_origin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{browser_referrer, followed_to};
+    use url::Url;
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_response_from_the_sent_url_was_not_followed() {
+        assert_eq!(
+            followed_to(&url("https://a.test/x"), &url("https://a.test/x")),
+            None
+        );
+        // The browser drops the fragment from the response URL.
+        assert_eq!(
+            followed_to(&url("https://a.test/x#top"), &url("https://a.test/x")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_followed_response_keeps_the_sent_fragment() {
+        assert_eq!(
+            followed_to(&url("https://a.test/x"), &url("https://b.test/y")),
+            Some(url("https://b.test/y"))
+        );
+        assert_eq!(
+            followed_to(&url("https://a.test/x#top"), &url("https://a.test/y")),
+            Some(url("https://a.test/y#top"))
+        );
+    }
+
+    #[test]
+    fn the_browser_gets_a_referrer_of_the_page_origin_only() {
+        let page = Some("https://app.test");
+        let same = url("https://app.test/doc?q=1");
+        assert_eq!(
+            browser_referrer(Some(same.clone()), page),
+            Some(same.clone())
+        );
+        assert_eq!(
+            browser_referrer(Some(url("https://other.test/doc")), page),
+            None
+        );
+        assert_eq!(
+            browser_referrer(Some(url("http://app.test/doc")), page),
+            None
+        );
+        assert_eq!(browser_referrer(Some(same), None), None);
+        assert_eq!(browser_referrer(None, page), None);
+    }
 }

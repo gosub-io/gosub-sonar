@@ -570,6 +570,24 @@ impl HopChain {
         None
     }
 
+    /// Redirects are followed hop by hop here, so a response is always the hop's own.
+    pub(super) fn followed(
+        &mut self,
+        _env: &ChainEnv<'_>,
+        _hop: &HopResponse,
+    ) -> Result<(), NetError> {
+        Ok(())
+    }
+
+    /// Options only the browser's `fetch()` takes.
+    pub(super) fn fetch_init(
+        &self,
+        _env: &ChainEnv<'_>,
+        req_builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        req_builder
+    }
+
     /// The proxy that may answer a `407` for this hop.
     pub(super) fn challenge_proxy(&self, env: &ChainEnv<'_>) -> Option<Url> {
         (self.url.scheme() == "http")

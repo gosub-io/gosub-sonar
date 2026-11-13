@@ -45,7 +45,8 @@
 use crate::net::utils::split_outside_quotes;
 use bytes::Bytes;
 use chrono::{DateTime, TimeDelta, Utc};
-use http::{header, HeaderMap, HeaderName, Method};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Method};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use url::Url;
@@ -96,6 +97,22 @@ fn connection_listed(headers: &HeaderMap) -> Vec<HeaderName> {
         .flat_map(|v| v.split(','))
         .filter_map(|name| HeaderName::try_from(name.trim()).ok())
         .collect()
+}
+
+/// A field line as text, byte for byte: non-ASCII (`obs-text`) bytes become the chars of the
+/// same value. Skipping a line that is not ASCII fails open: a `Cache-Control` line would lose
+/// its `no-store`, a `Vary` line its names, a request header compared by `Vary` its value.
+fn field_text(value: &HeaderValue) -> Cow<'_, str> {
+    match value.to_str() {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(value.as_bytes().iter().map(|&b| b as char).collect()),
+    }
+}
+
+/// `s` without the optional whitespace around it, which is spaces and tabs only (RFC 9110
+/// §5.6.3). `str::trim` would also take the chars `field_text` makes of the bytes 0x85 and 0xA0.
+fn trim_ows(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
 }
 
 /// How a request uses the cache, mirroring the Fetch standard's request cache mode.
@@ -264,13 +281,17 @@ pub struct CacheEntry {
     pub peer_addr: Option<std::net::SocketAddr>,
 }
 
+/// What one header costs a `HeaderMap` beyond its name and value bytes: the bucket, the index
+/// slot, the name and value structs. Measured at 136 bytes per distinct name on 64-bit.
+const HEADER_OVERHEAD: usize = 136;
+
 impl CacheEntry {
-    /// Bytes this entry occupies: the body plus a rough estimate of the headers.
+    /// Bytes this entry occupies: the body plus an estimate of the headers.
     pub fn size(&self) -> usize {
         let headers: usize = self
             .headers
             .iter()
-            .map(|(n, v)| n.as_str().len() + v.len() + 4)
+            .map(|(n, v)| n.as_str().len() + v.len() + HEADER_OVERHEAD)
             .sum();
         self.body.len() + headers
     }
@@ -511,7 +532,7 @@ const MAX_DELTA_SECS: i64 = 1 << 31;
 
 /// Parse a delta-seconds value (RFC 9111 §1.2.2): digits only, clamped to `MAX_DELTA_SECS`.
 fn delta_seconds(value: &str) -> Option<i64> {
-    let value = value.trim();
+    let value = trim_ows(value);
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -615,12 +636,11 @@ impl RequestDirectives {
     pub fn parse(headers: &HeaderMap) -> Self {
         let mut out = Self::default();
         if !headers.contains_key(header::CACHE_CONTROL) {
-            out.no_cache = headers
-                .get_all(header::PRAGMA)
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .flat_map(|v| v.split(','))
-                .any(|d| d.trim().eq_ignore_ascii_case("no-cache"));
+            out.no_cache = headers.get_all(header::PRAGMA).iter().any(|v| {
+                field_text(v)
+                    .split(',')
+                    .any(|d| trim_ows(d).eq_ignore_ascii_case("no-cache"))
+            });
         }
         for (name, value) in directives(headers) {
             match name.as_str() {
@@ -643,17 +663,21 @@ fn directives(headers: &HeaderMap) -> Vec<(String, Option<String>)> {
     headers
         .get_all(header::CACHE_CONTROL)
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(split_outside_quotes)
+        .flat_map(|v| {
+            split_outside_quotes(&field_text(v))
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
         .filter_map(|part| {
-            let part = part.trim();
+            let part = trim_ows(&part);
             if part.is_empty() {
                 return None;
             }
             Some(match part.split_once('=') {
                 Some((name, value)) => (
-                    name.trim().to_ascii_lowercase(),
-                    Some(value.trim().trim_matches('"').to_string()),
+                    trim_ows(name).to_ascii_lowercase(),
+                    Some(trim_ows(value).trim_matches('"').to_string()),
                 ),
                 None => (part.to_ascii_lowercase(), None),
             })
@@ -760,11 +784,15 @@ pub fn entry_from_response(
         headers.remove(header::CONTENT_LENGTH);
     }
 
+    // A name that is not a header name stays in the list, so the entry never matches; see
+    // `matches`.
     let vary = vary_names(response)
         .into_iter()
-        .filter_map(|name| {
-            let header_name = HeaderName::try_from(name.as_str()).ok()?;
-            Some((name, vary_value(request, &header_name)))
+        .map(|name| {
+            let value = HeaderName::try_from(name.as_str())
+                .ok()
+                .and_then(|header_name| vary_value(request, &header_name));
+            (name, value)
         })
         .collect();
 
@@ -785,11 +813,7 @@ pub fn entry_from_response(
 /// `en, nl`, `en,nl` and the two lines `en` and `nl` are the same value. `None` when the request
 /// carries no such header.
 fn vary_value(request: &HeaderMap, name: &HeaderName) -> Option<String> {
-    let lines: Vec<&str> = request
-        .get_all(name)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect();
+    let lines: Vec<Cow<'_, str>> = request.get_all(name).iter().map(field_text).collect();
     if lines.is_empty() {
         return None;
     }
@@ -801,7 +825,7 @@ fn vary_value(request: &HeaderMap, name: &HeaderName) -> Option<String> {
 fn normalize_list(value: &str) -> String {
     split_outside_quotes(value)
         .into_iter()
-        .map(str::trim)
+        .map(trim_ows)
         .filter(|e| !e.is_empty())
         .collect::<Vec<_>>()
         .join(", ")
@@ -812,9 +836,12 @@ fn vary_names(headers: &HeaderMap) -> Vec<String> {
     headers
         .get_all(header::VARY)
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(|n| n.trim().to_ascii_lowercase())
+        .flat_map(|v| {
+            field_text(v)
+                .split(',')
+                .map(|n| trim_ows(n).to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
         .filter(|n| !n.is_empty())
         .collect()
 }
@@ -1101,14 +1128,15 @@ impl Contents {
 const STORED_OVERHEAD: usize = 256;
 
 /// What a variant costs against the budget: the response plus the key and `Vary` list it is
-/// found by, so a flood of tiny bodies under long URLs cannot sit outside the accounting.
+/// found by, so a flood of tiny bodies under long URLs cannot sit outside the accounting. The
+/// key is held twice, in the map and in the LRU order.
 fn charge(key: &CacheKey, entry: &CacheEntry) -> usize {
     let vary: usize = entry
         .vary
         .iter()
         .map(|(name, value)| name.len() + value.as_ref().map_or(0, String::len))
         .sum();
-    entry.size() + key.url.as_str().len() + key.partition.len() + vary + STORED_OVERHEAD
+    entry.size() + 2 * (key.url.as_str().len() + key.partition.len()) + vary + STORED_OVERHEAD
 }
 
 /// [`HttpCache`] holding entries in memory, bounded by a byte budget.
@@ -1133,7 +1161,8 @@ impl InMemoryHttpCache {
         Self::with_limits(DEFAULT_MAX_BYTES, DEFAULT_MAX_ENTRY_BYTES)
     }
 
-    /// Cache with an explicit total budget and per-entry ceiling.
+    /// Cache with an explicit total budget and per-entry ceiling. Both count what an entry is
+    /// charged: body, headers, key and `Vary` values.
     pub fn with_limits(max_bytes: usize, max_entry_bytes: usize) -> Self {
         Self {
             contents: parking_lot::Mutex::new(Contents::default()),
@@ -1189,10 +1218,10 @@ impl HttpCache for InMemoryHttpCache {
     }
 
     fn put(&self, key: CacheKey, entry: Arc<CacheEntry>) {
-        if entry.size() > self.max_entry_bytes {
+        let charged = charge(&key, &entry);
+        if charged > self.max_entry_bytes {
             return;
         }
-        let charged = charge(&key, &entry);
         let mut contents = self.contents.lock();
         contents.clock += 1;
         let clock = contents.clock;
@@ -2039,6 +2068,81 @@ mod tests {
         ));
     }
 
+    /// A field line with a non-ASCII byte is still read: skipped whole, it would take the
+    /// `no-store` or the `Vary` names next to the byte with it.
+    #[test]
+    fn a_non_ascii_line_is_not_skipped() {
+        let with = |name: &str, value: &[u8]| {
+            let mut out = headers(&[("cache-control", "max-age=60")]);
+            out.append(
+                HeaderName::try_from(name).unwrap(),
+                HeaderValue::from_bytes(value).unwrap(),
+            );
+            out
+        };
+        let get =
+            |response: &HeaderMap| is_storable(&Method::GET, &HeaderMap::new(), 200, response);
+        assert!(!get(&with("cache-control", b"no-store, x=\"caf\xe9\"")));
+        assert!(!get(&with("vary", b"accept, x-caf\xe9")));
+
+        let stored = entry_from_response(
+            200,
+            &with("vary", b"accept, x-caf\xe9"),
+            &HeaderMap::new(),
+            Bytes::from_static(b"body"),
+            false,
+            at(0),
+            at(0),
+        );
+        assert!(!stored.matches(&HeaderMap::new(), false));
+    }
+
+    /// A request header with a non-ASCII byte is compared byte for byte, not as absent.
+    #[test]
+    fn vary_compares_non_ascii_values_by_byte() {
+        let request = |value: &[u8]| {
+            let mut out = HeaderMap::new();
+            out.insert("x-user", HeaderValue::from_bytes(value).unwrap());
+            out
+        };
+        let stored = entry_from_response(
+            200,
+            &headers(&[("cache-control", "max-age=60"), ("vary", "x-user")]),
+            &request(b"Jos\xe9"),
+            Bytes::from_static(b"body"),
+            false,
+            at(0),
+            at(0),
+        );
+        assert!(stored.matches(&request(b"Jos\xe9"), false));
+        assert!(!stored.matches(&request(b"Jos\xe8"), false));
+        assert!(!stored.matches(&HeaderMap::new(), false));
+    }
+
+    /// Only spaces and tabs are trimmed: the bytes 0xA0 and 0x85 are part of a value, though
+    /// `str::trim` takes the chars they read as.
+    #[test]
+    fn vary_trims_only_spaces_and_tabs() {
+        let request = |value: &[u8]| {
+            let mut out = HeaderMap::new();
+            out.insert("x-user", HeaderValue::from_bytes(value).unwrap());
+            out
+        };
+        let stored = entry_from_response(
+            200,
+            &headers(&[("cache-control", "max-age=60"), ("vary", "x-user")]),
+            &request(b"alice"),
+            Bytes::from_static(b"body"),
+            false,
+            at(0),
+            at(0),
+        );
+        assert!(stored.matches(&request(b"alice \t"), false));
+        assert!(!stored.matches(&request(b"alice\xa0"), false));
+        assert!(!stored.matches(&request(b"alice\x85"), false));
+        assert_eq!(delta_seconds("60\u{a0}"), None);
+    }
+
     /// RFC 9111 §4.3.4: a `304` without a validator selects a stored response only if that one
     /// has no validator either; one with a `Last-Modified` the entry lacks selects nothing.
     #[test]
@@ -2777,6 +2881,28 @@ mod tests {
         }
         assert!(cache.len() <= 8, "{} entries", cache.len());
         assert!(cache.byte_len() <= 64 * 1024);
+    }
+
+    /// Each header is charged for the map's own bookkeeping, not just its bytes: 100 empty
+    /// headers cost a `HeaderMap` over 13 KB.
+    #[test]
+    fn near_empty_headers_are_charged_for_the_map() {
+        let names: Vec<(String, &str)> = (0..100).map(|i| (format!("x-{i}"), "")).collect();
+        let fields: Vec<(&str, &str)> = names.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        assert!(entry(&fields).size() >= 100 * HEADER_OVERHEAD);
+    }
+
+    /// The per-entry ceiling covers the whole charge, so a tiny body under a long URL is
+    /// refused like a large body.
+    #[test]
+    fn the_per_entry_ceiling_counts_the_key() {
+        let cache = InMemoryHttpCache::with_limits(1024 * 1024, 4096);
+        let url = format!("https://example.com/?{}", "x".repeat(8 * 1024));
+        let k = CacheKey::new(&Method::GET, &Url::parse(&url).unwrap());
+        cache.put(k, entry(&[("cache-control", "max-age=60")]));
+        assert!(cache.is_empty());
+        cache.put(key(), entry(&[("cache-control", "max-age=60")]));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
