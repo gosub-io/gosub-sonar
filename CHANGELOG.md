@@ -70,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the last 1024 origins seen on HTTP/2 or HTTP/3. It kept an entry for every origin ever
   fetched, for the fetcher's lifetime. A forgotten HTTP/2 origin starts at the HTTP/1 limit
   again until its next response (GOS-358)
+- `spawn_pump` writes a file target through the handle its temp file was created with, and
+  moves it into place with `persist`. It opened the temp file again by path (create, truncate,
+  following a symlink), so whoever could write to the download directory could swap the path
+  in between. A destination name of 239 bytes or more no longer fails: it is cut short in the
+  temp name, which ran past the 255-byte limit (GOS-358)
 - The HTTP cache no longer stores a body in a coding it cannot undo (`zstd`, `gzip, x-frob`)
   as if it were decoded: such a body, and a `HEAD`'s response, keep their `Content-Encoding`
   and `Content-Length`, and a cache hit serves them that way. A body in no coding now answers

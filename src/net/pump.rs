@@ -9,7 +9,6 @@ use crate::types::PeekBuf;
 use bytes::BytesMut;
 use std::sync::Arc;
 use std::{path::PathBuf, time::Instant};
-use tokio::fs::OpenOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::task::JoinHandle;
 use tokio::{
@@ -96,12 +95,12 @@ where
             let setup = async {
                 let tmp_dest = temp_path_for(dest).map_err(|e| NetError::Io(Arc::new(e)))?;
 
-                let mut f = OpenOptions::new()
-                    .create(true)
-                    .truncate(true)
-                    .write(true)
-                    .open(tmp_dest.path())
-                    .await
+                // The handle the temp file was created with, not its path: whatever is at the
+                // path by now (a symlink put there by someone else) is not written to.
+                let mut f = tmp_dest
+                    .as_file()
+                    .try_clone()
+                    .map(tokio::fs::File::from_std)
                     .map_err(|e| NetError::Io(Arc::new(e)))?;
 
                 // Write peek data first
@@ -218,13 +217,17 @@ where
         if let Some(e) = file_error {
             return Err(e);
         }
-        let Some((tmp, _w)) = writer else {
+        let Some((tmp, w)) = writer else {
             return Ok(None);
         };
-        tokio::fs::rename(&tmp, &dest)
+        drop(w);
+        // `persist` renames and stops the temp file from removing its old path afterwards, which
+        // by then could be someone else's file.
+        tokio::task::spawn_blocking(move || tmp.persist(&dest).map(|_| dest))
             .await
-            .map_err(|e| NetError::Io(Arc::new(e)))?;
-        Ok(Some(dest))
+            .map_err(|e| NetError::Io(Arc::new(std::io::Error::other(e))))?
+            .map_err(|e| NetError::Io(Arc::new(e.error)))
+            .map(Some)
     })
 }
 
