@@ -109,6 +109,12 @@ fn field_text(value: &HeaderValue) -> Cow<'_, str> {
     }
 }
 
+/// `s` without the optional whitespace around it, which is spaces and tabs only (RFC 9110
+/// §5.6.3). `str::trim` would also take the chars `field_text` makes of the bytes 0x85 and 0xA0.
+fn trim_ows(s: &str) -> &str {
+    s.trim_matches([' ', '\t'])
+}
+
 /// How a request uses the cache, mirroring the Fetch standard's request cache mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CacheMode {
@@ -526,7 +532,7 @@ const MAX_DELTA_SECS: i64 = 1 << 31;
 
 /// Parse a delta-seconds value (RFC 9111 §1.2.2): digits only, clamped to `MAX_DELTA_SECS`.
 fn delta_seconds(value: &str) -> Option<i64> {
-    let value = value.trim();
+    let value = trim_ows(value);
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
@@ -633,7 +639,7 @@ impl RequestDirectives {
             out.no_cache = headers.get_all(header::PRAGMA).iter().any(|v| {
                 field_text(v)
                     .split(',')
-                    .any(|d| d.trim().eq_ignore_ascii_case("no-cache"))
+                    .any(|d| trim_ows(d).eq_ignore_ascii_case("no-cache"))
             });
         }
         for (name, value) in directives(headers) {
@@ -664,14 +670,14 @@ fn directives(headers: &HeaderMap) -> Vec<(String, Option<String>)> {
                 .collect::<Vec<_>>()
         })
         .filter_map(|part| {
-            let part = part.trim();
+            let part = trim_ows(&part);
             if part.is_empty() {
                 return None;
             }
             Some(match part.split_once('=') {
                 Some((name, value)) => (
-                    name.trim().to_ascii_lowercase(),
-                    Some(value.trim().trim_matches('"').to_string()),
+                    trim_ows(name).to_ascii_lowercase(),
+                    Some(trim_ows(value).trim_matches('"').to_string()),
                 ),
                 None => (part.to_ascii_lowercase(), None),
             })
@@ -819,7 +825,7 @@ fn vary_value(request: &HeaderMap, name: &HeaderName) -> Option<String> {
 fn normalize_list(value: &str) -> String {
     split_outside_quotes(value)
         .into_iter()
-        .map(str::trim)
+        .map(trim_ows)
         .filter(|e| !e.is_empty())
         .collect::<Vec<_>>()
         .join(", ")
@@ -833,7 +839,7 @@ fn vary_names(headers: &HeaderMap) -> Vec<String> {
         .flat_map(|v| {
             field_text(v)
                 .split(',')
-                .map(|n| n.trim().to_ascii_lowercase())
+                .map(|n| trim_ows(n).to_ascii_lowercase())
                 .collect::<Vec<_>>()
         })
         .filter(|n| !n.is_empty())
@@ -2111,6 +2117,30 @@ mod tests {
         assert!(stored.matches(&request(b"Jos\xe9"), false));
         assert!(!stored.matches(&request(b"Jos\xe8"), false));
         assert!(!stored.matches(&HeaderMap::new(), false));
+    }
+
+    /// Only spaces and tabs are trimmed: the bytes 0xA0 and 0x85 are part of a value, though
+    /// `str::trim` takes the chars they read as.
+    #[test]
+    fn vary_trims_only_spaces_and_tabs() {
+        let request = |value: &[u8]| {
+            let mut out = HeaderMap::new();
+            out.insert("x-user", HeaderValue::from_bytes(value).unwrap());
+            out
+        };
+        let stored = entry_from_response(
+            200,
+            &headers(&[("cache-control", "max-age=60"), ("vary", "x-user")]),
+            &request(b"alice"),
+            Bytes::from_static(b"body"),
+            false,
+            at(0),
+            at(0),
+        );
+        assert!(stored.matches(&request(b"alice \t"), false));
+        assert!(!stored.matches(&request(b"alice\xa0"), false));
+        assert!(!stored.matches(&request(b"alice\x85"), false));
+        assert_eq!(delta_seconds("60\u{a0}"), None);
     }
 
     /// RFC 9111 §4.3.4: a `304` without a validator selects a stored response only if that one
