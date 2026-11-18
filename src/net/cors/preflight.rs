@@ -277,9 +277,12 @@ impl CorsPreflightCache for InMemoryPreflightCache {
         now: OffsetDateTime,
     ) {
         // `max_age` is capped at MAX_PREFLIGHT_MAX_AGE, so the conversion cannot overflow;
-        // zero (an already-expired entry) is the safe direction if that ever changes.
-        let expires =
-            now + time::Duration::try_from(allows.max_age).unwrap_or(time::Duration::ZERO);
+        // zero (an already-expired entry) is the safe direction if that ever changes. A `now`
+        // so late that the expiry is past what `OffsetDateTime` holds stores nothing.
+        let max_age = time::Duration::try_from(allows.max_age).unwrap_or(time::Duration::ZERO);
+        let Some(expires) = now.checked_add(max_age) else {
+            return;
+        };
         let mut entries = self.entries.write();
         entries.retain(|_, (_, exp)| *exp > now);
         let key = Self::key(origin, url, credentials);
@@ -329,6 +332,23 @@ mod tests {
         let first = Url::parse("https://api.test/0").unwrap();
         assert!(cache.get("https://a.test", &first, false, now).is_none());
         assert!(cache.get("https://a.test", &extra, false, now).is_some());
+    }
+
+    /// An expiry past the last instant `OffsetDateTime` holds is not cached, and does not panic.
+    #[test]
+    fn a_grant_expiring_out_of_range_is_not_cached() {
+        let cache = InMemoryPreflightCache::new();
+        let now = time::macros::datetime!(9999-12-31 23:59:59 UTC);
+        let allows = PreflightAllows {
+            methods: Vec::new(),
+            methods_wildcard: false,
+            headers: Vec::new(),
+            headers_wildcard: false,
+            max_age: Duration::from_secs(5),
+        };
+        let url = Url::parse("https://api.test/").unwrap();
+        cache.put("https://a.test", &url, false, allows, now);
+        assert!(cache.get("https://a.test", &url, false, now).is_none());
     }
 
     /// Fetch §4.9, clear cache entries: both grants for the origin and URL go, with and without

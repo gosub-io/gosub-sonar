@@ -1030,6 +1030,11 @@ const ASCTIME_DATE: &[BorrowedFormatItem<'_>] = format_description!(
 /// Parse an HTTP-date (RFC 9110 §5.6.7). Accepts the preferred IMF-fixdate as well as the two
 /// obsolete formats servers still emit.
 pub fn parse_http_date(value: &str) -> Option<OffsetDateTime> {
+    parse_http_date_at(value, OffsetDateTime::now_utc())
+}
+
+/// [`parse_http_date`] as of `now`, which places the two-digit year of an RFC 850 date.
+fn parse_http_date_at(value: &str, now: OffsetDateTime) -> Option<OffsetDateTime> {
     // Matched case-insensitively (RFC 9111 §4.2). The day and month names in the formats above
     // are; the `GMT` is a literal.
     let value = value.trim();
@@ -1041,24 +1046,54 @@ pub fn parse_http_date(value: &str) -> Option<OffsetDateTime> {
         }
         _ => value,
     };
-    [IMF_FIXDATE, RFC850_DATE, ASCTIME_DATE]
+    // A leap second (`23:59:60`) is a valid time, but `time` has no second 60. It is read as
+    // the last instant before midnight, as `time`'s own RFC 2822 parser does. In each format
+    // the seconds are the only field followed by a colon and a space.
+    let leap_second = value.find(":60 ");
+    let swapped;
+    let value = match leap_second {
+        Some(i) => {
+            swapped = format!("{}:59{}", &value[..i], &value[i + 3..]);
+            swapped.as_str()
+        }
+        None => value,
+    };
+    let at = [IMF_FIXDATE, RFC850_DATE, ASCTIME_DATE]
         .into_iter()
-        .find_map(|format| parse_date_in(value, format))
+        .find_map(|format| parse_date_in(value, format, now.year()))?;
+    if leap_second.is_none() {
+        return Some(at);
+    }
+    // Leap seconds are only ever inserted at the end of a UTC day.
+    if (at.hour(), at.minute()) != (23, 59) {
+        return None;
+    }
+    at.replace_nanosecond(999_999_999).ok()
 }
 
 /// `value` read as a whole in `format`, or `None` when it does not fit or names no real day:
 /// one past the end of its month, or a weekday the date does not fall on.
-fn parse_date_in(value: &str, format: &[BorrowedFormatItem<'_>]) -> Option<OffsetDateTime> {
+fn parse_date_in(
+    value: &str,
+    format: &[BorrowedFormatItem<'_>],
+    this_year: i32,
+) -> Option<OffsetDateTime> {
     let mut parsed = Parsed::new();
     let rest = parsed.parse_items(value.as_bytes(), format).ok()?;
     if !rest.is_empty() {
         return None;
     }
     if parsed.year().is_none() {
-        // RFC 850's two-digit year: 69 to 99 are the 1900s, the rest the 2000s.
+        // RFC 850's two-digit year is the one with those digits that lies no more than 50 years
+        // ahead (RFC 9110 §5.6.7), so it falls in the 100 years ending 50 years from now.
         let last_two = i32::from(parsed.year_last_two()?);
-        let century = if last_two >= 69 { 1900 } else { 2000 };
-        parsed.set_year(century + last_two)?;
+        let mut year = this_year - this_year.rem_euclid(100) + last_two;
+        if year > this_year + 50 {
+            year -= 100;
+        } else if year <= this_year - 50 {
+            year += 100;
+        }
+        parsed.set_year(year)?;
     }
     let weekday = parsed.weekday();
     let at = PrimitiveDateTime::try_from(parsed).ok()?;
@@ -1068,9 +1103,12 @@ fn parse_date_in(value: &str, format: &[BorrowedFormatItem<'_>]) -> Option<Offse
     Some(at.assume_utc())
 }
 
-/// `time` as an IMF-fixdate (RFC 9110 §5.6.7), the form an HTTP-date is sent in.
+/// `time` as an IMF-fixdate (RFC 9110 §5.6.7), the form an HTTP-date is sent in. `None` when
+/// it is not representable in UTC.
 fn format_http_date(time: OffsetDateTime) -> Option<String> {
-    time.to_offset(UtcOffset::UTC).format(IMF_FIXDATE).ok()
+    time.checked_to_offset(UtcOffset::UTC)?
+        .format(IMF_FIXDATE)
+        .ok()
 }
 
 /// A header's value as an HTTP-date, or `None` when absent or unparsable.
@@ -2804,6 +2842,19 @@ mod tests {
         );
     }
 
+    /// A leap second is a valid time (RFC 9110 §5.6.7 takes it from RFC 5322), read as the
+    /// last instant before midnight. It only falls at the end of a day.
+    #[test]
+    fn http_dates_take_a_leap_second() {
+        let last = datetime!(2016-12-31 23:59:59.999_999_999 UTC);
+        assert_eq!(parse_http_date("Sat, 31 Dec 2016 23:59:60 GMT"), Some(last));
+        assert_eq!(parse_http_date("sat, 31 dec 2016 23:59:60 gmt"), Some(last));
+        assert_eq!(parse_http_date("Sat Dec 31 23:59:60 2016"), Some(last));
+        assert_eq!(parse_http_date("Sat, 31 Dec 2016 12:30:60 GMT"), None);
+        assert_eq!(parse_http_date("Sat, 31 Dec 2016 23:60:00 GMT"), None);
+        assert_eq!(parse_http_date("Sat, 31 Dec 2016 23:59:61 GMT"), None);
+    }
+
     /// The whole value is the date: nothing may trail it.
     #[test]
     fn http_dates_take_no_trailing_text() {
@@ -2811,20 +2862,48 @@ mod tests {
         assert_eq!(parse_http_date("Sun Nov  6 08:49:37 1994 GMT"), None);
     }
 
-    /// RFC 850's two-digit year: 69 and up are the 1900s, below that the 2000s.
+    /// RFC 9110 §5.6.7: an RFC 850 year that would be more than 50 years ahead is the one a
+    /// century earlier.
     #[test]
-    fn rfc850_years_get_their_century() {
+    fn rfc850_years_lie_at_most_50_years_ahead() {
+        let in_2026 = datetime!(2026-11-18 10:30:00 UTC);
+        let parsed = |value: &str| parse_http_date_at(value, in_2026);
         assert_eq!(
-            parse_http_date("Wednesday, 01-Jan-69 00:00:00 GMT"),
-            Some(datetime!(1969-01-01 00:00:00 UTC))
-        );
-        assert_eq!(
-            parse_http_date("Sunday, 01-Jan-68 00:00:00 GMT"),
-            Some(datetime!(2068-01-01 00:00:00 UTC))
-        );
-        assert_eq!(
-            parse_http_date("Wednesday, 18-Nov-26 10:30:00 GMT"),
+            parsed("Wednesday, 18-Nov-26 10:30:00 GMT"),
             Some(datetime!(2026-11-18 10:30:00 UTC))
+        );
+        assert_eq!(
+            parsed("Tuesday, 01-Jan-69 00:00:00 GMT"),
+            Some(datetime!(2069-01-01 00:00:00 UTC))
+        );
+        assert_eq!(
+            parsed("Wednesday, 01-Jan-76 00:00:00 GMT"),
+            Some(datetime!(2076-01-01 00:00:00 UTC))
+        );
+        assert_eq!(
+            parsed("Saturday, 01-Jan-77 00:00:00 GMT"),
+            Some(datetime!(1977-01-01 00:00:00 UTC))
+        );
+        assert_eq!(
+            parsed("Sunday, 06-Nov-94 08:49:37 GMT"),
+            Some(datetime!(1994-11-06 08:49:37 UTC))
+        );
+        // The weekday is checked against the year the rule picks.
+        assert_eq!(parsed("Wednesday, 01-Jan-69 00:00:00 GMT"), None);
+
+        // Near the end of a century the window reaches into the next one.
+        let in_2090 = datetime!(2090-06-01 00:00:00 UTC);
+        assert_eq!(
+            parse_http_date_at("Thursday, 01-Jan-05 00:00:00 GMT", in_2090),
+            Some(datetime!(2105-01-01 00:00:00 UTC))
+        );
+        assert_eq!(
+            parse_http_date_at("Friday, 01-Jan-40 00:00:00 GMT", in_2090),
+            Some(datetime!(2140-01-01 00:00:00 UTC))
+        );
+        assert_eq!(
+            parse_http_date_at("Tuesday, 01-Jan-41 00:00:00 GMT", in_2090),
+            Some(datetime!(2041-01-01 00:00:00 UTC))
         );
     }
 
@@ -2838,6 +2917,8 @@ mod tests {
             format_http_date(datetime!(2026-01-02 03:04:05 +2)).as_deref(),
             Some("Fri, 02 Jan 2026 01:04:05 GMT")
         );
+        // Past the last instant UTC can hold.
+        assert_eq!(format_http_date(datetime!(9999-12-31 23:59:59 -1)), None);
     }
 
     #[test]

@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `is_expired`, `CacheEntry::requested_at`, `received_at`, `current_age`, `freshness_lifetime`,
   `is_fresh` and `updated_by_304`, `cache::parse_http_date`, `cache::decide`,
   `cache::entry_from_response`, and the `now` of `CorsPreflightCache::get` and `put` (GOS-374)
+- The two-digit year of an RFC 850 HTTP-date is the one no more than 50 years ahead of now
+  (RFC 9110 §5.6.7), not a fixed 1970-2069 window
 
 ## [0.17.0] - 2026-11-13
 
