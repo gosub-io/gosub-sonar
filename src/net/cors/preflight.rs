@@ -278,14 +278,16 @@ impl CorsPreflightCache for InMemoryPreflightCache {
     ) {
         // `max_age` is capped at MAX_PREFLIGHT_MAX_AGE, so the conversion cannot overflow;
         // zero (an already-expired entry) is the safe direction if that ever changes. A `now`
-        // so late that the expiry is past what `OffsetDateTime` holds stores nothing.
+        // so late that the expiry is past what `OffsetDateTime` holds stores nothing, and drops
+        // the grant it would have replaced: the server's answer is no longer that one.
         let max_age = time::Duration::try_from(allows.max_age).unwrap_or(time::Duration::ZERO);
+        let key = Self::key(origin, url, credentials);
+        let mut entries = self.entries.write();
         let Some(expires) = now.checked_add(max_age) else {
+            entries.remove(&key);
             return;
         };
-        let mut entries = self.entries.write();
         entries.retain(|_, (_, exp)| *exp > now);
-        let key = Self::key(origin, url, credentials);
         if entries.len() >= MAX_PREFLIGHT_ENTRIES && !entries.contains_key(&key) {
             if let Some(soonest) = entries
                 .iter()
@@ -338,17 +340,26 @@ mod tests {
     #[test]
     fn a_grant_expiring_out_of_range_is_not_cached() {
         let cache = InMemoryPreflightCache::new();
-        let now = time::macros::datetime!(9999-12-31 23:59:59 UTC);
-        let allows = PreflightAllows {
+        let now = time::macros::datetime!(9999-12-31 23:59:50 UTC);
+        let allows = |secs: u64| PreflightAllows {
             methods: Vec::new(),
             methods_wildcard: false,
             headers: Vec::new(),
             headers_wildcard: false,
-            max_age: Duration::from_secs(5),
+            max_age: Duration::from_secs(secs),
         };
         let url = Url::parse("https://api.test/").unwrap();
-        cache.put("https://a.test", &url, false, allows, now);
+        let other = Url::parse("https://api.test/other").unwrap();
+        // Live grants for the same key and for another URL, expiring at 23:59:55.
+        let earlier = now - time::Duration::seconds(10);
+        cache.put("https://a.test", &url, false, allows(15), earlier);
+        cache.put("https://a.test", &other, false, allows(15), earlier);
+        assert!(cache.get("https://a.test", &url, false, now).is_some());
+
+        // Ten seconds from now is past the end of year 9999.
+        cache.put("https://a.test", &url, false, allows(10), now);
         assert!(cache.get("https://a.test", &url, false, now).is_none());
+        assert!(cache.get("https://a.test", &other, false, now).is_some());
     }
 
     /// Fetch §4.9, clear cache entries: both grants for the origin and URL go, with and without
