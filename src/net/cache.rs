@@ -1060,7 +1060,7 @@ fn parse_http_date_at(value: &str, now: OffsetDateTime) -> Option<OffsetDateTime
     };
     let at = [IMF_FIXDATE, RFC850_DATE, ASCTIME_DATE]
         .into_iter()
-        .find_map(|format| parse_date_in(value, format, now.year()))?;
+        .find_map(|format| parse_date_in(value, format, now))?;
     if leap_second.is_none() {
         return Some(at);
     }
@@ -1076,7 +1076,7 @@ fn parse_http_date_at(value: &str, now: OffsetDateTime) -> Option<OffsetDateTime
 fn parse_date_in(
     value: &str,
     format: &[BorrowedFormatItem<'_>],
-    this_year: i32,
+    now: OffsetDateTime,
 ) -> Option<OffsetDateTime> {
     let mut parsed = Parsed::new();
     let rest = parsed.parse_items(value.as_bytes(), format).ok()?;
@@ -1084,14 +1084,31 @@ fn parse_date_in(
         return None;
     }
     if parsed.year().is_none() {
-        // RFC 850's two-digit year is the one with those digits that lies no more than 50 years
-        // ahead (RFC 9110 §5.6.7), so it falls in the 100 years ending 50 years from now.
+        // RFC 850's two-digit year is the one with those digits that puts the date no more
+        // than 50 years ahead of `now` (RFC 9110 §5.6.7): the latest such year. Compared field
+        // by field, as 50 years from a 29 February is not a date. The weekday is checked
+        // below, against the year chosen here.
         let last_two = i32::from(parsed.year_last_two()?);
-        let mut year = this_year - this_year.rem_euclid(100) + last_two;
-        if year > this_year + 50 {
+        let rest = (
+            u8::from(parsed.month()?),
+            parsed.day()?.get(),
+            parsed.hour_24()?,
+            parsed.minute()?,
+            parsed.second()?,
+        );
+        let limit = (
+            now.year() + 50,
+            (
+                u8::from(now.month()),
+                now.day(),
+                now.hour(),
+                now.minute(),
+                now.second(),
+            ),
+        );
+        let mut year = now.year() - now.year().rem_euclid(100) + 100 + last_two;
+        while (year, rest) > limit {
             year -= 100;
-        } else if year <= this_year - 50 {
-            year += 100;
         }
         parsed.set_year(year)?;
     }
@@ -2883,6 +2900,19 @@ mod tests {
         assert_eq!(
             parsed("Saturday, 01-Jan-77 00:00:00 GMT"),
             Some(datetime!(1977-01-01 00:00:00 UTC))
+        );
+        // In the boundary year the date and time decide, not the year alone.
+        assert_eq!(
+            parsed("Friday, 31-Dec-76 00:00:00 GMT"),
+            Some(datetime!(1976-12-31 00:00:00 UTC))
+        );
+        assert_eq!(
+            parsed("Wednesday, 18-Nov-76 10:30:00 GMT"),
+            Some(datetime!(2076-11-18 10:30:00 UTC))
+        );
+        assert_eq!(
+            parsed("Thursday, 18-Nov-76 10:30:01 GMT"),
+            Some(datetime!(1976-11-18 10:30:01 UTC))
         );
         assert_eq!(
             parsed("Sunday, 06-Nov-94 08:49:37 GMT"),
