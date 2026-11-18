@@ -28,8 +28,9 @@ futures-core = "0.3"
 futures-util = "0.3"
 parking_lot = "0.12"
 dashmap = "6"
-# HTTP dates (cache, Retry-After) and expiry instants (HSTS, CORS preflight).
-time = { version = "0.3.41", features = ["formatting", "parsing", "macros"] }
+# HTTP dates (cache, Retry-After) and expiry instants (HSTS, CORS preflight). 0.3.47 fixes a
+# stack exhaustion parsing RFC 2822 (RUSTSEC-2026-0009), which `Retry-After` falls back to.
+time = { version = "0.3.47", features = ["formatting", "parsing", "macros"] }
 flate2 = { version = "1", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -78,7 +79,7 @@ tokio-stream = { version = "0.1.17", features = ["sync"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["stream"] }
 uuid = { version = "1", features = ["v4", "js"] }
 # `OffsetDateTime::now_utc` reads the clock through js-sys on wasm32.
-time = { version = "0.3.41", features = ["wasm-bindgen"] }
+time = { version = "0.3.47", features = ["wasm-bindgen"] }
 # The hosting page's origin, which decides whether the browser takes a referrer.
 js-sys = "0.3.99"
 
