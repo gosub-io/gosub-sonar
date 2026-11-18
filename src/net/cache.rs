@@ -44,11 +44,14 @@
 
 use crate::net::utils::split_outside_quotes;
 use bytes::Bytes;
-use chrono::{DateTime, TimeDelta, Utc};
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use time::format_description::BorrowedFormatItem;
+use time::macros::format_description;
+use time::parsing::Parsed;
+use time::{Duration, OffsetDateTime, PrimitiveDateTime, UtcOffset};
 use url::Url;
 
 /// Fraction of a response's age at the time it was received that a heuristic freshness lifetime
@@ -272,9 +275,9 @@ pub struct CacheEntry {
     /// [`FetchRequest::auto_decode`](crate::net::types::FetchRequest::auto_decode).
     pub decoded: bool,
     /// When the request that produced this response was sent.
-    pub requested_at: DateTime<Utc>,
+    pub requested_at: OffsetDateTime,
     /// When its response arrived.
-    pub received_at: DateTime<Utc>,
+    pub received_at: OffsetDateTime,
     /// The peer of the connection the response was read from, or of the one whose `304` last
     /// confirmed it; see [`FetchResultMeta::peer_addr`](crate::net::types::FetchResultMeta::peer_addr).
     /// `None` when the client did not report one.
@@ -324,10 +327,10 @@ impl CacheEntry {
 
     /// How long the response may be considered fresh (RFC 9111 §4.2.1), or `None` when it carries
     /// no `max-age`, no usable `Expires`, and no `Last-Modified` to guess from.
-    pub fn freshness_lifetime(&self) -> Option<TimeDelta> {
+    pub fn freshness_lifetime(&self) -> Option<Duration> {
         let directives = ResponseDirectives::parse(&self.headers);
         if let Some(max_age) = directives.max_age {
-            return Some(TimeDelta::seconds(max_age));
+            return Some(Duration::seconds(max_age));
         }
 
         let date = header_date(&self.headers, header::DATE);
@@ -335,23 +338,23 @@ impl CacheEntry {
             // `header_date` reports an unparsable Expires (`0`, a malformed date) as `None`.
             // That means "already expired", so the heuristic below must not be reached.
             let base = date.unwrap_or(self.received_at);
-            return Some((expires - base).max(TimeDelta::zero()));
+            return Some((expires - base).max(Duration::ZERO));
         }
         if self.headers.contains_key(header::EXPIRES) {
-            return Some(TimeDelta::zero());
+            return Some(Duration::ZERO);
         }
 
         // Heuristic freshness (§4.2.2): a fraction of how old the response already was.
         let last_modified = header_date(&self.headers, header::LAST_MODIFIED)?;
         let base = date.unwrap_or(self.received_at);
-        let age = (base - last_modified).max(TimeDelta::zero());
-        let secs = ((age.num_seconds() as f64) * HEURISTIC_FRACTION) as i64;
-        Some(TimeDelta::seconds(secs.min(HEURISTIC_MAX_SECS)))
+        let age = (base - last_modified).max(Duration::ZERO);
+        let secs = ((age.whole_seconds() as f64) * HEURISTIC_FRACTION) as i64;
+        Some(Duration::seconds(secs.min(HEURISTIC_MAX_SECS)))
     }
 
     /// How old the stored response is now (RFC 9111 §4.2.3), counting the `Age` it arrived with
     /// and the time the request itself took.
-    pub fn current_age(&self, now: DateTime<Utc>) -> TimeDelta {
+    pub fn current_age(&self, now: OffsetDateTime) -> Duration {
         // A list (`Age: 100, 200`) counts by its first member (RFC 9111 §5.1).
         let age_value = self
             .headers
@@ -359,21 +362,21 @@ impl CacheEntry {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.split(',').next())
             .and_then(delta_seconds)
-            .map(TimeDelta::seconds)
-            .unwrap_or_else(TimeDelta::zero);
+            .map(Duration::seconds)
+            .unwrap_or(Duration::ZERO);
 
         let apparent_age = match header_date(&self.headers, header::DATE) {
-            Some(date) => (self.received_at - date).max(TimeDelta::zero()),
-            None => TimeDelta::zero(),
+            Some(date) => (self.received_at - date).max(Duration::ZERO),
+            None => Duration::ZERO,
         };
-        let response_delay = (self.received_at - self.requested_at).max(TimeDelta::zero());
+        let response_delay = (self.received_at - self.requested_at).max(Duration::ZERO);
         let corrected_initial = apparent_age.max(age_value + response_delay);
-        let resident_time = (now - self.received_at).max(TimeDelta::zero());
+        let resident_time = (now - self.received_at).max(Duration::ZERO);
         corrected_initial + resident_time
     }
 
     /// Whether the response is still fresh (RFC 9111 §4.2).
-    pub fn is_fresh(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_fresh(&self, now: OffsetDateTime) -> bool {
         match self.freshness_lifetime() {
             Some(lifetime) => self.current_age(now) < lifetime,
             None => false,
@@ -473,8 +476,8 @@ impl CacheEntry {
     pub fn updated_by_304(
         &self,
         headers: &HeaderMap,
-        requested_at: DateTime<Utc>,
-        received_at: DateTime<Utc>,
+        requested_at: OffsetDateTime,
+        received_at: OffsetDateTime,
         request: &HeaderMap,
     ) -> Self {
         let mut updated = self.clone();
@@ -513,7 +516,9 @@ impl CacheEntry {
         // a stored one does (RFC 9110 §6.6.1), and the `Age` the old one arrived with is not
         // its age.
         if !headers.contains_key(header::DATE) {
-            if let Ok(date) = header::HeaderValue::from_str(&format_http_date(received_at)) {
+            if let Some(date) =
+                format_http_date(received_at).and_then(|d| HeaderValue::from_str(&d).ok())
+            {
                 updated.headers.insert(header::DATE, date);
             }
         }
@@ -527,7 +532,8 @@ impl CacheEntry {
 }
 
 /// Largest delta-seconds value used (RFC 9111 §1.2.2: a cache treats anything greater as
-/// 2^31). Keeps every duration below well within `TimeDelta`, which panics past its range.
+/// 2^31). Keeps every instant below far inside what `OffsetDateTime` holds; moving one past its
+/// range panics.
 const MAX_DELTA_SECS: i64 = 1 << 31;
 
 /// Parse a delta-seconds value (RFC 9111 §1.2.2): digits only, clamped to `MAX_DELTA_SECS`.
@@ -760,8 +766,8 @@ pub fn entry_from_response(
     request: &HeaderMap,
     body: Bytes,
     decoded: bool,
-    requested_at: DateTime<Utc>,
-    received_at: DateTime<Utc>,
+    requested_at: OffsetDateTime,
+    received_at: OffsetDateTime,
 ) -> CacheEntry {
     let mut headers = response.clone();
     for name in connection_listed(response) {
@@ -775,7 +781,9 @@ pub fn entry_from_response(
     headers.remove(header::SET_COOKIE);
     // A response is cached with the time it arrived when it carries none (RFC 9110 §6.6.1).
     if !headers.contains_key(header::DATE) {
-        if let Ok(date) = header::HeaderValue::from_str(&format_http_date(received_at)) {
+        if let Some(date) =
+            format_http_date(received_at).and_then(|d| HeaderValue::from_str(&d).ok())
+        {
             headers.insert(header::DATE, date);
         }
     }
@@ -855,7 +863,7 @@ pub fn decide(
     request: &HeaderMap,
     decoded: bool,
     mode: CacheMode,
-    now: DateTime<Utc>,
+    now: OffsetDateTime,
 ) -> CacheDecision {
     let asked = RequestDirectives::parse(request);
     // A reload asks for the network itself, and `no-store` means this exchange leaves no trace.
@@ -906,7 +914,7 @@ pub fn decide(
     }
 
     let age = entry.current_age(now);
-    let lifetime = entry.freshness_lifetime().unwrap_or_else(TimeDelta::zero);
+    let lifetime = entry.freshness_lifetime().unwrap_or(Duration::ZERO);
 
     // Fresh, or stale by no more than the request's `max-stale` allows. `max-stale` relaxes only
     // this: the request's `max-age` and `min-fresh` below are conditions of their own
@@ -917,7 +925,7 @@ pub fn decide(
         if let Some(max_stale) = asked.max_stale {
             let staleness = age - lifetime;
             usable = match max_stale {
-                Some(limit) => staleness <= TimeDelta::seconds(limit),
+                Some(limit) => staleness <= Duration::seconds(limit),
                 // `max-stale` without a value accepts any staleness.
                 None => true,
             };
@@ -930,18 +938,18 @@ pub fn decide(
     let mut stale_usable = false;
     if !usable && mode == CacheMode::Default && !stored.must_revalidate {
         if let Some(window) = stored.stale_while_revalidate {
-            stale_usable = age - lifetime <= TimeDelta::seconds(window);
+            stale_usable = age - lifetime <= Duration::seconds(window);
         }
     }
     // The request's own limits hold either way: a stale response is never young enough for its
     // `max-age` past that, and never fresh enough for any `min-fresh`.
     if let Some(max_age) = asked.max_age {
-        let young = age <= TimeDelta::seconds(max_age);
+        let young = age <= Duration::seconds(max_age);
         usable &= young;
         stale_usable &= young;
     }
     if let Some(min_fresh) = asked.min_fresh {
-        usable &= lifetime - age >= TimeDelta::seconds(min_fresh);
+        usable &= lifetime - age >= Duration::seconds(min_fresh);
         stale_usable = false;
     }
 
@@ -1003,11 +1011,27 @@ pub fn invalidates(method: &Method) -> bool {
     )
 }
 
+/// Sun, 06 Nov 1994 08:49:37 GMT
+const IMF_FIXDATE: &[BorrowedFormatItem<'_>] = format_description!(
+    "[weekday repr:short case_sensitive:false], [day] [month repr:short case_sensitive:false] \
+     [year] [hour]:[minute]:[second] GMT"
+);
+/// Sunday, 06-Nov-94 08:49:37 GMT
+const RFC850_DATE: &[BorrowedFormatItem<'_>] = format_description!(
+    "[weekday repr:long case_sensitive:false], [day]-[month repr:short case_sensitive:false]-\
+     [year repr:last_two] [hour]:[minute]:[second] GMT"
+);
+/// Sun Nov  6 08:49:37 1994
+const ASCTIME_DATE: &[BorrowedFormatItem<'_>] = format_description!(
+    "[weekday repr:short case_sensitive:false] [month repr:short case_sensitive:false] \
+     [day padding:space] [hour]:[minute]:[second] [year]"
+);
+
 /// Parse an HTTP-date (RFC 9110 §5.6.7). Accepts the preferred IMF-fixdate as well as the two
 /// obsolete formats servers still emit.
-pub fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
-    // Matched case-insensitively (RFC 9111 §4.2). chrono reads day and month names in any
-    // case already; the `GMT` in the formats below is a literal.
+pub fn parse_http_date(value: &str) -> Option<OffsetDateTime> {
+    // Matched case-insensitively (RFC 9111 §4.2). The day and month names in the formats above
+    // are; the `GMT` is a literal.
     let value = value.trim();
     let upper;
     let value = match value.len().checked_sub(3).and_then(|i| value.get(i..)) {
@@ -1017,28 +1041,40 @@ pub fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
         }
         _ => value,
     };
-    for format in [
-        // Sun, 06 Nov 1994 08:49:37 GMT
-        "%a, %d %b %Y %H:%M:%S GMT",
-        // Sunday, 06-Nov-94 08:49:37 GMT
-        "%A, %d-%b-%y %H:%M:%S GMT",
-        // Sun Nov  6 08:49:37 1994
-        "%a %b %e %H:%M:%S %Y",
-    ] {
-        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(value, format) {
-            return Some(naive.and_utc());
-        }
+    [IMF_FIXDATE, RFC850_DATE, ASCTIME_DATE]
+        .into_iter()
+        .find_map(|format| parse_date_in(value, format))
+}
+
+/// `value` read as a whole in `format`, or `None` when it does not fit or names no real day:
+/// one past the end of its month, or a weekday the date does not fall on.
+fn parse_date_in(value: &str, format: &[BorrowedFormatItem<'_>]) -> Option<OffsetDateTime> {
+    let mut parsed = Parsed::new();
+    let rest = parsed.parse_items(value.as_bytes(), format).ok()?;
+    if !rest.is_empty() {
+        return None;
     }
-    None
+    if parsed.year().is_none() {
+        // RFC 850's two-digit year: 69 to 99 are the 1900s, the rest the 2000s.
+        let last_two = i32::from(parsed.year_last_two()?);
+        let century = if last_two >= 69 { 1900 } else { 2000 };
+        parsed.set_year(century + last_two)?;
+    }
+    let weekday = parsed.weekday();
+    let at = PrimitiveDateTime::try_from(parsed).ok()?;
+    if weekday.is_some_and(|day| day != at.weekday()) {
+        return None;
+    }
+    Some(at.assume_utc())
 }
 
 /// `time` as an IMF-fixdate (RFC 9110 §5.6.7), the form an HTTP-date is sent in.
-fn format_http_date(time: DateTime<Utc>) -> String {
-    time.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+fn format_http_date(time: OffsetDateTime) -> Option<String> {
+    time.to_offset(UtcOffset::UTC).format(IMF_FIXDATE).ok()
 }
 
 /// A header's value as an HTTP-date, or `None` when absent or unparsable.
-fn header_date(headers: &HeaderMap, name: HeaderName) -> Option<DateTime<Utc>> {
+fn header_date(headers: &HeaderMap, name: HeaderName) -> Option<OffsetDateTime> {
     headers
         .get(name)
         .and_then(|v| v.to_str().ok())
@@ -1280,15 +1316,14 @@ impl HttpCache for InMemoryHttpCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
-    use http::HeaderValue;
+    use time::macros::datetime;
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    fn at(secs: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000 + secs).unwrap()
     }
 
-    fn http_date(time: DateTime<Utc>) -> String {
-        time.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    fn http_date(time: OffsetDateTime) -> String {
+        format_http_date(time).unwrap()
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -1368,7 +1403,7 @@ mod tests {
     #[test]
     fn a_list_age_counts_by_its_first_member() {
         let stored = entry(&[("cache-control", "max-age=600"), ("age", "100, 200")]);
-        assert_eq!(stored.current_age(at(0)), TimeDelta::seconds(100));
+        assert_eq!(stored.current_age(at(0)), Duration::seconds(100));
     }
 
     /// A response without `Date` is stored with the time it arrived (RFC 9110 §6.6.1); one
@@ -1388,7 +1423,7 @@ mod tests {
     #[test]
     fn max_age_decides_freshness() {
         let stored = entry(&[("cache-control", "max-age=60")]);
-        assert_eq!(stored.freshness_lifetime(), Some(TimeDelta::seconds(60)));
+        assert_eq!(stored.freshness_lifetime(), Some(Duration::seconds(60)));
         assert!(stored.is_fresh(at(59)));
         assert!(!stored.is_fresh(at(61)));
     }
@@ -1399,7 +1434,7 @@ mod tests {
             ("date", &http_date(at(0))),
             ("expires", &http_date(at(120))),
         ]);
-        assert_eq!(stored.freshness_lifetime(), Some(TimeDelta::seconds(120)));
+        assert_eq!(stored.freshness_lifetime(), Some(Duration::seconds(120)));
         assert!(stored.is_fresh(at(119)));
         assert!(!stored.is_fresh(at(121)));
     }
@@ -1420,8 +1455,8 @@ mod tests {
         );
     }
 
-    /// Out-of-range values from the server must not panic (`TimeDelta::seconds` does past
-    /// its bounds); they are clamped and the entry still ages.
+    /// Out-of-range values from the server must not panic (adding them to an `OffsetDateTime`
+    /// would); they are clamped and the entry still ages.
     #[test]
     fn huge_max_age_and_age_do_not_panic() {
         let stored = entry(&[
@@ -1430,9 +1465,9 @@ mod tests {
         ]);
         assert_eq!(
             stored.freshness_lifetime(),
-            Some(TimeDelta::seconds(MAX_DELTA_SECS))
+            Some(Duration::seconds(MAX_DELTA_SECS))
         );
-        assert!(stored.current_age(at(1)) >= TimeDelta::seconds(MAX_DELTA_SECS));
+        assert!(stored.current_age(at(1)) >= Duration::seconds(MAX_DELTA_SECS));
         assert!(!stored.is_fresh(at(1)));
 
         let request = headers(&[(
@@ -1450,14 +1485,14 @@ mod tests {
             ("date", &http_date(at(0))),
             ("expires", &http_date(at(9999))),
         ]);
-        assert_eq!(stored.freshness_lifetime(), Some(TimeDelta::seconds(10)));
+        assert_eq!(stored.freshness_lifetime(), Some(Duration::seconds(10)));
     }
 
     #[test]
     fn an_unparsable_expires_means_already_stale() {
         // `Expires: 0` is the common way to say "do not use this without asking".
         let stored = entry(&[("date", &http_date(at(0))), ("expires", "0")]);
-        assert_eq!(stored.freshness_lifetime(), Some(TimeDelta::zero()));
+        assert_eq!(stored.freshness_lifetime(), Some(Duration::ZERO));
         assert!(!stored.is_fresh(at(0)));
     }
 
@@ -1468,7 +1503,7 @@ mod tests {
             ("date", &http_date(at(0))),
             ("last-modified", &http_date(at(-1000))),
         ]);
-        assert_eq!(stored.freshness_lifetime(), Some(TimeDelta::seconds(100)));
+        assert_eq!(stored.freshness_lifetime(), Some(Duration::seconds(100)));
         assert!(stored.is_fresh(at(99)));
         assert!(!stored.is_fresh(at(101)));
     }
@@ -1481,7 +1516,7 @@ mod tests {
         ]);
         assert_eq!(
             stored.freshness_lifetime(),
-            Some(TimeDelta::seconds(HEURISTIC_MAX_SECS))
+            Some(Duration::seconds(HEURISTIC_MAX_SECS))
         );
     }
 
@@ -1500,8 +1535,8 @@ mod tests {
         stored.received_at = at(4);
 
         // corrected initial age = max(apparent 4s, age 30s + delay 4s) = 34s, plus residence.
-        assert_eq!(stored.current_age(at(4)), TimeDelta::seconds(34));
-        assert_eq!(stored.current_age(at(14)), TimeDelta::seconds(44));
+        assert_eq!(stored.current_age(at(4)), Duration::seconds(34));
+        assert_eq!(stored.current_age(at(14)), Duration::seconds(44));
     }
 
     #[test]
@@ -1510,7 +1545,7 @@ mod tests {
         let mut stored = (*entry(&[("date", &http_date(at(500)))])).clone();
         stored.requested_at = at(0);
         stored.received_at = at(0);
-        assert_eq!(stored.current_age(at(10)), TimeDelta::seconds(10));
+        assert_eq!(stored.current_age(at(10)), Duration::seconds(10));
     }
 
     #[test]
@@ -2651,7 +2686,7 @@ mod tests {
 
         assert_eq!(&updated.body[..], b"body", "the stored body is reused");
         assert_eq!(updated.headers.get(header::ETAG).unwrap(), "\"v2\"");
-        assert_eq!(updated.freshness_lifetime(), Some(TimeDelta::seconds(600)));
+        assert_eq!(updated.freshness_lifetime(), Some(Duration::seconds(600)));
         // Not overwritten by the 304, which carried no body.
         assert_eq!(updated.headers.get(header::CONTENT_LENGTH).unwrap(), "4");
         // Headers the 304 did not mention survive.
@@ -2683,7 +2718,7 @@ mod tests {
             http_date(at(1000)).as_str()
         );
         assert!(!updated.headers.contains_key(header::AGE));
-        assert_eq!(updated.current_age(at(1000)), TimeDelta::zero());
+        assert_eq!(updated.current_age(at(1000)), Duration::ZERO);
         assert!(updated.is_fresh(at(1050)));
 
         // What the 304 does carry still counts.
@@ -2693,7 +2728,7 @@ mod tests {
             at(1000),
             &HeaderMap::new(),
         );
-        assert_eq!(updated.current_age(at(1000)), TimeDelta::seconds(10));
+        assert_eq!(updated.current_age(at(1000)), Duration::seconds(10));
     }
 
     #[test]
@@ -2740,7 +2775,7 @@ mod tests {
 
     #[test]
     fn http_dates_parse_in_all_three_formats() {
-        let expected = Utc.with_ymd_and_hms(1994, 11, 6, 8, 49, 37).unwrap();
+        let expected = datetime!(1994-11-06 08:49:37 UTC);
         assert_eq!(
             parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
             Some(expected)
@@ -2752,6 +2787,57 @@ mod tests {
         assert_eq!(parse_http_date("Sun Nov  6 08:49:37 1994"), Some(expected));
         assert_eq!(parse_http_date("0"), None);
         assert_eq!(parse_http_date("not a date"), None);
+    }
+
+    /// A date that does not exist, or a weekday it does not fall on, is not a date.
+    #[test]
+    fn http_dates_name_a_real_day() {
+        assert_eq!(parse_http_date("Thu, 31 Apr 2025 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Thu, 29 Feb 2025 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Thursday, 31-Apr-25 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Thu Apr 31 08:49:37 2025"), None);
+        assert_eq!(parse_http_date("Mon, 06 Nov 1994 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 25:49:37 GMT"), None);
+        assert_eq!(
+            parse_http_date("Sat, 29 Feb 2020 00:00:00 GMT"),
+            Some(datetime!(2020-02-29 00:00:00 UTC))
+        );
+    }
+
+    /// The whole value is the date: nothing may trail it.
+    #[test]
+    fn http_dates_take_no_trailing_text() {
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMTX"), None);
+        assert_eq!(parse_http_date("Sun Nov  6 08:49:37 1994 GMT"), None);
+    }
+
+    /// RFC 850's two-digit year: 69 and up are the 1900s, below that the 2000s.
+    #[test]
+    fn rfc850_years_get_their_century() {
+        assert_eq!(
+            parse_http_date("Wednesday, 01-Jan-69 00:00:00 GMT"),
+            Some(datetime!(1969-01-01 00:00:00 UTC))
+        );
+        assert_eq!(
+            parse_http_date("Sunday, 01-Jan-68 00:00:00 GMT"),
+            Some(datetime!(2068-01-01 00:00:00 UTC))
+        );
+        assert_eq!(
+            parse_http_date("Wednesday, 18-Nov-26 10:30:00 GMT"),
+            Some(datetime!(2026-11-18 10:30:00 UTC))
+        );
+    }
+
+    #[test]
+    fn http_dates_format_as_imf_fixdate() {
+        assert_eq!(
+            format_http_date(datetime!(1994-11-06 08:49:37 UTC)).as_deref(),
+            Some("Sun, 06 Nov 1994 08:49:37 GMT")
+        );
+        assert_eq!(
+            format_http_date(datetime!(2026-01-02 03:04:05 +2)).as_deref(),
+            Some("Fri, 02 Jan 2026 01:04:05 GMT")
+        );
     }
 
     #[test]
@@ -2815,7 +2901,7 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert_eq!(
             cache.get(&key())[0].freshness_lifetime(),
-            Some(TimeDelta::seconds(120))
+            Some(Duration::seconds(120))
         );
 
         // A different variant of the same URL lives beside it.

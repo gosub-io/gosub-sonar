@@ -2470,7 +2470,7 @@ mod tests {
         hsts.store(
             "hsts-upgrade.invalid",
             crate::net::hsts::HstsEntry {
-                expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(1),
                 include_subdomains: false,
             },
         );
@@ -2495,7 +2495,7 @@ mod tests {
         hsts.store(
             "tls.test",
             crate::net::hsts::HstsEntry {
-                expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(1),
                 include_subdomains: false,
             },
         );
@@ -5211,7 +5211,7 @@ mod tests {
         store.store(
             host,
             crate::net::hsts::HstsEntry {
-                expires_at: chrono::Utc::now() + chrono::Duration::days(1),
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(1),
                 include_subdomains,
             },
         );
@@ -5292,7 +5292,7 @@ mod tests {
             .load("hsts.badssl.com")
             .expect("a live HSTS response must arm the store");
         assert!(entry.include_subdomains);
-        assert!(!entry.is_expired(chrono::Utc::now()));
+        assert!(!entry.is_expired(time::OffsetDateTime::now_utc()));
 
         // Upgrade: a plaintext request for the now-armed host must go out over https.
         ctx.seen.lock().clear();

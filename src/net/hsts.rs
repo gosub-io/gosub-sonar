@@ -12,10 +12,10 @@
 //! Native-only: on wasm32 the browser's fetch() applies its own HSTS, and CORS filtering hides the
 //! `Strict-Transport-Security` response header from us anyway.
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dashmap::DashMap;
 use http::{header, HeaderMap};
 use std::collections::HashSet;
+use time::{Duration, OffsetDateTime};
 use url::{Host, Url};
 
 /// Ceiling on `max-age`. The value is server-controlled and unbounded in the grammar, so this
@@ -26,7 +26,7 @@ const MAX_AGE_CAP_SECS: u64 = 100 * 365 * 24 * 60 * 60;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HstsEntry {
     /// When this policy stops applying. Derived from `max-age` at the time the header was seen.
-    pub expires_at: DateTime<Utc>,
+    pub expires_at: OffsetDateTime,
     /// Whether the policy extends to subdomains. Gates inherited matches only: a host always
     /// matches its own entry regardless of this flag.
     pub include_subdomains: bool,
@@ -34,7 +34,7 @@ pub struct HstsEntry {
 
 impl HstsEntry {
     /// Whether this entry has expired as of `now`.
-    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_expired(&self, now: OffsetDateTime) -> bool {
         now >= self.expires_at
     }
 }
@@ -96,7 +96,7 @@ impl HstsStore for InMemoryHstsStore {
 
     fn store(&self, host: &str, entry: HstsEntry) {
         if self.entries.len() >= MAX_HSTS_ENTRIES && !self.entries.contains_key(host) {
-            let now = Utc::now();
+            let now = OffsetDateTime::now_utc();
             self.entries.retain(|_, (e, _)| e.expires_at > now);
             if self.entries.len() >= MAX_HSTS_ENTRIES {
                 let oldest = self
@@ -265,7 +265,7 @@ fn parse_sts(value: &str) -> Option<StsDirectives> {
 /// Headers arriving over plaintext are ignored (§8.1) — honouring them would let an on-path
 /// attacker pin a host persistently. A successful `https` response also implies a validated
 /// chain, since the TLS stack rejects it otherwise.
-pub(crate) fn record(store: &dyn HstsStore, url: &Url, headers: &HeaderMap, now: DateTime<Utc>) {
+pub(crate) fn record(store: &dyn HstsStore, url: &Url, headers: &HeaderMap, now: OffsetDateTime) {
     if url.scheme() != "https" {
         return;
     }
@@ -291,9 +291,7 @@ pub(crate) fn record(store: &dyn HstsStore, url: &Url, headers: &HeaderMap, now:
     }
 
     let secs = sts.max_age.min(MAX_AGE_CAP_SECS) as i64;
-    let Some(expires_at) =
-        ChronoDuration::try_seconds(secs).and_then(|d| now.checked_add_signed(d))
-    else {
+    let Some(expires_at) = now.checked_add(Duration::seconds(secs)) else {
         return;
     };
 
@@ -311,7 +309,7 @@ pub(crate) fn record(store: &dyn HstsStore, url: &Url, headers: &HeaderMap, now:
 /// §8.2: a host is a Known HSTS Host given a congruent (exact) match, or *any* superdomain match
 /// asserting `includeSubDomains`. So the flag gates inherited matches only — an exact match
 /// ignores it — and a nearer non-matching entry does not shadow a permissive ancestor.
-pub(crate) fn should_upgrade(store: &dyn HstsStore, url: &Url, now: DateTime<Utc>) -> bool {
+pub(crate) fn should_upgrade(store: &dyn HstsStore, url: &Url, now: OffsetDateTime) -> bool {
     if url.scheme() != "http" {
         return false;
     }
@@ -323,7 +321,7 @@ pub(crate) fn should_upgrade(store: &dyn HstsStore, url: &Url, now: DateTime<Utc
 
 /// Whether `host` is a Known HSTS Host (§8.2): an exact entry, or an `includeSubDomains` entry
 /// on a superdomain, either one unexpired.
-pub(crate) fn is_known_host(store: &dyn HstsStore, host: &str, now: DateTime<Utc>) -> bool {
+pub(crate) fn is_known_host(store: &dyn HstsStore, host: &str, now: OffsetDateTime) -> bool {
     let mut candidate = normalize_host(host);
     let mut is_exact = true;
 
@@ -366,9 +364,9 @@ mod tests {
     #[test]
     fn the_hsts_store_is_bounded() {
         let store = InMemoryHstsStore::new();
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let entry = |days: i64| HstsEntry {
-            expires_at: now + chrono::TimeDelta::days(days),
+            expires_at: now + Duration::days(days),
             include_subdomains: false,
         };
         store.store("expired.test", entry(-1));
@@ -392,9 +390,9 @@ mod tests {
     #[test]
     fn far_future_entries_do_not_push_out_newer_ones() {
         let store = InMemoryHstsStore::new();
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let entry = |days: i64| HstsEntry {
-            expires_at: now + chrono::TimeDelta::days(days),
+            expires_at: now + Duration::days(days),
             include_subdomains: false,
         };
         store.store("bank.test", entry(365));
@@ -411,13 +409,13 @@ mod tests {
         assert!(store.load("h0.evil.test").is_none());
     }
 
-    fn now() -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000, 0).expect("valid fixed timestamp")
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixed timestamp")
     }
 
     fn entry(include_subdomains: bool) -> HstsEntry {
         HstsEntry {
-            expires_at: now() + ChronoDuration::days(365),
+            expires_at: now() + Duration::days(365),
             include_subdomains,
         }
     }
@@ -579,7 +577,7 @@ mod tests {
         );
         let e = store.load("example.org").expect("entry must be stored");
         assert!(e.include_subdomains);
-        assert_eq!(e.expires_at, now() + ChronoDuration::seconds(600));
+        assert_eq!(e.expires_at, now() + Duration::seconds(600));
     }
 
     #[test]
@@ -651,7 +649,7 @@ mod tests {
         let e = store.load("example.org").expect("entry must be stored");
         assert_eq!(
             e.expires_at,
-            now() + ChronoDuration::seconds(MAX_AGE_CAP_SECS as i64)
+            now() + Duration::seconds(MAX_AGE_CAP_SECS as i64)
         );
     }
 
@@ -740,7 +738,7 @@ mod tests {
         store.store(
             "sub.example.org",
             HstsEntry {
-                expires_at: now() - ChronoDuration::seconds(1),
+                expires_at: now() - Duration::seconds(1),
                 include_subdomains: true,
             },
         );
@@ -758,7 +756,7 @@ mod tests {
         store.store(
             "example.org",
             HstsEntry {
-                expires_at: now() - ChronoDuration::seconds(1),
+                expires_at: now() - Duration::seconds(1),
                 include_subdomains: false,
             },
         );

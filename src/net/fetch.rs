@@ -1078,7 +1078,10 @@ async fn fetch_response_top_inner(
                     // A stored response says how old it is (RFC 9111 §4): the cache's own
                     // `Age`, replacing the one it arrived with.
                     let mut headers = entry.headers.clone();
-                    let age = entry.current_age(chrono::Utc::now()).num_seconds().max(0);
+                    let age = entry
+                        .current_age(time::OffsetDateTime::now_utc())
+                        .whole_seconds()
+                        .max(0);
                     headers.insert(header::AGE, header::HeaderValue::from(age));
                     headers
                 },
@@ -2694,7 +2697,7 @@ mod tests {
         let entry = crate::net::hsts::HstsStore::load(store.as_ref(), "hsts.test")
             .expect("an https response carrying the header must arm the store");
         assert!(entry.include_subdomains);
-        assert!(!entry.is_expired(chrono::Utc::now()));
+        assert!(!entry.is_expired(time::OffsetDateTime::now_utc()));
     }
 
     /// The same header over plain HTTP must arm nothing (§8.1).
@@ -2742,7 +2745,7 @@ mod tests {
             store.as_ref(),
             "hsts.test",
             crate::net::hsts::HstsEntry {
-                expires_at: chrono::Utc::now() + chrono::Duration::days(30),
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(30),
                 include_subdomains: false,
             },
         );
@@ -3900,7 +3903,7 @@ mod tests {
             store.as_ref(),
             "hsts.test",
             crate::net::hsts::HstsEntry {
-                expires_at: chrono::Utc::now() + chrono::Duration::days(30),
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(30),
                 include_subdomains: false,
             },
         );
@@ -5655,9 +5658,11 @@ mod tests {
     /// fifty seconds its `Date` already put on it, not the `Age: 7` it arrived with.
     #[tokio::test(flavor = "current_thread")]
     async fn a_cache_hit_carries_a_generated_age() {
-        let date = (chrono::Utc::now() - chrono::TimeDelta::seconds(50))
-            .format("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string();
+        let date = (time::OffsetDateTime::now_utc() - time::Duration::seconds(50))
+            .format(time::macros::format_description!(
+                "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+            ))
+            .unwrap();
         let srv = TestServer::new()
             .route(
                 "/aged",
@@ -8004,7 +8009,7 @@ mod tests {
                 store.as_ref(),
                 "hsts.test",
                 crate::net::hsts::HstsEntry {
-                    expires_at: chrono::Utc::now() + chrono::TimeDelta::days(1),
+                    expires_at: time::OffsetDateTime::now_utc() + time::Duration::days(1),
                     include_subdomains: false,
                 },
             );

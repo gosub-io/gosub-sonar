@@ -23,6 +23,8 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use time::format_description::well_known::Rfc2822;
+use time::OffsetDateTime;
 
 /// When and how often a failed request is re-sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,13 +114,11 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
         let secs = value.parse::<u64>().unwrap_or(u64::MAX);
         return Some(Duration::from_secs(secs));
     }
-    let at = crate::net::cache::parse_http_date(value).or_else(|| {
-        chrono::DateTime::parse_from_rfc2822(value)
-            .ok()
-            .map(|at| at.with_timezone(&chrono::Utc))
-    })?;
-    let wait = at.signed_duration_since(chrono::Utc::now());
-    Some(wait.to_std().unwrap_or(Duration::ZERO))
+    let at = crate::net::cache::parse_http_date(value)
+        .or_else(|| OffsetDateTime::parse(value, &Rfc2822).ok())?;
+    // Negative for a date in the past, which `try_from` refuses.
+    let wait = at - OffsetDateTime::now_utc();
+    Some(Duration::try_from(wait).unwrap_or(Duration::ZERO))
 }
 
 /// Runs `attempt` until its result is not retryable or the policy is exhausted. `meta` gives
@@ -247,6 +247,7 @@ mod tests {
     use super::*;
     use crate::net::transport::TransportError;
     use std::sync::Arc;
+    use time::macros::format_description;
 
     fn transport(kind: TransportErrorKind) -> NetError {
         NetError::Transport(TransportError {
@@ -321,7 +322,9 @@ mod tests {
         assert_eq!(retry_after(&h), Some(Duration::from_secs(7)));
         h.insert(header::RETRY_AFTER, "soon".parse().unwrap());
         assert_eq!(retry_after(&h), None);
-        let future = (chrono::Utc::now() + chrono::Duration::seconds(90)).to_rfc2822();
+        let future = (OffsetDateTime::now_utc() + time::Duration::seconds(90))
+            .format(&Rfc2822)
+            .unwrap();
         h.insert(header::RETRY_AFTER, future.parse().unwrap());
         let d = retry_after(&h).unwrap();
         assert!(
@@ -361,12 +364,19 @@ mod tests {
     /// all three HTTP-date formats." An hour ahead, in each of them.
     #[test]
     fn retry_after_takes_every_http_date_format() {
-        let ahead = chrono::Utc::now() + chrono::Duration::hours(1);
-        for date in [
-            ahead.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-            ahead.format("%A, %d-%b-%y %H:%M:%S GMT").to_string(),
-            ahead.format("%a %b %e %H:%M:%S %Y").to_string(),
+        let ahead = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        for format in [
+            format_description!(
+                "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+            ),
+            format_description!(
+                "[weekday], [day]-[month repr:short]-[year repr:last_two] [hour]:[minute]:[second] GMT"
+            ),
+            format_description!(
+                "[weekday repr:short] [month repr:short] [day padding:space] [hour]:[minute]:[second] [year]"
+            ),
         ] {
+            let date = ahead.format(format).unwrap();
             let mut h = HeaderMap::new();
             h.insert(header::RETRY_AFTER, date.parse().unwrap());
             let wait = retry_after(&h).unwrap_or_else(|| panic!("{date}"));

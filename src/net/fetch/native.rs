@@ -226,8 +226,8 @@ pub(crate) struct PendingStore {
     pub(super) response_headers: HeaderMap,
     pub(super) request_headers: HeaderMap,
     pub(super) decoded: bool,
-    pub(super) requested_at: chrono::DateTime<chrono::Utc>,
-    pub(super) received_at: chrono::DateTime<chrono::Utc>,
+    pub(super) requested_at: time::OffsetDateTime,
+    pub(super) received_at: time::OffsetDateTime,
     pub(super) peer_addr: Option<std::net::SocketAddr>,
 }
 

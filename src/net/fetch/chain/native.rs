@@ -88,8 +88,8 @@ pub(super) struct HopPlan {
 /// made from it (RFC 9111 §4.2.3).
 pub(super) struct HopExchange {
     pub(super) response: HopResponse,
-    requested_at: chrono::DateTime<chrono::Utc>,
-    received_at: chrono::DateTime<chrono::Utc>,
+    requested_at: time::OffsetDateTime,
+    received_at: time::OffsetDateTime,
     // The `Authorization` the send added, for `Vary` to record.
     authorization: Option<header::HeaderValue>,
 }
@@ -111,14 +111,14 @@ impl HopExchange {
 
 /// When one send of a hop was asked for and its response received.
 pub(super) struct Timing {
-    requested_at: chrono::DateTime<chrono::Utc>,
-    received_at: chrono::DateTime<chrono::Utc>,
+    requested_at: time::OffsetDateTime,
+    received_at: time::OffsetDateTime,
 }
 
 impl Timing {
     /// The send is asked for now.
     pub(super) fn requested() -> Self {
-        let now = chrono::Utc::now();
+        let now = time::OffsetDateTime::now_utc();
         Timing {
             requested_at: now,
             received_at: now,
@@ -127,7 +127,7 @@ impl Timing {
 
     /// Its response is received now.
     pub(super) fn received(&mut self) {
-        self.received_at = chrono::Utc::now();
+        self.received_at = time::OffsetDateTime::now_utc();
     }
 }
 
@@ -195,7 +195,7 @@ impl HopChain {
     pub(super) fn apply_hsts(&mut self, env: &ChainEnv<'_>) -> Option<Url> {
         let mut before_hsts: Option<Url> = None;
         if let Some(ref store) = env.policy.transport.hsts {
-            if hsts::should_upgrade(store.as_ref(), &self.url, chrono::Utc::now()) {
+            if hsts::should_upgrade(store.as_ref(), &self.url, time::OffsetDateTime::now_utc()) {
                 before_hsts = Some(self.url.clone());
                 let upgraded = hsts::upgrade(&self.url);
                 env.observer.on_event(NetEvent::SecurityUpgraded {
@@ -262,7 +262,7 @@ impl HopChain {
         }
         let credentials_include = env.credentials_include;
         let serialized = cors::serialize_origin(o, self.origin_tainted);
-        let now = chrono::Utc::now();
+        let now = time::OffsetDateTime::now_utc();
         // A grant made with credentials also covers the request without them
         // (Fetch, "method cache entry match"). It is judged by the credentialed
         // rules it was made under, where a `*` is a literal, not a wildcard.
@@ -390,7 +390,7 @@ impl HopChain {
             Some(entry) => {
                 let response = self.answer_from_cache(env, entry, plan)?;
                 // Only a response from the network is stored, so these are not read.
-                let now = chrono::Utc::now();
+                let now = time::OffsetDateTime::now_utc();
                 Ok(HopExchange {
                     response,
                     requested_at: now,
@@ -430,7 +430,7 @@ impl HopChain {
             &self.headers,
             env.init.auto_decode && self.method != Method::HEAD,
             cache_mode,
-            chrono::Utc::now(),
+            time::OffsetDateTime::now_utc(),
         );
         match if env.background {
             decision
@@ -684,7 +684,7 @@ impl HopChain {
                     store.as_ref(),
                     &self.url,
                     resp.headers(),
-                    chrono::Utc::now(),
+                    time::OffsetDateTime::now_utc(),
                 );
             }
         }

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `chrono` is replaced by `time`, as `chrono` is unmaintained (RUSTSEC-2026-0543).
+  Instants are `time::OffsetDateTime` (in UTC) where they were `chrono::DateTime<Utc>`, and
+  spans are `time::Duration` where they were `chrono::TimeDelta`: `HstsEntry::expires_at` and
+  `is_expired`, `CacheEntry::requested_at`, `received_at`, `current_age`, `freshness_lifetime`,
+  `is_fresh` and `updated_by_304`, `cache::parse_http_date`, `cache::decide`,
+  `cache::entry_from_response`, and the `now` of `CorsPreflightCache::get` and `put` (GOS-374)
+
 ## [0.17.0] - 2026-11-13
 
 ### Changed
