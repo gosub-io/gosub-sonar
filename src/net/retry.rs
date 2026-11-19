@@ -114,11 +114,46 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
         let secs = value.parse::<u64>().unwrap_or(u64::MAX);
         return Some(Duration::from_secs(secs));
     }
-    let at = crate::net::cache::parse_http_date(value)
-        .or_else(|| OffsetDateTime::parse(value, &Rfc2822).ok())?;
+    let at = crate::net::cache::parse_http_date(value).or_else(|| parse_rfc2822(value))?;
     // Negative for a date in the past, which `try_from` refuses.
     let wait = at - OffsetDateTime::now_utc();
     Some(Duration::try_from(wait).unwrap_or(Duration::ZERO))
+}
+
+/// An RFC 2822 date. `time` (0.3.47) puts the sign of a numeric zone on its hours only, so it
+/// reads `-0030` as `+0030`; such a zone gets its sign back here.
+fn parse_rfc2822(value: &str) -> Option<OffsetDateTime> {
+    let at = OffsetDateTime::parse(value, &Rfc2822).ok()?;
+    // The zone is the last word once comments are gone: only comments and whitespace may
+    // follow it (RFC 2822 §3.3).
+    let zone = without_comments(value)
+        .split_ascii_whitespace()
+        .last()?
+        .to_owned();
+    if zone.starts_with("-00") && at.offset().is_positive() {
+        return Some(at.replace_offset(-at.offset()));
+    }
+    Some(at)
+}
+
+/// `value` without its RFC 2822 comments: parenthesised, nestable, with `\` quoting the next
+/// character.
+fn without_comments(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut depth = 0usize;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if depth > 0 => {
+                chars.next();
+            }
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Runs `attempt` until its result is not retryable or the policy is exhausted. `meta` gives
@@ -358,6 +393,51 @@ mod tests {
         // Past `max_backoff`, so the policy gives up rather than retrying soon.
         let policy = RetryPolicy::default();
         assert_eq!(policy.backoff(1, parsed("184467440737095516160")), None);
+    }
+
+    /// A numeric zone keeps its sign when it is under an hour.
+    #[test]
+    fn retry_after_rfc2822_zones_keep_their_sign() {
+        let now = OffsetDateTime::now_utc();
+        for offset in [
+            time::macros::offset!(-0:30),
+            time::macros::offset!(+0:30),
+            time::macros::offset!(-1:00),
+            time::macros::offset!(-1:30),
+            time::macros::offset!(+5:45),
+        ] {
+            let date = (now + time::Duration::hours(1))
+                .to_offset(offset)
+                .format(&Rfc2822)
+                .unwrap();
+            let mut h = HeaderMap::new();
+            h.insert(header::RETRY_AFTER, date.parse().unwrap());
+            let wait = retry_after(&h).unwrap_or_else(|| panic!("{date}"));
+            assert!(
+                wait > Duration::from_secs(3500) && wait <= Duration::from_secs(3600),
+                "{date}: {wait:?}"
+            );
+        }
+    }
+
+    /// The zone is found past comments, which may name another zone.
+    #[test]
+    fn retry_after_rfc2822_zone_is_not_read_from_a_comment() {
+        let now = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        for (offset, comment) in [
+            (time::macros::offset!(+0:30), " (previous -0030)"),
+            (time::macros::offset!(-0:30), " (was \\) +0030)"),
+            (time::macros::offset!(-0:30), " (a (nested) one)"),
+        ] {
+            let date = now.to_offset(offset).format(&Rfc2822).unwrap() + comment;
+            let mut h = HeaderMap::new();
+            h.insert(header::RETRY_AFTER, date.parse().unwrap());
+            let wait = retry_after(&h).unwrap_or_else(|| panic!("{date}"));
+            assert!(
+                wait > Duration::from_secs(3500) && wait <= Duration::from_secs(3600),
+                "{date}: {wait:?}"
+            );
+        }
     }
 
     /// RFC 9110 §5.6.7: "A recipient that parses a timestamp value in an HTTP field MUST accept
