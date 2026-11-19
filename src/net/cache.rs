@@ -514,13 +514,13 @@ impl CacheEntry {
         }
         // The 304 is a response of its own: one without a `Date` gets the time it arrived, as
         // a stored one does (RFC 9110 §6.6.1), and the `Age` the old one arrived with is not
-        // its age.
+        // its age. Without a `Date` to give it, the old one goes too: it would make the entry as
+        // old as the stored response.
         if !headers.contains_key(header::DATE) {
-            if let Some(date) =
-                format_http_date(received_at).and_then(|d| HeaderValue::from_str(&d).ok())
-            {
-                updated.headers.insert(header::DATE, date);
-            }
+            match format_http_date(received_at).and_then(|d| HeaderValue::from_str(&d).ok()) {
+                Some(date) => updated.headers.insert(header::DATE, date),
+                None => updated.headers.remove(header::DATE),
+            };
         }
         if !headers.contains_key(header::AGE) {
             updated.headers.remove(header::AGE);
@@ -2784,6 +2784,23 @@ mod tests {
             &HeaderMap::new(),
         );
         assert_eq!(updated.current_age(at(1000)), Duration::seconds(10));
+    }
+
+    /// A 304 that arrives at an instant no HTTP date can name (here past 9999 in UTC) gets no
+    /// `Date` of its own, and keeps none of the stored response's either.
+    #[test]
+    fn a_304_whose_arrival_has_no_http_date_drops_the_old_date() {
+        let stored = entry(&[("cache-control", "max-age=60"), ("etag", "\"v1\"")]);
+        assert!(stored.headers.contains_key(header::DATE));
+        let arrived = datetime!(9999-12-31 23:59:59 -1);
+        let updated = stored.updated_by_304(
+            &headers(&[("etag", "\"v1\"")]),
+            arrived,
+            arrived,
+            &HeaderMap::new(),
+        );
+        assert!(!updated.headers.contains_key(header::DATE));
+        assert_eq!(updated.current_age(arrived), Duration::ZERO);
     }
 
     #[test]
