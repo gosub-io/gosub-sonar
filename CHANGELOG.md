@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** `chrono` is replaced by `time`, as `chrono` is unmaintained (RUSTSEC-2026-0543).
+  Instants are `time::OffsetDateTime` where they were `chrono::DateTime<Utc>`, and spans are
+  `time::Duration` where they were `chrono::TimeDelta`: `HstsEntry::expires_at` and
+  `is_expired`, `CacheEntry::requested_at`, `received_at`, `current_age`, `freshness_lifetime`,
+  `is_fresh` and `updated_by_304`, `cache::parse_http_date`, `cache::decide`,
+  `cache::entry_from_response`, and the `now` of `CorsPreflightCache::get` and `put` (GOS-374).
+  The instants sonar takes itself are in UTC; one a caller passes in keeps its offset
+- The two-digit year of an RFC 850 HTTP-date is the one no more than 50 years ahead of now
+  (RFC 9110 §5.6.7), not a fixed 1970-2069 window
+
 ## [0.17.0] - 2026-11-13
 
 ### Changed

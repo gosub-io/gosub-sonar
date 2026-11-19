@@ -428,9 +428,9 @@ pub fn readable_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use http::HeaderValue;
     use std::time::Duration;
+    use time::OffsetDateTime;
     use url::Url;
 
     fn origin(s: &str) -> url::Origin {
@@ -908,7 +908,7 @@ mod tests {
             ("access-control-max-age", "60"),
         ]);
         let allows = validate_preflight_response(200, &resp, &o, false, false).unwrap();
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         cache.put("https://a.example", &url, false, allows, now);
 
         let hit = cache.get("https://a.example", &url, false, now).unwrap();
@@ -920,7 +920,7 @@ mod tests {
         let frag = Url::parse("https://api.example/data#frag").unwrap();
         assert!(cache.get("https://a.example", &frag, false, now).is_some());
         // Expired entries are not returned.
-        let later = now + chrono::TimeDelta::seconds(61);
+        let later = now + time::Duration::seconds(61);
         assert!(cache.get("https://a.example", &url, false, later).is_none());
     }
 

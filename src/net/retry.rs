@@ -23,6 +23,8 @@ use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use time::format_description::well_known::Rfc2822;
+use time::OffsetDateTime;
 
 /// When and how often a failed request is re-sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,13 +114,46 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
         let secs = value.parse::<u64>().unwrap_or(u64::MAX);
         return Some(Duration::from_secs(secs));
     }
-    let at = crate::net::cache::parse_http_date(value).or_else(|| {
-        chrono::DateTime::parse_from_rfc2822(value)
-            .ok()
-            .map(|at| at.with_timezone(&chrono::Utc))
-    })?;
-    let wait = at.signed_duration_since(chrono::Utc::now());
-    Some(wait.to_std().unwrap_or(Duration::ZERO))
+    let at = crate::net::cache::parse_http_date(value).or_else(|| parse_rfc2822(value))?;
+    // Negative for a date in the past, which `try_from` refuses.
+    let wait = at - OffsetDateTime::now_utc();
+    Some(Duration::try_from(wait).unwrap_or(Duration::ZERO))
+}
+
+/// An RFC 2822 date. `time` (0.3.47) puts the sign of a numeric zone on its hours only, so it
+/// reads `-0030` as `+0030`; such a zone gets its sign back here.
+fn parse_rfc2822(value: &str) -> Option<OffsetDateTime> {
+    let at = OffsetDateTime::parse(value, &Rfc2822).ok()?;
+    // The zone is the last word once comments are gone: only comments and whitespace may
+    // follow it (RFC 2822 §3.3).
+    let zone = without_comments(value)
+        .split_ascii_whitespace()
+        .last()?
+        .to_owned();
+    if zone.starts_with("-00") && at.offset().is_positive() {
+        return Some(at.replace_offset(-at.offset()));
+    }
+    Some(at)
+}
+
+/// `value` without its RFC 2822 comments: parenthesised, nestable, with `\` quoting the next
+/// character.
+fn without_comments(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut depth = 0usize;
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if depth > 0 => {
+                chars.next();
+            }
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Runs `attempt` until its result is not retryable or the policy is exhausted. `meta` gives
@@ -247,6 +282,7 @@ mod tests {
     use super::*;
     use crate::net::transport::TransportError;
     use std::sync::Arc;
+    use time::macros::format_description;
 
     fn transport(kind: TransportErrorKind) -> NetError {
         NetError::Transport(TransportError {
@@ -321,7 +357,9 @@ mod tests {
         assert_eq!(retry_after(&h), Some(Duration::from_secs(7)));
         h.insert(header::RETRY_AFTER, "soon".parse().unwrap());
         assert_eq!(retry_after(&h), None);
-        let future = (chrono::Utc::now() + chrono::Duration::seconds(90)).to_rfc2822();
+        let future = (OffsetDateTime::now_utc() + time::Duration::seconds(90))
+            .format(&Rfc2822)
+            .unwrap();
         h.insert(header::RETRY_AFTER, future.parse().unwrap());
         let d = retry_after(&h).unwrap();
         assert!(
@@ -357,16 +395,68 @@ mod tests {
         assert_eq!(policy.backoff(1, parsed("184467440737095516160")), None);
     }
 
+    /// A numeric zone keeps its sign when it is under an hour.
+    #[test]
+    fn retry_after_rfc2822_zones_keep_their_sign() {
+        let now = OffsetDateTime::now_utc();
+        for offset in [
+            time::macros::offset!(-0:30),
+            time::macros::offset!(+0:30),
+            time::macros::offset!(-1:00),
+            time::macros::offset!(-1:30),
+            time::macros::offset!(+5:45),
+        ] {
+            let date = (now + time::Duration::hours(1))
+                .to_offset(offset)
+                .format(&Rfc2822)
+                .unwrap();
+            let mut h = HeaderMap::new();
+            h.insert(header::RETRY_AFTER, date.parse().unwrap());
+            let wait = retry_after(&h).unwrap_or_else(|| panic!("{date}"));
+            assert!(
+                wait > Duration::from_secs(3500) && wait <= Duration::from_secs(3600),
+                "{date}: {wait:?}"
+            );
+        }
+    }
+
+    /// The zone is found past comments, which may name another zone.
+    #[test]
+    fn retry_after_rfc2822_zone_is_not_read_from_a_comment() {
+        let now = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        for (offset, comment) in [
+            (time::macros::offset!(+0:30), " (previous -0030)"),
+            (time::macros::offset!(-0:30), " (was \\) +0030)"),
+            (time::macros::offset!(-0:30), " (a (nested) one)"),
+        ] {
+            let date = now.to_offset(offset).format(&Rfc2822).unwrap() + comment;
+            let mut h = HeaderMap::new();
+            h.insert(header::RETRY_AFTER, date.parse().unwrap());
+            let wait = retry_after(&h).unwrap_or_else(|| panic!("{date}"));
+            assert!(
+                wait > Duration::from_secs(3500) && wait <= Duration::from_secs(3600),
+                "{date}: {wait:?}"
+            );
+        }
+    }
+
     /// RFC 9110 §5.6.7: "A recipient that parses a timestamp value in an HTTP field MUST accept
     /// all three HTTP-date formats." An hour ahead, in each of them.
     #[test]
     fn retry_after_takes_every_http_date_format() {
-        let ahead = chrono::Utc::now() + chrono::Duration::hours(1);
-        for date in [
-            ahead.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-            ahead.format("%A, %d-%b-%y %H:%M:%S GMT").to_string(),
-            ahead.format("%a %b %e %H:%M:%S %Y").to_string(),
+        let ahead = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        for format in [
+            format_description!(
+                "[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT"
+            ),
+            format_description!(
+                "[weekday], [day]-[month repr:short]-[year repr:last_two] [hour]:[minute]:[second] GMT"
+            ),
+            format_description!(
+                "[weekday repr:short] [month repr:short] [day padding:space] [hour]:[minute]:[second] [year]"
+            ),
         ] {
+            let date = ahead.format(format).unwrap();
             let mut h = HeaderMap::new();
             h.insert(header::RETRY_AFTER, date.parse().unwrap());
             let wait = retry_after(&h).unwrap_or_else(|| panic!("{date}"));

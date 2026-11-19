@@ -276,7 +276,11 @@ impl rustls::client::danger::ServerCertVerifier for OverridableVerifier {
         }
         // no click-through on HSTS hosts (RFC 6797 §12.1)
         if let Some(store) = &self.hsts {
-            if crate::net::hsts::is_known_host(store.as_ref(), &host, chrono::Utc::now()) {
+            if crate::net::hsts::is_known_host(
+                store.as_ref(),
+                &host,
+                time::OffsetDateTime::now_utc(),
+            ) {
                 return Err(denied);
             }
         }

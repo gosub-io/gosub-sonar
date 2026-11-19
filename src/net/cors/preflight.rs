@@ -2,10 +2,10 @@
 //! cache. On wasm32 the browser's `fetch()` enforces CORS itself, so none of this is built.
 
 use super::{is_cors_safelisted_method, parse_token_list, CorsError};
-use chrono::{DateTime, Utc};
 use http::header::{self, HeaderMap};
 use http::Method;
 use std::time::Duration;
+use time::OffsetDateTime;
 use url::Url;
 
 /// The `Origin` serialization used in CORS comparisons: the ASCII serialization of the origin,
@@ -201,7 +201,7 @@ pub trait CorsPreflightCache: Send + Sync {
         origin: &str,
         url: &Url,
         credentials: bool,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Option<PreflightAllows>;
 
     /// Store a grant. `allows.max_age` is already defaulted and capped; the entry expires at
@@ -212,7 +212,7 @@ pub trait CorsPreflightCache: Send + Sync {
         url: &Url,
         credentials: bool,
         allows: PreflightAllows,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     );
 
     /// Drop the grants for `origin` and `url`, with and without credentials ([Fetch] §4.9,
@@ -239,7 +239,7 @@ pub const MAX_PREFLIGHT_ENTRIES: usize = 1024;
 type PreflightKey = (String, String, bool);
 
 /// A grant and the instant it expires.
-type PreflightEntry = (PreflightAllows, DateTime<Utc>);
+type PreflightEntry = (PreflightAllows, OffsetDateTime);
 
 impl InMemoryPreflightCache {
     /// An empty cache.
@@ -261,7 +261,7 @@ impl CorsPreflightCache for InMemoryPreflightCache {
         origin: &str,
         url: &Url,
         credentials: bool,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) -> Option<PreflightAllows> {
         let entries = self.entries.read();
         let (allows, expires) = entries.get(&Self::key(origin, url, credentials))?;
@@ -274,15 +274,20 @@ impl CorsPreflightCache for InMemoryPreflightCache {
         url: &Url,
         credentials: bool,
         allows: PreflightAllows,
-        now: DateTime<Utc>,
+        now: OffsetDateTime,
     ) {
         // `max_age` is capped at MAX_PREFLIGHT_MAX_AGE, so the conversion cannot overflow;
-        // zero (an already-expired entry) is the safe direction if that ever changes.
-        let expires =
-            now + chrono::TimeDelta::from_std(allows.max_age).unwrap_or(chrono::TimeDelta::zero());
-        let mut entries = self.entries.write();
-        entries.retain(|_, (_, exp)| *exp > now);
+        // zero (an already-expired entry) is the safe direction if that ever changes. A `now`
+        // so late that the expiry is past what `OffsetDateTime` holds stores nothing, and drops
+        // the grant it would have replaced: the server's answer is no longer that one.
+        let max_age = time::Duration::try_from(allows.max_age).unwrap_or(time::Duration::ZERO);
         let key = Self::key(origin, url, credentials);
+        let mut entries = self.entries.write();
+        let Some(expires) = now.checked_add(max_age) else {
+            entries.remove(&key);
+            return;
+        };
+        entries.retain(|_, (_, exp)| *exp > now);
         if entries.len() >= MAX_PREFLIGHT_ENTRIES && !entries.contains_key(&key) {
             if let Some(soonest) = entries
                 .iter()
@@ -310,7 +315,7 @@ mod tests {
     #[test]
     fn the_preflight_cache_is_bounded() {
         let cache = InMemoryPreflightCache::new();
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let allows = |secs: u64| PreflightAllows {
             methods: Vec::new(),
             methods_wildcard: false,
@@ -331,12 +336,38 @@ mod tests {
         assert!(cache.get("https://a.test", &extra, false, now).is_some());
     }
 
+    /// An expiry past the last instant `OffsetDateTime` holds is not cached, and does not panic.
+    #[test]
+    fn a_grant_expiring_out_of_range_is_not_cached() {
+        let cache = InMemoryPreflightCache::new();
+        let now = time::macros::datetime!(9999-12-31 23:59:50 UTC);
+        let allows = |secs: u64| PreflightAllows {
+            methods: Vec::new(),
+            methods_wildcard: false,
+            headers: Vec::new(),
+            headers_wildcard: false,
+            max_age: Duration::from_secs(secs),
+        };
+        let url = Url::parse("https://api.test/").unwrap();
+        let other = Url::parse("https://api.test/other").unwrap();
+        // Live grants for the same key and for another URL, expiring at 23:59:55.
+        let earlier = now - time::Duration::seconds(10);
+        cache.put("https://a.test", &url, false, allows(15), earlier);
+        cache.put("https://a.test", &other, false, allows(15), earlier);
+        assert!(cache.get("https://a.test", &url, false, now).is_some());
+
+        // Ten seconds from now is past the end of year 9999.
+        cache.put("https://a.test", &url, false, allows(10), now);
+        assert!(cache.get("https://a.test", &url, false, now).is_none());
+        assert!(cache.get("https://a.test", &other, false, now).is_some());
+    }
+
     /// Fetch §4.9, clear cache entries: both grants for the origin and URL go, with and without
     /// credentials; others stay.
     #[test]
     fn clear_drops_the_grants_for_one_origin_and_url() {
         let cache = InMemoryPreflightCache::new();
-        let now = Utc::now();
+        let now = OffsetDateTime::now_utc();
         let allows = PreflightAllows {
             methods: Vec::new(),
             methods_wildcard: false,

@@ -74,7 +74,7 @@ impl Fetcher {
     /// Upgrades `req` to `https` when HSTS knows its host.
     pub(super) fn hsts_upgrade(&self, req: &mut FetchRequest) {
         if let Some(ref store) = self.cfg.hsts {
-            if hsts::should_upgrade(store.as_ref(), &req.url, chrono::Utc::now()) {
+            if hsts::should_upgrade(store.as_ref(), &req.url, time::OffsetDateTime::now_utc()) {
                 req.url = hsts::upgrade(&req.url);
             }
         }
